@@ -1267,8 +1267,8 @@ fn load_external_kernel(
     let initrd_config = if let Some(initramfs_path) = &external_kernel.initramfs_path {
         let data = std::fs::read(initramfs_path).map_err(StartMicrovmError::InitrdRead)?;
         guest_mem
-            .write(&data, GuestAddress(arch_mem_info.initrd_addr))
-            .unwrap();
+            .write_slice(&data, GuestAddress(arch_mem_info.initrd_addr))
+            .map_err(|_| StartMicrovmError::InitrdLoad)?;
         Some(InitrdConfig {
             address: GuestAddress(arch_mem_info.initrd_addr),
             size: data.len(),
@@ -1481,7 +1481,8 @@ pub fn create_guest_memory(
         #[cfg(test)]
         Payload::Empty => arch::arch_memory_regions(mem_size, None, 0, 0, None),
         Payload::Firmware => arch::arch_memory_regions(mem_size, None, 0, 0, firmware_size),
-    };
+    }
+    .map_err(|_| StartMicrovmError::InitrdLoad)?;
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     let (arch_mem_info, mut arch_mem_regions) = match payload {
         Payload::ExternalKernel(external_kernel) => {
@@ -2365,6 +2366,20 @@ pub mod tests {
         });
 
         create_guest_memory(mem_size_mib, &vm_resources, &Payload::Empty)
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn create_guest_memory_rejects_non_contiguous_initrd() {
+        let vm_resources = VmResources::default();
+        let payload = Payload::ExternalKernel(ExternalKernel {
+            initramfs_size: 2 << 20,
+            ..Default::default()
+        });
+
+        let result = create_guest_memory(1, &vm_resources, &payload);
+
+        assert!(matches!(result, Err(StartMicrovmError::InitrdLoad)));
     }
 
     #[test]

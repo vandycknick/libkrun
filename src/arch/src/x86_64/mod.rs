@@ -62,7 +62,7 @@ pub fn arch_memory_regions(
     kernel_size: usize,
     initrd_size: u64,
     firmware_size: Option<usize>,
-) -> (ArchMemoryInfo, Vec<(GuestAddress, usize)>) {
+) -> crate::Result<(ArchMemoryInfo, Vec<(GuestAddress, usize)>)> {
     let page_size: usize = unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() };
 
     let size = align_upwards!(size, page_size);
@@ -154,16 +154,23 @@ pub fn arch_memory_regions(
                 )
             }
         };
+    let initrd_addr = if initrd_size <= ram_above_gap {
+        ram_last_addr.checked_sub(initrd_size)
+    } else {
+        ram_below_gap.checked_sub(initrd_size)
+    }
+    .ok_or(Error::InitrdAddress)?;
+
     let info = ArchMemoryInfo {
         ram_below_gap,
         ram_above_gap,
         ram_last_addr,
         shm_start_addr,
         page_size,
-        initrd_addr: ram_last_addr - initrd_size,
+        initrd_addr,
         firmware_addr,
     };
-    (info, regions)
+    Ok((info, regions))
 }
 
 /// Returns a Vec of the valid memory addresses.
@@ -178,7 +185,7 @@ pub fn arch_memory_regions(
     kernel_size: usize,
     _initrd_size: u64,
     _firmware_size: Option<usize>,
-) -> (ArchMemoryInfo, Vec<(GuestAddress, usize)>) {
+) -> crate::Result<(ArchMemoryInfo, Vec<(GuestAddress, usize)>)> {
     let page_size: usize = unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() };
 
     let size = align_upwards!(size, page_size);
@@ -233,7 +240,7 @@ pub fn arch_memory_regions(
         initrd_addr: layout::INITRD_SEV_START,
         firmware_addr: 0,
     };
-    (info, regions)
+    Ok((info, regions))
 }
 
 /// Configures the system and should be called once per vm before starting vcpu threads.
@@ -277,8 +284,13 @@ pub fn configure_system(
 
     params.0.hdr.kernel_alignment = KERNEL_MIN_ALIGNMENT_BYTES;
     if let Some(initrd_config) = initrd {
-        params.0.hdr.ramdisk_image = initrd_config.address.raw_value() as u32;
-        params.0.hdr.ramdisk_size = initrd_config.size as u32;
+        let initrd_addr = initrd_config.address.raw_value();
+        let initrd_size = initrd_config.size as u64;
+
+        params.0.hdr.ramdisk_image = initrd_addr as u32;
+        params.0.ext_ramdisk_image = (initrd_addr >> 32) as u32;
+        params.0.hdr.ramdisk_size = initrd_size as u32;
+        params.0.ext_ramdisk_size = (initrd_size >> 32) as u32;
     }
 
     if cfg!(feature = "tdx") {
@@ -366,7 +378,8 @@ mod tests {
     #[test]
     fn regions_lt_4gb() {
         let (_info, regions) =
-            arch_memory_regions(1usize << 29, Some(KERNEL_LOAD_ADDR), KERNEL_SIZE, 0, None);
+            arch_memory_regions(1usize << 29, Some(KERNEL_LOAD_ADDR), KERNEL_SIZE, 0, None)
+                .unwrap();
         assert_eq!(2, regions.len());
         assert_eq!(GuestAddress(0), regions[0].0);
         assert_eq!(KERNEL_LOAD_ADDR as usize, regions[0].1);
@@ -385,7 +398,8 @@ mod tests {
             KERNEL_SIZE,
             0,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(3, regions.len());
         assert_eq!(GuestAddress(0), regions[0].0);
         assert_eq!(KERNEL_LOAD_ADDR as usize, regions[0].1);
@@ -394,6 +408,67 @@ mod tests {
             regions[1].0
         );
         assert_eq!(GuestAddress(1u64 << 32), regions[2].0);
+    }
+
+    #[test]
+    fn initrd_avoids_32_bit_mmio_hole() {
+        const MIB: usize = 1 << 20;
+        const INITRD_SIZE: u64 = 2 << 20;
+
+        let test_cases = [
+            (3327 * MIB, (3327 * MIB) as u64 - INITRD_SIZE),
+            (3328 * MIB, MMIO_MEM_START - INITRD_SIZE),
+            (3329 * MIB, MMIO_MEM_START - INITRD_SIZE),
+            (3330 * MIB, FIRST_ADDR_PAST_32BITS),
+        ];
+
+        for (mem_size, expected_initrd_addr) in test_cases {
+            let (info, regions) =
+                arch_memory_regions(mem_size, None, 0, INITRD_SIZE, None).unwrap();
+            let initrd_end = info.initrd_addr.checked_add(INITRD_SIZE).unwrap();
+            let contained_in_ram = regions.iter().any(|(region_addr, region_size)| {
+                let region_start = region_addr.raw_value();
+                let region_end = region_start.checked_add(*region_size as u64).unwrap();
+                info.initrd_addr >= region_start && initrd_end <= region_end
+            });
+
+            assert_eq!(info.initrd_addr, expected_initrd_addr);
+            assert!(contained_in_ram);
+            assert!(initrd_end <= MMIO_MEM_START || info.initrd_addr >= FIRST_ADDR_PAST_32BITS);
+        }
+    }
+
+    #[test]
+    fn initrd_requires_one_contiguous_ram_region() {
+        let result = arch_memory_regions(1 << 20, None, 0, 2 << 20, None);
+
+        assert!(matches!(result, Err(Error::InitrdAddress)));
+    }
+
+    #[test]
+    fn configure_system_sets_extended_initrd_fields() {
+        const INITRD_ADDR: u64 = 0x0000_0001_2345_6789;
+        const INITRD_SIZE: usize = 0x0000_0001_3456_789a;
+
+        let (info, regions) = arch_memory_regions(128 << 20, None, 0, 0, None).unwrap();
+        let gm = GuestMemoryMmap::from_ranges(&regions).unwrap();
+        let initrd = Some(InitrdConfig {
+            address: GuestAddress(INITRD_ADDR),
+            size: INITRD_SIZE,
+        });
+
+        configure_system(&gm, &info, GuestAddress(0), 0, &initrd, 1).unwrap();
+
+        let params: BootParamsWrapper = gm.read_obj(GuestAddress(layout::ZERO_PAGE_START)).unwrap();
+        let ramdisk_image = params.0.hdr.ramdisk_image;
+        let ext_ramdisk_image = params.0.ext_ramdisk_image;
+        let ramdisk_size = params.0.hdr.ramdisk_size;
+        let ext_ramdisk_size = params.0.ext_ramdisk_size;
+
+        assert_eq!(ramdisk_image, INITRD_ADDR as u32);
+        assert_eq!(ext_ramdisk_image, (INITRD_ADDR >> 32) as u32);
+        assert_eq!(ramdisk_size, INITRD_SIZE as u32);
+        assert_eq!(ext_ramdisk_size, (INITRD_SIZE as u64 >> 32) as u32);
     }
 
     #[test]
@@ -412,21 +487,21 @@ mod tests {
         // Now assigning some memory that falls before the 32bit memory hole.
         let mem_size = 128 << 20;
         let (arch_mem_info, arch_mem_regions) =
-            arch_memory_regions(mem_size, Some(KERNEL_LOAD_ADDR), KERNEL_SIZE, 0, None);
+            arch_memory_regions(mem_size, Some(KERNEL_LOAD_ADDR), KERNEL_SIZE, 0, None).unwrap();
         let gm = GuestMemoryMmap::from_ranges(&arch_mem_regions).unwrap();
         configure_system(&gm, &arch_mem_info, GuestAddress(0), 0, &None, no_vcpus).unwrap();
 
         // Now assigning some memory that is equal to the start of the 32bit memory hole.
         let mem_size = 3328 << 20;
         let (arch_mem_info, arch_mem_regions) =
-            arch_memory_regions(mem_size, Some(KERNEL_LOAD_ADDR), KERNEL_SIZE, 0, None);
+            arch_memory_regions(mem_size, Some(KERNEL_LOAD_ADDR), KERNEL_SIZE, 0, None).unwrap();
         let gm = GuestMemoryMmap::from_ranges(&arch_mem_regions).unwrap();
         configure_system(&gm, &arch_mem_info, GuestAddress(0), 0, &None, no_vcpus).unwrap();
 
         // Now assigning some memory that falls after the 32bit memory hole.
         let mem_size = 3330 << 20;
         let (arch_mem_info, arch_mem_regions) =
-            arch_memory_regions(mem_size, Some(KERNEL_LOAD_ADDR), KERNEL_SIZE, 0, None);
+            arch_memory_regions(mem_size, Some(KERNEL_LOAD_ADDR), KERNEL_SIZE, 0, None).unwrap();
         let gm = GuestMemoryMmap::from_ranges(&arch_mem_regions).unwrap();
         configure_system(&gm, &arch_mem_info, GuestAddress(0), 0, &None, no_vcpus).unwrap();
     }
