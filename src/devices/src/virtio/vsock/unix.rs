@@ -534,10 +534,14 @@ impl Proxy for UnixProxy {
             "release: id={}, tx_cnt={}, last_tx_cnt={}",
             self.id, self.tx_cnt, self.last_tx_cnt_sent
         );
-        let remove_proxy = ProxyRemoval::Deferred;
+        self.status = ProxyStatus::Closed;
+        if let Err(e) = shutdown(self.fd.as_raw_fd(), Shutdown::Both) {
+            warn!("error shutting down released socket: {e}");
+        }
 
         ProxyUpdate {
-            remove_proxy,
+            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::empty())),
+            remove_proxy: ProxyRemoval::Deferred,
             ..Default::default()
         }
     }
@@ -717,5 +721,36 @@ impl Proxy for UnixAcceptorProxy {
 impl AsRawFd for UnixAcceptorProxy {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+
+    use vm_memory::GuestAddress;
+
+    use super::*;
+
+    #[test]
+    fn release_immediately_closes_host_endpoint() {
+        let (proxy_stream, mut host_stream) = UnixStream::pair().unwrap();
+        host_stream.set_nonblocking(true).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let queue = Arc::new(Mutex::new(VirtQueue::new(256)));
+        let rxq = Arc::new(Mutex::new(MuxerRxQ::new()));
+        let mut proxy =
+            UnixProxy::new_reverse(1, 3, 1024, 1234, proxy_stream.into(), mem, queue, rxq);
+
+        let update = proxy.release();
+
+        assert_eq!(proxy.status, ProxyStatus::Closed);
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Deferred));
+        let (id, fd, events) = update.polling.unwrap();
+        assert_eq!(id, proxy.id);
+        assert_eq!(fd, proxy.fd.as_raw_fd());
+        assert!(events.is_empty());
+        assert_eq!(host_stream.read(&mut [0; 1]).unwrap(), 0);
     }
 }
