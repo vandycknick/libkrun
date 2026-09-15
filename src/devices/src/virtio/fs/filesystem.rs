@@ -10,6 +10,7 @@ use utils::worker_message::WorkerMessage;
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::mem;
@@ -104,6 +105,22 @@ pub enum GetxattrReply {
     /// for the size of the value to change in between `getxattr` calls and should not assume that a
     /// subsequent call to `getxattr` with the returned count will always succeed.
     Count(u32),
+}
+
+/// A successful `ioctl` reply.
+#[derive(Eq, PartialEq)]
+pub struct IoctlReply {
+    pub result: i32,
+    pub data: Vec<u8>,
+}
+
+impl fmt::Debug for IoctlReply {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IoctlReply")
+            .field("result", &self.result)
+            .field("data_len", &self.data.len())
+            .finish()
+    }
 }
 
 /// A reply to a `listxattr` method call.
@@ -1184,7 +1201,7 @@ pub trait FileSystem {
         in_size: u32,
         out_size: u32,
         exit_code: &Arc<AtomicI32>,
-    ) -> io::Result<Vec<u8>> {
+    ) -> io::Result<IoctlReply> {
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
 
@@ -1216,5 +1233,26 @@ pub trait FileSystem {
     /// TODO: support this
     fn notify_reply(&self) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::virtio::fs::filesystem::IoctlReply;
+
+    #[test]
+    fn ioctl_reply_debug_redacts_data() {
+        let marker = b"synthetic-ioctl-payload-marker".to_vec();
+        let reply = IoctlReply {
+            result: 1,
+            data: marker.clone(),
+        };
+
+        let debug = format!("{reply:?}");
+        assert_eq!(
+            debug,
+            format!("IoctlReply {{ result: 1, data_len: {} }}", marker.len())
+        );
+        assert!(!debug.contains("synthetic-ioctl-payload-marker"));
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use std::ffi::CString;
 use std::io::IsTerminal;
@@ -50,6 +50,8 @@ pub struct DeviceRequirements {
     pub process_shareable_memory: bool,
     /// Whether this device requests qualified macOS stage-2 RAM reclaim.
     pub host_reclaim: bool,
+    #[doc(hidden)]
+    pub fs_tag: Option<String>,
 }
 
 /// Context provided to devices during attachment.
@@ -335,6 +337,7 @@ impl<'a> DeviceManager<'a> for MmioDeviceManager<'a> {
             crossbeam_channel::Sender<utils::worker_message::WorkerMessage>,
         >,
     ) -> Result<(), VmmError> {
+        self.validate_unique_fs_tags()?;
         for (i, device) in self.devices.into_iter().enumerate() {
             let mut ctx = AttachContext::new_mmio(
                 vmm,
@@ -346,6 +349,20 @@ impl<'a> DeviceManager<'a> for MmioDeviceManager<'a> {
                 map_sender.clone(),
             );
             device.attach(&mut ctx)?;
+        }
+        Ok(())
+    }
+}
+
+impl MmioDeviceManager<'_> {
+    fn validate_unique_fs_tags(&self) -> Result<(), VmmError> {
+        let mut fs_tags = HashSet::new();
+        for device in &self.devices {
+            if let Some(tag) = device.requirements().fs_tag
+                && !fs_tags.insert(tag)
+            {
+                return Err(VmmError::InvalidParam());
+            }
         }
         Ok(())
     }
@@ -452,6 +469,135 @@ pub struct FsDevice<'a> {
     _lifetime: PhantomData<&'a ()>,
 }
 
+/// The closed set of immutable Rosetta filesystem response profiles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RosettaProfile {
+    CapturedCompatibilityV1,
+}
+
+/// Fully owned input used to construct one immutable Rosetta filesystem.
+pub struct RosettaFsConfig {
+    profile: RosettaProfile,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    host_root: PathBuf,
+    translator_sha256: [u8; 32],
+    captured_result: i32,
+    captured_response: [u8; 1024],
+}
+
+impl std::fmt::Debug for RosettaFsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RosettaFsConfig")
+            .field("profile", &self.profile)
+            .field("host_root", &"<redacted>")
+            .field("translator_sha256_len", &self.translator_sha256.len())
+            .field("captured_result", &self.captured_result)
+            .field("captured_response_len", &self.captured_response.len())
+            .finish()
+    }
+}
+
+impl RosettaFsConfig {
+    pub fn new(
+        profile: RosettaProfile,
+        host_root: PathBuf,
+        translator_sha256: &[u8],
+        captured_result: i32,
+        captured_response: &[u8],
+    ) -> Result<Self, VmmError> {
+        let invalid_host_root = host_root.to_str().is_none_or(|path| {
+            path.is_empty() || path.len() > 4096 || path.as_bytes().contains(&0)
+        });
+        if !host_root.is_absolute()
+            || invalid_host_root
+            || captured_result < 0
+            || translator_sha256.len() != 32
+            || captured_response.len() != 1024
+        {
+            return Err(VmmError::InvalidParam());
+        }
+        Ok(Self {
+            profile,
+            host_root,
+            translator_sha256: translator_sha256
+                .try_into()
+                .map_err(|_| VmmError::InvalidParam())?,
+            captured_result,
+            captured_response: captured_response
+                .try_into()
+                .map_err(|_| VmmError::InvalidParam())?,
+        })
+    }
+}
+
+/// A dedicated immutable filesystem device for the `rosetta` mount tag.
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub struct RosettaFsDevice {
+    #[cfg(target_os = "macos")]
+    inner: Arc<Mutex<devices::virtio::Fs>>,
+}
+
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+impl RosettaFsDevice {
+    pub fn new(tag: &str, config: RosettaFsConfig) -> Result<Self, VmmError> {
+        if tag != "rosetta" {
+            return Err(VmmError::InvalidParam());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let profile = match config.profile {
+                RosettaProfile::CapturedCompatibilityV1 => {
+                    devices::virtio::fs::RosettaProfile::CapturedCompatibilityV1
+                }
+            };
+            let config = devices::virtio::fs::RosettaFsConfig::from_host(
+                profile,
+                &config.host_root,
+                &config.translator_sha256,
+                config.captured_result,
+                &config.captured_response,
+            )
+            .map_err(|error| VmmError::Internal(format!("Rosetta filesystem: {error}")))?;
+            let fs = devices::virtio::Fs::new_rosetta(tag.to_string(), config)
+                .map_err(|error| VmmError::Internal(format!("Rosetta filesystem: {error:?}")))?;
+            Ok(Self {
+                inner: Arc::new(Mutex::new(fs)),
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = config;
+            Err(VmmError::FeatureDisabled())
+        }
+    }
+}
+
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+impl<'a> AttachDevice<'a> for RosettaFsDevice {
+    fn requirements(&self) -> DeviceRequirements {
+        DeviceRequirements {
+            fs_tag: Some("rosetta".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner
+                .lock()
+                .map_err(|_| VmmError::Internal("Rosetta filesystem lock poisoned".into()))?
+                .set_exit_code(ctx.exit_code().clone());
+            ctx.register(&format!("virtiofs{}", ctx.device_index()), self.inner)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (self, ctx);
+            Err(VmmError::FeatureDisabled())
+        }
+    }
+}
+
 #[cfg_attr(
     feature = "ffi",
     ffier::export(cfg = "not(any(feature = \"tee\", feature = \"aws-nitro\"))")
@@ -515,7 +661,12 @@ impl<'a> FsDevice<'a> {
             read_only,
             Vec::new(),
         )
-        .map_err(|e| VmmError::Internal(format!("fs device: {e:?}")))?;
+        .map_err(|error| match error {
+            devices::virtio::FsError::InvalidTagLength { length, max } => VmmError::Internal(
+                format!("fs device: tag is {length} bytes, maximum is {max} bytes"),
+            ),
+            error => VmmError::Internal(format!("fs device: {error:?}")),
+        })?;
 
         Ok(Self {
             inner: Arc::new(Mutex::new(fs)),
@@ -540,6 +691,7 @@ impl<'a> AttachDevice<'a> for FsDevice<'a> {
     fn requirements(&self) -> DeviceRequirements {
         DeviceRequirements {
             shm_size: self.shm_size,
+            fs_tag: Some(self.tag.clone()),
             ..Default::default()
         }
     }
@@ -1718,11 +1870,113 @@ fn resolve_parent_dirs<'a, 'b>(
 
 #[cfg(test)]
 mod tests {
-    use crate::api::device_builders::{AttachDevice, BalloonDevice};
+    use std::path::PathBuf;
+
+    use crate::api::device_builders::{
+        AttachDevice, BalloonDevice, FsDevice, MmioDeviceManager, RosettaFsConfig, RosettaProfile,
+    };
+    use crate::api::error::VmmError;
 
     #[test]
     fn balloon_automatically_requests_reporting_qualification() {
         let balloon = BalloonDevice::new().unwrap();
         assert!(balloon.requirements().host_reclaim);
+    }
+
+    #[test]
+    fn fs_device_rejects_oversized_tag_without_panicking() {
+        let result = FsDevice::new(&"x".repeat(81), ".");
+
+        match result {
+            Err(VmmError::Internal(message)) => {
+                assert_eq!(message, "fs device: tag is 81 bytes, maximum is 36 bytes")
+            }
+            Err(error) => panic!("unexpected error: {error}"),
+            Ok(_) => panic!("oversized tag was accepted"),
+        }
+    }
+
+    #[test]
+    fn rosetta_config_validates_all_owned_fields() {
+        let valid = || {
+            RosettaFsConfig::new(
+                RosettaProfile::CapturedCompatibilityV1,
+                PathBuf::from("/synthetic/root"),
+                &[0; 32],
+                0,
+                &[0; 1024],
+            )
+        };
+        assert!(valid().is_ok());
+        assert!(matches!(
+            RosettaFsConfig::new(
+                RosettaProfile::CapturedCompatibilityV1,
+                PathBuf::from("relative"),
+                &[0; 32],
+                0,
+                &[0; 1024],
+            ),
+            Err(VmmError::InvalidParam())
+        ));
+        assert!(matches!(
+            RosettaFsConfig::new(
+                RosettaProfile::CapturedCompatibilityV1,
+                PathBuf::from("/synthetic/root"),
+                &[0; 31],
+                0,
+                &[0; 1024],
+            ),
+            Err(VmmError::InvalidParam())
+        ));
+        assert!(matches!(
+            RosettaFsConfig::new(
+                RosettaProfile::CapturedCompatibilityV1,
+                PathBuf::from("/synthetic/root"),
+                &[0; 32],
+                -1,
+                &[0; 1024],
+            ),
+            Err(VmmError::InvalidParam())
+        ));
+        assert!(matches!(
+            RosettaFsConfig::new(
+                RosettaProfile::CapturedCompatibilityV1,
+                PathBuf::from("/synthetic/root"),
+                &[0; 32],
+                0,
+                &[0; 1023],
+            ),
+            Err(VmmError::InvalidParam())
+        ));
+    }
+
+    #[test]
+    fn rosetta_config_debug_redacts_source_and_payload_fields() {
+        let config = RosettaFsConfig::new(
+            RosettaProfile::CapturedCompatibilityV1,
+            PathBuf::from("/private/source-marker"),
+            &[0x42; 32],
+            7,
+            &[0x5a; 1024],
+        )
+        .unwrap();
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("host_root: \"<redacted>\""));
+        assert!(!debug.contains("source-marker"));
+        assert!(!debug.contains("66, 66"));
+        assert!(!debug.contains("90, 90"));
+    }
+
+    #[test]
+    fn device_manager_rejects_duplicate_filesystem_tags_before_attachment() {
+        let mut manager = MmioDeviceManager::new();
+        manager.add(FsDevice::new_null("same").unwrap());
+        manager.add(FsDevice::new_null("same").unwrap());
+
+        assert!(matches!(
+            manager.validate_unique_fs_tags(),
+            Err(VmmError::InvalidParam())
+        ));
     }
 }

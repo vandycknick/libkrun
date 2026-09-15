@@ -24,8 +24,8 @@ use std::time::Duration;
 use utils::worker_message::WorkerMessage;
 
 use super::filesystem::{
-    Context, DirEntry, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, ListxattrReply,
-    OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
+    Context, DirEntry, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, IoctlReply,
+    ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use super::fuse;
 use super::inode_alloc::InodeAllocator;
@@ -50,6 +50,7 @@ const VIRTUAL_TIMEOUT: Duration = Duration::MAX;
 /// Overlay that injects virtual inodes into an inner `FileSystem`.
 pub struct AugmentFs<T> {
     inner: T,
+    intercept_exit_ioctl: bool,
     /// Maps (parent_inode, name) → child inode number. One-shot entries
     /// are removed on first lookup so the file can only be opened once.
     name_to_inode: RwLock<HashMap<(Inode, CString), Inode>>,
@@ -82,9 +83,21 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> AugmentFs<T> {
 
         Self {
             inner,
+            intercept_exit_ioctl: true,
             name_to_inode: RwLock::new(name_to_inode),
             inodes: RwLock::new(inodes),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn new_without_exit_ioctl(
+        inner: T,
+        inode_alloc: &InodeAllocator,
+        entries: Vec<VirtualDirEntry<'static>>,
+    ) -> Self {
+        let mut fs = Self::new(inner, inode_alloc, entries);
+        fs.intercept_exit_ioctl = false;
+        fs
     }
 
     fn register_entries(
@@ -745,15 +758,18 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
         in_size: u32,
         out_size: u32,
         exit_code: &Arc<AtomicI32>,
-    ) -> io::Result<Vec<u8>> {
+    ) -> io::Result<IoctlReply> {
         // We can't use nix::request_code_none here since it's system-dependent
         // and we need the value from Linux.
         const VIRTIO_IOC_EXIT_CODE_REQ: u32 = 0x7602;
 
         match cmd {
-            VIRTIO_IOC_EXIT_CODE_REQ => {
+            VIRTIO_IOC_EXIT_CODE_REQ if self.intercept_exit_ioctl => {
                 exit_code.store(arg as i32, Ordering::SeqCst);
-                Ok(Vec::new())
+                Ok(IoctlReply {
+                    result: 0,
+                    data: Vec::new(),
+                })
             }
             _ => self.inner.ioctl(
                 ctx, inode, handle, flags, cmd, arg, in_size, out_size, exit_code,

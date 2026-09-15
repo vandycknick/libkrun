@@ -3,6 +3,8 @@ mod device;
 #[allow(dead_code)]
 mod filesystem;
 pub mod fuse;
+#[cfg(target_os = "macos")]
+mod immutable;
 mod inode_alloc;
 #[allow(dead_code)]
 mod multikey;
@@ -37,6 +39,8 @@ use super::descriptor_utils;
 pub use self::defs::uapi::VIRTIO_ID_FS as TYPE_FS;
 pub use self::device::Fs;
 pub use self::filesystem::ExportTable;
+#[cfg(target_os = "macos")]
+pub use self::immutable::{RosettaFsConfig, RosettaProfile};
 
 mod defs {
     use super::super::QueueConfig;
@@ -80,6 +84,13 @@ pub enum FsError {
     /// The `size` field of the `SetxattrIn` message does not match the length
     /// of the decoded value.
     InvalidXattrSize((u32, usize)),
+    /// The filesystem tag does not fit in the virtio-fs configuration field.
+    InvalidTagLength {
+        length: usize,
+        max: usize,
+    },
+    /// The dedicated immutable filesystem only supports its reserved tag.
+    InvalidRosettaTag,
     QueueReader(DescriptorError),
     QueueWriter(DescriptorError),
 }
