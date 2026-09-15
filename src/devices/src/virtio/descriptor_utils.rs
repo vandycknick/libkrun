@@ -7,18 +7,17 @@ use std::collections::VecDeque;
 use std::fmt::{self, Display};
 use std::io::{self, Read, Write};
 use std::mem::{MaybeUninit, size_of};
-use std::ops::Deref;
 use std::ptr::copy_nonoverlapping;
 use std::result;
 
 use crate::virtio::queue::DescriptorChain;
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError,
-    GuestMemoryMmap, GuestMemoryRegion, Le16, Le32, Le64, VolatileMemory, VolatileMemoryError,
+    Address, ByteValued, GuestAddress, GuestMemoryError, Le16, Le32, Le64, VolatileMemoryError,
     VolatileSlice,
 };
 
 use super::file_traits::{FileReadWriteAtVolatile, FileReadWriteVolatile};
+use crate::virtio::{LeasedVolatileSlice, RuntimeGuestMemory};
 
 #[derive(Debug)]
 pub enum Error {
@@ -56,7 +55,7 @@ impl std::error::Error for Error {}
 
 #[derive(Clone)]
 struct DescriptorChainConsumer<'a> {
-    buffers: VecDeque<VolatileSlice<'a>>,
+    buffers: VecDeque<LeasedVolatileSlice<'a>>,
     bytes_consumed: usize,
 }
 
@@ -85,16 +84,16 @@ impl<'a> DescriptorChainConsumer<'a> {
     /// the error is returned to the caller.
     fn consume<F>(&mut self, count: usize, f: F) -> io::Result<usize>
     where
-        F: FnOnce(&[VolatileSlice]) -> io::Result<usize>,
+        F: for<'b> FnOnce(&'b [VolatileSlice<'b>]) -> io::Result<usize>,
     {
         let mut buflen = 0;
-        let mut bufs = Vec::with_capacity(self.buffers.len());
-        for &vs in &self.buffers {
+        let mut leased = Vec::with_capacity(self.buffers.len());
+        for vs in &self.buffers {
             if buflen >= count {
                 break;
             }
 
-            bufs.push(vs);
+            leased.push(vs.clone());
 
             let rem = count - buflen;
             if rem < vs.len() {
@@ -104,10 +103,11 @@ impl<'a> DescriptorChainConsumer<'a> {
             }
         }
 
-        if bufs.is_empty() {
+        if leased.is_empty() {
             return Ok(0);
         }
 
+        let bufs: Vec<VolatileSlice<'_>> = leased.iter().map(LeasedVolatileSlice::slice).collect();
         let bytes_consumed = f(&bufs)?;
 
         // This can happen if a driver tricks a device into reading/writing more data than
@@ -190,7 +190,7 @@ pub struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     /// Construct a new Reader wrapper over `desc_chain`.
-    pub fn new(mem: &'a GuestMemoryMmap, chain: DescriptorChain<'a>) -> Result<Reader<'a>> {
+    pub fn new(mem: &'a RuntimeGuestMemory, chain: DescriptorChain<'a>) -> Result<Reader<'a>> {
         let mut total_len: usize = 0;
         let buffers = chain
             .into_iter()
@@ -203,17 +203,10 @@ impl<'a> Reader<'a> {
                     .checked_add(desc.len as usize)
                     .ok_or(Error::DescriptorChainOverflow)?;
 
-                let region = mem.find_region(desc.addr).ok_or(Error::FindMemoryRegion)?;
-                let offset = desc
-                    .addr
-                    .checked_sub(region.start_addr().raw_value())
-                    .unwrap();
-                region
-                    .deref()
-                    .get_slice(offset.raw_value() as usize, desc.len as usize)
-                    .map_err(Error::VolatileMemoryError)
+                mem.get_slice(desc.addr, desc.len as usize)
+                    .map_err(Error::GuestMemoryError)
             })
-            .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
+            .collect::<Result<VecDeque<LeasedVolatileSlice<'a>>>>()?;
         Ok(Reader {
             buffer: DescriptorChainConsumer {
                 buffers,
@@ -342,7 +335,7 @@ pub struct Writer<'a> {
 
 impl<'a> Writer<'a> {
     /// Construct a new Writer wrapper over `desc_chain`.
-    pub fn new(mem: &'a GuestMemoryMmap, chain: DescriptorChain<'a>) -> Result<Writer<'a>> {
+    pub fn new(mem: &'a RuntimeGuestMemory, chain: DescriptorChain<'a>) -> Result<Writer<'a>> {
         let mut total_len: usize = 0;
         let buffers = chain
             .into_iter()
@@ -355,17 +348,10 @@ impl<'a> Writer<'a> {
                     .checked_add(desc.len as usize)
                     .ok_or(Error::DescriptorChainOverflow)?;
 
-                let region = mem.find_region(desc.addr).ok_or(Error::FindMemoryRegion)?;
-                let offset = desc
-                    .addr
-                    .checked_sub(region.start_addr().raw_value())
-                    .unwrap();
-                region
-                    .deref()
-                    .get_slice(offset.raw_value() as usize, desc.len as usize)
-                    .map_err(Error::VolatileMemoryError)
+                mem.get_slice(desc.addr, desc.len as usize)
+                    .map_err(Error::GuestMemoryError)
             })
-            .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
+            .collect::<Result<VecDeque<LeasedVolatileSlice<'a>>>>()?;
 
         Ok(Writer {
             buffer: DescriptorChainConsumer {
@@ -497,7 +483,7 @@ unsafe impl ByteValued for virtq_desc {}
 
 /// Test utility function to create a descriptor chain in guest memory.
 pub fn create_descriptor_chain(
-    memory: &GuestMemoryMmap,
+    memory: &RuntimeGuestMemory,
     descriptor_array_addr: GuestAddress,
     mut buffers_start_addr: GuestAddress,
     descriptors: Vec<(DescriptorType, u32)>,
@@ -540,6 +526,7 @@ pub fn create_descriptor_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::virtio::RuntimeGuestMemory as GuestMemoryMmap;
 
     #[test]
     fn reader_test_simple_chain() {

@@ -22,8 +22,8 @@ use super::super::proxy::{
 use super::super::windows::sockaddr_storage::{
     SockaddrStorage, storage_to_winsock, winsock_to_storage,
 };
+use crate::virtio::RuntimeGuestMemory;
 use utils::epoll::EventSet;
-use vm_memory::GuestMemoryMmap;
 
 pub type SendtoAddr = SockaddrStorage;
 
@@ -52,7 +52,7 @@ pub(crate) fn create(
     cid: u64,
     family: u16,
     peer_port: u32,
-    mem: GuestMemoryMmap,
+    mem: RuntimeGuestMemory,
     queue: Arc<Mutex<VirtQueue>>,
     rxq: Arc<Mutex<MuxerRxQ>>,
 ) -> Result<super::TsiDgramProxy, ProxyError> {

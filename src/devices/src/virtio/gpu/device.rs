@@ -2,11 +2,11 @@ use std::io::Write;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
-use vm_memory::{ByteValued, GuestMemoryMmap};
+use vm_memory::ByteValued;
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
-    VirtioShmRegion, fs::ExportTable,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RuntimeGuestMemory,
+    VirtioDevice, VirtioShmRegion, fs::ExportTable,
 };
 use super::defs;
 use super::defs::uapi;
@@ -190,10 +190,14 @@ impl VirtioDevice for Gpu {
 
     fn activate(
         &mut self,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
+        if !mem.allows_external_mapping() {
+            error!("virtio-gpu does not support reclaimable guest backing memory");
+            return Err(ActivateError::BadActivate);
+        }
         let [control_q, _cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
             error!(
                 "Cannot perform activate. Expected {} queue(s)",

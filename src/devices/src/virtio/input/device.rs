@@ -4,10 +4,10 @@ use std::thread::JoinHandle;
 
 use log::{debug, error};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
-use vm_memory::GuestMemoryMmap;
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RuntimeGuestMemory,
+    VirtioDevice,
 };
 use super::worker::InputWorker;
 use super::{InputError, defs, defs::uapi};
@@ -216,7 +216,7 @@ impl VirtioDevice for Input {
 
     fn activate(
         &mut self,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {

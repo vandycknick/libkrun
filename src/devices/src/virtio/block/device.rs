@@ -18,6 +18,7 @@ use std::result;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use crate::virtio::RuntimeGuestMemory;
 use imago::{
     DynStorage, FormatAccess, FormatDriverBuilder, PermissiveImplicitOpenGate, Storage,
     StorageOpenOptions, file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk,
@@ -27,7 +28,7 @@ use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::{
     virtio_blk::*, virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX,
 };
-use vm_memory::{ByteValued, GuestMemoryMmap};
+use vm_memory::ByteValued;
 
 #[cfg(target_os = "windows")]
 use std::mem::MaybeUninit;
@@ -430,7 +431,7 @@ impl VirtioDevice for Block {
 
     fn activate(
         &mut self,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {

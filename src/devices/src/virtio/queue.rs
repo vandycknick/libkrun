@@ -5,15 +5,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use crate::virtio::RuntimeGuestMemory;
 use std::cmp::min;
 use std::fmt::{self, Debug, Display};
 use std::num::Wrapping;
 use std::sync::atomic::{Ordering, fence};
 use virtio_bindings::virtio_ring::VRING_USED_F_NO_NOTIFY;
-use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError,
-    GuestMemoryMmap, VolatileMemoryError,
-};
+use vm_memory::{Address, ByteValued, GuestAddress, GuestMemoryError, VolatileMemoryError};
 
 /// Size of used ring header: flags (u16) + idx (u16)
 pub(crate) const VIRTQ_USED_RING_HEADER_SIZE: u64 = 4;
@@ -200,7 +198,7 @@ pub struct DescriptorChain<'a> {
     ttl: u16, // used to prevent infinite chain cycles
 
     /// Reference to guest memory
-    pub mem: &'a GuestMemoryMmap,
+    pub mem: &'a RuntimeGuestMemory,
 
     /// Index into the descriptor table
     pub index: u16,
@@ -221,7 +219,7 @@ pub struct DescriptorChain<'a> {
 
 impl<'a> DescriptorChain<'a> {
     pub fn checked_new(
-        mem: &GuestMemoryMmap,
+        mem: &RuntimeGuestMemory,
         desc_table: GuestAddress,
         queue_size: u16,
         index: u16,
@@ -374,7 +372,7 @@ impl Queue {
         min(self.size, self.max_size)
     }
 
-    pub fn is_valid(&self, mem: &GuestMemoryMmap) -> bool {
+    pub fn is_valid(&self, mem: &RuntimeGuestMemory) -> bool {
         let queue_size = u64::from(self.actual_size());
         let desc_table = self.desc_table;
         let desc_table_size = 16 * queue_size;
@@ -435,17 +433,17 @@ impl Queue {
 
     /// Returns the number of yet-to-be-popped descriptor chains in the avail ring.
     #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self, mem: &GuestMemoryMmap) -> u16 {
+    pub fn len(&self, mem: &RuntimeGuestMemory) -> u16 {
         (self.avail_idx(mem, Ordering::Acquire).unwrap() - self.next_avail).0
     }
 
     /// Checks if the driver has made any descriptor chains available in the avail ring.
-    pub fn is_empty(&self, mem: &GuestMemoryMmap) -> bool {
+    pub fn is_empty(&self, mem: &RuntimeGuestMemory) -> bool {
         self.len(mem) == 0
     }
 
     /// Pop the first available descriptor chain from the avail ring.
-    pub fn pop<'b>(&mut self, mem: &'b GuestMemoryMmap) -> Option<DescriptorChain<'b>> {
+    pub fn pop<'b>(&mut self, mem: &'b RuntimeGuestMemory) -> Option<DescriptorChain<'b>> {
         if self.len(mem) == 0 || self.actual_size() == 0 {
             return None;
         }
@@ -497,7 +495,7 @@ impl Queue {
 
     pub fn add_used(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &RuntimeGuestMemory,
         head_index: u16,
         len: u32,
     ) -> Result<(), Error> {
@@ -540,7 +538,11 @@ impl Queue {
     // Neither of these interrupt suppression methods are reliable, as they are not synchronized
     // with the device, but they serve as useful optimizations. So we only ensure access to the
     // virtq_avail.used_event is atomic, but do not need to synchronize with other memory accesses.
-    fn used_event(&self, mem: &GuestMemoryMmap, order: Ordering) -> Result<Wrapping<u16>, Error> {
+    fn used_event(
+        &self,
+        mem: &RuntimeGuestMemory,
+        order: Ordering,
+    ) -> Result<Wrapping<u16>, Error> {
         // This can not overflow an u64 since it is working with relatively small numbers compared
         // to u64::MAX.
         let used_event_offset =
@@ -559,7 +561,7 @@ impl Queue {
     // the provided ordering.
     fn set_avail_event(
         &self,
-        mem: &GuestMemoryMmap,
+        mem: &RuntimeGuestMemory,
         val: u16,
         order: Ordering,
     ) -> Result<(), Error> {
@@ -582,7 +584,7 @@ impl Queue {
     // Set the value of the `flags` field of the used ring, applying the specified ordering.
     fn set_used_flags(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &RuntimeGuestMemory,
         val: u16,
         order: Ordering,
     ) -> Result<(), Error> {
@@ -594,7 +596,7 @@ impl Queue {
     //
     // Every access in this method uses `Relaxed` ordering because a fence is added by the caller
     // when appropriate.
-    fn set_notification(&mut self, mem: &GuestMemoryMmap, enable: bool) -> Result<(), Error> {
+    fn set_notification(&mut self, mem: &RuntimeGuestMemory, enable: bool) -> Result<(), Error> {
         if enable {
             if self.event_idx_enabled {
                 // We call `set_avail_event` using the `next_avail` value, instead of reading
@@ -633,7 +635,7 @@ impl Queue {
     //         break;
     //     }
     // }
-    pub fn enable_notification(&mut self, mem: &GuestMemoryMmap) -> Result<bool, Error> {
+    pub fn enable_notification(&mut self, mem: &RuntimeGuestMemory) -> Result<bool, Error> {
         self.set_notification(mem, true)?;
         // Ensures the following read is not reordered before any previous write operation.
         fence(Ordering::SeqCst);
@@ -648,11 +650,11 @@ impl Queue {
             .map(|idx| idx != self.next_avail)
     }
 
-    pub fn disable_notification(&mut self, mem: &GuestMemoryMmap) -> Result<(), Error> {
+    pub fn disable_notification(&mut self, mem: &RuntimeGuestMemory) -> Result<(), Error> {
         self.set_notification(mem, false)
     }
 
-    pub fn needs_notification(&mut self, mem: &GuestMemoryMmap) -> Result<bool, Error> {
+    pub fn needs_notification(&mut self, mem: &RuntimeGuestMemory) -> Result<bool, Error> {
         let used_idx = self.next_used;
 
         // Complete all the writes in add_used() before reading the event.
@@ -695,7 +697,7 @@ impl Queue {
     /// Fetch the available ring index (`virtq_avail->idx`) from guest memory.
     /// This is written by the driver, to indicate the next slot that will be filled in the avail
     /// ring.
-    fn avail_idx(&self, mem: &GuestMemoryMmap, order: Ordering) -> Result<Wrapping<u16>, Error> {
+    fn avail_idx(&self, mem: &RuntimeGuestMemory, order: Ordering) -> Result<Wrapping<u16>, Error> {
         let addr = self
             .avail_ring
             .checked_add(2)
@@ -718,7 +720,7 @@ pub(crate) mod tests {
     // Represents a location in GuestMemoryMmap which holds a given type.
     pub struct SomeplaceInMemory<'a, T> {
         pub location: GuestAddress,
-        mem: &'a GuestMemoryMmap,
+        mem: &'a RuntimeGuestMemory,
         phantom: PhantomData<*const T>,
     }
 
@@ -727,7 +729,7 @@ pub(crate) mod tests {
     where
         T: vm_memory::ByteValued,
     {
-        fn new(location: GuestAddress, mem: &'a GuestMemoryMmap) -> Self {
+        fn new(location: GuestAddress, mem: &'a RuntimeGuestMemory) -> Self {
             SomeplaceInMemory {
                 location,
                 mem,
@@ -777,7 +779,7 @@ pub(crate) mod tests {
     }
 
     impl<'a> VirtqDesc<'a> {
-        fn new(start: GuestAddress, mem: &'a GuestMemoryMmap) -> Self {
+        fn new(start: GuestAddress, mem: &'a RuntimeGuestMemory) -> Self {
             assert_eq!(start.0 & 0xf, 0);
 
             let addr = SomeplaceInMemory::new(start, mem);
@@ -824,7 +826,7 @@ pub(crate) mod tests {
     {
         fn new(
             start: GuestAddress,
-            mem: &'a GuestMemoryMmap,
+            mem: &'a RuntimeGuestMemory,
             qsize: u16,
             alignment: usize,
         ) -> Self {
@@ -881,7 +883,7 @@ pub(crate) mod tests {
 
     impl<'a> VirtQueue<'a> {
         // We try to make sure things are aligned properly :-s
-        pub fn new(start: GuestAddress, mem: &'a GuestMemoryMmap, qsize: u16) -> Self {
+        pub fn new(start: GuestAddress, mem: &'a RuntimeGuestMemory, qsize: u16) -> Self {
             // power of 2?
             assert!(qsize > 0 && qsize & (qsize - 1) == 0);
 
@@ -949,11 +951,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_checked_new_descriptor_chain() {
-        let m = &GuestMemoryMmap::from_ranges(&[
-            (GuestAddress(0), 0x10000),
-            (GuestAddress(0x20000), 0x2000),
-        ])
-        .unwrap();
+        let m = &RuntimeGuestMemory::passthrough(
+            GuestMemoryMmap::from_ranges(&[
+                (GuestAddress(0), 0x10000),
+                (GuestAddress(0x20000), 0x2000),
+            ])
+            .unwrap(),
+        );
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
         assert!(vq.end().0 < 0x1000);
@@ -983,7 +987,7 @@ pub(crate) mod tests {
 
             let c = DescriptorChain::checked_new(m, vq.dtable_start(), 16, 0).unwrap();
 
-            assert_eq!(c.mem as *const GuestMemoryMmap, m as *const GuestMemoryMmap);
+            assert!(std::ptr::eq(c.mem, m));
             assert_eq!(c.desc_table, vq.dtable_start());
             assert_eq!(c.queue_size, 16);
             assert_eq!(c.ttl, c.queue_size);
@@ -1000,7 +1004,9 @@ pub(crate) mod tests {
     #[test]
     #[allow(unused)]
     fn test_queue_validation() {
-        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let m = &RuntimeGuestMemory::passthrough(
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+        );
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
         let mut q = vq.create_queue();
@@ -1051,7 +1057,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_queue_processing() {
-        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let m = &RuntimeGuestMemory::passthrough(
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+        );
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
         let mut q = vq.create_queue();
 
@@ -1119,7 +1127,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_add_used() {
-        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let m = &RuntimeGuestMemory::passthrough(
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+        );
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
         let mut q = vq.create_queue();

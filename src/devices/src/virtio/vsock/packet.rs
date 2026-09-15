@@ -24,17 +24,17 @@ use std::os::raw::c_char;
 use std::result;
 
 #[cfg(windows)]
-use super::windows::sockaddr_storage::SockaddrStorage;
+use crate::virtio::vsock::windows::sockaddr_storage::SockaddrStorage;
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{AddressFamily, sockaddr};
 #[cfg(unix)]
 use nix::sys::socket::{SockaddrLike, SockaddrStorage};
 use utils::byte_order;
-use vm_memory::{self, Address, GuestAddress, GuestMemoryBackend, GuestMemoryError};
+use vm_memory::{self, Address, GuestAddress, GuestMemoryError};
 
-use super::super::DescriptorChain;
-use super::defs;
-use super::{Result, VsockError};
+use crate::virtio::vsock::defs;
+use crate::virtio::vsock::{Result, VsockError};
+use crate::virtio::{DescriptorChain, LeasedHostAddress, RuntimeGuestMemory};
 
 // The vsock packet header is defined by the C struct:
 //
@@ -195,14 +195,15 @@ pub struct VsockPacket {
     buf: Option<*mut u8>,
     buf_size: usize,
     owned_buf: Option<Vec<u8>>,
+    leases: Vec<LeasedHostAddress>,
 }
 
-fn get_host_address<T: GuestMemoryBackend>(
-    mem: &T,
+fn get_host_address(
+    mem: &RuntimeGuestMemory,
     guest_addr: GuestAddress,
     size: usize,
-) -> result::Result<*mut u8, GuestMemoryError> {
-    Ok(mem.get_slice(guest_addr, size)?.ptr_guard_mut().as_ptr())
+) -> result::Result<LeasedHostAddress, GuestMemoryError> {
+    mem.get_host_address(guest_addr, size)
 }
 
 impl VsockPacket {
@@ -223,12 +224,14 @@ impl VsockPacket {
             return Err(VsockError::HdrDescTooSmall(head.len));
         }
 
+        let header = get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
+            .map_err(VsockError::GuestMemoryMmap)?;
         let mut pkt = Self {
-            hdr: get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
-                .map_err(VsockError::GuestMemoryMmap)?,
+            hdr: header.as_ptr(),
             buf: None,
             buf_size: 0,
             owned_buf: None,
+            leases: vec![header],
         };
         let pkt_len = pkt.len();
 
@@ -255,10 +258,10 @@ impl VsockPacket {
                 .checked_add(VSOCK_PKT_HDR_SIZE as u64)
                 .ok_or(VsockError::GuestMemoryBounds)?;
             pkt.buf_size = head_data_size;
-            pkt.buf = Some(
-                get_host_address(head.mem, buf_addr, pkt.buf_size)
-                    .map_err(VsockError::GuestMemoryMmap)?,
-            );
+            let buffer = get_host_address(head.mem, buf_addr, pkt.buf_size)
+                .map_err(VsockError::GuestMemoryMmap)?;
+            pkt.buf = Some(buffer.as_ptr());
+            pkt.leases.push(buffer);
             if pkt.buf_size < pkt_len as usize {
                 return Err(VsockError::BufDescTooSmall);
             }
@@ -276,10 +279,10 @@ impl VsockPacket {
                 return Err(VsockError::BufDescTooSmall);
             }
             pkt.buf_size = buf_desc.len as usize;
-            pkt.buf = Some(
-                get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
-                    .map_err(VsockError::GuestMemoryMmap)?,
-            );
+            let buffer = get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
+                .map_err(VsockError::GuestMemoryMmap)?;
+            pkt.buf = Some(buffer.as_ptr());
+            pkt.leases.push(buffer);
             return Ok(pkt);
         }
 
@@ -295,7 +298,7 @@ impl VsockPacket {
             let src = get_host_address(head.mem, buf_addr, head_data_size)
                 .map_err(VsockError::GuestMemoryMmap)?;
             owned_buf.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(src as *const u8, head_data_size)
+                std::slice::from_raw_parts(src.as_ptr() as *const u8, head_data_size)
             });
         }
 
@@ -304,7 +307,7 @@ impl VsockPacket {
             let src = get_host_address(buf_desc.mem, buf_desc.addr, buf_desc.len as usize)
                 .map_err(VsockError::GuestMemoryMmap)?;
             owned_buf.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(src as *const u8, buf_desc.len as usize)
+                std::slice::from_raw_parts(src.as_ptr() as *const u8, buf_desc.len as usize)
             });
         }
 
@@ -317,7 +320,7 @@ impl VsockPacket {
                 let src = get_host_address(desc.mem, desc.addr, desc.len as usize)
                     .map_err(VsockError::GuestMemoryMmap)?;
                 owned_buf.extend_from_slice(unsafe {
-                    std::slice::from_raw_parts(src as *const u8, desc.len as usize)
+                    std::slice::from_raw_parts(src.as_ptr() as *const u8, desc.len as usize)
                 });
             }
             next = desc.next_descriptor();
@@ -349,12 +352,14 @@ impl VsockPacket {
             return Err(VsockError::HdrDescTooSmall(head.len));
         }
 
+        let header = get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
+            .map_err(VsockError::GuestMemoryMmap)?;
         let mut pkt = Self {
-            hdr: get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
-                .map_err(VsockError::GuestMemoryMmap)?,
+            hdr: header.as_ptr(),
             buf: None,
             buf_size: 0,
             owned_buf: None,
+            leases: vec![header],
         };
 
         // Starting from Linux 6.2 the virtio-vsock driver can use a single descriptor for both
@@ -366,18 +371,18 @@ impl VsockPacket {
                 .ok_or(VsockError::GuestMemoryBounds)?;
 
             pkt.buf_size = head.len as usize - VSOCK_PKT_HDR_SIZE;
-            pkt.buf = Some(
-                get_host_address(head.mem, buf_addr, pkt.buf_size)
-                    .map_err(VsockError::GuestMemoryMmap)?,
-            );
+            let buffer = get_host_address(head.mem, buf_addr, pkt.buf_size)
+                .map_err(VsockError::GuestMemoryMmap)?;
+            pkt.buf = Some(buffer.as_ptr());
+            pkt.leases.push(buffer);
         } else {
             let buf_desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
 
             pkt.buf_size = buf_desc.len as usize;
-            pkt.buf = Some(
-                get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
-                    .map_err(VsockError::GuestMemoryMmap)?,
-            );
+            let buffer = get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
+                .map_err(VsockError::GuestMemoryMmap)?;
+            pkt.buf = Some(buffer.as_ptr());
+            pkt.leases.push(buffer);
         }
 
         Ok(pkt)

@@ -2,6 +2,8 @@ use std::marker::PhantomData;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use crate::vmm::VmCtl;
@@ -17,9 +19,22 @@ use utils::eventfd::EventFd;
 #[cfg(target_os = "macos")]
 use utils::pollable_channel::PollableChannelSender;
 
-use super::device_builders::{DeviceManager, MmioDeviceManager};
-use super::error::VmmError;
-use super::payload::Payload;
+use crate::api::device_builders::{DeviceManager, MmioDeviceManager};
+use crate::api::error::VmmError;
+use crate::api::payload::Payload;
+
+#[cfg(target_os = "macos")]
+const HOST_MAPPING_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
+
+#[cfg(target_os = "macos")]
+fn host_mapping_maintenance_timeout(effective: bool, elapsed: Duration) -> i32 {
+    if !effective {
+        return -1;
+    }
+    let remaining = HOST_MAPPING_MAINTENANCE_INTERVAL.saturating_sub(elapsed);
+    // Round up: a sub-millisecond remainder must not turn into a busy poll.
+    remaining.as_nanos().div_ceil(1_000_000).min(30_000) as i32
+}
 
 #[derive(Default)]
 pub struct VmmBuilder<'a> {
@@ -160,6 +175,63 @@ pub struct VmmHandle {
     vm_ctl_tx: PollableChannelSender<VmCtl>,
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     shutdown_efd: Option<EventFd>,
+    #[cfg(target_os = "macos")]
+    reclaim_state: std::sync::Arc<hvf::reclaim::ReclaimState>,
+}
+
+/// Outcome of the per-VM host reclaim qualification probe.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostReclaimQualification {
+    NotRun,
+    Passed,
+    Failed,
+    Inconclusive,
+}
+
+/// Host memory reclaim state of a running VMM on macOS.
+///
+/// `effective` means reports are advised free: reclaim was requested, the
+/// page-state qualification probe passed, and no release failure disabled it.
+/// Discard is lazy. The counters are cumulative operations, not measured
+/// reductions in resident or compressed memory.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostReclaimStatus {
+    pub requested: bool,
+    pub qualification: HostReclaimQualification,
+    pub effective: bool,
+    /// Cumulative successfully advised bytes, including repeat reports.
+    pub released_bytes: u64,
+    /// Successfully advised coalesced ranges, not unique physical extents.
+    pub released_extents: u64,
+    pub retried_faults: u64,
+    pub skipped_reports: u64,
+    pub failed_operations: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl VmmHandle {
+    /// Snapshot of host memory reclaim for this VM.
+    pub fn host_reclaim_status(&self) -> HostReclaimStatus {
+        use hvf::reclaim::ReclaimQualification;
+        let stats = self.reclaim_state.stats();
+        HostReclaimStatus {
+            requested: self.reclaim_state.policy_enabled(),
+            qualification: match self.reclaim_state.qualification() {
+                ReclaimQualification::NotRun => HostReclaimQualification::NotRun,
+                ReclaimQualification::Passed => HostReclaimQualification::Passed,
+                ReclaimQualification::Failed => HostReclaimQualification::Failed,
+                ReclaimQualification::Inconclusive => HostReclaimQualification::Inconclusive,
+            },
+            effective: self.reclaim_state.is_effective(),
+            released_bytes: stats.released_bytes,
+            released_extents: stats.released_extents,
+            retried_faults: stats.retried_faults,
+            skipped_reports: stats.skipped_reports,
+            failed_operations: stats.failed_operations,
+        }
+    }
 }
 
 impl Clone for VmmHandle {
@@ -167,6 +239,8 @@ impl Clone for VmmHandle {
         Self {
             #[cfg(target_os = "macos")]
             vm_ctl_tx: self.vm_ctl_tx.clone(),
+            #[cfg(target_os = "macos")]
+            reclaim_state: std::sync::Arc::clone(&self.reclaim_state),
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             shutdown_efd: self
                 .shutdown_efd
@@ -236,14 +310,22 @@ impl<'a> Vmm<'a> {
                 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
                 shutdown_efd,
                 ..
-            } => Ok(VmmHandle {
+            } => {
+                // Lock once: a second `lock()` while the first guard is still
+                // alive within one expression would deadlock the caller.
                 #[cfg(target_os = "macos")]
-                vm_ctl_tx: vmm.lock().unwrap().vm_ctl_sender(),
-                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-                shutdown_efd: shutdown_efd
-                    .as_ref()
-                    .map(|efd| efd.try_clone().expect("dup shutdown_efd")),
-            }),
+                let inner = vmm.lock().unwrap();
+                Ok(VmmHandle {
+                    #[cfg(target_os = "macos")]
+                    vm_ctl_tx: inner.vm_ctl_sender(),
+                    #[cfg(target_os = "macos")]
+                    reclaim_state: inner.vm.reclaim_state(),
+                    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                    shutdown_efd: shutdown_efd
+                        .as_ref()
+                        .map(|efd| efd.try_clone().expect("dup shutdown_efd")),
+                })
+            }
             #[cfg(feature = "aws-nitro")]
             VmmInner::Nitro(_) => Err(VmmError::FeatureDisabled()),
         }
@@ -252,13 +334,49 @@ impl<'a> Vmm<'a> {
     pub fn run(self) {
         match self.inner {
             VmmInner::Vmm {
-                mut event_manager, ..
-            } => loop {
-                if let Err(e) = event_manager.run() {
-                    log::error!("fatal event loop error: {e:?}");
-                    return;
+                #[cfg(target_os = "macos")]
+                vmm,
+                mut event_manager,
+                ..
+            } => {
+                #[cfg(target_os = "macos")]
+                let reclaim = match vmm.lock() {
+                    Ok(inner) => inner.vm.reclaim_state(),
+                    Err(error) => {
+                        log::error!("cannot initialize host mapping maintenance: {error}");
+                        return;
+                    }
+                };
+                #[cfg(target_os = "macos")]
+                let mut last_maintenance = Instant::now();
+                loop {
+                    #[cfg(target_os = "macos")]
+                    let result = event_manager.run_with_timeout(host_mapping_maintenance_timeout(
+                        reclaim.is_effective(),
+                        last_maintenance.elapsed(),
+                    ));
+                    #[cfg(not(target_os = "macos"))]
+                    let result = event_manager.run();
+                    if let Err(e) = result {
+                        log::error!("fatal event loop error: {e:?}");
+                        return;
+                    }
+                    #[cfg(target_os = "macos")]
+                    if reclaim.is_effective()
+                        && last_maintenance.elapsed() >= HOST_MAPPING_MAINTENANCE_INTERVAL
+                    {
+                        let started = Instant::now();
+                        // This scope retains the owning VMM and its guest_memory.
+                        // Do not move maintenance onto an unowned status handle.
+                        if let Err(error) = unsafe { reclaim.normalize_host_mappings() } {
+                            log::error!("fatal host mapping maintenance error: {error}");
+                            return;
+                        }
+                        last_maintenance = Instant::now();
+                        log::debug!("normalized host RAM mappings in {:?}", started.elapsed());
+                    }
                 }
-            },
+            }
             #[cfg(feature = "aws-nitro")]
             VmmInner::Nitro(enclave) => {
                 let exit_code = enclave.run().unwrap_or_else(|e| {
@@ -461,4 +579,25 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         },
         _lifetime: PhantomData,
     })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use std::time::Duration;
+
+    use crate::api::vmm_builder::host_mapping_maintenance_timeout;
+
+    #[test]
+    fn host_mapping_timeout_is_bounded_and_rounds_up() {
+        for (elapsed, expected) in [
+            (Duration::ZERO, 30_000),
+            (Duration::from_secs(10), 20_000),
+            (Duration::from_secs(30) - Duration::from_nanos(1), 1),
+            (Duration::from_secs(30), 0),
+            (Duration::from_secs(60), 0),
+        ] {
+            assert_eq!(host_mapping_maintenance_timeout(true, elapsed), expected);
+            assert_eq!(host_mapping_maintenance_timeout(false, elapsed), -1);
+        }
+    }
 }

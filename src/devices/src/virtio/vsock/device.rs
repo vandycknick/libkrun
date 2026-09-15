@@ -11,11 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use utils::byte_order;
 use utils::eventfd::EventFd;
-use vm_memory::GuestMemoryMmap;
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue as VirtQueue, QueueConfig,
-    VirtioDevice,
+    RuntimeGuestMemory, VirtioDevice,
 };
 use super::TsiFlags;
 use super::muxer::VsockMuxer;
@@ -232,7 +231,7 @@ impl VirtioDevice for Vsock {
 
     fn activate(
         &mut self,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {

@@ -4,7 +4,7 @@ use crate::virtio::net::tap::Tap;
 use crate::virtio::net::unixgram::Unixgram;
 use crate::virtio::net::unixstream::Unixstream;
 use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE};
-use crate::virtio::{DeviceQueue, InterruptTransport};
+use crate::virtio::{DeviceQueue, InterruptTransport, RuntimeGuestMemory};
 
 use super::VNET_HDR_LEN;
 use super::backend::{NetBackend, ReadError, WriteError};
@@ -16,14 +16,14 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::thread;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::GuestAddress;
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
     tx_q: DeviceQueue,
     interrupt: InterruptTransport,
 
-    mem: GuestMemoryMmap,
+    mem: RuntimeGuestMemory,
     backend: Box<dyn NetBackend + Send>,
 
     rx_frame_buf: [u8; MAX_BUFFER_SIZE],
@@ -41,7 +41,7 @@ impl NetWorker {
         rx_q: DeviceQueue,
         tx_q: DeviceQueue,
         interrupt: InterruptTransport,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
     ) -> Result<Self, ConnectError> {
