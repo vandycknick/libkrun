@@ -1,3 +1,4 @@
+use arch::guest_memory::HostMemoryLease;
 use std::collections::BTreeMap;
 use std::env;
 use std::io::IoSliceMut;
@@ -6,9 +7,9 @@ use std::os::unix::io::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use super::super::Queue as VirtQueue;
-use super::protocol::GpuResponse::*;
-use super::protocol::{
+use crate::virtio::Queue as VirtQueue;
+use crate::virtio::gpu::protocol::GpuResponse::*;
+use crate::virtio::gpu::protocol::{
     GpuResponse, GpuResponsePlaneInfo, VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE,
     VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAX_SCANOUTS, VirtioGpuResult,
 };
@@ -39,13 +40,13 @@ use rutabaga_gfx::{
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
-use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap, VolatileSlice};
+use vm_memory::{GuestAddress, VolatileSlice};
 
-use super::{GpuError, Result};
 use crate::display::DisplayInfo;
 use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::VIRTIO_GPU_FLAG_INFO_RING_IDX;
-use crate::virtio::{InterruptTransport, VirtioShmRegion};
+use crate::virtio::gpu::{GpuError, Result};
+use crate::virtio::{InterruptTransport, RuntimeGuestMemory, VirtioShmRegion};
 
 // These constants match libkrun.h and virglrenderer.
 const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
@@ -82,26 +83,28 @@ impl VirtioFsLookup for ExportTableLookup {
     }
 }
 
+type RutabagaBacking = (Vec<RutabagaIovec>, Vec<Arc<dyn HostMemoryLease>>);
+
 fn sglist_to_rutabaga_iovecs(
     vecs: &[(GuestAddress, usize)],
-    mem: &GuestMemoryMmap,
-) -> Result<Vec<RutabagaIovec>> {
-    if vecs
+    mem: &RuntimeGuestMemory,
+) -> Result<RutabagaBacking> {
+    let slices = vecs
         .iter()
-        .any(|&(addr, len)| mem.get_slice(addr, len).is_err())
-    {
-        return Err(GpuError::GuestMemory);
-    }
+        .map(|&(addr, len)| mem.get_slice(addr, len))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| GpuError::GuestMemory)?;
 
-    let mut rutabaga_iovecs: Vec<RutabagaIovec> = Vec::new();
-    for &(addr, len) in vecs {
-        let slice = mem.get_slice(addr, len).unwrap();
+    let mut rutabaga_iovecs = Vec::with_capacity(slices.len());
+    let mut leases = Vec::new();
+    for (slice, &(_, len)) in slices.iter().zip(vecs) {
         rutabaga_iovecs.push(RutabagaIovec {
-            base: slice.ptr_guard_mut().as_ptr() as *mut c_void,
+            base: slice.slice().ptr_guard_mut().as_ptr() as *mut c_void,
             len,
         });
+        leases.extend(slice.lease());
     }
-    Ok(rutabaga_iovecs)
+    Ok((rutabaga_iovecs, leases))
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -186,6 +189,7 @@ pub struct VirtioGpuScanout {
 pub struct VirtioGpu {
     rutabaga: Rutabaga,
     resources: BTreeMap<u32, VirtioGpuResource>,
+    backing_leases: BTreeMap<u32, Vec<Arc<dyn HostMemoryLease>>>,
     fence_state: Arc<Mutex<FenceState>>,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
@@ -196,7 +200,7 @@ pub struct VirtioGpu {
 
 impl VirtioGpu {
     fn create_fence_handler(
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         queue_ctl: Arc<Mutex<VirtQueue>>,
         fence_state: Arc<Mutex<FenceState>>,
         interrupt: InterruptTransport,
@@ -252,7 +256,7 @@ impl VirtioGpu {
     }
 
     pub fn create_rutabaga(
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         queue_ctl: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         fence_state: Arc<Mutex<FenceState>>,
@@ -324,7 +328,7 @@ impl VirtioGpu {
     }
 
     pub fn create_fallback_rutabaga(
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         queue_ctl: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         fence_state: Arc<Mutex<FenceState>>,
@@ -343,7 +347,7 @@ impl VirtioGpu {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         queue_ctl: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         virgl_flags: u32,
@@ -384,6 +388,7 @@ impl VirtioGpu {
         Self {
             rutabaga,
             resources: Default::default(),
+            backing_leases: Default::default(),
             fence_state,
             scanouts: Default::default(),
             displays,
@@ -468,6 +473,7 @@ impl VirtioGpu {
         }
 
         self.rutabaga.unref_resource(resource_id)?;
+        self.backing_leases.remove(&resource_id);
         Ok(OkNoData)
     }
 
@@ -641,17 +647,20 @@ impl VirtioGpu {
     pub fn attach_backing(
         &mut self,
         resource_id: u32,
-        mem: &GuestMemoryMmap,
+        mem: &RuntimeGuestMemory,
         vecs: Vec<(GuestAddress, usize)>,
     ) -> VirtioGpuResult {
-        let rutabaga_iovecs = sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
+        let (rutabaga_iovecs, leases) =
+            sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
         self.rutabaga.attach_backing(resource_id, rutabaga_iovecs)?;
+        self.backing_leases.insert(resource_id, leases);
         Ok(OkNoData)
     }
 
     /// Detaches any previously attached iovecs from the resource.
     pub fn detach_backing(&mut self, resource_id: u32) -> VirtioGpuResult {
         self.rutabaga.detach_backing(resource_id)?;
+        self.backing_leases.remove(&resource_id);
         Ok(OkNoData)
     }
 
@@ -766,15 +775,18 @@ impl VirtioGpu {
         resource_id: u32,
         resource_create_blob: ResourceCreateBlob,
         vecs: Vec<(GuestAddress, usize)>,
-        mem: &GuestMemoryMmap,
+        mem: &RuntimeGuestMemory,
     ) -> VirtioGpuResult {
         let mut rutabaga_iovecs = None;
+        let mut backing_leases = None;
 
         if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
             panic!("GUEST_HANDLE unimplemented");
         } else if resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D {
-            rutabaga_iovecs =
-                Some(sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?);
+            let (iovecs, leases) =
+                sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
+            rutabaga_iovecs = Some(iovecs);
+            backing_leases = Some(leases);
         }
 
         self.rutabaga.resource_create_blob(
@@ -784,6 +796,10 @@ impl VirtioGpu {
             rutabaga_iovecs,
             None,
         )?;
+
+        if let Some(leases) = backing_leases {
+            self.backing_leases.insert(resource_id, leases);
+        }
 
         let resource = VirtioGpuResource::new(resource_id, 0, 0, None, resource_create_blob.size);
 
@@ -1061,6 +1077,31 @@ impl VirtioGpu {
     }
 }
 
+/// Translate virglrenderer flags (which became part of the libkrun 1.x public API) to a rutabaga_gfx capset mask.
+/// Won't be necessary anymore when libkrun 2.x removes these from the API.
+pub fn virgl_flags_to_capsets(flags: u32) -> u64 {
+    let mut capset_mask = 0;
+
+    capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_CROSS_DOMAIN;
+
+    if flags & VIRGLRENDERER_NO_VIRGL == 0 {
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL;
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL2;
+    }
+
+    // Enable Venus if requested (requires render server mode)
+    if flags & VIRGLRENDERER_VENUS != 0 {
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VENUS;
+    }
+
+    // Enable DRM native context if requested (in-process mode)
+    if flags & VIRGLRENDERER_DRM != 0 {
+        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_DRM;
+    }
+
+    capset_mask
+}
+
 // A guest-controlled `offset` that wraps `offset + size` or `base + offset` would
 // otherwise pass the size guard and place the mmap(MAP_FIXED) out of bounds.
 fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Option<u64> {
@@ -1071,13 +1112,102 @@ fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Op
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use arch::guest_memory::{
+        GuestRange, HostMemoryAccess, HostMemoryAccessError, HostMemoryLease,
+    };
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    use crate::virtio::RuntimeGuestMemory;
     use crate::virtio::gpu::protocol::VIRTIO_GPU_MAX_SCANOUTS;
+    use crate::virtio::gpu::virtio_gpu::{
+        AssociatedScanouts, checked_blob_map_addr, sglist_to_rutabaga_iovecs,
+    };
+
+    struct LimitedAccess {
+        active: Arc<AtomicUsize>,
+        limit: usize,
+    }
+
+    struct Lease(Arc<AtomicUsize>);
+
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    impl HostMemoryLease for Lease {}
+
+    impl HostMemoryAccess for LimitedAccess {
+        fn access(
+            self: Arc<Self>,
+            _range: GuestRange,
+        ) -> Result<Arc<dyn HostMemoryLease>, HostMemoryAccessError> {
+            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            if active > self.limit {
+                self.active.fetch_sub(1, Ordering::AcqRel);
+                return Err(HostMemoryAccessError::new("lease capacity exhausted"));
+            }
+            Ok(Arc::new(Lease(Arc::clone(&self.active))))
+        }
+
+        fn allows_external_mapping(&self) -> bool {
+            false
+        }
+    }
+
+    fn memory(limit: usize) -> (RuntimeGuestMemory, Arc<AtomicUsize>) {
+        let active = Arc::new(AtomicUsize::new(0));
+        let access: Arc<dyn HostMemoryAccess> = Arc::new(LimitedAccess {
+            active: Arc::clone(&active),
+            limit,
+        });
+        (
+            RuntimeGuestMemory::new(
+                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap(),
+                access,
+            ),
+            active,
+        )
+    }
+
+    #[test]
+    fn sglist_collection_is_fallible_and_releases_partial_leases() {
+        let (memory, active) = memory(1);
+        let capacity_error = sglist_to_rutabaga_iovecs(
+            &[(GuestAddress(0x1000), 0x100), (GuestAddress(0x2000), 0x100)],
+            &memory,
+        );
+
+        assert!(capacity_error.is_err());
+        assert_eq!(active.load(Ordering::Acquire), 0);
+
+        let guest_input_error = sglist_to_rutabaga_iovecs(
+            &[(GuestAddress(0x1000), 0x100), (GuestAddress(0x5000), 0x100)],
+            &memory,
+        );
+        assert!(guest_input_error.is_err());
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn empty_sg_entries_do_not_acquire_leases() {
+        let (memory, active) = memory(0);
+        let (iovecs, leases) =
+            sglist_to_rutabaga_iovecs(&[(GuestAddress(0x1000), 0)], &memory).unwrap();
+
+        assert_eq!(iovecs.len(), 1);
+        assert_eq!(iovecs[0].len, 0);
+        assert!(leases.is_empty());
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn checked_blob_map_addr_rejects_out_of_range_and_wrapping_offsets() {
-        use super::checked_blob_map_addr;
-
         let base = 0x1_0000_u64;
         let shm = 0x1_0000_u64;
 
@@ -1098,8 +1228,6 @@ mod test {
 
     #[test]
     fn test_virtio_gpu_associated_scanouts() {
-        use super::AssociatedScanouts;
-
         let mut scanouts = AssociatedScanouts::default();
 
         assert!(!scanouts.has_any_enabled());
@@ -1132,29 +1260,4 @@ mod test {
             .for_each(|scanout| scanouts.disable(scanout));
         assert!(!scanouts.has_any_enabled());
     }
-}
-
-/// Translate virglrenderer flags (which became part of the libkrun 1.x public API) to a rutabaga_gfx capset mask.
-/// Won't be necessary anymore when libkrun 2.x removes these from the API.
-pub fn virgl_flags_to_capsets(flags: u32) -> u64 {
-    let mut capset_mask = 0;
-
-    capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_CROSS_DOMAIN;
-
-    if flags & VIRGLRENDERER_NO_VIRGL == 0 {
-        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL;
-        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VIRGL2;
-    }
-
-    // Enable Venus if requested (requires render server mode)
-    if flags & VIRGLRENDERER_VENUS != 0 {
-        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_VENUS;
-    }
-
-    // Enable DRM native context if requested (in-process mode)
-    if flags & VIRGLRENDERER_DRM != 0 {
-        capset_mask |= 1 << rutabaga_gfx::RUTABAGA_CAPSET_DRM;
-    }
-
-    capset_mask
 }

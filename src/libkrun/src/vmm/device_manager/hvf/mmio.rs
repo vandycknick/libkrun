@@ -299,7 +299,8 @@ mod tests {
     use arch;
     use devices::legacy::DummyIrqChip;
     use devices::virtio::{
-        ActivateResult, DeviceQueue, InterruptTransport, QueueConfig, VirtioDevice,
+        ActivateResult, DeviceQueue, InterruptTransport, QueueConfig, RuntimeGuestMemory,
+        VirtioDevice,
     };
     use std::sync::Arc;
     use vm_memory::{GuestAddress, GuestMemoryMmap};
@@ -374,7 +375,7 @@ mod tests {
 
         fn activate(
             &mut self,
-            _mem: GuestMemoryMmap,
+            _mem: RuntimeGuestMemory,
             _interrupt: InterruptTransport,
             _queues: Vec<DeviceQueue>,
         ) -> ActivateResult {

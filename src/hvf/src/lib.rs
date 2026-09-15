@@ -8,6 +8,11 @@
 #[allow(non_upper_case_globals)]
 #[allow(deref_nullptr)]
 pub mod bindings;
+mod discard;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+mod probe;
+pub mod reclaim;
+pub mod remap;
 
 #[macro_use]
 extern crate log;
@@ -20,12 +25,15 @@ use std::cell::Cell;
 
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name};
+use arch::guest_memory::RamLayout;
 use log::debug;
+use reclaim::{FaultResolution, ReclaimQualification, ReclaimState, ReclaimStateError};
 
 unsafe extern "C" {
     pub fn mach_absolute_time() -> u64;
@@ -99,6 +107,9 @@ const EC_AA64_SMC: u64 = 0x17;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const EC_SYSTEMREGISTERTRAP: u64 = 0x18;
 const EC_DATAABORT: u64 = 0x24;
+const EC_DATAABORT_CURRENT: u64 = 0x25;
+const EC_INSTRUCTIONABORT: u64 = 0x20;
+const EC_INSTRUCTIONABORT_CURRENT: u64 = 0x21;
 const EC_AA64_BKPT: u64 = 0x3c;
 
 #[derive(Debug)]
@@ -106,7 +117,11 @@ pub enum Error {
     EnableEL2,
     FindSymbol(libloading::Error),
     MemoryMap,
+    MemorySize,
     MemoryUnmap,
+    InvalidMemoryFault,
+    ReclaimState(ReclaimStateError),
+    ReclaimProbeCleanup(String),
     NestedCheck,
     VcpuCreate,
     VcpuInitialRegisters,
@@ -118,7 +133,9 @@ pub enum Error {
     VcpuSetRegister,
     VcpuSetSystemRegister(u16, u64),
     VcpuSetVtimerMask,
+    VmBusy,
     VmCreate,
+    VmDestroy,
 }
 
 impl Display for Error {
@@ -129,7 +146,11 @@ impl Display for Error {
             EnableEL2 => write!(f, "Error enabling EL2 mode in HVF"),
             FindSymbol(err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
+            MemorySize => write!(f, "Memory region size is not representable by HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
+            InvalidMemoryFault => write!(f, "Invalid fault in mapped guest RAM"),
+            ReclaimState(err) => write!(f, "Error tracking guest RAM in HVF: {err}"),
+            ReclaimProbeCleanup(err) => write!(f, "Error cleaning up HVF reclaim probe: {err}"),
             NestedCheck => write!(
                 f,
                 "Nested virtualization was requested but it's not support in this system"
@@ -147,7 +168,9 @@ impl Display for Error {
                 "Error setting HVF vCPU system register 0x{reg:#x} to 0x{val:#x}"
             ),
             VcpuSetVtimerMask => write!(f, "Error setting HVF vCPU vtimer mask"),
+            VmBusy => write!(f, "HVF VM is still owned by a cleanup worker"),
             VmCreate => write!(f, "Error creating HVF VM instance"),
+            VmDestroy => write!(f, "Error destroying HVF VM instance"),
         }
     }
 }
@@ -229,7 +252,45 @@ pub fn check_nested_virt() -> Result<bool, Error> {
     Ok(el2_supported)
 }
 
-pub struct HvfVm {}
+pub struct HvfVm {
+    reclaim_state: Arc<ReclaimState>,
+    nested_enabled: bool,
+    ipa_bits: Option<u32>,
+    lifetime: Arc<HvfVmLifetime>,
+}
+
+pub(crate) struct HvfVmLifetime {
+    destroyed: AtomicBool,
+}
+
+impl HvfVmLifetime {
+    pub(crate) fn new() -> Self {
+        Self {
+            destroyed: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn destroy(&self) -> Result<(), Error> {
+        if self.destroyed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        if unsafe { hv_vm_destroy() } != HV_SUCCESS {
+            self.destroyed.store(false, Ordering::Release);
+            Err(Error::VmDestroy)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for HvfVmLifetime {
+    fn drop(&mut self) {
+        if !self.destroyed.swap(true, Ordering::AcqRel) && unsafe { hv_vm_destroy() } != HV_SUCCESS
+        {
+            log::error!("failed to destroy HVF VM at final owner teardown");
+        }
+    }
+}
 
 static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
     libloading::Library::new(
@@ -240,7 +301,15 @@ static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
 
 impl HvfVm {
     pub fn new(nested_enabled: bool) -> Result<Self, Error> {
+        let reclaim_state = Arc::new(ReclaimState::new());
         let config = unsafe { hv_vm_config_create() };
+        let mut ipa_bits = 0;
+        let ipa_bits = if unsafe { hv_vm_config_get_ipa_size(config, &mut ipa_bits) } == HV_SUCCESS
+        {
+            Some(ipa_bits)
+        } else {
+            None
+        };
         if nested_enabled {
             let set_el2_enabled: libloading::Symbol<
                 'static,
@@ -261,7 +330,12 @@ impl HvfVm {
         if ret != HV_SUCCESS {
             Err(Error::VmCreate)
         } else {
-            Ok(Self {})
+            Ok(Self {
+                reclaim_state,
+                nested_enabled,
+                ipa_bits,
+                lifetime: Arc::new(HvfVmLifetime::new()),
+            })
         }
     }
 
@@ -271,11 +345,12 @@ impl HvfVm {
         guest_start_addr: u64,
         size: u64,
     ) -> Result<(), Error> {
+        let size = size.try_into().map_err(|_| Error::MemorySize)?;
         let ret = unsafe {
             hv_vm_map(
                 host_start_addr as *mut core::ffi::c_void,
                 guest_start_addr,
-                size.try_into().unwrap(),
+                size,
                 (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
             )
         };
@@ -286,14 +361,88 @@ impl HvfVm {
         }
     }
 
+    pub fn reclaim_state(&self) -> Arc<ReclaimState> {
+        Arc::clone(&self.reclaim_state)
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub fn qualify_reclaim<T: Send + 'static>(
+        &self,
+        occupied: &[arch::guest_memory::GuestRange],
+        parent_lifetime: T,
+    ) -> Result<(), Error> {
+        if self.nested_enabled {
+            self.reclaim_state.record_qualification(
+                ReclaimQualification::Inconclusive,
+                "host reclaim is not qualified for nested EL2 guests",
+            );
+            return Ok(());
+        }
+        if !self.reclaim_state.is_eligible() {
+            self.reclaim_state.record_qualification(
+                ReclaimQualification::Inconclusive,
+                "workload RAM is not private anonymous memory",
+            );
+            return Ok(());
+        }
+        let Some(ipa_bits) = self.ipa_bits else {
+            self.reclaim_state.record_qualification(
+                ReclaimQualification::Inconclusive,
+                "hv_vm_config_get_ipa_size did not return the VM IPA cap",
+            );
+            return Ok(());
+        };
+        let report = probe::run_reclaim_probe(
+            ipa_bits,
+            occupied,
+            probe::ProbeMode::Release,
+            Arc::clone(&self.lifetime),
+            parent_lifetime,
+        )
+        .map_err(|error| Error::ReclaimProbeCleanup(error.to_string()))?;
+        let detail = format!(
+            "ipa_bits={ipa_bits} elapsed_us={} baseline={:?} touched={:?} released={:?} retouched={:?}; {}",
+            report.elapsed.as_micros(),
+            report.baseline,
+            report.touched,
+            report.released,
+            report.retouched,
+            report.detail
+        );
+        self.reclaim_state
+            .record_qualification(report.qualification, &detail);
+        Ok(())
+    }
+
+    /// Installs the releasable RAM layout once every region is mapped.
+    pub fn initialize_reclaim(&self, layout: RamLayout) -> Result<(), Error> {
+        self.reclaim_state
+            .initialize(layout)
+            .map_err(Error::ReclaimState)
+    }
+
     pub fn unmap_memory(&self, guest_start_addr: u64, size: u64) -> Result<(), Error> {
-        let ret = unsafe { hv_vm_unmap(guest_start_addr, size.try_into().unwrap()) };
+        let size = size.try_into().map_err(|_| Error::MemorySize)?;
+        let ret = unsafe { hv_vm_unmap(guest_start_addr, size) };
         if ret != HV_SUCCESS {
             Err(Error::MemoryUnmap)
         } else {
             Ok(())
         }
     }
+
+    /// Destroys the VM if this is its final lifetime owner.
+    ///
+    /// A busy error consumes this outer handle, but another owner (such as a
+    /// reclaim-probe cleanup worker) retains the VM until its work completes.
+    pub fn destroy(self) -> Result<(), Error> {
+        let Self { lifetime, .. } = self;
+        unique_vm_lifetime(lifetime)?.destroy()
+    }
+}
+
+fn unique_vm_lifetime(lifetime: Arc<HvfVmLifetime>) -> Result<HvfVmLifetime, Error> {
+    Arc::try_unwrap(lifetime).map_err(|_| Error::VmBusy)
 }
 
 #[derive(Debug)]
@@ -304,6 +453,8 @@ pub enum VcpuExit<'a> {
     HypervisorCall,
     MmioRead(u64, &'a mut [u8]),
     MmioWrite(u64, &'a [u8]),
+    /// A stage-2 fault raced a RAM release cycle; re-run the vCPU.
+    MemoryRetry,
     PsciHandled,
     SecureMonitorCall,
     Shutdown,
@@ -318,6 +469,13 @@ struct MmioRead {
     addr: u64,
     len: usize,
     srt: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MmioAccess {
+    is_write: bool,
+    len: usize,
+    register: u32,
 }
 
 pub struct HvfVcpu<'a> {
@@ -571,9 +729,13 @@ impl HvfVcpu<'_> {
         }
     }
 
-    pub fn run(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
+    pub fn run(
+        &mut self,
+        vcpu_list: Arc<dyn Vcpus>,
+        reclaim_state: &Arc<ReclaimState>,
+    ) -> Result<VcpuExit<'_>, Error> {
+        let entered_generation = reclaim_state.vcpu_run_generation();
         let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
-
         if let Some(mmio_read) = self.pending_mmio_read.take()
             && mmio_read.srt < 31
         {
@@ -633,41 +795,74 @@ impl HvfVcpu<'_> {
                 debug!("vcpu[{}]: BRK exit", self.vcpuid);
                 Ok(VcpuExit::Breakpoint)
             }
-            EC_DATAABORT => {
-                let isv: bool = (syndrome & (1 << 24)) != 0;
-                let iswrite: bool = ((syndrome >> 6) & 1) != 0;
-                let s1ptw: bool = ((syndrome >> 7) & 1) != 0;
-                let sas: u32 = ((syndrome >> 22) & 3) as u32;
-                let len: usize = (1 << sas) as usize;
-                let srt: u32 = ((syndrome >> 16) & 0x1f) as u32;
-                let cm: u32 = ((syndrome >> 8) & 0x1) as u32;
-
-                debug!(
-                    "EC_DATAABORT {} {} {} {} {} {} {} {}",
-                    syndrome, isv as u8, iswrite as u8, s1ptw as u8, sas, len, srt, cm
-                );
-
+            EC_INSTRUCTIONABORT | EC_INSTRUCTIONABORT_CURRENT => {
                 let pa = self.vcpu_exit.exception.physical_address;
+                if is_translation_fault(syndrome)
+                    && fault_address_is_valid(syndrome)
+                    && let Some(generation) = entered_generation
+                {
+                    match reclaim_state
+                        .resolve_translation_fault(pa, generation)
+                        .map_err(Error::ReclaimState)?
+                    {
+                        FaultResolution::Retry => return Ok(VcpuExit::MemoryRetry),
+                        FaultResolution::Invalid => {}
+                    }
+                }
+                if !fault_address_is_valid(syndrome) {
+                    return Err(Error::InvalidMemoryFault);
+                }
+                if entered_generation.is_some() && reclaim_state.contains_ram(pa) {
+                    return Err(Error::InvalidMemoryFault);
+                }
+                Err(Error::InvalidMemoryFault)
+            }
+            EC_DATAABORT | EC_DATAABORT_CURRENT => {
+                let pa = self.vcpu_exit.exception.physical_address;
+                if is_translation_fault(syndrome)
+                    && fault_address_is_valid(syndrome)
+                    && let Some(generation) = entered_generation
+                {
+                    match reclaim_state
+                        .resolve_translation_fault(pa, generation)
+                        .map_err(Error::ReclaimState)?
+                    {
+                        FaultResolution::Retry => return Ok(VcpuExit::MemoryRetry),
+                        FaultResolution::Invalid => {}
+                    }
+                }
+                if is_translation_fault(syndrome) && !fault_address_is_valid(syndrome) {
+                    return Err(Error::InvalidMemoryFault);
+                }
+                if entered_generation.is_some() && reclaim_state.contains_ram(pa) {
+                    return Err(Error::InvalidMemoryFault);
+                }
+                let access = decode_mmio_access(syndrome).ok_or(Error::InvalidMemoryFault)?;
                 self.pending_advance_pc = true;
 
-                if iswrite {
-                    let val = if srt < 31 {
-                        self.read_reg(hv_reg_t_HV_REG_X0 + srt)?
+                if access.is_write {
+                    let val = if access.register < 31 {
+                        self.read_reg(hv_reg_t_HV_REG_X0 + access.register)?
                     } else {
                         0
                     };
 
-                    match len {
+                    match access.len {
                         1 => self.mmio_buf[0..1].copy_from_slice(&(val as u8).to_le_bytes()),
+                        2 => self.mmio_buf[0..2].copy_from_slice(&(val as u16).to_le_bytes()),
                         4 => self.mmio_buf[0..4].copy_from_slice(&(val as u32).to_le_bytes()),
                         8 => self.mmio_buf[0..8].copy_from_slice(&val.to_le_bytes()),
-                        _ => panic!("unsupported mmio len={len}"),
+                        _ => return Err(Error::InvalidMemoryFault),
                     };
 
-                    Ok(VcpuExit::MmioWrite(pa, &self.mmio_buf[0..len]))
+                    Ok(VcpuExit::MmioWrite(pa, &self.mmio_buf[0..access.len]))
                 } else {
-                    self.pending_mmio_read = Some(MmioRead { addr: pa, srt, len });
-                    Ok(VcpuExit::MmioRead(pa, &mut self.mmio_buf[0..len]))
+                    self.pending_mmio_read = Some(MmioRead {
+                        addr: pa,
+                        srt: access.register,
+                        len: access.len,
+                    });
+                    Ok(VcpuExit::MmioRead(pa, &mut self.mmio_buf[0..access.len]))
                 }
             }
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -756,5 +951,88 @@ impl HvfVcpu<'_> {
             }
             _ => panic!("unexpected exception: 0x{ec:x}"),
         }
+    }
+}
+
+fn is_translation_fault(syndrome: u64) -> bool {
+    matches!(syndrome & 0x3f, 0b000100..=0b000111)
+}
+
+// Arm ESR_EL2 defines FnV at ISS[10]: when set, the fault address supplied for
+// an abort is not valid and must not be used for RAM lookup or MMIO dispatch.
+fn fault_address_is_valid(syndrome: u64) -> bool {
+    syndrome & (1 << 10) == 0
+}
+
+fn decode_mmio_access(syndrome: u64) -> Option<MmioAccess> {
+    let instruction_syndrome_valid = syndrome & (1 << 24) != 0;
+    let stage_one_page_walk = syndrome & (1 << 7) != 0;
+    let cache_maintenance = syndrome & (1 << 8) != 0;
+    if !is_translation_fault(syndrome)
+        || !fault_address_is_valid(syndrome)
+        || !instruction_syndrome_valid
+        || stage_one_page_walk
+        || cache_maintenance
+    {
+        return None;
+    }
+    Some(MmioAccess {
+        is_write: syndrome & (1 << 6) != 0,
+        len: 1usize << ((syndrome >> 22) & 0x3),
+        register: ((syndrome >> 16) & 0x1f) as u32,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    mod actual_reclaim;
+
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use crate::{
+        Error, HvfVmLifetime, MmioAccess, decode_mmio_access, fault_address_is_valid,
+        is_translation_fault, unique_vm_lifetime,
+    };
+
+    #[test]
+    fn explicit_destroy_requires_unique_lifetime_ownership() {
+        let outer = Arc::new(HvfVmLifetime::new());
+        let worker = Arc::clone(&outer);
+
+        assert!(matches!(unique_vm_lifetime(outer), Err(Error::VmBusy)));
+        assert_eq!(Arc::strong_count(&worker), 1);
+        let lifetime = Arc::try_unwrap(worker)
+            .ok()
+            .expect("last lifetime owner must be unique");
+        assert!(!lifetime.destroyed.load(Ordering::Acquire));
+        lifetime.destroyed.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn decodes_only_translation_fault_status_codes() {
+        for level in 0b000100..=0b000111 {
+            assert!(is_translation_fault(level));
+            assert!(is_translation_fault((0x24 << 26) | (1 << 7) | level));
+        }
+        for status in [0, 0b001001, 0b001100, 0b010000, 0b100001] {
+            assert!(!is_translation_fault(status));
+        }
+        assert!(fault_address_is_valid(0b000100));
+        assert!(!fault_address_is_valid((1 << 10) | 0b000100));
+
+        let valid_mmio = (1 << 24) | (2 << 22) | (3 << 16) | (1 << 6) | 0b000100;
+        assert_eq!(
+            decode_mmio_access(valid_mmio),
+            Some(MmioAccess {
+                is_write: true,
+                len: 4,
+                register: 3,
+            })
+        );
+        assert_eq!(decode_mmio_access(valid_mmio & !(1 << 24)), None);
+        assert_eq!(decode_mmio_access(valid_mmio | (1 << 7)), None);
+        assert_eq!(decode_mmio_access(valid_mmio | (1 << 8)), None);
+        assert_eq!(decode_mmio_access((valid_mmio & !0x3f) | 0b001100), None);
     }
 }

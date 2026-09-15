@@ -9,10 +9,11 @@ use std::sync::Arc;
 use utils::windows::{AsRawFd, RawFd};
 
 use utils::eventfd::EventFd;
-use vm_memory::{ByteValued, Bytes, GuestMemoryMmap};
+use vm_memory::ByteValued;
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RuntimeGuestMemory,
+    VirtioDevice,
 };
 use super::{defs, defs::control_event, defs::uapi};
 use crate::virtio::console::console_control::{
@@ -138,11 +139,9 @@ impl Console {
 
         while let Some(head) = control_rx.queue.pop(mem) {
             if let Some(buf) = self.control.queue_pop() {
-                match mem.write(&buf, head.addr) {
-                    Ok(n) => {
-                        if n != buf.len() {
-                            log::error!("process_control_rx: partial write");
-                        }
+                match mem.write_slice(&buf, head.addr) {
+                    Ok(()) => {
+                        let n = buf.len();
                         raise_irq = true;
                         log::trace!("process_control_rx wrote {n}");
                         if let Err(e) = control_rx.queue.add_used(mem, head.index, n as u32) {
@@ -332,7 +331,7 @@ impl VirtioDevice for Console {
 
     fn activate(
         &mut self,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {

@@ -14,19 +14,19 @@ use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
 use super::tsi_stream::TsiStreamProxy;
 
 use crate::virtio::InterruptTransport;
+use crate::virtio::RuntimeGuestMemory;
 use crate::virtio::vsock::defs;
 use crate::virtio::vsock::unix_proxy::{UnixAcceptorProxy, UnixProxy};
 use crossbeam_channel::Sender;
 use rand::{RngExt, rng, rngs::ThreadRng};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
-use vm_memory::GuestMemoryMmap;
 
 pub struct MuxerThread {
     cid: u64,
     pub epoll: Epoll,
     rxq: Arc<Mutex<MuxerRxQ>>,
     proxy_map: ProxyMap,
-    mem: GuestMemoryMmap,
+    mem: RuntimeGuestMemory,
     queue: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
     reaper_sender: Sender<u64>,
@@ -40,7 +40,7 @@ impl MuxerThread {
         epoll: Epoll,
         rxq: Arc<Mutex<MuxerRxQ>>,
         proxy_map: ProxyMap,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         reaper_sender: Sender<u64>,

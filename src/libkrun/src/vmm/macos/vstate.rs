@@ -14,12 +14,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
+use crate::vmm::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 
 use arch::ArchMemoryInfo;
+use arch::guest_memory::{RamLayout, RamPermissions, RamRegion, ReclaimError};
 use crossbeam_channel::{Receiver, Sender, after, select, unbounded};
 use devices::legacy::VcpuList;
+use hvf::reclaim::{ReclaimState, ReclaimStateError};
 use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
 use vm_memory::{
@@ -38,6 +40,10 @@ pub enum Error {
     REGSConfiguration(arch::aarch64::regs::Error),
     /// Cannot set the memory regions.
     SetUserMemoryRegion(hvf::Error),
+    /// Cannot restore a partially initialized HVF memory map.
+    MemoryMappingRollback(hvf::Error),
+    /// Workload RAM does not match the authoritative architecture layout.
+    ReclaimLayout(ReclaimError),
     /// The vCPU event channel was closed (the vCPU thread has exited).
     VcpuChannelClosed,
     /// Failed to signal Vcpu.
@@ -76,6 +82,10 @@ impl Display for Error {
                 "The number of configured slots is bigger than the maximum reported by KVM"
             ),
             SetUserMemoryRegion(e) => write!(f, "Cannot set the memory regions: {e:?}"),
+            MemoryMappingRollback(e) => {
+                write!(f, "Cannot roll back partially mapped guest memory: {e:?}")
+            }
+            ReclaimLayout(e) => write!(f, "Invalid workload RAM layout: {e}"),
             SignalVcpu(e) => write!(f, "Failed to signal Vcpu: {e}"),
             REGSConfiguration(e) => write!(
                 f,
@@ -97,6 +107,7 @@ pub type Result<T> = result::Result<T, Error>;
 /// A wrapper around creating and using a VM.
 pub struct Vm {
     hvf_vm: HvfVm,
+    remapper: Option<Arc<hvf::remap::HostMemoryRemapper>>,
 }
 
 impl Vm {
@@ -104,30 +115,61 @@ impl Vm {
     pub fn new(nested_enabled: bool) -> Result<Self> {
         let hvf_vm = HvfVm::new(nested_enabled).map_err(Error::VmSetup)?;
 
-        Ok(Vm { hvf_vm })
+        Ok(Vm {
+            hvf_vm,
+            remapper: None,
+        })
     }
 
     /// Initializes the guest memory.
-    pub fn memory_init(&mut self, guest_mem: &GuestMemoryMmap) -> Result<()> {
-        for region in guest_mem.iter() {
-            // It's safe to unwrap because the guest address is valid.
-            let host_addr = guest_mem.get_host_address(region.start_addr()).unwrap();
+    pub fn memory_init(
+        &mut self,
+        guest_mem: &GuestMemoryMmap,
+        reclaim_layout: RamLayout,
+    ) -> Result<()> {
+        if self.hvf_vm.reclaim_state().is_initialized() {
+            return Err(Error::VmSetup(hvf::Error::ReclaimState(
+                ReclaimStateError::AlreadyInitialized,
+            )));
+        }
+        let mappings = memory_mappings(guest_mem)?;
+        let mut mapped = Vec::new();
+        for (host_addr, guest_start, len) in mappings {
             debug!(
                 "Guest memory host_addr={:x?} guest_addr={:x?} len={:x?}",
-                host_addr,
-                region.start_addr().raw_value(),
-                region.len()
+                host_addr, guest_start, len
             );
-            self.hvf_vm
-                .map_memory(
-                    host_addr as u64,
-                    region.start_addr().raw_value(),
-                    region.len(),
-                )
-                .map_err(Error::SetUserMemoryRegion)?;
+            if let Err(error) = self.hvf_vm.map_memory(host_addr, guest_start, len) {
+                self.rollback_memory_mappings(&mapped)?;
+                return Err(Error::SetUserMemoryRegion(error));
+            }
+            mapped.push((guest_start, len));
         }
 
+        self.hvf_vm
+            .initialize_reclaim(reclaim_layout)
+            .map_err(Error::VmSetup)?;
+        self.remapper = hvf::remap::HostMemoryRemapper::new(self.reclaim_state()).map(Arc::new);
         Ok(())
+    }
+
+    pub fn host_memory_remapper(&self) -> Option<Arc<hvf::remap::HostMemoryRemapper>> {
+        self.remapper.clone()
+    }
+
+    fn rollback_memory_mappings(&self, mapped: &[(u64, u64)]) -> Result<()> {
+        let mut first_error = None;
+        for (guest_start, len) in mapped.iter().rev() {
+            if let Err(error) = self.hvf_vm.unmap_memory(*guest_start, *len)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(Error::MemoryMappingRollback(error)),
+            None => Ok(()),
+        }
     }
 
     pub fn add_mapping(
@@ -159,6 +201,104 @@ impl Vm {
             reply_sender.send(true).unwrap();
         }
     }
+
+    pub fn reclaim_state(&self) -> Arc<ReclaimState> {
+        self.hvf_vm.reclaim_state()
+    }
+
+    pub fn configure_reclaim(
+        &self,
+        guest_mem: &GuestMemoryMmap,
+        mem_info: &ArchMemoryInfo,
+        requested: bool,
+    ) -> Result<()> {
+        let reclaim_state = self.hvf_vm.reclaim_state();
+        reclaim_state.set_policy_enabled(requested);
+        if !requested {
+            return Ok(());
+        }
+        let mut occupied = Vec::with_capacity(guest_mem.num_regions() + 1);
+        occupied.push(
+            arch::guest_memory::GuestRange::new(0, mem_info.ram_start_addr)
+                .map_err(Error::ReclaimLayout)?,
+        );
+        for region in guest_mem.iter() {
+            occupied.push(
+                arch::guest_memory::GuestRange::new(region.start_addr().raw_value(), region.len())
+                    .map_err(Error::ReclaimLayout)?,
+            );
+        }
+        self.hvf_vm
+            .qualify_reclaim(&occupied, guest_mem.clone())
+            .map_err(Error::VmSetup)
+    }
+
+    #[cfg(test)]
+    pub fn destroy(self) -> Result<()> {
+        self.hvf_vm.destroy().map_err(Error::VmSetup)
+    }
+}
+
+fn memory_mappings(guest_mem: &GuestMemoryMmap) -> Result<Vec<(u64, u64, u64)>> {
+    guest_mem
+        .iter()
+        .map(|region| {
+            let host_addr = guest_mem
+                .get_host_address(region.start_addr())
+                .map_err(Error::GuestMemoryMmap)?;
+            Ok((
+                host_addr as u64,
+                region.start_addr().raw_value(),
+                region.len(),
+            ))
+        })
+        .collect()
+}
+
+/// Describes the workload RAM the balloon may release. File-backed RAM is
+/// mapped but never registered, so reclaim stays inert for it.
+pub(crate) fn build_reclaim_layout(
+    guest_mem: &GuestMemoryMmap,
+    mem_info: &ArchMemoryInfo,
+) -> Result<RamLayout> {
+    let granule = u64::try_from(mem_info.page_size)
+        .map_err(|_| Error::ReclaimLayout(ReclaimError::InvalidAlignment))?;
+    let ram_len = mem_info
+        .ram_last_addr
+        .checked_sub(mem_info.ram_start_addr)
+        .filter(|len| *len > 0)
+        .ok_or(Error::ReclaimLayout(ReclaimError::EmptyRange))?;
+    let ram_start = GuestAddress(mem_info.ram_start_addr);
+    let memory_region = guest_mem
+        .find_region(ram_start)
+        .ok_or(Error::ReclaimLayout(ReclaimError::NotRam))?;
+    let region_end = memory_region
+        .start_addr()
+        .raw_value()
+        .checked_add(memory_region.len())
+        .ok_or(Error::ReclaimLayout(ReclaimError::AddressOverflow))?;
+    if memory_region.start_addr() != ram_start || region_end != mem_info.ram_last_addr {
+        return Err(Error::ReclaimLayout(ReclaimError::NotRam));
+    }
+    let host_addr = guest_mem
+        .get_host_address(ram_start)
+        .map_err(Error::GuestMemoryMmap)?;
+    let mut layout = RamLayout::new(granule).map_err(Error::ReclaimLayout)?;
+    if memory_region.file_offset().is_some() {
+        return Ok(layout);
+    }
+    layout
+        .register_region(
+            RamRegion::new(
+                mem_info.ram_start_addr,
+                host_addr as u64,
+                ram_len,
+                RamPermissions::READ_WRITE_EXECUTE,
+            )
+            .map_err(Error::ReclaimLayout)?,
+        )
+        .map_err(Error::ReclaimLayout)?;
+    Ok(layout)
 }
 
 /// Encapsulates configuration parameters for the guest vCPUS.
@@ -198,6 +338,7 @@ pub struct Vcpu {
     response_sender: Sender<VcpuResponse>,
 
     vcpu_list: Arc<VcpuList>,
+    reclaim_state: Arc<ReclaimState>,
     nested_enabled: bool,
 }
 
@@ -272,6 +413,7 @@ impl Vcpu {
         boot_receiver: Option<Receiver<u64>>,
         exit_evt: EventFd,
         vcpu_list: Arc<VcpuList>,
+        reclaim_state: Arc<ReclaimState>,
         nested_enabled: bool,
     ) -> Result<Self> {
         let (event_sender, event_receiver) = unbounded();
@@ -291,6 +433,7 @@ impl Vcpu {
             response_receiver: Some(response_receiver),
             response_sender,
             vcpu_list,
+            reclaim_state,
             nested_enabled,
         })
     }
@@ -303,6 +446,10 @@ impl Vcpu {
     /// Gets the MPIDR register value.
     pub fn get_mpidr(&self) -> u64 {
         self.mpidr
+    }
+
+    pub fn reclaim_state(&self) -> &Arc<ReclaimState> {
+        &self.reclaim_state
     }
 
     /// Sets a MMIO bus for this vcpu.
@@ -358,7 +505,7 @@ impl Vcpu {
     fn run_emulation(&mut self, hvf_vcpu: &mut HvfVcpu) -> Result<VcpuEmulation> {
         let vcpuid = hvf_vcpu.id();
 
-        match hvf_vcpu.run(self.vcpu_list.clone()) {
+        match hvf_vcpu.run(self.vcpu_list.clone(), &self.reclaim_state) {
             Ok(exit) => match exit {
                 VcpuExit::Breakpoint => {
                     debug!("vCPU {vcpuid} breakpoint");
@@ -396,6 +543,7 @@ impl Vcpu {
                     }
                     Ok(VcpuEmulation::Handled)
                 }
+                VcpuExit::MemoryRetry => Ok(VcpuEmulation::Handled),
                 VcpuExit::PsciHandled => {
                     debug!("vCPU {vcpuid} PSCI");
                     Ok(VcpuEmulation::Handled)
@@ -430,7 +578,10 @@ impl Vcpu {
                     Ok(VcpuEmulation::WaitForEventTimeout(duration))
                 }
             },
-            Err(e) => panic!("Error running HVF vCPU: {e:?}"),
+            Err(error) => {
+                error!("Error running HVF vCPU {vcpuid}: {error:?}");
+                Err(Error::VcpuRun)
+            }
         }
     }
 
@@ -649,10 +800,15 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use std::time::Duration;
 
-    use super::*;
+    use crate::vmm::macos::vstate::{Vcpu, Vm, build_reclaim_layout, memory_mappings};
+    #[cfg(target_arch = "x86_64")]
+    use crate::vmm::macos::vstate::{VcpuEvent, VcpuHandle, VcpuResponse};
+    use arch::ArchMemoryInfo;
     use arch::aarch64::layout::DRAM_MEM_START_EFI;
     use devices::legacy::VcpuList;
-    use vm_memory::{GuestAddress, GuestMemoryMmap};
+    use hvf::reclaim::{ReclaimState, ReclaimStateError};
+    use utils::eventfd::EventFd;
+    use vm_memory::{FileOffset, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
     // Auxiliary function being used throughout the tests.
     // Does NOT create a real HVF VM — Vcpu::new_aarch64 and most vcpu methods
@@ -661,7 +817,17 @@ mod tests {
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)]).unwrap();
         let exit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
         let vcpu_list = Arc::new(VcpuList::new(1));
-        let vcpu = Vcpu::new_aarch64(1, GuestAddress(0), None, exit_evt, vcpu_list, false).unwrap();
+        let reclaim_state = Arc::new(ReclaimState::new());
+        let vcpu = Vcpu::new_aarch64(
+            1,
+            GuestAddress(0),
+            None,
+            exit_evt,
+            vcpu_list,
+            reclaim_state,
+            false,
+        )
+        .unwrap();
         (vcpu, gm)
     }
 
@@ -674,16 +840,144 @@ mod tests {
     }
 
     #[test]
-    fn test_vm_memory_init() {
+    fn test_vcpu_owns_shared_reclaim_state() {
+        let state = Arc::new(ReclaimState::new());
+        let vcpu = Vcpu::new_aarch64(
+            0,
+            GuestAddress(0),
+            None,
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            Arc::new(VcpuList::new(1)),
+            Arc::clone(&state),
+            false,
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(vcpu.reclaim_state(), &state));
+    }
+
+    #[test]
+    fn test_reclaim_layout_excludes_shm_region() {
+        let ram_start = DRAM_MEM_START_EFI;
+        let ram_len = 0x8000;
+        let shm_start = ram_start + 0x1_0000;
+        let guest_mem = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(ram_start), ram_len),
+            (GuestAddress(shm_start), 0x4000),
+        ])
+        .unwrap();
+        let mem_info = ArchMemoryInfo {
+            ram_start_addr: ram_start,
+            ram_last_addr: ram_start + ram_len as u64,
+            shm_start_addr: shm_start,
+            page_size: 0x4000,
+            ..ArchMemoryInfo::default()
+        };
+
+        let layout = build_reclaim_layout(&guest_mem, &mem_info).unwrap();
+        assert_eq!(layout.granule(), 0x4000);
+        assert!(layout.region_containing(ram_start).is_some());
+        assert!(layout.region_containing(shm_start).is_none());
+    }
+
+    #[test]
+    fn test_file_backed_ram_is_mapped_but_not_reclaimable() {
+        let ram_start = DRAM_MEM_START_EFI;
+        let ram_len = 0x4000;
+        let path = std::env::temp_dir().join(format!(
+            "libkrun-reclaim-file-backed-{}",
+            std::process::id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(ram_len as u64).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let guest_mem = GuestMemoryMmap::from_ranges_with_files(&[(
+            GuestAddress(ram_start),
+            ram_len,
+            Some(FileOffset::new(file, 0)),
+        )])
+        .unwrap();
+        let mem_info = ArchMemoryInfo {
+            ram_start_addr: ram_start,
+            ram_last_addr: ram_start + ram_len as u64,
+            page_size: 0x4000,
+            ..ArchMemoryInfo::default()
+        };
+
+        let layout = build_reclaim_layout(&guest_mem, &mem_info).unwrap();
+        assert!(!layout.has_registered_regions());
+        assert!(layout.region_containing(ram_start).is_none());
+        let mappings = memory_mappings(&guest_mem).unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].1, ram_start);
+        assert_eq!(mappings[0].2, ram_len as u64);
+    }
+
+    #[test]
+    fn test_vm_memory_init_rejects_duplicate_before_mapping() {
         let mut vm = Vm::new(false).expect("Cannot create new vm");
 
         // Use a realistic guest physical address; hv_vm_map rejects GPA 0.
+        let first_gpa = DRAM_MEM_START_EFI;
+        let len = 0x20_0000;
         let gm = GuestMemoryMmap::from_ranges(&[(
-            GuestAddress(DRAM_MEM_START_EFI),
-            0x20_0000, // 2 MB
+            GuestAddress(first_gpa),
+            len, // 2 MB
         )])
         .unwrap();
-        vm.memory_init(&gm).expect("memory_init failed");
+        let mem_info = ArchMemoryInfo {
+            ram_start_addr: first_gpa,
+            ram_last_addr: first_gpa + len as u64,
+            page_size: 0x4000,
+            ..ArchMemoryInfo::default()
+        };
+        let reclaim_layout = build_reclaim_layout(&gm, &mem_info).expect("invalid RAM layout");
+        vm.memory_init(&gm, reclaim_layout)
+            .expect("memory_init failed");
+
+        let second_gpa = first_gpa + 0x40_0000;
+        let second_gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(second_gpa), len)]).unwrap();
+        let second_mem_info = ArchMemoryInfo {
+            ram_start_addr: second_gpa,
+            ram_last_addr: second_gpa + len as u64,
+            page_size: 0x4000,
+            ..ArchMemoryInfo::default()
+        };
+        let second_layout =
+            build_reclaim_layout(&second_gm, &second_mem_info).expect("invalid second RAM layout");
+        assert!(matches!(
+            vm.memory_init(&second_gm, second_layout),
+            Err(crate::vmm::macos::vstate::Error::VmSetup(
+                hvf::Error::ReclaimState(ReclaimStateError::AlreadyInitialized)
+            ))
+        ));
+
+        let first_host = gm
+            .get_host_address(GuestAddress(first_gpa))
+            .expect("first host mapping is unavailable");
+        assert!(matches!(
+            vm.hvf_vm
+                .map_memory(first_host as u64, first_gpa, len as u64),
+            Err(hvf::Error::MemoryMap)
+        ));
+        let second_host = second_gm
+            .get_host_address(GuestAddress(second_gpa))
+            .expect("second host mapping is unavailable");
+        vm.hvf_vm
+            .map_memory(second_host as u64, second_gpa, len as u64)
+            .expect("duplicate initialization mapped the second range");
+        vm.hvf_vm
+            .unmap_memory(second_gpa, len as u64)
+            .expect("failed to clean up second mapping");
+
+        vm.hvf_vm
+            .unmap_memory(first_gpa, len as u64)
+            .expect("first mapping was removed by duplicate initialization");
     }
 
     #[test]
@@ -693,12 +987,14 @@ mod tests {
 
         // Try it for when vcpu id is 0.
         let vcpu_list = Arc::new(VcpuList::new(1));
+        let reclaim_state = Arc::new(ReclaimState::new());
         let mut vcpu = Vcpu::new_aarch64(
             0,
             GuestAddress(0),
             None,
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
             vcpu_list,
+            reclaim_state,
             false,
         )
         .unwrap();
@@ -706,12 +1002,14 @@ mod tests {
 
         // Try it for when vcpu id is NOT 0.
         let vcpu_list = Arc::new(VcpuList::new(2));
+        let reclaim_state = Arc::new(ReclaimState::new());
         let mut vcpu = Vcpu::new_aarch64(
             1,
             GuestAddress(0),
             None,
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
             vcpu_list,
+            reclaim_state,
             false,
         )
         .unwrap();

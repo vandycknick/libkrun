@@ -4,14 +4,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::{mem, thread};
 
-use vm_memory::GuestMemoryMmap;
-
 use crate::virtio::console::console_control::ConsoleControl;
 use crate::virtio::console::port_io::{PortInput, PortOutput};
 use crate::virtio::console::process_rx::process_rx;
 use crate::virtio::console::process_tx::process_tx;
 use crate::virtio::port_io::PortTerminalProperties;
-use crate::virtio::{InterruptTransport, Queue};
+use crate::virtio::{InterruptTransport, Queue, RuntimeGuestMemory};
 
 pub struct PortDescription {
     pub name: Cow<'static, str>,
@@ -123,7 +121,7 @@ impl Port {
 
     pub fn start(
         &mut self,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         rx_queue: Queue,
         tx_queue: Queue,
         interrupt: InterruptTransport,

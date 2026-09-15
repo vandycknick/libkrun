@@ -23,9 +23,8 @@ use super::tsi_stream::TsiStreamProxy;
 use super::unix_proxy::UnixProxy;
 use crossbeam_channel::{Sender, unbounded};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
-use vm_memory::GuestMemoryMmap;
 
-use crate::virtio::InterruptTransport;
+use crate::virtio::{InterruptTransport, RuntimeGuestMemory};
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 #[cfg(windows)]
@@ -87,7 +86,7 @@ pub fn push_packet(
     rx: MuxerRx,
     rxq_mutex: &Arc<Mutex<MuxerRxQ>>,
     queue_mutex: &Arc<Mutex<VirtQueue>>,
-    mem: &GuestMemoryMmap,
+    mem: &RuntimeGuestMemory,
 ) {
     let mut queue = queue_mutex.lock().unwrap();
     if let Some(head) = queue.pop(mem) {
@@ -108,7 +107,7 @@ pub struct VsockMuxer {
     cid: u64,
     host_port_map: Option<HashMap<u16, u16>>,
     queue: Option<Arc<Mutex<VirtQueue>>>,
-    mem: Option<GuestMemoryMmap>,
+    mem: Option<RuntimeGuestMemory>,
     rxq: Arc<Mutex<MuxerRxQ>>,
     epoll: Epoll,
     interrupt: Option<InterruptTransport>,
@@ -142,7 +141,7 @@ impl VsockMuxer {
 
     pub(crate) fn activate(
         &mut self,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
     ) {

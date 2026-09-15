@@ -7,10 +7,9 @@
 
 use std::sync::Arc;
 
-use super::{ActivateResult, InterruptTransport, Queue};
+use super::{ActivateResult, InterruptTransport, Queue, RuntimeGuestMemory};
 use crate::virtio::AsAny;
 use utils::eventfd::EventFd;
-use vm_memory::GuestMemoryMmap;
 
 /// Configuration for a single virtqueue.
 /// This is used by devices to declare their queue requirements,
@@ -44,7 +43,7 @@ impl DeviceQueue {
 /// and memory attached to it.
 pub enum DeviceState {
     Inactive,
-    Activated(GuestMemoryMmap, InterruptTransport),
+    Activated(RuntimeGuestMemory, InterruptTransport),
 }
 
 impl DeviceState {
@@ -146,7 +145,7 @@ pub trait VirtioDevice: AsAny + Send {
     /// Ownership of the queues is transferred to the device.
     fn activate(
         &mut self,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult;

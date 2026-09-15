@@ -18,8 +18,8 @@ use super::super::defs::uapi;
 use super::super::muxer::{MuxerRx, push_packet};
 use super::super::packet::{TsiConnectReq, TsiGetnameRsp, TsiSendtoAddr, VsockPacket};
 use super::super::proxy::{ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
+use crate::virtio::RuntimeGuestMemory;
 use utils::epoll::EventSet;
-use vm_memory::GuestMemoryMmap;
 
 pub type SendtoAddr = SockaddrStorage;
 
@@ -28,7 +28,7 @@ pub(crate) fn create(
     cid: u64,
     family: u16,
     peer_port: u32,
-    mem: GuestMemoryMmap,
+    mem: RuntimeGuestMemory,
     queue: Arc<Mutex<super::super::super::Queue>>,
     rxq: Arc<Mutex<super::super::muxer_rxq::MuxerRxQ>>,
 ) -> Result<super::TsiDgramProxy, ProxyError> {

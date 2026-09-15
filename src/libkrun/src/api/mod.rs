@@ -51,6 +51,8 @@ pub use devices::virtio::block::{DiskFormat, SyncMode};
 pub use error::VmmError;
 pub use logging::{LogLevel, LogOptions, LogStyle, init_log};
 pub use payload::{KernelFormat, Payload};
+#[cfg(target_os = "macos")]
+pub use vmm_builder::{HostReclaimQualification, HostReclaimStatus};
 pub use vmm_builder::{Vmm, VmmBuilder, VmmHandle, check_nested_virt};
 
 #[cfg(feature = "net")]

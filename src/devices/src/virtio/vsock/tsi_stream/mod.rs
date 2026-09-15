@@ -18,8 +18,8 @@ use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use super::proxy::{Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
+use crate::virtio::RuntimeGuestMemory;
 use utils::epoll::EventSet;
-use vm_memory::GuestMemoryMmap;
 
 #[cfg(unix)]
 mod unix;
@@ -41,7 +41,7 @@ pub struct TsiStreamProxy {
     pub(crate) control_port: u32,
     pub(crate) fd: OwnedFd,
     pub status: ProxyStatus,
-    pub(crate) mem: GuestMemoryMmap,
+    pub(crate) mem: RuntimeGuestMemory,
     pub(crate) queue: Arc<Mutex<VirtQueue>>,
     pub(crate) rxq: Arc<Mutex<MuxerRxQ>>,
     pub(crate) rx_cnt: Wrapping<u32>,
@@ -63,7 +63,7 @@ impl TsiStreamProxy {
         local_port: u32,
         peer_port: u32,
         control_port: u32,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Result<Self, ProxyError> {
@@ -102,7 +102,7 @@ impl TsiStreamProxy {
         local_port: u32,
         peer_port: u32,
         fd: OwnedFd,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Self {

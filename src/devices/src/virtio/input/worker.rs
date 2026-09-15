@@ -6,11 +6,11 @@ use std::thread::{self, JoinHandle};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 use virtio_bindings::virtio_input;
-use vm_memory::{ByteValued, GuestMemoryMmap};
+use vm_memory::ByteValued;
 
 use super::super::DeviceQueue;
-use crate::virtio::InterruptTransport;
 use crate::virtio::descriptor_utils::{Reader, Writer};
+use crate::virtio::{InterruptTransport, RuntimeGuestMemory};
 use krun_input::{InputEventProviderBackend, InputEventProviderInstance, InputEventsImpl};
 
 // Create a wrapper type to work around orphan rules
@@ -28,7 +28,7 @@ pub struct InputWorker {
     event_q: DeviceQueue,  // Device -> Guest events
     status_q: DeviceQueue, // Guest -> Device events
     interrupt: InterruptTransport,
-    mem: GuestMemoryMmap,
+    mem: RuntimeGuestMemory,
     backend_wrapper: InputEventProviderBackend<'static>,
     stop_fd: EventFd,
 }
@@ -38,7 +38,7 @@ impl InputWorker {
         event_q: DeviceQueue,
         status_q: DeviceQueue,
         interrupt: InterruptTransport,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         backend: InputEventProviderBackend<'static>,
         stop_fd: EventFd,
     ) -> Self {

@@ -14,7 +14,6 @@ use utils::windows::AsRawFd;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
-use vm_memory::GuestMemoryMmap;
 
 use super::super::{FsError, Queue};
 use super::augment_fs::AugmentFs;
@@ -26,7 +25,7 @@ use super::passthrough::{self, PassthroughFs};
 use super::read_only::PassthroughFsRo;
 use super::server::Server;
 use super::virtual_entry::VirtualDirEntry;
-use crate::virtio::{InterruptTransport, VirtioShmRegion};
+use crate::virtio::{InterruptTransport, RuntimeGuestMemory, VirtioShmRegion};
 
 enum FsServer {
     ReadWrite(Server<AugmentFs<PassthroughFs>>),
@@ -80,7 +79,7 @@ pub struct FsWorker {
     queues: Vec<Queue>,
     queue_evts: Vec<Arc<EventFd>>,
     interrupt: InterruptTransport,
-    mem: GuestMemoryMmap,
+    mem: RuntimeGuestMemory,
     allow_idmap: bool,
     shm_region: Option<VirtioShmRegion>,
     server: FsServer,
@@ -96,7 +95,7 @@ impl FsWorker {
         queues: Vec<Queue>,
         queue_evts: Vec<Arc<EventFd>>,
         interrupt: InterruptTransport,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         allow_idmap: bool,
         shm_region: Option<VirtioShmRegion>,
         passthrough_cfg: Option<passthrough::Config>,

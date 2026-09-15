@@ -48,6 +48,8 @@ pub struct DeviceRequirements {
     pub gpu_shm: Option<usize>,
     /// Whether this device needs process-shareable memory (vhost-user).
     pub process_shareable_memory: bool,
+    /// Whether this device requests qualified macOS stage-2 RAM reclaim.
+    pub host_reclaim: bool,
 }
 
 /// Context provided to devices during attachment.
@@ -198,6 +200,11 @@ impl<'a> AttachContext<'a> {
         &self,
     ) -> Option<crossbeam_channel::Sender<utils::worker_message::WorkerMessage>> {
         self.map_sender.clone()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn reclaim_state(&self) -> Arc<hvf::reclaim::ReclaimState> {
+        self.vmm.vm.reclaim_state()
     }
 
     /// Append a string to the kernel command line.
@@ -896,8 +903,31 @@ impl BalloonDevice {
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
 #[cfg_attr(not(feature = "ffi"), cfg(not(feature = "tee")))]
 impl<'a> AttachDevice<'a> for BalloonDevice {
+    fn requirements(&self) -> DeviceRequirements {
+        DeviceRequirements {
+            host_reclaim: true,
+            ..DeviceRequirements::default()
+        }
+    }
+
     #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        #[cfg(target_os = "macos")]
+        {
+            let reclaim_state = ctx.reclaim_state();
+            let failure_event = ctx
+                .vmm
+                .exit_evt
+                .try_clone()
+                .map_err(|error| VmmError::Internal(format!("balloon exit event: {error}")))?;
+            let mut balloon = self
+                .inner
+                .lock()
+                .map_err(|_| VmmError::Internal("balloon lock poisoned".to_string()))?;
+            balloon.set_reclaim_state(reclaim_state);
+            balloon.set_host_memory_remapper(ctx.vmm.vm.host_memory_remapper());
+            balloon.set_failure_signal(failure_event, ctx.exit_code().clone());
+        }
         ctx.subscribe_events(self.inner.clone())?;
         ctx.register("balloon", self.inner)
     }
@@ -1646,4 +1676,15 @@ fn resolve_parent_dirs<'a, 'b>(
         }
     }
     Ok(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api::device_builders::{AttachDevice, BalloonDevice};
+
+    #[test]
+    fn balloon_automatically_requests_reporting_qualification() {
+        let balloon = BalloonDevice::new().unwrap();
+        assert!(balloon.requirements().host_reclaim);
+    }
 }
