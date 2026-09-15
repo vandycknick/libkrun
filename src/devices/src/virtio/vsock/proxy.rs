@@ -50,6 +50,9 @@ pub enum ProxyStatus {
     WaitingCreditUpdate,
     ReverseInit,
     WaitingOnAccept,
+    WaitingOnHost,
+    SendingConnectResponse,
+    PeerHalfClosed,
 }
 
 #[derive(Default)]
@@ -75,6 +78,76 @@ pub struct ProxyUpdate {
     pub new_proxy: Option<(u32, OwnedFd, AddressFamily, NewProxyType)>,
     pub push_accept: Option<(u64, u64)>,
     pub push_credit_req: Option<MuxerRx>,
+}
+
+pub struct DeferredCredit {
+    request: Option<Box<MuxerRx>>,
+    update: Option<Box<MuxerRx>>,
+    enabled: bool,
+}
+
+impl Default for DeferredCredit {
+    fn default() -> Self {
+        Self {
+            request: None,
+            update: None,
+            enabled: true,
+        }
+    }
+}
+
+impl DeferredCredit {
+    pub fn push(&mut self, mut credit: Box<MuxerRx>, fwd_cnt: u32) -> Result<(), Box<MuxerRx>> {
+        if !self.enabled {
+            return Err(credit);
+        }
+        // Credit counters are free-running, so the current proxy counter
+        // contains all information carried by an older same-kind packet.
+        match credit.as_mut() {
+            MuxerRx::CreditRequest {
+                fwd_cnt: packet_fwd_cnt,
+                ..
+            } => {
+                *packet_fwd_cnt = fwd_cnt;
+                self.request = Some(credit);
+            }
+            MuxerRx::CreditUpdate {
+                fwd_cnt: packet_fwd_cnt,
+                ..
+            } => {
+                *packet_fwd_cnt = fwd_cnt;
+                self.update = Some(credit);
+            }
+            _ => return Err(credit),
+        }
+        Ok(())
+    }
+
+    pub fn pop(&mut self, fwd_cnt: u32) -> Option<Box<MuxerRx>> {
+        let mut credit = self.request.take().or_else(|| self.update.take())?;
+        match credit.as_mut() {
+            MuxerRx::CreditRequest {
+                fwd_cnt: packet_fwd_cnt,
+                ..
+            }
+            | MuxerRx::CreditUpdate {
+                fwd_cnt: packet_fwd_cnt,
+                ..
+            } => *packet_fwd_cnt = fwd_cnt,
+            _ => return None,
+        }
+        Some(credit)
+    }
+
+    pub fn disable(&mut self) {
+        self.request = None;
+        self.update = None;
+        self.enabled = false;
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
 }
 
 impl fmt::Display for ProxyError {
@@ -111,6 +184,25 @@ pub trait Proxy: Send + AsRawFd {
     fn shutdown(&mut self, _pkt: &VsockPacket) {}
     fn release(&mut self) -> ProxyUpdate;
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate;
+    fn admit_mux(&mut self) -> Option<ProxyUpdate> {
+        None
+    }
+    fn fail_mux(&mut self) -> Option<ProxyUpdate> {
+        None
+    }
+    fn is_mux(&self) -> bool {
+        false
+    }
+    fn defer_credit(&mut self, credit: Box<MuxerRx>) -> Result<(), Box<MuxerRx>> {
+        Err(credit)
+    }
+    fn pop_deferred_credit(&mut self) -> Option<Box<MuxerRx>> {
+        None
+    }
+    fn disable_deferred_credit(&mut self) {}
+    fn deferred_credit_enabled(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(windows)]

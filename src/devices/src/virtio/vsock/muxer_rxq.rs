@@ -51,17 +51,15 @@ impl MuxerRxQ {
     /// pending RX data later. Aside from this queue, there is no other storage for RSTs, so
     /// failing to push one means that we have to drop the packet.
     ///
-    /// Returns:
-    /// - `true` if the new item has been successfully queued; or
-    /// - `false` if there was no room left in the queue.
-    pub fn push(&mut self, rx: MuxerRx) -> bool {
+    /// Returns the item to the caller when there is no room left in the queue.
+    pub fn push(&mut self, rx: MuxerRx) -> Result<(), Box<MuxerRx>> {
         // Pushing to a non-full, synchronized queue will always succeed.
         if self.is_synced() && !self.is_full() {
             self.q.push_back(rx);
-            return true;
+            return Ok(());
         }
 
-        false
+        Err(Box::new(rx))
     }
 
     /// Pop an RX item from the front of the queue.
@@ -105,6 +103,22 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_type(uapi::VSOCK_TYPE_STREAM)
                 .set_flags(0)
                 .set_buf_alloc(0)
+                .set_fwd_cnt(0);
+        }
+        MuxerRx::Shutdown {
+            local_port,
+            peer_port,
+            flags,
+        } => {
+            pkt.set_op(uapi::VSOCK_OP_SHUTDOWN)
+                .set_src_cid(uapi::VSOCK_HOST_CID)
+                .set_dst_cid(cid)
+                .set_src_port(local_port)
+                .set_dst_port(peer_port)
+                .set_len(0)
+                .set_type(uapi::VSOCK_TYPE_STREAM)
+                .set_flags(flags)
+                .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
                 .set_fwd_cnt(0);
         }
         MuxerRx::ConnResponse {

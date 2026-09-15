@@ -977,6 +977,10 @@ pub struct VsockDevice {
     tsi_flags: devices::virtio::TsiFlags,
     host_port_map: HashMap<u16, u16>,
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
+    #[cfg(unix)]
+    unix_mux_fd: Option<std::os::fd::OwnedFd>,
+    #[cfg(unix)]
+    unix_mux_protected_identities: Vec<devices::virtio::UnixSocketIdentity>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export)]
@@ -991,6 +995,10 @@ impl VsockDevice {
             tsi_flags,
             host_port_map: HashMap::new(),
             unix_ipc_port_map: HashMap::new(),
+            #[cfg(unix)]
+            unix_mux_fd: None,
+            #[cfg(unix)]
+            unix_mux_protected_identities: Vec::new(),
         })
     }
 
@@ -1010,6 +1018,26 @@ impl VsockDevice {
         self.unix_ipc_port_map
             .insert(port, (PathBuf::from(path), listen));
     }
+
+    /// Use an inherited Unix stream socket as the private dynamic vsock mux.
+    #[cfg(unix)]
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    pub fn set_unix_mux_fd(&mut self, fd: std::os::fd::OwnedFd) {
+        self.unix_mux_fd = Some(fd);
+    }
+
+    /// Reject connection descriptors aliasing this known socket endpoint.
+    #[cfg(unix)]
+    #[cfg_attr(feature = "ffi", ffier(skip))]
+    pub fn add_unix_mux_protected_fd(
+        &mut self,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<(), VmmError> {
+        let identity = devices::virtio::unix_socket_identity(fd)
+            .map_err(|error| VmmError::Internal(format!("protected vsock fd: {error}")))?;
+        self.unix_mux_protected_identities.push(identity);
+        Ok(())
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export)]
@@ -1020,9 +1048,19 @@ impl<'a> AttachDevice<'a> for VsockDevice {
         let unix_ipc_port_map =
             (!self.unix_ipc_port_map.is_empty()).then_some(self.unix_ipc_port_map);
 
-        let vsock =
+        let mut vsock =
             devices::virtio::Vsock::new(self.cid, host_port_map, unix_ipc_port_map, self.tsi_flags)
                 .map_err(|e| VmmError::Internal(format!("vsock: {e:?}")))?;
+        #[cfg(unix)]
+        for identity in self.unix_mux_protected_identities {
+            vsock.add_unix_mux_protected_identity(identity);
+        }
+        #[cfg(unix)]
+        if let Some(fd) = self.unix_mux_fd {
+            vsock
+                .set_unix_mux_fd(fd)
+                .map_err(|e| VmmError::Internal(format!("vsock mux: {e}")))?;
+        }
 
         let inner = Arc::new(Mutex::new(vsock));
         ctx.subscribe_events(inner.clone())?;

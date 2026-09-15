@@ -284,16 +284,11 @@ impl Epoll {
     ) -> io::Result<usize> {
         let max_events = events.len().min(max_events).min(i32::MAX as usize);
 
-        let _tout = if timeout >= 0 {
-            Some(Duration::from_millis(timeout as u64))
-        } else {
-            None
-        };
-
-        let ts = libc::timespec {
-            tv_sec: 3,
-            tv_nsec: 0,
-        };
+        let timeout = (timeout >= 0).then(|| Duration::from_millis(timeout as u64));
+        let ts = timeout.map(|duration| libc::timespec {
+            tv_sec: duration.as_secs() as libc::time_t,
+            tv_nsec: duration.subsec_nanos() as libc::c_long,
+        });
 
         self.kevs.clear();
         self.kevs.reserve_exact(max_events);
@@ -306,7 +301,7 @@ impl Epoll {
                 0,
                 spare.as_mut_ptr().cast::<libc::kevent>(),
                 max_events as i32,
-                &ts as *const libc::timespec,
+                ts.as_ref().map_or(ptr::null(), |ts| ts as *const _),
             )
         };
 

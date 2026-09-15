@@ -267,13 +267,11 @@ pub(crate) fn sendmsg(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) -> P
 
     if ret > 0 && (proxy.tx_cnt - proxy.last_tx_cnt_sent).0 >= proxy.peer_buf_alloc / 2 {
         proxy.last_tx_cnt_sent = proxy.tx_cnt;
-        let rx = MuxerRx::CreditUpdate {
+        update.push_credit_req = Some(MuxerRx::CreditUpdate {
             local_port: pkt.dst_port(),
             peer_port: pkt.src_port(),
             fwd_cnt: proxy.tx_cnt.0,
-        };
-        push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
-        update.signal_queue = true;
+        });
     }
 
     update

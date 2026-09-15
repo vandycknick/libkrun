@@ -47,7 +47,7 @@ rutabaga_gfx = { version = "0.1.85", features = ["virgl_renderer"], optional = t
 imago = { version = "0.2.4", default-features = false, features = ["sync", "vm-memory"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30.1", features = ["ioctl", "net", "poll", "socket", "fs"] }
+nix = { version = "0.30.1", features = ["ioctl", "net", "poll", "socket", "fs", "uio"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
