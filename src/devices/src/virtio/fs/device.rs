@@ -18,6 +18,8 @@ use super::super::{
     RuntimeGuestMemory, VirtioDevice, VirtioShmRegion,
 };
 use super::ExportTable;
+#[cfg(target_os = "macos")]
+use super::immutable::RosettaFsConfig;
 use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
 use super::worker::FsWorker;
@@ -25,17 +27,21 @@ use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
 use crate::virtio::passthrough::PermissionSemantics;
 
+// Defined by Linux UAPI include/uapi/linux/virtio_fs.h and the public
+// VIRTIO 1.3 specification, section 5.11.4 (Device configuration layout).
+const VIRTIO_FS_TAG_LEN: usize = 36;
+
 #[derive(Copy, Clone)]
 #[repr(C, packed)]
 struct VirtioFsConfig {
-    tag: [u8; 36],
+    tag: [u8; VIRTIO_FS_TAG_LEN],
     num_request_queues: u32,
 }
 
 impl Default for VirtioFsConfig {
     fn default() -> Self {
         VirtioFsConfig {
-            tag: [0; 36],
+            tag: [0; VIRTIO_FS_TAG_LEN],
             num_request_queues: 0,
         }
     }
@@ -58,6 +64,8 @@ pub struct Fs {
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
     map_sender: Option<Sender<WorkerMessage>>,
+    #[cfg(target_os = "macos")]
+    rosetta: Option<RosettaFsConfig>,
 }
 
 impl Fs {
@@ -69,6 +77,14 @@ impl Fs {
         read_only: bool,
         virtual_entries: Vec<VirtualDirEntry<'static>>,
     ) -> super::Result<Fs> {
+        let tag_len = fs_id.len();
+        if tag_len > VIRTIO_FS_TAG_LEN {
+            return Err(FsError::InvalidTagLength {
+                length: tag_len,
+                max: VIRTIO_FS_TAG_LEN,
+            });
+        }
+
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
         let tag = fs_id.into_bytes();
@@ -108,7 +124,26 @@ impl Fs {
             exit_code,
             #[cfg(target_os = "macos")]
             map_sender: None,
+            #[cfg(target_os = "macos")]
+            rosetta: None,
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn new_rosetta(fs_id: String, config: RosettaFsConfig) -> super::Result<Fs> {
+        if fs_id != "rosetta" {
+            return Err(FsError::InvalidRosettaTag);
+        }
+        let mut fs = Self::new(
+            fs_id,
+            PermissionSemantics::LinuxComplete,
+            None,
+            Arc::new(AtomicI32::new(i32::MAX)),
+            true,
+            Vec::new(),
+        )?;
+        fs.rosetta = Some(config);
+        Ok(fs)
     }
 
     pub fn id(&self) -> &str {
@@ -228,6 +263,8 @@ impl VirtioDevice for Fs {
             self.exit_code.clone(),
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
+            #[cfg(target_os = "macos")]
+            self.rosetta.clone(),
         )
         .map_err(|e| {
             error!("virtio_fs: failed to create worker: {}", e);
@@ -256,5 +293,92 @@ impl VirtioDevice for Fs {
         }
         self.device_state = DeviceState::Inactive;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicI32;
+
+    use crate::virtio::fs::FsError;
+    use crate::virtio::fs::device::{Fs, VIRTIO_FS_TAG_LEN};
+    use crate::virtio::fs::virtual_entry::VirtualDirEntry;
+    use crate::virtio::passthrough::PermissionSemantics;
+
+    fn new_fs(tag: String) -> Result<Fs, FsError> {
+        Fs::new(
+            tag,
+            PermissionSemantics::LinuxComplete,
+            None,
+            Arc::new(AtomicI32::new(0)),
+            false,
+            Vec::<VirtualDirEntry<'static>>::new(),
+        )
+    }
+
+    fn tag_error(tag: String) -> FsError {
+        match new_fs(tag) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized tag was accepted"),
+        }
+    }
+
+    #[test]
+    fn accepts_tag_at_protocol_limit() {
+        let tag = "x".repeat(VIRTIO_FS_TAG_LEN);
+        let fs = new_fs(tag.clone()).unwrap();
+
+        assert_eq!(fs.config.tag.as_slice(), tag.as_bytes());
+    }
+
+    #[test]
+    fn preserves_empty_tag() {
+        let fs = new_fs(String::new()).unwrap();
+
+        assert_eq!(fs.config.tag, [0; VIRTIO_FS_TAG_LEN]);
+    }
+
+    #[test]
+    fn rejects_tag_over_protocol_limit() {
+        let error = tag_error("x".repeat(VIRTIO_FS_TAG_LEN + 1));
+
+        assert!(matches!(
+            error,
+            FsError::InvalidTagLength {
+                length: 37,
+                max: VIRTIO_FS_TAG_LEN,
+            }
+        ));
+    }
+
+    #[test]
+    fn measures_multibyte_tag_in_bytes() {
+        let accepted = "é".repeat(VIRTIO_FS_TAG_LEN / 2);
+        let fs = new_fs(accepted.clone()).unwrap();
+        assert_eq!(fs.config.tag.as_slice(), accepted.as_bytes());
+
+        let rejected = "é".repeat(VIRTIO_FS_TAG_LEN / 2 + 1);
+        let error = tag_error(rejected);
+        assert!(matches!(
+            error,
+            FsError::InvalidTagLength {
+                length: 38,
+                max: VIRTIO_FS_TAG_LEN,
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_huge_tag_with_controlled_error() {
+        let error = tag_error("x".repeat(1_000_000));
+
+        assert!(matches!(
+            error,
+            FsError::InvalidTagLength {
+                length: 1_000_000,
+                max: VIRTIO_FS_TAG_LEN,
+            }
+        ));
     }
 }

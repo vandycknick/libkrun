@@ -46,6 +46,8 @@ pub use device_builders::{
 pub use device_builders::{DisplayBackend, DisplayInfoBuilder};
 #[cfg(feature = "gpu")]
 pub use device_builders::{GpuDevice, VirglRendererFlags};
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub use device_builders::{RosettaFsConfig, RosettaFsDevice, RosettaProfile};
 #[cfg(feature = "blk")]
 pub use devices::virtio::block::{DiskFormat, SyncMode};
 pub use error::VmmError;

@@ -20,8 +20,8 @@ use std::time::Duration;
 use utils::worker_message::WorkerMessage;
 
 use super::filesystem::{
-    Context, DirEntry, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, ListxattrReply,
-    OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
+    Context, DirEntry, Entry, Extensions, FileSystem, FsOptions, GetxattrReply, IoctlReply,
+    ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use super::fuse;
 use super::inode_alloc::InodeAllocator;
@@ -327,7 +327,7 @@ impl FileSystem for PassthroughFsRo {
         in_size: u32,
         out_size: u32,
         exit_code: &Arc<AtomicI32>,
-    ) -> io::Result<Vec<u8>> {
+    ) -> io::Result<IoctlReply> {
         self.inner.ioctl(
             ctx, inode, handle, flags, cmd, arg, in_size, out_size, exit_code,
         )
