@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::collections::VecDeque;
 use std::num::Wrapping;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -15,7 +17,7 @@ use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use super::proxy::{Proxy, ProxyError, ProxyStatus, ProxyUpdate, RecvPkt};
+use super::proxy::{DeferredCredit, Proxy, ProxyError, ProxyStatus, ProxyUpdate, RecvPkt};
 
 use crate::virtio::RuntimeGuestMemory;
 use utils::epoll::EventSet;
@@ -49,6 +51,17 @@ pub struct UnixProxy {
     pub(crate) last_tx_cnt_sent: Wrapping<u32>,
     pub(crate) push_cnt: Wrapping<u32>,
     pub(crate) rx_cnt: Wrapping<u32>,
+    pub(crate) deferred_credit: DeferredCredit,
+    #[cfg(unix)]
+    pub(crate) mux_transport: bool,
+    #[cfg(unix)]
+    pub(crate) connect_response: Option<(Vec<u8>, usize)>,
+    #[cfg(unix)]
+    pub(crate) pending_tx: VecDeque<Vec<u8>>,
+    #[cfg(unix)]
+    pub(crate) pending_tx_offset: usize,
+    #[cfg(unix)]
+    pub(crate) pending_tx_bytes: usize,
 }
 
 impl UnixProxy {
@@ -82,6 +95,17 @@ impl UnixProxy {
             last_tx_cnt_sent: Wrapping(0),
             push_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
+            deferred_credit: DeferredCredit::default(),
+            #[cfg(unix)]
+            mux_transport: false,
+            #[cfg(unix)]
+            connect_response: None,
+            #[cfg(unix)]
+            pending_tx: VecDeque::new(),
+            #[cfg(unix)]
+            pending_tx_offset: 0,
+            #[cfg(unix)]
+            pending_tx_bytes: 0,
         })
     }
 
@@ -114,8 +138,53 @@ impl UnixProxy {
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
+            deferred_credit: DeferredCredit::default(),
             path: Default::default(),
+            #[cfg(unix)]
+            mux_transport: false,
+            #[cfg(unix)]
+            connect_response: None,
+            #[cfg(unix)]
+            pending_tx: VecDeque::new(),
+            #[cfg(unix)]
+            pending_tx_offset: 0,
+            #[cfg(unix)]
+            pending_tx_bytes: 0,
         }
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_mux_reverse(
+        id: u64,
+        cid: u64,
+        local_port: u32,
+        peer_port: u32,
+        fd: OwnedFd,
+        mem: RuntimeGuestMemory,
+        queue: Arc<Mutex<VirtQueue>>,
+        rxq: Arc<Mutex<MuxerRxQ>>,
+    ) -> Self {
+        let mut proxy = Self::new_reverse(id, cid, local_port, peer_port, fd, mem, queue, rxq);
+        proxy.mux_transport = true;
+        proxy
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_waiting_on_host(
+        id: u64,
+        cid: u64,
+        local_port: u32,
+        peer_port: u32,
+        fd: OwnedFd,
+        mem: RuntimeGuestMemory,
+        queue: Arc<Mutex<VirtQueue>>,
+        rxq: Arc<Mutex<MuxerRxQ>>,
+    ) -> Self {
+        let mut proxy = Self::new_mux_reverse(id, cid, local_port, peer_port, fd, mem, queue, rxq);
+        proxy.status = ProxyStatus::WaitingOnHost;
+        proxy
     }
 
     pub(crate) fn push_reset(&self) {
@@ -155,7 +224,18 @@ impl UnixProxy {
                         pkt.hdr().len() + cnt
                     }
                     RecvPkt::Close => {
-                        self.status = ProxyStatus::Closed;
+                        #[cfg(unix)]
+                        {
+                            self.status = if self.mux_transport {
+                                ProxyStatus::PeerHalfClosed
+                            } else {
+                                ProxyStatus::Closed
+                            };
+                        }
+                        #[cfg(windows)]
+                        {
+                            self.status = ProxyStatus::Closed;
+                        }
                         0
                     }
                     RecvPkt::Error => 0,
@@ -201,6 +281,21 @@ impl UnixProxy {
             .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
             .set_fwd_cnt(self.tx_cnt.0);
     }
+
+    #[cfg(unix)]
+    pub(crate) fn push_shutdown(&self) {
+        push_packet(
+            self.cid,
+            MuxerRx::Shutdown {
+                local_port: self.local_port,
+                peer_port: self.peer_port,
+                flags: uapi::VSOCK_FLAGS_SHUTDOWN_SEND,
+            },
+            &self.rxq,
+            &self.queue,
+            &self.mem,
+        );
+    }
 }
 
 impl Proxy for UnixProxy {
@@ -210,6 +305,22 @@ impl Proxy for UnixProxy {
 
     fn status(&self) -> ProxyStatus {
         self.status
+    }
+
+    fn defer_credit(&mut self, credit: Box<MuxerRx>) -> Result<(), Box<MuxerRx>> {
+        self.deferred_credit.push(credit, self.tx_cnt.0)
+    }
+
+    fn pop_deferred_credit(&mut self) -> Option<Box<MuxerRx>> {
+        self.deferred_credit.pop(self.tx_cnt.0)
+    }
+
+    fn disable_deferred_credit(&mut self) {
+        self.deferred_credit.disable();
+    }
+
+    fn deferred_credit_enabled(&self) -> bool {
+        self.deferred_credit.is_enabled()
     }
 
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
@@ -271,6 +382,21 @@ impl Proxy for UnixProxy {
 
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
         sys::process_event(self, evset)
+    }
+
+    #[cfg(unix)]
+    fn admit_mux(&mut self) -> Option<ProxyUpdate> {
+        sys::admit_mux(self)
+    }
+
+    #[cfg(unix)]
+    fn fail_mux(&mut self) -> Option<ProxyUpdate> {
+        sys::fail_mux(self)
+    }
+
+    #[cfg(unix)]
+    fn is_mux(&self) -> bool {
+        self.mux_transport
     }
 }
 

@@ -5,6 +5,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+#[cfg(unix)]
+mod control_proxy;
+#[cfg(unix)]
+pub use control_proxy::{UnixSocketIdentity, unix_socket_identity};
 mod device;
 mod event_handler;
 mod muxer;

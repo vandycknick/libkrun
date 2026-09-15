@@ -6,6 +6,8 @@
 // found in the THIRD-PARTY file.
 
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +23,8 @@ use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
+#[cfg(unix)]
+use crate::virtio::vsock::UnixSocketIdentity;
 
 pub(crate) const RXQ_INDEX: usize = 0;
 pub(crate) const TXQ_INDEX: usize = 1;
@@ -77,6 +81,16 @@ impl Vsock {
         self.cid
     }
 
+    #[cfg(unix)]
+    pub fn set_unix_mux_fd(&mut self, fd: OwnedFd) -> std::io::Result<()> {
+        self.muxer.set_unix_mux_fd(fd)
+    }
+
+    #[cfg(unix)]
+    pub fn add_unix_mux_protected_identity(&mut self, identity: UnixSocketIdentity) {
+        self.muxer.add_unix_mux_protected_identity(identity);
+    }
+
     /// Walk the driver-provided RX queue buffers and attempt to fill them up with any data that we
     /// have pending. Return `true` if descriptors have been added to the used ring, and `false`
     /// otherwise.
@@ -121,6 +135,9 @@ impl Vsock {
                 error!("failed to add used elements to the queue: {e:?}");
             }
         }
+
+        drop(queue_rx);
+        have_used |= self.muxer.retry_deferred_credit();
 
         have_used
     }
