@@ -14,8 +14,8 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use super::proxy::{Proxy, ProxyError, ProxyStatus, ProxyUpdate, RecvPkt};
 
+use crate::virtio::RuntimeGuestMemory;
 use utils::epoll::EventSet;
-use vm_memory::GuestMemoryMmap;
 
 #[cfg(unix)]
 mod unix;
@@ -37,7 +37,7 @@ pub struct TsiDgramProxy {
     pub(crate) sendto_addr: Option<sys::SendtoAddr>,
     pub(crate) listening: bool,
     pub(crate) family: AddressFamily,
-    pub(crate) mem: GuestMemoryMmap,
+    pub(crate) mem: RuntimeGuestMemory,
     pub(crate) queue: Arc<Mutex<VirtQueue>>,
     pub(crate) rxq: Arc<Mutex<MuxerRxQ>>,
     pub(crate) rx_cnt: Wrapping<u32>,
@@ -52,7 +52,7 @@ impl TsiDgramProxy {
         cid: u64,
         family: u16,
         peer_port: u32,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Result<Self, ProxyError> {

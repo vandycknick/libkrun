@@ -6,6 +6,8 @@
 
 use std::result;
 
+pub mod guest_memory;
+
 #[derive(Default)]
 pub struct ArchMemoryInfo {
     #[cfg(target_arch = "x86_64")]

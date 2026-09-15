@@ -10,7 +10,7 @@ use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
 use crate::virtio::queue::Error as QueueError;
 use crate::virtio::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
-    TYPE_NET, VirtioDevice,
+    RuntimeGuestMemory, TYPE_NET, VirtioDevice,
 };
 
 use super::backend::{ReadError, WriteError};
@@ -22,7 +22,7 @@ use std::os::fd::RawFd;
 use std::path::PathBuf;
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
+use vm_memory::{ByteValued, GuestMemoryError};
 
 const VIRTIO_F_VERSION_1: u32 = 32;
 
@@ -172,7 +172,7 @@ impl VirtioDevice for Net {
 
     fn activate(
         &mut self,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {

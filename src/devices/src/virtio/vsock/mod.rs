@@ -11,7 +11,7 @@ mod muxer;
 mod muxer_rxq;
 mod muxer_thread;
 #[allow(dead_code)]
-mod packet;
+pub(crate) mod packet;
 mod proxy;
 mod reaper;
 #[cfg(target_os = "macos")]

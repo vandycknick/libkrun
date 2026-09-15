@@ -81,8 +81,12 @@ impl Balloon {
 
         if let Err(e) = self.queue_event(FRQ_INDEX).read() {
             error!("Failed to read balloon free-page reporting queue event: {e:?}");
-        } else if self.process_frq() {
-            self.device_state.signal_used_queue();
+        } else {
+            match self.process_frq() {
+                Ok(true) => self.device_state.signal_used_queue(),
+                Ok(false) => {}
+                Err(error) => self.fail_vm(&error),
+            }
         }
     }
 

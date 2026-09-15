@@ -14,10 +14,10 @@ use rutabaga_gfx::{
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
-use vm_memory::{GuestAddress, GuestMemoryMmap};
+use vm_memory::GuestAddress;
 
 use super::super::descriptor_utils::{Reader, Writer};
-use super::super::{DeviceQueue, GpuError, Queue as VirtQueue};
+use super::super::{DeviceQueue, GpuError, Queue as VirtQueue, RuntimeGuestMemory};
 use super::protocol::{
     GpuCommand, GpuResponse, VirtioGpuResult, virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
 };
@@ -33,7 +33,7 @@ use krun_display::Rect;
 pub struct Worker {
     control_evt: EventFd,
     control_queue: Arc<Mutex<VirtQueue>>,
-    mem: GuestMemoryMmap,
+    mem: RuntimeGuestMemory,
     interrupt: InterruptTransport,
     shm_region: VirtioShmRegion,
     virgl_flags: u32,
@@ -48,7 +48,7 @@ impl Worker {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         control_q: DeviceQueue,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         interrupt: InterruptTransport,
         shm_region: VirtioShmRegion,
         virgl_flags: u32,
@@ -116,7 +116,7 @@ impl Worker {
     fn process_gpu_command(
         &mut self,
         virtio_gpu: &mut VirtioGpu,
-        mem: &GuestMemoryMmap,
+        mem: &RuntimeGuestMemory,
         hdr: virtio_gpu_ctrl_hdr,
         cmd: GpuCommand,
         reader: &mut Reader,

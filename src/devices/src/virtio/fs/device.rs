@@ -11,11 +11,11 @@ use utils::eventfd::{EFD_NONBLOCK, EventFd};
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 use virtio_bindings::{virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX};
-use vm_memory::{ByteValued, GuestMemoryMmap};
+use vm_memory::ByteValued;
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, FsError, QueueConfig, VirtioDevice,
-    VirtioShmRegion,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, FsError, QueueConfig,
+    RuntimeGuestMemory, VirtioDevice, VirtioShmRegion,
 };
 use super::ExportTable;
 use super::passthrough;
@@ -197,7 +197,7 @@ impl VirtioDevice for Fs {
 
     fn activate(
         &mut self,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {

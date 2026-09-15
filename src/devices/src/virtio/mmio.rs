@@ -18,7 +18,7 @@ use super::*;
 use crate::bus::BusDevice;
 use crate::legacy::IrqChip;
 use utils::{byte_order, eventfd::EventFd};
-use vm_memory::{GuestAddress, GuestMemoryMmap};
+use vm_memory::GuestAddress;
 
 //TODO crosvm uses 0 here, but IIRC virtio specified some other vendor id that should be used
 const VENDOR_ID: u32 = 0;
@@ -67,7 +67,7 @@ pub struct MmioTransport {
     pub(crate) queue_select: u32,
     pub(crate) device_status: u32,
     pub(crate) config_generation: u32,
-    mem: GuestMemoryMmap,
+    mem: RuntimeGuestMemory,
     // Queues owned by the transport during negotiation.
     // These are moved to the device on activation.
     queues: Option<Vec<Queue>>,
@@ -164,8 +164,8 @@ impl InterruptTransport {
 
 impl MmioTransport {
     /// Constructs a new MMIO transport for the given virtio device.
-    pub fn new(
-        mem: GuestMemoryMmap,
+    pub fn new<M: Into<RuntimeGuestMemory>>(
+        mem: M,
         intc: IrqChip,
         device: Arc<Mutex<dyn VirtioDevice>>,
     ) -> Result<MmioTransport, CreateMmioTransportError> {
@@ -188,7 +188,7 @@ impl MmioTransport {
             queue_select: 0,
             device_status: device_status::INIT,
             config_generation: 0,
-            mem,
+            mem: mem.into(),
             queues: Some(queues),
             queue_evts,
             queue_config,
@@ -596,7 +596,7 @@ pub(crate) mod tests {
 
         fn activate(
             &mut self,
-            _mem: GuestMemoryMmap,
+            _mem: RuntimeGuestMemory,
             _interrupt: InterruptTransport,
             _queues: Vec<DeviceQueue>,
         ) -> ActivateResult {

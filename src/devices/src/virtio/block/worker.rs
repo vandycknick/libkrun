@@ -3,7 +3,7 @@ use crate::virtio::descriptor_utils::{Reader, Writer};
 use super::super::DeviceQueue;
 use super::device::{CacheType, DiskProperties};
 
-use crate::virtio::InterruptTransport;
+use crate::virtio::{InterruptTransport, RuntimeGuestMemory};
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -14,7 +14,7 @@ use utils::eventfd::EventFd;
 #[cfg(target_os = "windows")]
 use utils::windows::AsRawFd;
 use virtio_bindings::virtio_blk::*;
-use vm_memory::{ByteValued, GuestMemoryMmap};
+use vm_memory::ByteValued;
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -61,7 +61,7 @@ unsafe impl ByteValued for DiscardWriteData {}
 pub struct BlockWorker {
     device_queue: DeviceQueue,
     interrupt: InterruptTransport,
-    mem: GuestMemoryMmap,
+    mem: RuntimeGuestMemory,
     disk: DiskProperties,
     stop_fd: EventFd,
 }
@@ -70,7 +70,7 @@ impl BlockWorker {
     pub fn new(
         device_queue: DeviceQueue,
         interrupt: InterruptTransport,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         disk: DiskProperties,
         stop_fd: EventFd,
     ) -> Self {
@@ -161,7 +161,7 @@ impl BlockWorker {
         }
     }
 
-    fn process_queue(&mut self, mem: &GuestMemoryMmap) {
+    fn process_queue(&mut self, mem: &RuntimeGuestMemory) {
         while let Some(head) = self.device_queue.queue.pop(mem) {
             let mut reader = match Reader::new(mem, head.clone()) {
                 Ok(r) => r,

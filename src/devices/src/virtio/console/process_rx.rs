@@ -2,15 +2,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{io, thread};
 
-use vm_memory::{GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::GuestMemoryError;
 
 use crate::virtio::console::console_control::ConsoleControl;
 use crate::virtio::console::port_io::PortInput;
-use crate::virtio::{DescriptorChain, InterruptTransport, Queue};
+use crate::virtio::{DescriptorChain, InterruptTransport, Queue, RuntimeGuestMemory};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_rx(
-    mem: GuestMemoryMmap,
+    mem: RuntimeGuestMemory,
     mut queue: Queue,
     interrupt: InterruptTransport,
     input: Arc<Mutex<Box<dyn PortInput + Send>>>,
@@ -71,7 +71,7 @@ pub(crate) fn process_rx(
 
 fn pop_head_blocking<'mem>(
     queue: &mut Queue,
-    mem: &'mem GuestMemoryMmap,
+    mem: &'mem RuntimeGuestMemory,
     interrupt: &InterruptTransport,
     stop: &AtomicBool,
 ) -> Option<DescriptorChain<'mem>> {
@@ -99,8 +99,7 @@ fn read_to_desc(
     //       bump.
     #[allow(deprecated)]
     desc.mem
-        .try_access(desc.len as usize, desc.addr, |_, len, addr, region| {
-            let mut target = region.get_slice(addr, len).unwrap();
+        .try_access(desc.len as usize, desc.addr, |_, _len, _, mut target| {
             match input.read_volatile(&mut target) {
                 Ok(n) => {
                     if n == 0 {

@@ -2,9 +2,10 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
+use crate::virtio::RuntimeGuestMemory;
 use utils::eventfd::EFD_NONBLOCK;
 use utils::eventfd::EventFd;
-use vm_memory::{ByteValued, GuestMemoryMmap};
+use vm_memory::ByteValued;
 
 use crate::virtio::console::defs::control_event::{
     VIRTIO_CONSOLE_CONSOLE_PORT, VIRTIO_CONSOLE_PORT_ADD, VIRTIO_CONSOLE_PORT_NAME,
@@ -69,7 +70,7 @@ impl ConsoleControl {
         })
     }
 
-    pub fn mark_console_port(&self, _mem: &GuestMemoryMmap, port_id: u32) {
+    pub fn mark_console_port(&self, _mem: &RuntimeGuestMemory, port_id: u32) {
         self.push_msg(VirtioConsoleControl {
             id: port_id,
             event: VIRTIO_CONSOLE_CONSOLE_PORT,

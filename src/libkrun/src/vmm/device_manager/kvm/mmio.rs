@@ -308,7 +308,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use devices::legacy::KvmIoapic;
     use devices::virtio::{
-        ActivateResult, DeviceQueue, InterruptTransport, QueueConfig, VirtioDevice,
+        ActivateResult, DeviceQueue, InterruptTransport, QueueConfig, RuntimeGuestMemory,
+        VirtioDevice,
     };
     use std::sync::Arc;
     use utils::errno;
@@ -383,7 +384,7 @@ mod tests {
 
         fn activate(
             &mut self,
-            _mem: GuestMemoryMmap,
+            _mem: RuntimeGuestMemory,
             _intc: InterruptTransport,
             _queues: Vec<DeviceQueue>,
         ) -> ActivateResult {

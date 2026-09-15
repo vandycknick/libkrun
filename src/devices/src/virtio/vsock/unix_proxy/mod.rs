@@ -17,8 +17,8 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use super::proxy::{Proxy, ProxyError, ProxyStatus, ProxyUpdate, RecvPkt};
 
+use crate::virtio::RuntimeGuestMemory;
 use utils::epoll::EventSet;
-use vm_memory::GuestMemoryMmap;
 
 #[cfg(unix)]
 mod unix;
@@ -36,7 +36,7 @@ pub struct UnixProxy {
     pub(crate) cid: u64,
     pub(crate) fd: OwnedFd,
     pub status: ProxyStatus,
-    pub(crate) mem: GuestMemoryMmap,
+    pub(crate) mem: RuntimeGuestMemory,
     pub(crate) queue: Arc<Mutex<VirtQueue>>,
     pub(crate) rxq: Arc<Mutex<MuxerRxQ>>,
     pub(crate) path: PathBuf,
@@ -58,7 +58,7 @@ impl UnixProxy {
         cid: u64,
         local_port: u32,
         control_port: u32,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
         path: PathBuf,
@@ -92,7 +92,7 @@ impl UnixProxy {
         local_port: u32,
         peer_port: u32,
         fd: OwnedFd,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         queue: Arc<Mutex<VirtQueue>>,
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Self {

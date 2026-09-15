@@ -1,9 +1,9 @@
 use rand::{TryRng, rngs::SysRng};
 use utils::eventfd::EventFd;
-use vm_memory::{Bytes, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RngError, VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RngError,
+    RuntimeGuestMemory, VirtioDevice,
 };
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
@@ -122,7 +122,7 @@ impl VirtioDevice for Rng {
 
     fn activate(
         &mut self,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {

@@ -48,7 +48,7 @@ use devices::legacy::{IoApic, IrqChipT};
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
-use devices::virtio::{MmioTransport, VirtioDevice};
+use devices::virtio::{MmioTransport, RuntimeGuestMemory, VirtioDevice};
 
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
@@ -64,6 +64,8 @@ use crate::vmm::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
 use crate::vmm::vstate::KvmContext;
 #[cfg(all(target_os = "linux", feature = "tee"))]
 use crate::vmm::vstate::MeasuredRegion;
+#[cfg(target_os = "macos")]
+use crate::vmm::vstate::build_reclaim_ledger;
 use crate::vmm::vstate::{Error as VstateError, Vcpu, VcpuConfig, Vm};
 use arch::{ArchMemoryInfo, InitrdConfig};
 use device_manager::shm::ShmManager;
@@ -673,6 +675,28 @@ fn measure_qboot_regions(
 }
 
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
+#[cfg(target_os = "macos")]
+fn incompatible_host_reclaim_mapping(
+    requirements: &[crate::api::device_builders::DeviceRequirements],
+) -> bool {
+    let host_reclaim = requirements
+        .iter()
+        .any(|requirement| requirement.host_reclaim);
+    let external_mapping = requirements.iter().any(|requirement| {
+        requirement.process_shareable_memory || requirement.shm_size.is_some() || {
+            #[cfg(feature = "gpu")]
+            {
+                requirement.gpu_shm.is_some()
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                false
+            }
+        }
+    });
+    host_reclaim && external_mapping
+}
+
 pub fn build_microvm(
     vm_resources: &super::resources::VmResources,
     event_manager: &mut EventManager,
@@ -689,6 +713,17 @@ pub fn build_microvm(
     #[cfg(not(feature = "gpu"))]
     let gpu_shm_size: Option<usize> = None;
     let use_vhost_user = requirements.iter().any(|r| r.process_shareable_memory);
+    #[cfg(target_os = "macos")]
+    let host_reclaim = requirements.iter().any(|r| r.host_reclaim);
+    #[cfg(target_os = "macos")]
+    {
+        if incompatible_host_reclaim_mapping(&requirements) {
+            return Err(StartMicrovmError::AttachDevice(
+                "macOS host reclaim is incompatible with external or shared guest mappings"
+                    .to_string(),
+            ));
+        }
+    }
 
     #[cfg(feature = "tdx")]
     let td_shim_parsed = match &vm_resources.tee_firmware_config {
@@ -792,9 +827,17 @@ pub fn build_microvm(
         }
     }
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "macos")))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
+
+    #[cfg(all(not(feature = "tee"), target_os = "macos"))]
+    let vm = setup_vm(
+        &guest_memory,
+        &arch_memory_info,
+        vm_resources.nested_enabled,
+        host_reclaim,
+    )?;
 
     #[cfg(feature = "tee")]
     let (_kvm, vm) = {
@@ -1165,7 +1208,6 @@ pub fn build_microvm(
         #[cfg(target_os = "macos")]
         paused_at: 0,
     };
-
     // Set raw mode for FDs that are connected to legacy serial devices.
     for serial_tty in serial_ttys {
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty), false);
@@ -1929,12 +1971,20 @@ pub(crate) fn setup_vm(
 #[cfg(target_os = "macos")]
 pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
+    arch_memory_info: &ArchMemoryInfo,
     nested_enabled: bool,
+    host_reclaim: bool,
 ) -> std::result::Result<Vm, StartMicrovmError> {
+    let reclaim_ledger = build_reclaim_ledger(guest_memory, arch_memory_info)
+        .map_err(Error::Vm)
+        .map_err(StartMicrovmError::Internal)?;
     let mut vm = Vm::new(nested_enabled)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
-    vm.memory_init(guest_memory)
+    vm.memory_init(guest_memory, reclaim_ledger)
+        .map_err(Error::Vm)
+        .map_err(StartMicrovmError::Internal)?;
+    vm.configure_reclaim(guest_memory, arch_memory_info, host_reclaim)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     Ok(vm)
@@ -2124,7 +2174,7 @@ fn create_vcpus_aarch64(
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 fn create_vcpus_aarch64(
-    _vm: &Vm,
+    vm: &Vm,
     vcpu_config: &VcpuConfig,
     mem_info: &ArchMemoryInfo,
     entry_addr: GuestAddress,
@@ -2149,6 +2199,7 @@ fn create_vcpus_aarch64(
             boot_receiver,
             exit_evt.try_clone().map_err(Error::EventFd)?,
             vcpu_list.clone(),
+            vm.reclaim_state(),
             nested_enabled,
         )
         .map_err(Error::Vcpu)?;
@@ -2200,7 +2251,18 @@ pub(crate) fn attach_mmio_device(
     intc: IrqChip,
     device: Arc<Mutex<dyn VirtioDevice>>,
 ) -> std::result::Result<(), device_manager::mmio::Error> {
-    let mmio_device = MmioTransport::new(vmm.guest_memory().clone(), intc, device)?;
+    #[cfg(target_os = "macos")]
+    let runtime_memory = {
+        let reclaim_state = vmm.vm.reclaim_state();
+        if reclaim_state.runtime_access_enabled() {
+            RuntimeGuestMemory::new(vmm.guest_memory().clone(), reclaim_state)
+        } else {
+            RuntimeGuestMemory::passthrough(vmm.guest_memory().clone())
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let runtime_memory = RuntimeGuestMemory::passthrough(vmm.guest_memory().clone());
+    let mmio_device = MmioTransport::new(runtime_memory, intc, device)?;
 
     let type_id = mmio_device.locked_device().device_type();
     let _cmdline = &mut vmm.kernel_cmdline;
@@ -2275,6 +2337,69 @@ pub fn setup_terminal_raw_mode(
 pub mod tests {
     use super::*;
     use crate::vmm::vmm_config::kernel_bundle::KernelBundle;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_reclaim_rejects_external_and_shared_mappings() {
+        use crate::api::device_builders::DeviceRequirements;
+
+        let reclaim = DeviceRequirements {
+            host_reclaim: true,
+            ..DeviceRequirements::default()
+        };
+        let external = DeviceRequirements {
+            process_shareable_memory: true,
+            ..DeviceRequirements::default()
+        };
+        let shared = DeviceRequirements {
+            shm_size: Some(0x4000),
+            ..DeviceRequirements::default()
+        };
+
+        assert!(incompatible_host_reclaim_mapping(&[reclaim, external]));
+        assert!(incompatible_host_reclaim_mapping(&[
+            DeviceRequirements {
+                host_reclaim: true,
+                ..DeviceRequirements::default()
+            },
+            shared,
+        ]));
+        assert!(!incompatible_host_reclaim_mapping(&[DeviceRequirements {
+            host_reclaim: true,
+            ..DeviceRequirements::default()
+        },]));
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[ignore = "requires an isolated code-signed process with Hypervisor entitlement"]
+    fn real_hvf_setup_qualifies_with_mapped_workload_ram() {
+        use hvf::reclaim::ReclaimQualification;
+        use vm_memory::Bytes;
+
+        let (guest_memory, arch_memory_info, _shm_manager, _payload_config) =
+            default_guest_memory(128).unwrap();
+        let address = GuestAddress(arch_memory_info.ram_start_addr);
+        let expected = [0xa5_u8; 0x4000];
+        guest_memory.write(&expected, address).unwrap();
+
+        let vm = setup_vm(&guest_memory, &arch_memory_info, false, true).unwrap();
+        let qualification = vm.reclaim_state().qualification();
+        let mut actual = [0_u8; 0x4000];
+        guest_memory.read(&mut actual, address).unwrap();
+        let destroy = vm.destroy();
+
+        eprintln!(
+            "production setup qualification={qualification:?} workload_bytes={} checksum={}",
+            actual.len(),
+            actual
+                .iter()
+                .fold(0_u64, |sum, byte| sum + u64::from(*byte))
+        );
+        assert!(destroy.is_ok());
+        assert_eq!(qualification, ReclaimQualification::Passed);
+        assert_eq!(actual, expected);
+    }
 
     #[allow(unused)]
     fn default_guest_memory(

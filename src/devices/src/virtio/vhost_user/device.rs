@@ -31,13 +31,13 @@ use vhost::vhost_user::{
     VhostUserProtocolFeatures,
 };
 use vhost::{VhostBackend, VhostUserMemoryRegionInfo, VringConfigData};
-use vm_memory::{Address, ByteValued, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Address, ByteValued, GuestMemoryBackend, GuestMemoryRegion};
 use vmm_sys_util::eventfd::EventFd as VhostEventFd;
 
 use crate::display::DisplayInfo;
 use crate::virtio::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
-    VirtioDevice, VirtioShmRegion,
+    RuntimeGuestMemory, VirtioDevice, VirtioShmRegion,
 };
 
 /// VHOST_USER_F_PROTOCOL_FEATURES (bit 30) is a backend-only feature
@@ -413,9 +413,15 @@ impl VhostUserDevice {
     /// Activate the vhost-user device by setting up memory and vrings.
     fn activate_vhost_user(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &RuntimeGuestMemory,
         queues: &[DeviceQueue],
     ) -> IoResult<()> {
+        if !mem.allows_external_mapping() {
+            return Err(io::Error::new(
+                ErrorKind::Unsupported,
+                "vhost-user does not support reclaimable guest backing memory",
+            ));
+        }
         let mut frontend = self.frontend.lock().unwrap();
 
         debug!("{}: activating vhost-user device", self.device_name);
@@ -474,18 +480,22 @@ impl VhostUserDevice {
 
         // Can't use from_guest_region(): vhost 0.17 expects vm-memory 0.18 types.
         let regions: Vec<VhostUserMemoryRegionInfo> = mem
-            .iter()
-            .filter_map(|region| {
-                let file_offset = region.file_offset()?;
-                Some(VhostUserMemoryRegionInfo {
-                    guest_phys_addr: region.start_addr().raw_value(),
-                    memory_size: region.len(),
-                    userspace_addr: region.as_ptr() as u64,
-                    mmap_offset: file_offset.start(),
-                    mmap_handle: file_offset.file().as_raw_fd(),
-                })
+            .with_external_mapping(|memory| {
+                memory
+                    .iter()
+                    .filter_map(|region| {
+                        let file_offset = region.file_offset()?;
+                        Some(VhostUserMemoryRegionInfo {
+                            guest_phys_addr: region.start_addr().raw_value(),
+                            memory_size: region.len(),
+                            userspace_addr: region.as_ptr() as u64,
+                            mmap_offset: file_offset.start(),
+                            mmap_handle: file_offset.file().as_raw_fd(),
+                        })
+                    })
+                    .collect()
             })
-            .collect();
+            .map_err(io::Error::other)?;
 
         debug!(
             "{}: sharing {} file-backed regions with backend",
@@ -522,24 +532,24 @@ impl VhostUserDevice {
             let avail_ring_gpa = queue.avail_ring.0;
             let used_ring_gpa = queue.used_ring.0;
 
-            let desc_table_vmm =
-                mem.get_host_address(Address::new(desc_table_gpa))
-                    .map_err(|_| {
-                        io::Error::new(
-                            ErrorKind::InvalidInput,
-                            format!("GPA 0x{:x} not found in any memory region", desc_table_gpa),
-                        )
-                    })? as u64;
-            let avail_ring_vmm =
-                mem.get_host_address(Address::new(avail_ring_gpa))
-                    .map_err(|_| {
-                        io::Error::new(
-                            ErrorKind::InvalidInput,
-                            format!("GPA 0x{:x} not found in any memory region", avail_ring_gpa),
-                        )
-                    })? as u64;
+            let desc_table_vmm = mem
+                .external_host_address(Address::new(desc_table_gpa))
+                .map_err(|_| {
+                    io::Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("GPA 0x{:x} not found in any memory region", desc_table_gpa),
+                    )
+                })? as u64;
+            let avail_ring_vmm = mem
+                .external_host_address(Address::new(avail_ring_gpa))
+                .map_err(|_| {
+                    io::Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("GPA 0x{:x} not found in any memory region", avail_ring_gpa),
+                    )
+                })? as u64;
             let used_ring_vmm = mem
-                .get_host_address(Address::new(used_ring_gpa))
+                .external_host_address(Address::new(used_ring_gpa))
                 .map_err(|_| {
                     io::Error::new(
                         ErrorKind::InvalidInput,
@@ -705,7 +715,7 @@ impl VirtioDevice for VhostUserDevice {
 
     fn activate(
         &mut self,
-        mem: GuestMemoryMmap,
+        mem: RuntimeGuestMemory,
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
