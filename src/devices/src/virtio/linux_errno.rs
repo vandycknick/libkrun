@@ -196,6 +196,18 @@ pub fn enoent() -> io::Error {
 pub fn eacces() -> io::Error {
     io::Error::from_raw_os_error(LINUX_EACCES)
 }
+pub fn ebadf() -> io::Error {
+    io::Error::from_raw_os_error(LINUX_EBADF)
+}
+pub fn enotdir() -> io::Error {
+    io::Error::from_raw_os_error(LINUX_ENOTDIR)
+}
+pub fn enotty() -> io::Error {
+    io::Error::from_raw_os_error(LINUX_ENOTTY)
+}
+pub fn emfile() -> io::Error {
+    io::Error::from_raw_os_error(LINUX_EMFILE)
+}
 pub fn eexist() -> io::Error {
     io::Error::from_raw_os_error(LINUX_EEXIST)
 }

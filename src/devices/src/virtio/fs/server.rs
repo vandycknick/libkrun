@@ -21,8 +21,8 @@ use super::super::linux_errno::linux_error;
 use super::bindings;
 use super::descriptor_utils::{Reader, Writer};
 use super::filesystem::{
-    Context, DirEntry, Entry, Extensions, FileSystem, GetxattrReply, ListxattrReply, SecContext,
-    ZeroCopyReader, ZeroCopyWriter,
+    Context, DirEntry, Entry, Extensions, FileSystem, GetxattrReply, IoctlReply, ListxattrReply,
+    SecContext, ZeroCopyReader, ZeroCopyWriter,
 };
 use super::fs_utils::einval;
 use super::fuse::*;
@@ -1230,9 +1230,14 @@ impl<F: FileSystem + Sync> Server<F> {
             out_size,
             exit_code,
         ) {
-            Ok(data) => {
+            Ok(IoctlReply { data, .. }) if data.len() > out_size as usize => reply_error(
+                linux_error(io::Error::from_raw_os_error(libc::EOVERFLOW)),
+                in_header.unique,
+                w,
+            ),
+            Ok(IoctlReply { result, data }) => {
                 let out = IoctlOut {
-                    result: 0,
+                    result,
                     ..Default::default()
                 };
                 reply_ok(Some(out), Some(&data), in_header.unique, w)
@@ -1678,4 +1683,269 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
     }
 
     Ok(extensions)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::mem::size_of;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicI32;
+
+    use vm_memory::{ByteValued, GuestAddress};
+
+    use crate::virtio::RuntimeGuestMemory;
+    use crate::virtio::descriptor_utils::{
+        DescriptorType, Reader, Writer, create_descriptor_chain,
+    };
+    use crate::virtio::fs::augment_fs::AugmentFs;
+    use crate::virtio::fs::filesystem::{Context, FileSystem, IoctlReply};
+    use crate::virtio::fs::fuse::{InHeader, IoctlIn, IoctlOut, Opcode, OutHeader};
+    use crate::virtio::fs::inode_alloc::InodeAllocator;
+    use crate::virtio::fs::{FsError, server::Server};
+    use crate::virtio::linux_errno::linux_error;
+
+    const UNIQUE: u64 = 0x0123_4567_89ab_cdef;
+    const REQUEST_ADDRESS: GuestAddress = GuestAddress(0x1000);
+
+    #[derive(Clone)]
+    enum IoctlFixtureReply {
+        Success { result: i32, data: Vec<u8> },
+        Error(i32),
+    }
+
+    struct IoctlFixture(IoctlFixtureReply);
+
+    impl FileSystem for IoctlFixture {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn ioctl(
+            &self,
+            _ctx: Context,
+            _inode: Self::Inode,
+            _handle: Self::Handle,
+            _flags: u32,
+            _cmd: u32,
+            _arg: u64,
+            _in_size: u32,
+            _out_size: u32,
+            _exit_code: &Arc<AtomicI32>,
+        ) -> io::Result<IoctlReply> {
+            match &self.0 {
+                IoctlFixtureReply::Success { result, data } => Ok(IoctlReply {
+                    result: *result,
+                    data: data.clone(),
+                }),
+                IoctlFixtureReply::Error(errno) => {
+                    Err(linux_error(io::Error::from_raw_os_error(*errno)))
+                }
+            }
+        }
+    }
+
+    fn dispatch_ioctl(
+        fixture_reply: IoctlFixtureReply,
+        cmd: u32,
+        unique: u64,
+        declared_out_size: u32,
+        writer_capacity: usize,
+    ) -> (RuntimeGuestMemory, GuestAddress, Result<usize, FsError>) {
+        let request_len = size_of::<InHeader>() + size_of::<IoctlIn>();
+        let response_address = GuestAddress(REQUEST_ADDRESS.0 + request_len as u64);
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap();
+        let in_header = InHeader {
+            len: request_len as u32,
+            opcode: Opcode::Ioctl as u32,
+            unique,
+            nodeid: 1,
+            ..Default::default()
+        };
+        let ioctl_in = IoctlIn {
+            cmd,
+            out_size: declared_out_size,
+            ..Default::default()
+        };
+        memory
+            .write_slice(in_header.as_slice(), REQUEST_ADDRESS)
+            .unwrap();
+        memory
+            .write_slice(
+                ioctl_in.as_slice(),
+                GuestAddress(REQUEST_ADDRESS.0 + size_of::<InHeader>() as u64),
+            )
+            .unwrap();
+        memory
+            .write_slice(&vec![0x5a; writer_capacity + 1], response_address)
+            .unwrap();
+
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0),
+            REQUEST_ADDRESS,
+            vec![
+                (DescriptorType::Readable, request_len as u32),
+                (DescriptorType::Writable, writer_capacity as u32),
+            ],
+            0,
+        )
+        .unwrap();
+        let reader = Reader::new(&memory, chain.clone()).unwrap();
+        let writer = Writer::new(&memory, chain).unwrap();
+        let fs = AugmentFs::new(
+            IoctlFixture(fixture_reply),
+            &InodeAllocator::new(),
+            Vec::new(),
+        );
+        let result = Server::new(fs).handle_message(
+            reader,
+            writer,
+            false,
+            &None,
+            &Arc::new(AtomicI32::new(0)),
+            #[cfg(target_os = "macos")]
+            &None,
+        );
+
+        (memory, response_address, result)
+    }
+
+    fn assert_success_reply(result: i32, data: &[u8]) {
+        let expected_len = size_of::<OutHeader>() + size_of::<IoctlOut>() + data.len();
+        let (memory, response_address, written) = dispatch_ioctl(
+            IoctlFixtureReply::Success {
+                result,
+                data: data.to_vec(),
+            },
+            0x1234,
+            UNIQUE,
+            data.len() as u32,
+            expected_len,
+        );
+
+        assert_eq!(written.unwrap(), expected_len);
+        let header: OutHeader = memory.read_obj(response_address).unwrap();
+        assert_eq!(header.len as usize, expected_len);
+        assert_eq!(header.error, 0);
+        assert_eq!(header.unique, UNIQUE);
+        let ioctl_out_address = GuestAddress(response_address.0 + size_of::<OutHeader>() as u64);
+        let ioctl_out: IoctlOut = memory.read_obj(ioctl_out_address).unwrap();
+        assert_eq!(ioctl_out.result, result);
+        let data_address = GuestAddress(ioctl_out_address.0 + size_of::<IoctlOut>() as u64);
+        let mut actual_data = vec![0; data.len()];
+        memory.read_slice(&mut actual_data, data_address).unwrap();
+        assert_eq!(actual_data, data);
+    }
+
+    #[test]
+    fn ioctl_encodes_result_independently_from_data_length() {
+        assert_success_reply(0, &[]);
+        assert_success_reply(0, &[0xaa; 69]);
+        assert_success_reply(1, &[0xaa; 69]);
+        assert_success_reply(1, &[]);
+        assert_success_reply(i32::MAX, &[0x00, 0x7f, 0xff]);
+    }
+
+    #[test]
+    fn ordinary_augmented_ioctl_success_keeps_result_zero() {
+        let exit_ioctl = 0x7602;
+        let expected_len = size_of::<OutHeader>() + size_of::<IoctlOut>();
+        let (memory, response_address, written) = dispatch_ioctl(
+            IoctlFixtureReply::Success {
+                result: i32::MAX,
+                data: vec![0xff],
+            },
+            exit_ioctl,
+            UNIQUE,
+            0,
+            expected_len,
+        );
+
+        assert_eq!(written.unwrap(), expected_len);
+        let ioctl_out: IoctlOut = memory
+            .read_obj(GuestAddress(
+                response_address.0 + size_of::<OutHeader>() as u64,
+            ))
+            .unwrap();
+        assert_eq!(ioctl_out.result, 0);
+    }
+
+    #[test]
+    fn ioctl_error_is_a_linux_header_error_without_ioctl_output() {
+        let expected_len = size_of::<OutHeader>();
+        for (host_errno, linux_errno) in [(libc::ENOTTY, 25), (libc::EOPNOTSUPP, 95)] {
+            let (memory, response_address, written) = dispatch_ioctl(
+                IoctlFixtureReply::Error(host_errno),
+                0x1234,
+                UNIQUE,
+                0,
+                expected_len,
+            );
+
+            assert_eq!(written.unwrap(), expected_len);
+            let header: OutHeader = memory.read_obj(response_address).unwrap();
+            assert_eq!(header.len as usize, expected_len);
+            assert_eq!(header.error, -linux_errno);
+            assert_eq!(header.unique, UNIQUE);
+        }
+    }
+
+    #[test]
+    fn ioctl_reply_respects_descriptor_capacity() {
+        let reply_len = size_of::<OutHeader>() + size_of::<IoctlOut>() + 1;
+        let (_, _, exact) = dispatch_ioctl(
+            IoctlFixtureReply::Success {
+                result: 1,
+                data: vec![0xaa],
+            },
+            0x1234,
+            UNIQUE,
+            1,
+            reply_len,
+        );
+        assert_eq!(exact.unwrap(), reply_len);
+
+        let (memory, response_address, short) = dispatch_ioctl(
+            IoctlFixtureReply::Success {
+                result: 1,
+                data: vec![0xaa],
+            },
+            0x1234,
+            UNIQUE,
+            1,
+            reply_len - 1,
+        );
+        assert!(matches!(short, Err(FsError::EncodeMessage(_))));
+        let sentinel: u8 = memory
+            .read_obj(GuestAddress(response_address.0 + (reply_len - 1) as u64))
+            .unwrap();
+        assert_eq!(sentinel, 0x5a);
+    }
+
+    #[test]
+    fn ioctl_rejects_payload_larger_than_declared_output() {
+        let writer_capacity = size_of::<OutHeader>() + size_of::<IoctlOut>() + 2;
+        let (memory, response_address, written) = dispatch_ioctl(
+            IoctlFixtureReply::Success {
+                result: i32::MAX,
+                data: vec![0xaa, 0xbb],
+            },
+            0x1234,
+            UNIQUE,
+            1,
+            writer_capacity,
+        );
+
+        assert_eq!(written.unwrap(), size_of::<OutHeader>());
+        let header: OutHeader = memory.read_obj(response_address).unwrap();
+        assert_eq!(header.len as usize, size_of::<OutHeader>());
+        assert_eq!(header.error, -75);
+        assert_eq!(header.unique, UNIQUE);
+        let first_output_byte: u8 = memory
+            .read_obj(GuestAddress(
+                response_address.0 + size_of::<OutHeader>() as u64,
+            ))
+            .unwrap();
+        assert_eq!(first_output_byte, 0x5a);
+    }
 }

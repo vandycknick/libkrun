@@ -19,6 +19,8 @@ use super::super::{FsError, Queue};
 use super::augment_fs::AugmentFs;
 use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
+#[cfg(target_os = "macos")]
+use super::immutable::{ImmutableRosettaFs, RosettaFsConfig};
 use super::inode_alloc::InodeAllocator;
 use super::null_fs::NullFs;
 use super::passthrough::{self, PassthroughFs};
@@ -31,6 +33,8 @@ enum FsServer {
     ReadWrite(Server<AugmentFs<PassthroughFs>>),
     ReadOnly(Server<AugmentFs<PassthroughFsRo>>),
     Null(Server<AugmentFs<NullFs>>),
+    #[cfg(target_os = "macos")]
+    Rosetta(Server<AugmentFs<ImmutableRosettaFs>>),
 }
 
 impl FsServer {
@@ -71,6 +75,10 @@ impl FsServer {
                 #[cfg(target_os = "macos")]
                 map_sender,
             ),
+            #[cfg(target_os = "macos")]
+            FsServer::Rosetta(s) => {
+                s.handle_message(r, w, allow_idmap, shm_region, exit_code, map_sender)
+            }
         }
     }
 }
@@ -104,8 +112,29 @@ impl FsWorker {
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
+        #[cfg(target_os = "macos")] rosetta: Option<RosettaFsConfig>,
     ) -> Result<Self, io::Error> {
         let inode_alloc = Arc::new(InodeAllocator::new());
+        #[cfg(target_os = "macos")]
+        if let Some(config) = rosetta {
+            let server = FsServer::Rosetta(Server::new(AugmentFs::new_without_exit_ioctl(
+                ImmutableRosettaFs::new(config),
+                &inode_alloc,
+                Vec::new(),
+            )));
+            return Ok(Self {
+                queues,
+                queue_evts,
+                interrupt,
+                mem,
+                allow_idmap: false,
+                shm_region: None,
+                server,
+                stop_fd,
+                exit_code,
+                map_sender: None,
+            });
+        }
         let server = match passthrough_cfg {
             Some(cfg) if read_only => {
                 let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;

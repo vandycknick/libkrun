@@ -22,7 +22,7 @@ use vm_memory::ByteValued;
 
 use super::super::filesystem::{
     Context, DirEntry, Entry, ExportTable, Extensions, FileSystem, FsOptions, GetxattrReply,
-    ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
+    IoctlReply, ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use super::super::fuse;
 use super::super::inode_alloc::InodeAllocator;
@@ -2136,7 +2136,7 @@ impl FileSystem for PassthroughFs {
         _in_size: u32,
         out_size: u32,
         _exit_code: &Arc<AtomicI32>,
-    ) -> io::Result<Vec<u8>> {
+    ) -> io::Result<IoctlReply> {
         const VIRTIO_IOC_MAGIC: u8 = b'v';
 
         const VIRTIO_IOC_TYPE_EXPORT_FD: u8 = 1;
@@ -2175,7 +2175,10 @@ impl FileSystem for PassthroughFs {
 
                 let mut ret: Vec<_> = self.cfg.export_fsid.to_ne_bytes().into();
                 ret.extend_from_slice(&handle.to_ne_bytes());
-                Ok(ret)
+                Ok(IoctlReply {
+                    result: 0,
+                    data: ret,
+                })
             }
             _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
         }
