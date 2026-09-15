@@ -101,6 +101,8 @@ pub enum Error {
     VcpuHandle(vstate::Error),
     /// vCPU resume failed.
     VcpuResume,
+    /// Required per-vCPU translation memory ordering is unavailable.
+    VcpuTranslationOrdering,
     /// Vm error.
     Vm(vstate::Error),
 }
@@ -124,6 +126,9 @@ impl Display for Error {
             VcpuEvent(e) => write!(f, "Cannot send event to vCPU. {e:?}"),
             VcpuHandle(e) => write!(f, "Cannot create a vCPU handle. {e}"),
             VcpuResume => write!(f, "vCPUs resume failed."),
+            VcpuTranslationOrdering => {
+                write!(f, "required translation memory ordering is unavailable")
+            }
             Vm(e) => write!(f, "Vm error: {e}"),
         }
     }
@@ -185,14 +190,70 @@ impl Vmm {
         for mut vcpu in vcpus.drain(..) {
             vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
 
-            self.vcpus_handles
-                .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
+            match vcpu.start_threaded() {
+                Ok(handle) => self.vcpus_handles.push(handle),
+                Err(error) => {
+                    #[cfg(target_os = "macos")]
+                    self.abort_vcpu_startup()?;
+                    return Err(Error::VcpuHandle(error));
+                }
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(first) = self.vcpus_handles.first() {
+                let probes = self
+                    .vcpus_handles
+                    .iter()
+                    .map(VcpuHandle::translation_ordering_probe)
+                    .collect::<Vec<_>>();
+                first
+                    .vcpu_list()
+                    .set_host_translation_ordering_consensus(&probes);
+                let required = self
+                    .vcpus_handles
+                    .iter()
+                    .any(VcpuHandle::translation_ordering_requested);
+                if required {
+                    let blocker = first.vcpu_list().guest_translation_ordering_blocker();
+                    error!(
+                        "required guest translation memory ordering is unqualified: {blocker:?}"
+                    );
+                    self.abort_vcpu_startup()?;
+                    return Err(Error::VcpuTranslationOrdering);
+                }
+            }
+            if self
+                .vcpus_handles
+                .iter()
+                .any(|handle| handle.send_event(vstate::VcpuEvent::Start).is_err())
+            {
+                self.abort_vcpu_startup()?;
+                return Err(Error::VcpuEvent(vstate::Error::VcpuChannelClosed));
+            }
         }
 
         // The vcpus start off in the `Paused` state, let them run.
         self.resume_vcpus()?;
 
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn abort_vcpu_startup(&mut self) -> Result<()> {
+        for handle in &self.vcpus_handles {
+            handle.request_stop();
+        }
+        let mut cleanup_error = None;
+        for handle in self.vcpus_handles.drain(..) {
+            if let Err(error) = handle.join_startup()
+                && cleanup_error.is_none()
+            {
+                cleanup_error = Some(error);
+            }
+        }
+        cleanup_error.map_or(Ok(()), |error| Err(Error::VcpuHandle(error)))
     }
 
     /// Sends a resume command to the vcpus.

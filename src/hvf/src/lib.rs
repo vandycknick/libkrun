@@ -120,14 +120,20 @@ pub enum Error {
     MemoryMap,
     MemorySize,
     MemoryUnmap,
-    InvalidMemoryFault,
+    InvalidMemoryFault {
+        syndrome: u64,
+        pc: u64,
+        physical_address: u64,
+    },
     ReclaimState(ReclaimStateError),
     ReclaimProbeCleanup(String),
     NestedCheck,
     VcpuCreate,
+    VcpuDestroy,
     VcpuInitialRegisters,
     VcpuReadRegister,
     VcpuReadSystemRegister,
+    VcpuTranslationOrderingRestore,
     VcpuRequestExit,
     VcpuRun,
     VcpuSetPendingIrq,
@@ -149,7 +155,14 @@ impl Display for Error {
             MemoryMap => write!(f, "Error registering memory region in HVF"),
             MemorySize => write!(f, "Memory region size is not representable by HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
-            InvalidMemoryFault => write!(f, "Invalid fault in mapped guest RAM"),
+            InvalidMemoryFault {
+                syndrome,
+                pc,
+                physical_address,
+            } => write!(
+                f,
+                "Invalid memory fault: syndrome=0x{syndrome:x}, pc=0x{pc:x}, physical_address=0x{physical_address:x}"
+            ),
             ReclaimState(err) => write!(f, "Error tracking guest RAM in HVF: {err}"),
             ReclaimProbeCleanup(err) => write!(f, "Error cleaning up HVF reclaim probe: {err}"),
             NestedCheck => write!(
@@ -157,9 +170,14 @@ impl Display for Error {
                 "Nested virtualization was requested but it's not support in this system"
             ),
             VcpuCreate => write!(f, "Error creating HVF vCPU instance"),
+            VcpuDestroy => write!(f, "Error destroying HVF vCPU instance"),
             VcpuInitialRegisters => write!(f, "Error setting up initial HVF vCPU registers"),
             VcpuReadRegister => write!(f, "Error reading HVF vCPU register"),
             VcpuReadSystemRegister => write!(f, "Error reading HVF vCPU system register"),
+            VcpuTranslationOrderingRestore => write!(
+                f,
+                "Error restoring HVF vCPU translation memory ordering after probing"
+            ),
             VcpuRequestExit => write!(f, "Error requesting HVF vCPU exit"),
             VcpuRun => write!(f, "Error running HVF vCPU"),
             VcpuSetPendingIrq => write!(f, "Error setting HVF vCPU pending irq"),
@@ -188,6 +206,33 @@ pub trait Vcpus {
     fn get_pending_irq(&self, vcpuid: u64) -> u32;
     fn handle_sysreg_read(&self, vcpuid: u64, reg: u32) -> Option<u64>;
     fn handle_sysreg_write(&self, vcpuid: u64, reg: u32, val: u64) -> bool;
+}
+
+const ACTLR_EL1_ENTSO: u64 = 1 << 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TranslationOrderingProbe {
+    NotRequested,
+    Unsupported(TranslationOrderingUnsupported),
+    Supported { midr: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TranslationOrderingUnsupported {
+    MidrRead {
+        status: hv_return_t,
+    },
+    ActlrRead {
+        status: hv_return_t,
+    },
+    ToggleSet {
+        status: hv_return_t,
+    },
+    ToggleRead {
+        status: hv_return_t,
+        expected: u64,
+        observed: u64,
+    },
 }
 
 pub fn vcpu_request_exit(vcpuid: u64) -> Result<(), Error> {
@@ -518,10 +563,18 @@ impl HvfVcpu<'_> {
         // when using HVF in-kernel GICv3.
         let ret = unsafe { hv_vcpu_set_sys_reg(vcpuid, hv_sys_reg_t_HV_SYS_REG_MPIDR_EL1, mpidr) };
         if ret != HV_SUCCESS {
+            if unsafe { hv_vcpu_destroy(vcpuid) } != HV_SUCCESS {
+                error!("failed to destroy HVF vCPU after MPIDR initialization failure");
+            }
             return Err(Error::VcpuCreate);
         }
 
-        let vcpu_exit: &hv_vcpu_exit_t = unsafe { vcpu_exit_ptr.as_mut().unwrap() };
+        let Some(vcpu_exit) = (unsafe { vcpu_exit_ptr.as_mut() }) else {
+            if unsafe { hv_vcpu_destroy(vcpuid) } != HV_SUCCESS {
+                error!("failed to destroy HVF vCPU after missing exit state");
+            }
+            return Err(Error::VcpuCreate);
+        };
 
         Ok(Self {
             vcpuid,
@@ -642,6 +695,96 @@ impl HvfVcpu<'_> {
         self.vcpuid
     }
 
+    pub fn destroy(self) -> Result<(), Error> {
+        if unsafe { hv_vcpu_destroy(self.vcpuid) } != HV_SUCCESS {
+            Err(Error::VcpuDestroy)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn probe_translation_ordering(&self) -> Result<TranslationOrderingProbe, Error> {
+        let mut midr = 0;
+        let midr_status = unsafe {
+            hv_vcpu_get_sys_reg(self.vcpuid, hv_sys_reg_t_HV_SYS_REG_MIDR_EL1, &mut midr)
+        };
+        if midr_status != HV_SUCCESS {
+            return Ok(TranslationOrderingProbe::Unsupported(
+                TranslationOrderingUnsupported::MidrRead {
+                    status: midr_status,
+                },
+            ));
+        }
+
+        let mut baseline = 0;
+        let baseline_status = unsafe {
+            hv_vcpu_get_sys_reg(
+                self.vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1,
+                &mut baseline,
+            )
+        };
+        if baseline_status != HV_SUCCESS {
+            return Ok(TranslationOrderingProbe::Unsupported(
+                TranslationOrderingUnsupported::ActlrRead {
+                    status: baseline_status,
+                },
+            ));
+        }
+
+        let toggled = baseline ^ ACTLR_EL1_ENTSO;
+        let toggle_status =
+            unsafe { hv_vcpu_set_sys_reg(self.vcpuid, hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1, toggled) };
+
+        let mut toggled_readback = 0;
+        let toggle_readback_status = if toggle_status == HV_SUCCESS {
+            unsafe {
+                hv_vcpu_get_sys_reg(
+                    self.vcpuid,
+                    hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1,
+                    &mut toggled_readback,
+                )
+            }
+        } else {
+            toggle_status
+        };
+        let restore_status = unsafe {
+            hv_vcpu_set_sys_reg(self.vcpuid, hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1, baseline)
+        };
+        let mut restored = 0;
+        let restored_readback_status = unsafe {
+            hv_vcpu_get_sys_reg(
+                self.vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1,
+                &mut restored,
+            )
+        };
+        if restore_status != HV_SUCCESS
+            || restored_readback_status != HV_SUCCESS
+            || restored != baseline
+        {
+            return Err(Error::VcpuTranslationOrderingRestore);
+        }
+        if toggle_status != HV_SUCCESS {
+            return Ok(TranslationOrderingProbe::Unsupported(
+                TranslationOrderingUnsupported::ToggleSet {
+                    status: toggle_status,
+                },
+            ));
+        }
+        if toggle_readback_status != HV_SUCCESS || toggled_readback != toggled {
+            return Ok(TranslationOrderingProbe::Unsupported(
+                TranslationOrderingUnsupported::ToggleRead {
+                    status: toggle_readback_status,
+                    expected: toggled,
+                    observed: toggled_readback,
+                },
+            ));
+        }
+
+        Ok(TranslationOrderingProbe::Supported { midr })
+    }
+
     fn read_reg(&self, reg: u32) -> Result<u64, Error> {
         let mut val: u64 = 0;
         let ret = unsafe { hv_vcpu_get_reg(self.vcpuid, reg, &mut val as *mut _) };
@@ -650,6 +793,15 @@ impl HvfVcpu<'_> {
         } else {
             Ok(val)
         }
+    }
+
+    fn invalid_memory_fault(&self, syndrome: u64) -> Result<Error, Error> {
+        self.read_reg(hv_reg_t_HV_REG_PC)
+            .map(|pc| Error::InvalidMemoryFault {
+                syndrome,
+                pc,
+                physical_address: self.vcpu_exit.exception.physical_address,
+            })
     }
 
     pub fn write_reg(&self, rt: u32, val: u64) -> Result<(), Error> {
@@ -820,16 +972,16 @@ impl HvfVcpu<'_> {
                     }
                 }
                 if !fault_address_is_valid(syndrome) {
-                    return Err(Error::InvalidMemoryFault);
+                    return Err(self.invalid_memory_fault(syndrome)?);
                 }
                 if entered_generation.is_some()
                     && reclaim_state
                         .contains_ram(pa)
                         .map_err(Error::ReclaimState)?
                 {
-                    return Err(Error::InvalidMemoryFault);
+                    return Err(self.invalid_memory_fault(syndrome)?);
                 }
-                Err(Error::InvalidMemoryFault)
+                Err(self.invalid_memory_fault(syndrome)?)
             }
             EC_DATAABORT | EC_DATAABORT_CURRENT => {
                 let pa = self.vcpu_exit.exception.physical_address;
@@ -848,16 +1000,18 @@ impl HvfVcpu<'_> {
                     }
                 }
                 if is_translation_fault(syndrome) && !fault_address_is_valid(syndrome) {
-                    return Err(Error::InvalidMemoryFault);
+                    return Err(self.invalid_memory_fault(syndrome)?);
                 }
                 if entered_generation.is_some()
                     && reclaim_state
                         .contains_ram(pa)
                         .map_err(Error::ReclaimState)?
                 {
-                    return Err(Error::InvalidMemoryFault);
+                    return Err(self.invalid_memory_fault(syndrome)?);
                 }
-                let access = decode_mmio_access(syndrome).ok_or(Error::InvalidMemoryFault)?;
+                let Some(access) = decode_mmio_access(syndrome) else {
+                    return Err(self.invalid_memory_fault(syndrome)?);
+                };
                 self.pending_advance_pc = true;
 
                 if access.is_write {
@@ -872,7 +1026,7 @@ impl HvfVcpu<'_> {
                         2 => self.mmio_buf[0..2].copy_from_slice(&(val as u16).to_le_bytes()),
                         4 => self.mmio_buf[0..4].copy_from_slice(&(val as u32).to_le_bytes()),
                         8 => self.mmio_buf[0..8].copy_from_slice(&val.to_le_bytes()),
-                        _ => return Err(Error::InvalidMemoryFault),
+                        _ => return Err(self.invalid_memory_fault(syndrome)?),
                     };
 
                     Ok(VcpuExit::MmioWrite(pa, &self.mmio_buf[0..access.len]))
@@ -899,42 +1053,30 @@ impl HvfVcpu<'_> {
                     sys_reg_name(reg).unwrap_or("unknown sysreg")
                 );
 
-                self.pending_advance_pc = true;
-
                 if isread {
-                    assert!(rt < 32);
-
                     // See https://developer.arm.com/documentation/dui0801/l/Overview-of-AArch64-state/Registers-in-AArch64-state
                     if rt == 31 {
+                        self.pending_advance_pc = true;
                         return Ok(VcpuExit::SystemRegister);
                     }
 
                     match vcpu_list.handle_sysreg_read(self.vcpuid, reg) {
                         Some(val) => {
                             self.write_reg(rt, val)?;
+                            self.pending_advance_pc = true;
                             Ok(VcpuExit::SystemRegister)
                         }
-                        None => panic!(
-                            "UNKNOWN rt={}, reg={} name={}",
-                            rt,
-                            reg,
-                            sys_reg_name(reg).unwrap_or("unknown sysreg")
-                        ),
+                        None => Err(Error::VcpuReadSystemRegister),
                     }
                 } else {
-                    assert!(rt < 32);
-
                     // See https://developer.arm.com/documentation/dui0801/l/Overview-of-AArch64-state/Registers-in-AArch64-state
                     let val = if rt == 31 { 0u64 } else { self.read_reg(rt)? };
 
                     if vcpu_list.handle_sysreg_write(self.vcpuid, reg, val) {
+                        self.pending_advance_pc = true;
                         Ok(VcpuExit::SystemRegister)
                     } else {
-                        panic!(
-                            "unexpected write: {} name={}",
-                            reg,
-                            sys_reg_name(reg).unwrap_or("unknown sysreg")
-                        );
+                        Err(Error::VcpuSetSystemRegister(reg as u16, val))
                     }
                 }
             }

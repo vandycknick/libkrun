@@ -50,6 +50,8 @@ pub struct DeviceRequirements {
     pub process_shareable_memory: bool,
     /// Whether this device requests qualified macOS stage-2 RAM reclaim.
     pub host_reclaim: bool,
+    /// Whether this device requires per-vCPU translation memory ordering.
+    pub translation_memory_ordering: bool,
     #[doc(hidden)]
     pub fs_tag: Option<String>,
 }
@@ -577,6 +579,7 @@ impl<'a> AttachDevice<'a> for RosettaFsDevice {
     fn requirements(&self) -> DeviceRequirements {
         DeviceRequirements {
             fs_tag: Some("rosetta".to_string()),
+            translation_memory_ordering: true,
             ..Default::default()
         }
     }

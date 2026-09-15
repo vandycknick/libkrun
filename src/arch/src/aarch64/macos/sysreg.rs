@@ -31,6 +31,10 @@ arm64_sys_reg!(
 
 arm64_sys_reg!(SYSREG_MDCCINT_EL1, 2, 0, 0, 0, 2);
 
+arm64_sys_reg!(SYSREG_MIDR_EL1, 3, 0, 0, 0, 0);
+arm64_sys_reg!(SYSREG_ACTLR_EL1, 3, 0, 1, 1, 0);
+arm64_sys_reg!(SYSREG_AIDR_EL1, 3, 1, 7, 0, 0);
+
 arm64_sys_reg!(SYSREG_OSLAR_EL1, 2, 0, 4, 1, 0);
 arm64_sys_reg!(SYSREG_OSDLR_EL1, 2, 0, 4, 1, 3);
 
@@ -78,6 +82,9 @@ pub const ICC_CTLR_EL1_PRI_BITS_SHIFT: u32 = 8;
 
 pub fn sys_reg_name(addr: u32) -> Option<&'static str> {
     match addr {
+        SYSREG_MIDR_EL1 => Some("SYSREG_MIDR_EL1"),
+        SYSREG_ACTLR_EL1 => Some("SYSREG_ACTLR_EL1"),
+        SYSREG_AIDR_EL1 => Some("SYSREG_AIDR_EL1"),
         SYSREG_ICC_IAR0_EL1 => Some("SYSREG_ICC_IAR0_EL1"),
         SYSREG_ICC_IAR1_EL1 => Some("SYSREG_ICC_IAR1_EL1"),
         SYSREG_ICC_EOIR0_EL1 => Some("SYSREG_ICC_EOIR0_EL1"),
@@ -143,4 +150,21 @@ pub fn is_id_sysreg(reg: u32) -> bool {
         && sysreg_crn(reg) == 0
         && sysreg_crm(reg) >= 1
         && sysreg_crm(reg) < 8
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::aarch64::macos::sysreg::{
+        SYSREG_ACTLR_EL1, SYSREG_AIDR_EL1, SYSREG_MIDR_EL1, sys_reg_name,
+    };
+
+    #[test]
+    fn translation_ordering_registers_use_architectural_encodings() {
+        assert_eq!(SYSREG_MIDR_EL1, 0x30_0000);
+        assert_eq!(SYSREG_ACTLR_EL1, 0x32_0400);
+        assert_eq!(SYSREG_AIDR_EL1, 0x3e_4000);
+        assert_eq!(sys_reg_name(SYSREG_MIDR_EL1), Some("SYSREG_MIDR_EL1"));
+        assert_eq!(sys_reg_name(SYSREG_ACTLR_EL1), Some("SYSREG_ACTLR_EL1"));
+        assert_eq!(sys_reg_name(SYSREG_AIDR_EL1), Some("SYSREG_AIDR_EL1"));
+    }
 }

@@ -716,10 +716,18 @@ pub fn build_microvm(
     #[cfg(target_os = "macos")]
     let host_reclaim = requirements.iter().any(|r| r.host_reclaim);
     #[cfg(target_os = "macos")]
+    let translation_memory_ordering = requirements.iter().any(|r| r.translation_memory_ordering);
+    #[cfg(target_os = "macos")]
     {
         if incompatible_host_reclaim_mapping(&requirements) {
             return Err(StartMicrovmError::AttachDevice(
                 "macOS host reclaim is incompatible with external or shared guest mappings"
+                    .to_string(),
+            ));
+        }
+        if translation_memory_ordering && vm_resources.nested_enabled {
+            return Err(StartMicrovmError::AttachDevice(
+                "translation memory ordering is not qualified with nested virtualization"
                     .to_string(),
             ));
         }
@@ -763,7 +771,11 @@ pub fn build_microvm(
         fw_range_for_mem,
     )?;
 
-    let vcpu_config = vm_resources.vcpu_config();
+    let mut vcpu_config = vm_resources.vcpu_config();
+    #[cfg(target_os = "macos")]
+    {
+        vcpu_config.translation_memory_ordering = translation_memory_ordering;
+    }
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
@@ -2203,6 +2215,8 @@ fn create_vcpus_aarch64(
             nested_enabled,
         )
         .map_err(Error::Vcpu)?;
+
+        vcpu.set_translation_memory_ordering(vcpu_config.translation_memory_ordering);
 
         vcpu.configure_aarch64(mem_info).map_err(Error::Vcpu)?;
 

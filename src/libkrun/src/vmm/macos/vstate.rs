@@ -22,7 +22,7 @@ use arch::guest_memory::{RamPermissions, RamRegion, ReclaimError, ReclaimLedger}
 use crossbeam_channel::{Receiver, Sender, after, select, unbounded};
 use devices::legacy::VcpuList;
 use hvf::reclaim::ReclaimState;
-use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
+use hvf::{HvfVcpu, HvfVm, TranslationOrderingProbe, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
@@ -62,6 +62,8 @@ pub enum Error {
     VcpuTlsInit,
     /// Vcpu not present in TLS.
     VcpuTlsNotPresent,
+    /// A vCPU thread panicked during startup cleanup.
+    VcpuThreadPanic,
     /// Unexpected KVM_RUN exit reason
     VcpuUnhandledKvmExit,
     /// Cannot configure the microvm.
@@ -94,6 +96,7 @@ impl Display for Error {
             VcpuSpawn(e) => write!(f, "Cannot spawn a new vCPU thread: {e}"),
             VcpuTlsInit => write!(f, "Cannot clean init vcpu TLS"),
             VcpuTlsNotPresent => write!(f, "Vcpu not present in TLS"),
+            VcpuThreadPanic => write!(f, "vCPU thread panicked during startup cleanup"),
             VcpuUnhandledKvmExit => write!(f, "Unexpected KVM_RUN exit reason"),
             VcpuArmPreferredTarget => write!(f, "Error getting the Vcpu preferred target on Arm"),
             VcpuArmInit => write!(f, "Error doing Vcpu Init on Arm"),
@@ -301,6 +304,8 @@ pub struct VcpuConfig {
     pub ht_enabled: bool,
     /// CPUID template to use.
     pub cpu_template: Option<CpuFeaturesTemplate>,
+    /// Request a qualified per-vCPU translation memory-ordering contract.
+    pub translation_memory_ordering: bool,
 }
 
 // Using this for easier explicit type-casting to help IDEs interpret the code.
@@ -331,6 +336,7 @@ pub struct Vcpu {
     vcpu_list: Arc<VcpuList>,
     reclaim_state: Arc<ReclaimState>,
     nested_enabled: bool,
+    translation_memory_ordering: bool,
 }
 
 impl Vcpu {
@@ -426,6 +432,7 @@ impl Vcpu {
             vcpu_list,
             reclaim_state,
             nested_enabled,
+            translation_memory_ordering: false,
         })
     }
 
@@ -441,6 +448,10 @@ impl Vcpu {
 
     pub fn reclaim_state(&self) -> &Arc<ReclaimState> {
         &self.reclaim_state
+    }
+
+    pub fn set_translation_memory_ordering(&mut self, enabled: bool) {
+        self.translation_memory_ordering = enabled;
     }
 
     /// Sets a MMIO bus for this vcpu.
@@ -468,26 +479,43 @@ impl Vcpu {
     pub fn start_threaded(mut self) -> Result<VcpuHandle> {
         let event_sender = self.event_sender.take().unwrap();
         let response_receiver = self.response_receiver.take().unwrap();
-        let (init_tls_sender, init_tls_receiver) = unbounded();
+        let (init_sender, init_receiver) = unbounded();
+        let vcpu_list = Arc::clone(&self.vcpu_list);
 
         let vcpu_thread = thread::Builder::new()
             .name(format!("fc_vcpu {}", self.cpu_index()))
             .spawn(move || {
-                self.init_thread_local_data()
-                    .expect("Cannot cleanly initialize vcpu TLS.");
-
-                self.run(init_tls_sender);
+                if let Err(error) = self.init_thread_local_data() {
+                    let _ = init_sender.send(Err(error));
+                    return;
+                }
+                self.run(init_sender);
             })
             .map_err(Error::VcpuSpawn)?;
 
-        let hvf_id = init_tls_receiver
-            .recv()
-            .expect("Error waiting for TLS initialization.");
+        let initialized = match init_receiver.recv() {
+            Ok(Ok(initialized)) => initialized,
+            Ok(Err(error)) => {
+                if vcpu_thread.join().is_err() {
+                    return Err(Error::VcpuThreadPanic);
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                if vcpu_thread.join().is_err() {
+                    return Err(Error::VcpuThreadPanic);
+                }
+                return Err(Error::VcpuChannelClosed);
+            }
+        };
 
         Ok(VcpuHandle::new(
             event_sender,
             response_receiver,
-            hvf_id,
+            initialized.hvf_id,
+            initialized.translation_ordering_requested,
+            initialized.translation_ordering,
+            vcpu_list,
             vcpu_thread,
         ))
     }
@@ -577,36 +605,106 @@ impl Vcpu {
     }
 
     /// Main loop of the vCPU thread.
-    pub fn run(&mut self, init_tls_sender: Sender<u64>) {
-        let mut hvf_vcpu =
-            HvfVcpu::new(self.mpidr, self.nested_enabled).expect("Can't create HVF vCPU");
+    fn run(&mut self, init_sender: Sender<Result<VcpuInitialization>>) {
+        let mut hvf_vcpu = match HvfVcpu::new(self.mpidr, self.nested_enabled) {
+            Ok(vcpu) => vcpu,
+            Err(error) => {
+                let _ = init_sender.send(Err(Error::VmSetup(error)));
+                return;
+            }
+        };
         let hvf_vcpuid = hvf_vcpu.id();
+
+        let translation_ordering = if self.translation_memory_ordering {
+            match hvf_vcpu.probe_translation_ordering() {
+                Ok(probe) => probe,
+                Err(error) => {
+                    if let Err(cleanup_error) = hvf_vcpu.destroy() {
+                        error!(
+                            "failed to destroy HVF vCPU after unsafe translation ordering probe: {cleanup_error:?}"
+                        );
+                    }
+                    let _ = init_sender.send(Err(Error::VmSetup(error)));
+                    return;
+                }
+            }
+        } else {
+            TranslationOrderingProbe::NotRequested
+        };
 
         // Report the HVF-assigned vCPU id (creation order is not deterministic)
         // so the coordinator can break this vCPU out of HVF to pause it.
-        init_tls_sender
-            .send(hvf_vcpuid)
-            .expect("Cannot notify vcpu TLS initialization.");
+        if init_sender
+            .send(Ok(VcpuInitialization {
+                hvf_id: hvf_vcpuid,
+                translation_ordering_requested: self.translation_memory_ordering,
+                translation_ordering,
+            }))
+            .is_err()
+        {
+            if let Err(error) = hvf_vcpu.destroy() {
+                error!("failed to destroy HVF vCPU after startup cancellation: {error:?}");
+            }
+            return;
+        }
+
+        match self.event_receiver.recv() {
+            Ok(VcpuEvent::Start) => {}
+            _ => {
+                if let Err(error) = hvf_vcpu.destroy() {
+                    error!("failed to destroy HVF vCPU after startup cancellation: {error:?}");
+                }
+                return;
+            }
+        }
 
         let (wfe_sender, wfe_receiver) = unbounded();
         self.vcpu_list.register(hvf_vcpuid, wfe_sender);
 
         let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
-            boot_receiver.recv().unwrap()
+            loop {
+                select! {
+                    recv(boot_receiver) -> entry => match entry {
+                        Ok(entry) => break entry,
+                        Err(_) => {
+                            if let Err(error) = hvf_vcpu.destroy() {
+                                error!("failed to destroy HVF vCPU after boot channel closure: {error:?}");
+                            }
+                            return;
+                        }
+                    },
+                    recv(self.event_receiver) -> event => match event {
+                        Ok(VcpuEvent::Exit) | Err(_) => {
+                            if let Err(error) = hvf_vcpu.destroy() {
+                                error!("failed to destroy HVF vCPU after startup cancellation: {error:?}");
+                            }
+                            return;
+                        }
+                        _ => continue,
+                    },
+                }
+            }
         } else {
             self.boot_entry_addr
         };
 
-        hvf_vcpu
-            .set_initial_state(entry_addr, self.fdt_addr)
-            .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+        if let Err(error) = hvf_vcpu.set_initial_state(entry_addr, self.fdt_addr) {
+            error!("failed to initialize HVF vCPU {hvf_vcpuid}: {error:?}");
+            self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+            if let Err(error) = hvf_vcpu.destroy() {
+                error!("failed to destroy uninitialized HVF vCPU: {error:?}");
+            }
+            return;
+        }
 
         loop {
             // An out-of-band pause request breaks the vCPU out of HVF via
             // `vcpu_request_exit` (-> Canceled), so we observe it here between
             // guest runs and freeze on this thread, where the HvfVcpu lives.
-            if let Ok(VcpuEvent::Pause) = self.event_receiver.try_recv() {
-                self.pause_and_park(&hvf_vcpu);
+            match self.event_receiver.try_recv() {
+                Ok(VcpuEvent::Exit) => break,
+                Ok(VcpuEvent::Pause) if self.pause_and_park(&hvf_vcpu) => break,
+                _ => {}
             }
             match self.run_emulation(&mut hvf_vcpu) {
                 // Emulation ran successfully, continue.
@@ -615,11 +713,15 @@ impl Vcpu {
                 Ok(VcpuEmulation::Interrupted) => self.wait_for_resume(),
                 // Wait for an external event.
                 Ok(VcpuEmulation::WaitForEvent) => {
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, None, &hvf_vcpu)
+                    if self.wait_for_event(hvf_vcpuid, &wfe_receiver, None, &hvf_vcpu) {
+                        break;
+                    }
                 }
                 Ok(VcpuEmulation::WaitForEventExpired) => (),
                 Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu)
+                    if self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu) {
+                        break;
+                    }
                 }
                 // The guest was rebooted or halted.
                 Ok(VcpuEmulation::Stopped) => {
@@ -632,6 +734,9 @@ impl Vcpu {
                     break;
                 }
             }
+        }
+        if let Err(error) = hvf_vcpu.destroy() {
+            error!("failed to destroy HVF vCPU after exit: {error:?}");
         }
     }
 
@@ -646,24 +751,26 @@ impl Vcpu {
         receiver: &Receiver<u32>,
         timeout: Option<Duration>,
         hvf_vcpu: &HvfVcpu,
-    ) {
+    ) -> bool {
         if !self.vcpu_list.should_wait(hvf_vcpuid) {
-            return;
+            return false;
         }
-        let paused = if let Some(timeout) = timeout {
+        let event = if let Some(timeout) = timeout {
             select! {
-                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); false }
-                recv(self.event_receiver) -> ev => matches!(ev, Ok(VcpuEvent::Pause)),
-                recv(after(timeout)) -> _ => false,
+                recv(receiver) -> _ => None,
+                recv(self.event_receiver) -> event => event.ok(),
+                recv(after(timeout)) -> _ => None,
             }
         } else {
             select! {
-                recv(receiver) -> r => { r.expect("WFE channel closed unexpectedly"); false }
-                recv(self.event_receiver) -> ev => matches!(ev, Ok(VcpuEvent::Pause)),
+                recv(receiver) -> _ => None,
+                recv(self.event_receiver) -> event => event.ok(),
             }
         };
-        if paused {
-            self.pause_and_park(hvf_vcpu);
+        match event {
+            Some(VcpuEvent::Exit) => true,
+            Some(VcpuEvent::Pause) => self.pause_and_park(hvf_vcpu),
+            _ => false,
         }
     }
 
@@ -674,10 +781,10 @@ impl Vcpu {
     /// keeps the guest's CNTVCT continuous so armed timers don't fire en masse
     /// to catch up the gap. The coordinator computes the tick count once for the
     /// whole VM, so multi-vCPU offsets stay in lockstep.
-    fn pause_and_park(&mut self, hvf_vcpu: &HvfVcpu) {
-        self.response_sender
-            .send(VcpuResponse::Paused)
-            .expect("failed to send Paused status");
+    fn pause_and_park(&mut self, hvf_vcpu: &HvfVcpu) -> bool {
+        if self.response_sender.send(VcpuResponse::Paused).is_err() {
+            return true;
+        }
         loop {
             match self.event_receiver.recv() {
                 Ok(VcpuEvent::Resume(paused_ticks)) => {
@@ -686,13 +793,14 @@ impl Vcpu {
                         .unwrap_or_else(|e| {
                             panic!("vCPU {} vtimer advance failed: {e:?}", self.id)
                         });
-                    self.response_sender
-                        .send(VcpuResponse::Resumed)
-                        .expect("failed to send Resumed status");
-                    return;
+                    if self.response_sender.send(VcpuResponse::Resumed).is_err() {
+                        return true;
+                    }
+                    return false;
                 }
+                Ok(VcpuEvent::Exit) => return true,
                 Ok(_) => {}
-                Err(_) => return,
+                Err(_) => return true,
             }
         }
     }
@@ -717,6 +825,10 @@ impl Drop for Vcpu {
 #[derive(Debug)]
 /// List of events that the Vcpu can receive.
 pub enum VcpuEvent {
+    /// Start this vCPU after VM-wide initialization has completed.
+    Start,
+    /// Abort a vCPU parked during VM-wide initialization.
+    Exit,
     /// Pause the Vcpu.
     Pause,
     /// Resume the Vcpu, advancing its vtimer offset by this many host ticks
@@ -741,6 +853,16 @@ pub struct VcpuHandle {
     event_sender: Sender<VcpuEvent>,
     response_receiver: Receiver<VcpuResponse>,
     hvf_id: u64,
+    translation_ordering: TranslationOrderingProbe,
+    translation_ordering_requested: bool,
+    vcpu_list: Arc<VcpuList>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+struct VcpuInitialization {
+    hvf_id: u64,
+    translation_ordering_requested: bool,
+    translation_ordering: TranslationOrderingProbe,
 }
 
 impl VcpuHandle {
@@ -748,12 +870,19 @@ impl VcpuHandle {
         event_sender: Sender<VcpuEvent>,
         response_receiver: Receiver<VcpuResponse>,
         hvf_id: u64,
-        _vcpu_thread: thread::JoinHandle<()>,
+        translation_ordering_requested: bool,
+        translation_ordering: TranslationOrderingProbe,
+        vcpu_list: Arc<VcpuList>,
+        vcpu_thread: thread::JoinHandle<()>,
     ) -> Self {
         Self {
             event_sender,
             response_receiver,
             hvf_id,
+            translation_ordering_requested,
+            translation_ordering,
+            vcpu_list,
+            thread: Some(vcpu_thread),
         }
     }
 
@@ -761,6 +890,37 @@ impl VcpuHandle {
     /// vCPU out of HVF (`vcpu_request_exit`) when pausing.
     pub fn hvf_id(&self) -> u64 {
         self.hvf_id
+    }
+
+    pub fn translation_ordering_probe(&self) -> TranslationOrderingProbe {
+        self.translation_ordering
+    }
+
+    pub fn translation_ordering_requested(&self) -> bool {
+        self.translation_ordering_requested
+    }
+
+    pub fn vcpu_list(&self) -> &Arc<VcpuList> {
+        &self.vcpu_list
+    }
+
+    pub fn request_stop(&self) {
+        let _ = self.event_sender.send(VcpuEvent::Exit);
+        if let Err(error) = hvf::vcpu_request_exit(self.hvf_id) {
+            debug!(
+                "vCPU {} was not running during startup abort: {error:?}",
+                self.hvf_id
+            );
+        }
+    }
+
+    pub fn join_startup(mut self) -> Result<()> {
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            return Err(Error::VcpuThreadPanic);
+        }
+        Ok(())
     }
 
     pub fn send_event(&self, event: VcpuEvent) -> Result<()> {
