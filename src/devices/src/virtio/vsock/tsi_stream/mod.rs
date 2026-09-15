@@ -17,7 +17,9 @@ use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use super::proxy::{Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
+use super::proxy::{
+    DeferredCredit, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
+};
 use crate::virtio::RuntimeGuestMemory;
 use utils::epoll::EventSet;
 
@@ -52,6 +54,7 @@ pub struct TsiStreamProxy {
     pub(crate) push_cnt: Wrapping<u32>,
     pub(crate) pending_accepts: u64,
     pub(crate) unixsock_path: Option<PathBuf>,
+    pub(crate) deferred_credit: DeferredCredit,
 }
 
 impl TsiStreamProxy {
@@ -90,6 +93,7 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
+            deferred_credit: DeferredCredit::default(),
         })
     }
 
@@ -128,6 +132,7 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
+            deferred_credit: DeferredCredit::default(),
         }
     }
 
@@ -237,6 +242,22 @@ impl Proxy for TsiStreamProxy {
 
     fn status(&self) -> ProxyStatus {
         self.status
+    }
+
+    fn defer_credit(&mut self, credit: Box<MuxerRx>) -> Result<(), Box<MuxerRx>> {
+        self.deferred_credit.push(credit, self.tx_cnt.0)
+    }
+
+    fn pop_deferred_credit(&mut self) -> Option<Box<MuxerRx>> {
+        self.deferred_credit.pop(self.tx_cnt.0)
+    }
+
+    fn disable_deferred_credit(&mut self) {
+        self.deferred_credit.disable();
+    }
+
+    fn deferred_credit_enabled(&self) -> bool {
+        self.deferred_credit.is_enabled()
     }
 
     fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
