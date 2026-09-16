@@ -14,6 +14,24 @@ until their virtqueue chain is acknowledged. The host may discard their contents
 during that interval. It must not replay old reports after acknowledgement:
 those pages may already contain live guest allocations or device buffers.
 
+## Automatic capabilities and terminology
+
+Attaching `BalloonDevice::new()` requests reporting qualification automatically.
+There is no additional `host_reclaim(true)` builder call. On macOS the reporting
+feature is initially absent and is advertised only after successful qualification
+of private anonymous RAM with guest EL2 disabled. Failed/inconclusive probes,
+nested guests, and incompatible providers retain the basic balloon without
+reporting. Unrelated balloon features are preserved. Probe cleanup failures
+remain fatal when safe VM reuse cannot be established.
+
+`FreePageReporter` names the guest-kernel/device protocol. `HostMemoryReclaimer`
+is the report-driven HVF release implementation (`ReclaimState`).
+`HostMemoryRemapper` is independent host mapping maintenance.
+`GuestCacheReclaimer` is an optional guest-agent policy outside libkrun, not a
+consequence of attaching the balloon. Silo's macOS target is 26+; this work adds
+no older-version private-trap route and preserves the existing RAM provider and
+stock virtio protocol.
+
 ## Release path
 
 For each validated, coalesced range of private anonymous workload RAM:
@@ -73,8 +91,11 @@ using same-address `mach_vm_remap(copy=false, VM_FLAGS_FIXED | VM_FLAGS_OVERWRIT
 This shares the existing backing object; it is not anonymous backing replacement,
 zeroing, or a replay of old free-page reports. The owner of guest RAM remains alive
 throughout the operation. No detached maintenance thread or status reader owns
-this responsibility. Reclaim-off, unqualified and disabled VMs do not schedule it;
-a normalization failure is fatal rather than continuing with uncertain mappings.
+this responsibility. Compatible memory setup creates HostMemoryRemapper even
+without a balloon, with failed reporting qualification, or with guest EL2.
+External/shared providers are excluded. A normalization failure is fatal rather
+than continuing with uncertain mappings, deliberately stricter than OrbStack's
+recovered timer retry policy.
 
 Host accesses, including virtio block reads into guest RAM, populate host PTEs
 whose footprint charge can survive successful page-wise advice. Normalization
@@ -82,12 +103,13 @@ removes those translations and their accounting; later host accesses fault them
 back in. Guest mappings and live data are preserved. This is distinct from
 physical discard: clean backing may remain resident until pressure.
 
-Use only the 30-second maintenance cadence, independent of report arrival or
-status polling. This amortizes normalization work without adding another timer
-to each report. The free-page report cycle and backing allocation sizes remain
-unchanged. The event-loop wait accounts for the next maintenance deadline even
-when no device events arrive, rounding up sub-millisecond waits to avoid busy
-polling.
+Arm the first periodic pass for 30 seconds after memory setup. Report processing
+prepares mappings before discard: at least 250 ms after the last successful pass,
+run immediately; otherwise bring the timer forward to that boundary without
+postponing an earlier deadline. Successful passes arm another 30-second deadline.
+No reported ranges are retained by the scheduler. The event-loop wait accounts
+for the next deadline even without device events and rounds up sub-millisecond
+waits to avoid busy polling. Teardown leaves no detached timer callback.
 
 ## Qualification and accounting
 

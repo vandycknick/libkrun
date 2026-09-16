@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use arch::guest_memory::GuestRange;
 #[cfg(target_os = "macos")]
 use hvf::reclaim::{ReclaimState, ReleaseOutcome};
+#[cfg(target_os = "macos")]
+use hvf::remap::HostMemoryRemapper;
 use utils::eventfd::EventFd;
 #[cfg(target_os = "macos")]
 use vm_memory::Address;
@@ -41,6 +43,14 @@ pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_F_VERSION_1 as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_FREE_PAGE_HINT as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_REPORTING as u64);
 
+fn reporting_features(enabled: bool) -> u64 {
+    if enabled {
+        AVAIL_FEATURES
+    } else {
+        AVAIL_FEATURES & !(1 << uapi::VIRTIO_BALLOON_F_REPORTING)
+    }
+}
+
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C, packed)]
 pub struct VirtioBalloonConfig {
@@ -67,6 +77,8 @@ pub struct Balloon {
     #[cfg(target_os = "macos")]
     reclaim_state: Option<Arc<ReclaimState>>,
     #[cfg(target_os = "macos")]
+    host_memory_remapper: Option<Arc<HostMemoryRemapper>>,
+    #[cfg(target_os = "macos")]
     failure_signal: Option<(EventFd, Arc<AtomicI32>)>,
 }
 
@@ -74,7 +86,7 @@ impl Balloon {
     pub fn new() -> super::Result<Balloon> {
         Ok(Balloon {
             queues: None,
-            avail_features: AVAIL_FEATURES,
+            avail_features: reporting_features(!cfg!(target_os = "macos")),
             acked_features: 0,
             activate_evt: EventFd::new(utils::eventfd::EFD_NONBLOCK)
                 .map_err(BalloonError::EventFd)?,
@@ -83,13 +95,21 @@ impl Balloon {
             #[cfg(target_os = "macos")]
             reclaim_state: None,
             #[cfg(target_os = "macos")]
+            host_memory_remapper: None,
+            #[cfg(target_os = "macos")]
             failure_signal: None,
         })
     }
 
     #[cfg(target_os = "macos")]
     pub fn set_reclaim_state(&mut self, state: Arc<ReclaimState>) {
+        self.avail_features = reporting_features(state.is_effective());
         self.reclaim_state = Some(state);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_host_memory_remapper(&mut self, remapper: Option<Arc<HostMemoryRemapper>>) {
+        self.host_memory_remapper = remapper;
     }
 
     #[cfg(target_os = "macos")]
@@ -135,6 +155,8 @@ impl Balloon {
             .as_mut()
             .expect("queues should exist when activated");
         let mut have_used = false;
+        #[cfg(target_os = "macos")]
+        let mut prepared = false;
 
         while let Some(head) = queues[FRQ_INDEX].queue.pop(mem) {
             let index = head.index;
@@ -196,6 +218,11 @@ impl Balloon {
             // retain its ranges for release after add_used returns them.
             #[cfg(target_os = "macos")]
             if let Some(state) = &self.reclaim_state {
+                if !prepared && let Some(remapper) = &self.host_memory_remapper {
+                    // The active VMM owns the registered RAM throughout this callback.
+                    unsafe { remapper.before_reports() }.map_err(|error| error.to_string())?;
+                    prepared = true;
+                }
                 for range in coalesce_free_page_ranges(&descriptors) {
                     debug!(
                         "balloon: free report guest_addr={:#x} len={}",
@@ -362,7 +389,7 @@ mod tests {
     fn free_page_ranges_coalesce_adjacent_descriptors_in_any_order() {
         use vm_memory::GuestAddress;
 
-        use super::coalesce_free_page_ranges;
+        use crate::virtio::balloon::device::coalesce_free_page_ranges;
 
         let mib = 2 * 1024 * 1024;
         let runs = coalesce_free_page_ranges(&[
@@ -378,6 +405,32 @@ mod tests {
             .map(|range| (range.start(), range.byte_len()))
             .collect();
         assert_eq!(spans, vec![(0, 2 * mib), (4 * mib, 2 * mib)]);
+    }
+
+    #[test]
+    fn reporting_selection_preserves_unrelated_features() {
+        use crate::virtio::balloon::device::{AVAIL_FEATURES, reporting_features};
+        let reporting = 1 << uapi::VIRTIO_BALLOON_F_REPORTING;
+        assert_eq!(reporting_features(true), AVAIL_FEATURES);
+        assert_eq!(reporting_features(false), AVAIL_FEATURES & !reporting);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unqualified_balloon_does_not_advertise_reporting() {
+        use hvf::reclaim::ReclaimState;
+        use std::sync::Arc;
+        let mut balloon = Balloon::new().unwrap();
+        let reporting = 1 << uapi::VIRTIO_BALLOON_F_REPORTING;
+        assert_eq!(balloon.avail_features() & reporting, 0);
+        let state = Arc::new(ReclaimState::new());
+        state.set_policy_enabled(true);
+        balloon.set_reclaim_state(state);
+        assert_eq!(balloon.avail_features() & reporting, 0);
+        assert_ne!(
+            balloon.avail_features() & (1 << uapi::VIRTIO_BALLOON_F_STATS_VQ),
+            0
+        );
     }
 
     #[test]

@@ -2,8 +2,6 @@ use std::marker::PhantomData;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
-#[cfg(target_os = "macos")]
-use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use crate::vmm::VmCtl;
@@ -22,19 +20,6 @@ use utils::pollable_channel::PollableChannelSender;
 use crate::api::device_builders::{DeviceManager, MmioDeviceManager};
 use crate::api::error::VmmError;
 use crate::api::payload::Payload;
-
-#[cfg(target_os = "macos")]
-const HOST_MAPPING_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
-
-#[cfg(target_os = "macos")]
-fn host_mapping_maintenance_timeout(effective: bool, elapsed: Duration) -> i32 {
-    if !effective {
-        return -1;
-    }
-    let remaining = HOST_MAPPING_MAINTENANCE_INTERVAL.saturating_sub(elapsed);
-    // Round up: a sub-millisecond remainder must not turn into a busy poll.
-    remaining.as_nanos().div_ceil(1_000_000).min(30_000) as i32
-}
 
 #[derive(Default)]
 pub struct VmmBuilder<'a> {
@@ -340,21 +325,28 @@ impl<'a> Vmm<'a> {
                 ..
             } => {
                 #[cfg(target_os = "macos")]
-                let reclaim = match vmm.lock() {
-                    Ok(inner) => inner.vm.reclaim_state(),
+                let remapper = match vmm.lock() {
+                    Ok(inner) => inner.vm.host_memory_remapper(),
                     Err(error) => {
                         log::error!("cannot initialize host mapping maintenance: {error}");
                         return;
                     }
                 };
-                #[cfg(target_os = "macos")]
-                let mut last_maintenance = Instant::now();
                 loop {
                     #[cfg(target_os = "macos")]
-                    let result = event_manager.run_with_timeout(host_mapping_maintenance_timeout(
-                        reclaim.is_effective(),
-                        last_maintenance.elapsed(),
-                    ));
+                    let timeout = match remapper
+                        .as_ref()
+                        .map(|worker| worker.timeout_millis())
+                        .transpose()
+                    {
+                        Ok(timeout) => timeout.unwrap_or(-1),
+                        Err(error) => {
+                            log::error!("fatal HostMemoryRemapper error: {error}");
+                            return;
+                        }
+                    };
+                    #[cfg(target_os = "macos")]
+                    let result = event_manager.run_with_timeout(timeout);
                     #[cfg(not(target_os = "macos"))]
                     let result = event_manager.run();
                     if let Err(e) = result {
@@ -362,18 +354,12 @@ impl<'a> Vmm<'a> {
                         return;
                     }
                     #[cfg(target_os = "macos")]
-                    if reclaim.is_effective()
-                        && last_maintenance.elapsed() >= HOST_MAPPING_MAINTENANCE_INTERVAL
-                    {
-                        let started = Instant::now();
+                    if let Some(remapper) = &remapper {
                         // This scope retains the owning VMM and its guest_memory.
-                        // Do not move maintenance onto an unowned status handle.
-                        if let Err(error) = unsafe { reclaim.normalize_host_mappings() } {
-                            log::error!("fatal host mapping maintenance error: {error}");
+                        if let Err(error) = unsafe { remapper.poll() } {
+                            log::error!("fatal HostMemoryRemapper error: {error}");
                             return;
                         }
-                        last_maintenance = Instant::now();
-                        log::debug!("normalized host RAM mappings in {:?}", started.elapsed());
                     }
                 }
             }
@@ -579,25 +565,4 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         },
         _lifetime: PhantomData,
     })
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
-    use std::time::Duration;
-
-    use crate::api::vmm_builder::host_mapping_maintenance_timeout;
-
-    #[test]
-    fn host_mapping_timeout_is_bounded_and_rounds_up() {
-        for (elapsed, expected) in [
-            (Duration::ZERO, 30_000),
-            (Duration::from_secs(10), 20_000),
-            (Duration::from_secs(30) - Duration::from_nanos(1), 1),
-            (Duration::from_secs(30), 0),
-            (Duration::from_secs(60), 0),
-        ] {
-            assert_eq!(host_mapping_maintenance_timeout(true, elapsed), expected);
-            assert_eq!(host_mapping_maintenance_timeout(false, elapsed), -1);
-        }
-    }
 }

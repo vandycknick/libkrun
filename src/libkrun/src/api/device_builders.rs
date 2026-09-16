@@ -1038,7 +1038,6 @@ impl<'a> AttachDevice<'a> for ConsoleDevice<'a> {
 #[cfg(not(feature = "tee"))]
 pub struct BalloonDevice {
     pub(crate) inner: Arc<Mutex<devices::virtio::Balloon>>,
-    host_reclaim: bool,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "not(feature = \"tee\")"))]
@@ -1049,13 +1048,7 @@ impl BalloonDevice {
             .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(balloon)),
-            host_reclaim: false,
         })
-    }
-
-    pub fn host_reclaim(mut self, enabled: bool) -> Self {
-        self.host_reclaim = enabled;
-        self
     }
 }
 
@@ -1064,7 +1057,7 @@ impl BalloonDevice {
 impl<'a> AttachDevice<'a> for BalloonDevice {
     fn requirements(&self) -> DeviceRequirements {
         DeviceRequirements {
-            host_reclaim: self.host_reclaim,
+            host_reclaim: true,
             ..DeviceRequirements::default()
         }
     }
@@ -1084,6 +1077,7 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
                 .lock()
                 .map_err(|_| VmmError::Internal("balloon lock poisoned".to_string()))?;
             balloon.set_reclaim_state(reclaim_state);
+            balloon.set_host_memory_remapper(ctx.vmm.vm.host_memory_remapper());
             balloon.set_failure_signal(failure_event, ctx.exit_code().clone());
         }
         ctx.subscribe_events(self.inner.clone())?;
@@ -1884,12 +1878,9 @@ mod tests {
     use crate::api::error::VmmError;
 
     #[test]
-    fn balloon_host_reclaim_is_explicit_and_default_off() {
-        let default = BalloonDevice::new().unwrap();
-        assert!(!default.requirements().host_reclaim);
-
-        let requested = BalloonDevice::new().unwrap().host_reclaim(true);
-        assert!(requested.requirements().host_reclaim);
+    fn balloon_automatically_requests_reporting_qualification() {
+        let balloon = BalloonDevice::new().unwrap();
+        assert!(balloon.requirements().host_reclaim);
     }
 
     #[test]

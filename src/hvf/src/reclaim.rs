@@ -82,6 +82,7 @@ pub enum ReclaimStateError {
     ReleaseUnmap,
     RestoreMap,
     NormalizeMapping(i32),
+    RemapperLockPoisoned,
     TransitionTimeout,
     ExtentLost,
 }
@@ -102,6 +103,7 @@ impl Display for ReclaimStateError {
                     "failed to normalize host RAM mappings: Mach error {code}"
                 )
             }
+            Self::RemapperLockPoisoned => write!(f, "host memory remapper lock poisoned"),
             Self::TransitionTimeout => {
                 write!(
                     f,
@@ -301,7 +303,7 @@ impl ReclaimState {
     /// The caller must keep every registered RAM allocation alive throughout
     /// this call. A retained ReclaimState alone does not own those allocations.
     pub unsafe fn normalize_host_mappings(&self) -> Result<(), ReclaimStateError> {
-        if !self.is_effective() {
+        if !self.is_eligible() {
             return Ok(());
         }
         let Some(map) = self.map.get() else {
@@ -350,7 +352,7 @@ impl ReclaimState {
             .is_some_and(|map| map.layout.has_registered_regions())
     }
 
-    /// Whether new reports may be advised free and host mappings normalized.
+    /// Whether new reports may be advised free. HostMemoryRemapper is independent.
     /// Fault classification remains active for registered RAM even when false:
     /// earlier transitions still need recovery or detection of lost mappings.
     pub fn is_effective(&self) -> bool {

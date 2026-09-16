@@ -12,6 +12,7 @@ mod discard;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 mod probe;
 pub mod reclaim;
+pub mod remap;
 
 #[macro_use]
 extern crate log;

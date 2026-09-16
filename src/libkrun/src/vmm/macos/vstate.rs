@@ -107,6 +107,7 @@ pub type Result<T> = result::Result<T, Error>;
 /// A wrapper around creating and using a VM.
 pub struct Vm {
     hvf_vm: HvfVm,
+    remapper: Option<Arc<hvf::remap::HostMemoryRemapper>>,
 }
 
 impl Vm {
@@ -114,7 +115,10 @@ impl Vm {
     pub fn new(nested_enabled: bool) -> Result<Self> {
         let hvf_vm = HvfVm::new(nested_enabled).map_err(Error::VmSetup)?;
 
-        Ok(Vm { hvf_vm })
+        Ok(Vm {
+            hvf_vm,
+            remapper: None,
+        })
     }
 
     /// Initializes the guest memory.
@@ -144,7 +148,13 @@ impl Vm {
 
         self.hvf_vm
             .initialize_reclaim(reclaim_layout)
-            .map_err(Error::VmSetup)
+            .map_err(Error::VmSetup)?;
+        self.remapper = hvf::remap::HostMemoryRemapper::new(self.reclaim_state()).map(Arc::new);
+        Ok(())
+    }
+
+    pub fn host_memory_remapper(&self) -> Option<Arc<hvf::remap::HostMemoryRemapper>> {
+        self.remapper.clone()
     }
 
     fn rollback_memory_mappings(&self, mapped: &[(u64, u64)]) -> Result<()> {

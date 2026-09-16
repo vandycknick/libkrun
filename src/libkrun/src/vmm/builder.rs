@@ -679,10 +679,7 @@ fn measure_qboot_regions(
 fn incompatible_host_reclaim_mapping(
     requirements: &[crate::api::device_builders::DeviceRequirements],
 ) -> bool {
-    let host_reclaim = requirements
-        .iter()
-        .any(|requirement| requirement.host_reclaim);
-    let external_mapping = requirements.iter().any(|requirement| {
+    requirements.iter().any(|requirement| {
         requirement.process_shareable_memory || requirement.shm_size.is_some() || {
             #[cfg(feature = "gpu")]
             {
@@ -693,8 +690,7 @@ fn incompatible_host_reclaim_mapping(
                 false
             }
         }
-    });
-    host_reclaim && external_mapping
+    })
 }
 
 pub fn build_microvm(
@@ -716,13 +712,12 @@ pub fn build_microvm(
     #[cfg(target_os = "macos")]
     let host_reclaim = requirements.iter().any(|r| r.host_reclaim);
     #[cfg(target_os = "macos")]
-    {
-        if incompatible_host_reclaim_mapping(&requirements) {
-            return Err(StartMicrovmError::AttachDevice(
-                "macOS host reclaim is incompatible with external or shared guest mappings"
-                    .to_string(),
-            ));
-        }
+    let private_ram_compatible = !incompatible_host_reclaim_mapping(&requirements);
+    #[cfg(target_os = "macos")]
+    if !private_ram_compatible {
+        log::info!(
+            "HostMemoryReclaimer and HostMemoryRemapper unavailable: external/shared RAM mappings"
+        );
     }
 
     #[cfg(feature = "tdx")]
@@ -837,6 +832,7 @@ pub fn build_microvm(
         &arch_memory_info,
         vm_resources.nested_enabled,
         host_reclaim,
+        private_ram_compatible,
     )?;
 
     #[cfg(feature = "tee")]
@@ -1994,10 +1990,19 @@ pub(crate) fn setup_vm(
     arch_memory_info: &ArchMemoryInfo,
     nested_enabled: bool,
     host_reclaim: bool,
+    private_ram_compatible: bool,
 ) -> std::result::Result<Vm, StartMicrovmError> {
     let reclaim_layout = build_reclaim_layout(guest_memory, arch_memory_info)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
+    let reclaim_layout = if private_ram_compatible {
+        reclaim_layout
+    } else {
+        arch::guest_memory::RamLayout::new(reclaim_layout.granule())
+            .map_err(crate::vmm::vstate::Error::ReclaimLayout)
+            .map_err(Error::Vm)
+            .map_err(StartMicrovmError::Internal)?
+    };
     let mut vm = Vm::new(nested_enabled)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
@@ -2394,7 +2399,7 @@ pub mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn host_reclaim_rejects_external_and_shared_mappings() {
+    fn host_memory_capabilities_exclude_external_and_shared_mappings() {
         use crate::api::device_builders::DeviceRequirements;
 
         let reclaim = DeviceRequirements {
@@ -2410,6 +2415,9 @@ pub mod tests {
             ..DeviceRequirements::default()
         };
 
+        assert!(incompatible_host_reclaim_mapping(std::slice::from_ref(
+            &external
+        )));
         assert!(incompatible_host_reclaim_mapping(&[reclaim, external]));
         assert!(incompatible_host_reclaim_mapping(&[
             DeviceRequirements {
@@ -2437,8 +2445,14 @@ pub mod tests {
         let expected = [0xa5_u8; 0x4000];
         guest_memory.write(&expected, address).unwrap();
 
-        let vm = setup_vm(&guest_memory, &arch_memory_info, false, true).unwrap();
+        let vm = setup_vm(&guest_memory, &arch_memory_info, false, true, true).unwrap();
         let qualification = vm.reclaim_state().qualification();
+        {
+            use devices::virtio::{Balloon, VirtioDevice};
+            let mut balloon = Balloon::new().unwrap();
+            balloon.set_reclaim_state(vm.reclaim_state());
+            assert_ne!(balloon.avail_features() & (1 << 5), 0);
+        }
         let mut actual = [0_u8; 0x4000];
         guest_memory.read(&mut actual, address).unwrap();
         let destroy = vm.destroy();
@@ -2453,6 +2467,75 @@ pub mod tests {
         assert!(destroy.is_ok());
         assert_eq!(qualification, ReclaimQualification::Passed);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[ignore = "requires an isolated code-signed process with Hypervisor entitlement"]
+    fn real_hvf_remapper_without_balloon_preserves_live_memory() {
+        use vm_memory::Bytes;
+        let (memory, info, _, _) = default_guest_memory(128).unwrap();
+        let address = GuestAddress(info.ram_start_addr);
+        let expected = [0x5a_u8; 0x4000];
+        memory.write(&expected, address).unwrap();
+        let vm = setup_vm(&memory, &info, false, false, true).unwrap();
+        assert!(!vm.reclaim_state().is_effective());
+        let remapper = vm.host_memory_remapper().expect("independent remapper");
+        assert!((1..=30_000).contains(&remapper.timeout_millis().unwrap()));
+        // Exercise the actual periodic path with no balloon and no guest reports.
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        unsafe { remapper.poll() }.unwrap();
+        assert!((1..=30_000).contains(&remapper.timeout_millis().unwrap()));
+        let mut actual = [0_u8; 0x4000];
+        memory.read(&mut actual, address).unwrap();
+        assert_eq!(actual, expected);
+        drop(remapper);
+        vm.destroy().unwrap();
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[ignore = "requires an isolated code-signed process with Hypervisor entitlement"]
+    fn real_hvf_incompatible_provider_keeps_basic_balloon() {
+        use devices::virtio::{Balloon, VirtioDevice};
+        let (memory, info, _, _) = default_guest_memory(128).unwrap();
+        let vm = setup_vm(&memory, &info, false, true, false).unwrap();
+        assert!(!vm.reclaim_state().is_effective());
+        assert!(vm.host_memory_remapper().is_none());
+        let mut balloon = Balloon::new().unwrap();
+        balloon.set_reclaim_state(vm.reclaim_state());
+        assert_eq!(balloon.avail_features() & (1 << 5), 0);
+        assert_ne!(balloon.avail_features() & (1 << 1), 0);
+        vm.destroy().unwrap();
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[ignore = "requires nested-EL2 hardware and an isolated code-signed process"]
+    fn real_hvf_nested_guest_masks_reporting_but_keeps_remapper() {
+        use devices::virtio::{Balloon, VirtioDevice};
+        use vm_memory::Bytes;
+        assert!(
+            hvf::check_nested_virt().unwrap(),
+            "nested EL2 support required"
+        );
+        let (memory, info, _, _) = default_guest_memory(128).unwrap();
+        let vm = setup_vm(&memory, &info, true, true, true).unwrap();
+        assert!(!vm.reclaim_state().is_effective());
+        let mut balloon = Balloon::new().unwrap();
+        balloon.set_reclaim_state(vm.reclaim_state());
+        assert_eq!(balloon.avail_features() & (1 << 5), 0);
+        let address = GuestAddress(info.ram_start_addr);
+        let expected = [0x35_u8; 0x4000];
+        memory.write(&expected, address).unwrap();
+        let remapper = vm.host_memory_remapper().expect("EL2-independent remapper");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        unsafe { remapper.before_reports() }.unwrap();
+        let mut actual = [0_u8; 0x4000];
+        memory.read(&mut actual, address).unwrap();
+        assert_eq!(actual, expected);
+        drop(remapper);
+        vm.destroy().unwrap();
     }
 
     #[allow(unused)]
