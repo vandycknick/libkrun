@@ -533,8 +533,16 @@ pub(crate) fn do_shutdown(proxy: &mut super::UnixProxy, pkt: &VsockPacket) {
         Shutdown::Write
     };
 
-    if let Err(e) = shutdown(proxy.fd.as_raw_fd(), how) {
+    if let Err(e) = shutdown_socket(proxy.fd.as_raw_fd(), how) {
         warn!("error sending shutdown to socket: {e}");
+    }
+}
+
+fn shutdown_socket(fd: RawFd, how: Shutdown) -> Result<(), Errno> {
+    match shutdown(fd, how) {
+        // The peer can disconnect before the guest's shutdown reaches the proxy.
+        Ok(()) | Err(Errno::ENOTCONN) => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -736,6 +744,58 @@ mod tests {
     use crate::virtio::vsock::packet::{VSOCK_PKT_HDR_SIZE, VsockPacket};
     use crate::virtio::vsock::unix_proxy::unix::*;
     use crate::virtio::{Descriptor, DescriptorChain, Queue, RuntimeGuestMemory};
+
+    #[test]
+    fn socket_shutdown_is_idempotent() {
+        let (fd, peer) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+        .unwrap();
+        shutdown_socket(fd.as_raw_fd(), Shutdown::Write).unwrap();
+        let mut buffer = [0; 1];
+        assert_eq!(
+            recv(peer.as_raw_fd(), &mut buffer, MsgFlags::empty()).unwrap(),
+            0
+        );
+        send(peer.as_raw_fd(), b"x", MsgFlags::empty()).unwrap();
+        assert_eq!(
+            recv(fd.as_raw_fd(), &mut buffer, MsgFlags::empty()).unwrap(),
+            1
+        );
+        assert_eq!(buffer, *b"x");
+        shutdown_socket(fd.as_raw_fd(), Shutdown::Both).unwrap();
+        shutdown_socket(fd.as_raw_fd(), Shutdown::Both).unwrap();
+        drop(peer);
+        shutdown_socket(fd.as_raw_fd(), Shutdown::Both).unwrap();
+    }
+
+    #[test]
+    fn socket_shutdown_accepts_disconnected_socket() {
+        let fd = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            shutdown(fd.as_raw_fd(), Shutdown::Both),
+            Err(Errno::ENOTCONN)
+        );
+        shutdown_socket(fd.as_raw_fd(), Shutdown::Both).unwrap();
+    }
+
+    #[test]
+    fn socket_shutdown_preserves_unexpected_errors() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(
+            shutdown_socket(file.as_raw_fd(), Shutdown::Both),
+            Err(Errno::ENOTSOCK)
+        );
+    }
 
     const QUEUE_SIZE: u16 = 32;
     const CREDIT_PACKET_DESC: GuestAddress = GuestAddress(0x3000);

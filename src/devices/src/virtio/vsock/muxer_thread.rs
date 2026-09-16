@@ -176,11 +176,11 @@ impl MuxerThread {
         match update.remove_proxy {
             ProxyRemoval::Keep => {}
             ProxyRemoval::Immediate => {
-                warn!("immediately removing proxy: {id}");
+                debug!("immediately removing proxy: {id}");
                 self.proxy_map.write().unwrap().remove(&id);
             }
             ProxyRemoval::Deferred => {
-                warn!("deferring proxy removal: {id}");
+                debug!("deferring proxy removal: {id}");
                 if self.reaper_sender.send(id).is_err() {
                     self.proxy_map.write().unwrap().remove(&id);
                 }
