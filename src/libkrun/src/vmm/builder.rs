@@ -1297,6 +1297,28 @@ pub fn build_microvm(
     Ok(vmm)
 }
 
+// Stream into the final guest allocation: a temporary initramfs-sized Vec
+// duplicates boot memory and can leave heap pages retained after it is dropped.
+// Exact-length volatile I/O rejects short reads and invalid guest ranges rather
+// than allowing the guest to boot with a silently truncated image.
+fn load_initrd(
+    guest_mem: &GuestMemoryMmap,
+    address: GuestAddress,
+    file: &mut File,
+) -> std::result::Result<InitrdConfig, StartMicrovmError> {
+    let length = file
+        .metadata()
+        .map_err(StartMicrovmError::InitrdRead)?
+        .len();
+    let size = usize::try_from(length).map_err(|error| {
+        StartMicrovmError::InitrdRead(io::Error::new(io::ErrorKind::InvalidData, error))
+    })?;
+    guest_mem
+        .read_exact_volatile_from(address, file, size)
+        .map_err(|error| StartMicrovmError::InitrdRead(io::Error::other(error)))?;
+    Ok(InitrdConfig { address, size })
+}
+
 fn load_external_kernel(
     guest_mem: &GuestMemoryMmap,
     arch_mem_info: &ArchMemoryInfo,
@@ -1436,14 +1458,12 @@ fn load_external_kernel(
     debug!("load_external_kernel: 0x{:x}", entry_addr.0);
 
     let initrd_config = if let Some(initramfs_path) = &external_kernel.initramfs_path {
-        let data = std::fs::read(initramfs_path).map_err(StartMicrovmError::InitrdRead)?;
-        guest_mem
-            .write(&data, GuestAddress(arch_mem_info.initrd_addr))
-            .unwrap();
-        Some(InitrdConfig {
-            address: GuestAddress(arch_mem_info.initrd_addr),
-            size: data.len(),
-        })
+        let mut file = File::open(initramfs_path).map_err(StartMicrovmError::InitrdRead)?;
+        Some(load_initrd(
+            guest_mem,
+            GuestAddress(arch_mem_info.initrd_addr),
+            &mut file,
+        )?)
     } else {
         None
     };
@@ -2327,8 +2347,50 @@ pub fn setup_terminal_raw_mode(
 }
 #[cfg(test)]
 pub mod tests {
-    use super::*;
+    use crate::vmm::builder::*;
     use crate::vmm::vmm_config::kernel_bundle::KernelBundle;
+
+    #[cfg(unix)]
+    #[test]
+    fn initrd_streams_into_guest_memory_without_overwriting_neighbors() {
+        use std::io::{Seek, SeekFrom, Write};
+        use vmm_sys_util::tempfile::TempFile;
+
+        let temporary = TempFile::new().unwrap();
+        let mut file = temporary.as_file().try_clone().unwrap();
+        let payload = [0x5a; 1024];
+        file.write_all(&payload).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0x1000), 0x4000)]).unwrap();
+        memory
+            .write_slice(&[0xcc; 0x4000], GuestAddress(0x1000))
+            .unwrap();
+        let loaded = load_initrd(&memory, GuestAddress(0x2000), &mut file).unwrap();
+        assert_eq!(loaded.address, GuestAddress(0x2000));
+        assert_eq!(loaded.size, payload.len());
+        let mut contents = [0; 0x4000];
+        memory
+            .read_slice(&mut contents, GuestAddress(0x1000))
+            .unwrap();
+        assert_eq!(&contents[0x1000..0x1400], &payload);
+        assert!(contents[..0x1000].iter().all(|byte| *byte == 0xcc));
+        assert!(contents[0x1400..].iter().all(|byte| *byte == 0xcc));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initrd_rejects_a_file_larger_than_guest_memory() {
+        use vmm_sys_util::tempfile::TempFile;
+
+        let temporary = TempFile::new().unwrap();
+        let mut file = temporary.as_file().try_clone().unwrap();
+        file.set_len(0x8000).unwrap();
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0x1000), 0x4000)]).unwrap();
+        assert!(matches!(
+            load_initrd(&memory, GuestAddress(0x1000), &mut file),
+            Err(StartMicrovmError::InitrdRead(_))
+        ));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
