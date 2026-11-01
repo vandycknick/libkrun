@@ -316,9 +316,13 @@ mod tests {
             type_id: u32,
             device_id: &str,
         ) -> Result<u64> {
-            let mmio_device =
-                devices::virtio::MmioTransport::new(guest_mem, DummyIrqChip::new().into(), device)
-                    .unwrap();
+            let mmio_device = devices::virtio::MmioTransport::new(
+                guest_mem,
+                DummyIrqChip::new().into(),
+                device,
+                None,
+            )
+            .unwrap();
             let (mmio_base, _irq) =
                 self.register_mmio_device(mmio_device, type_id, device_id.to_string())?;
             Ok(mmio_base)

@@ -422,7 +422,7 @@ mod tests {
         // This production IRQ implementation only writes eventfd for used-queue
         // notifications; no VM or in-kernel IRQ setup is needed to exercise it.
         let irqchip = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(KvmIoapic {}))));
-        let interrupt = InterruptTransport::new(irqchip, "block-zero-range".into())
+        let interrupt = InterruptTransport::new(irqchip, "block-zero-range".into(), None)
             .expect("eventfd interrupt transport");
         let completion = interrupt.event().try_clone().expect("completion event");
         let event = Arc::new(EventFd::new(EFD_NONBLOCK).expect("queue event"));

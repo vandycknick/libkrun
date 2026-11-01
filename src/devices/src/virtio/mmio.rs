@@ -80,10 +80,15 @@ pub struct MmioTransport {
     interrupt: InterruptTransport,
 }
 
+enum InterruptEvent {
+    Exclusive(EventFd),
+    Shared(Arc<EventFd>),
+}
+
 struct InterruptTransportInner {
     log_target: String,
     status: AtomicUsize,
-    event: EventFd,
+    event: InterruptEvent,
     intc: IrqChip,
     irq_line: Option<u32>,
 }
@@ -92,11 +97,20 @@ struct InterruptTransportInner {
 pub struct InterruptTransport(Arc<InterruptTransportInner>);
 
 impl InterruptTransport {
-    pub fn new(intc: IrqChip, log_target: String) -> Result<Self, CreateMmioTransportError> {
+    pub fn new(
+        intc: IrqChip,
+        log_target: String,
+        shared_event: Option<Arc<EventFd>>,
+    ) -> Result<Self, CreateMmioTransportError> {
         Ok(Self(Arc::new(InterruptTransportInner {
             log_target,
             status: AtomicUsize::new(0),
-            event: EventFd::new(0).map_err(CreateMmioTransportError::CreateInterruptEventFd)?,
+            event: match shared_event {
+                Some(event) => InterruptEvent::Shared(event),
+                None => InterruptEvent::Exclusive(
+                    EventFd::new(0).map_err(CreateMmioTransportError::CreateInterruptEventFd)?,
+                ),
+            },
             intc,
             irq_line: None,
         })))
@@ -107,7 +121,10 @@ impl InterruptTransport {
     }
 
     pub fn event(&self) -> &EventFd {
-        &self.0.event
+        match &self.0.event {
+            InterruptEvent::Exclusive(event) => event,
+            InterruptEvent::Shared(event) => event,
+        }
     }
 
     pub fn intc(&self) -> &IrqChip {
@@ -135,7 +152,7 @@ impl InterruptTransport {
         self.intc()
             .lock()
             .unwrap()
-            .set_irq(self.0.irq_line, Some(&self.0.event))?;
+            .set_irq(self.0.irq_line, Some(self.event()))?;
         Ok(())
     }
 
@@ -168,6 +185,7 @@ impl MmioTransport {
         mem: M,
         intc: IrqChip,
         device: Arc<Mutex<dyn VirtioDevice>>,
+        shared_interrupt_event: Option<Arc<EventFd>>,
     ) -> Result<MmioTransport, CreateMmioTransportError> {
         let locked = device
             .try_lock()
@@ -181,7 +199,7 @@ impl MmioTransport {
         let queue_evts = Self::create_queue_evts(queue_config.len())?;
 
         Ok(MmioTransport {
-            interrupt: InterruptTransport::new(intc, debug_log_target)?,
+            interrupt: InterruptTransport::new(intc, debug_log_target, shared_interrupt_event)?,
             device,
             features_select: 0,
             acked_features_select: 0,
@@ -619,8 +637,13 @@ pub(crate) mod tests {
     fn test_new() {
         let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
         let dummy = DummyDevice::new();
-        let mut d =
-            MmioTransport::new(m, DummyIrqChip::new().into(), Arc::new(Mutex::new(dummy))).unwrap();
+        let mut d = MmioTransport::new(
+            m,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(dummy)),
+            None,
+        )
+        .unwrap();
 
         // We just make sure here that the implementation of a mmio device behaves as we expect,
         // given a known virtio device implementation (the dummy device).
@@ -650,6 +673,7 @@ pub(crate) mod tests {
             m,
             DummyIrqChip::new().into(),
             Arc::new(Mutex::new(DummyDevice::new())),
+            None,
         )
         .unwrap();
 
@@ -730,7 +754,8 @@ pub(crate) mod tests {
     fn test_bus_device_write() {
         let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
         let dummy_dev = Arc::new(Mutex::new(DummyDevice::new()));
-        let mut d = MmioTransport::new(m, DummyIrqChip::new().into(), dummy_dev.clone()).unwrap();
+        let mut d =
+            MmioTransport::new(m, DummyIrqChip::new().into(), dummy_dev.clone(), None).unwrap();
         let mut buf = vec![0; 5];
         write_le_u32(&mut buf[..4], 1);
 
@@ -891,6 +916,7 @@ pub(crate) mod tests {
             m,
             DummyIrqChip::new().into(),
             Arc::new(Mutex::new(DummyDevice::new())),
+            None,
         )
         .unwrap();
 
@@ -1004,6 +1030,7 @@ pub(crate) mod tests {
             m,
             DummyIrqChip::new().into(),
             Arc::new(Mutex::new(DummyDevice::new())),
+            None,
         )
         .unwrap();
         let mut buf = [0; 4];
@@ -1053,5 +1080,266 @@ pub(crate) mod tests {
         dummy_dev.set_avail_features(8);
         dummy_dev.ack_features_by_page(0, 8);
         assert_eq!(dummy_dev.acked_features(), 24);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "blk"))]
+    #[test]
+    fn shared_irq_raw_workers_keep_independent_ack_and_survive_device_drop() {
+        use std::fs;
+        use std::os::fd::{AsRawFd, BorrowedFd};
+        use std::path::{Path, PathBuf};
+        use std::sync::Barrier;
+        use std::time::{Duration, Instant};
+
+        use nix::poll::{PollFd, PollFlags, poll};
+        use utils::tempfile::TempFile;
+        use virtio_bindings::virtio_blk::{VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
+
+        use crate::legacy::{IrqChipDevice, KvmIoapic};
+        use crate::virtio::RuntimeGuestMemory;
+        use crate::virtio::block::{Block, CacheType, DiskFormat, SyncMode};
+        use crate::virtio::queue::tests::VirtQueue;
+
+        struct RunningRaw {
+            transport: MmioTransport,
+            block: Arc<Mutex<Block>>,
+            memory: RuntimeGuestMemory,
+            kick: Arc<EventFd>,
+            used_index: GuestAddress,
+            available_index: GuestAddress,
+            available_ring: GuestAddress,
+            path: PathBuf,
+        }
+
+        impl RunningRaw {
+            fn new(path: &Path, shared: Arc<EventFd>) -> Self {
+                fs::write(path, [0xa5; 4096]).expect("populate real Raw backing");
+                let block = Arc::new(Mutex::new(
+                    Block::new(
+                        "shared-irq-raw".into(),
+                        None,
+                        CacheType::Writeback,
+                        path.to_str().expect("fixture UTF-8").into(),
+                        DiskFormat::Raw,
+                        false,
+                        false,
+                        SyncMode::Relaxed,
+                    )
+                    .expect("open real Raw device"),
+                ));
+                let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x3000)])
+                    .expect("real guest memory");
+                let queue = VirtQueue::new(GuestAddress(0), &memory, 8);
+                queue.dtable[0].set(0x1000, 16, 1, 1);
+                queue.dtable[1].set(0x1100, 512, 1, 2);
+                queue.dtable[2].set(0x1400, 1, 2, 0);
+                let configured = queue.create_queue();
+                let used_index = queue.used.idx.location;
+                let available_index = queue.avail.idx.location;
+                let available_ring = queue.avail.ring[0].location;
+                let irqchip = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(KvmIoapic {}))));
+                let mut transport =
+                    MmioTransport::new(memory.clone(), irqchip, block.clone(), Some(shared))
+                        .expect("real shared-notification MMIO transport");
+                transport.set_irq_line(15);
+                set_device_status(&mut transport, device_status::ACKNOWLEDGE);
+                set_device_status(
+                    &mut transport,
+                    device_status::ACKNOWLEDGE | device_status::DRIVER,
+                );
+                set_device_status(
+                    &mut transport,
+                    device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
+                );
+                for (offset, value) in [
+                    (0x38, 8_u32),
+                    (0x80, configured.desc_table.0 as u32),
+                    (0x90, configured.avail_ring.0 as u32),
+                    (0xa0, configured.used_ring.0 as u32),
+                    (0x44, 1_u32),
+                ] {
+                    transport.write(0, offset, &value.to_le_bytes());
+                }
+                let kick = transport.queue_evts()[0].clone();
+                set_device_status(
+                    &mut transport,
+                    device_status::ACKNOWLEDGE
+                        | device_status::DRIVER
+                        | device_status::FEATURES_OK
+                        | device_status::DRIVER_OK,
+                );
+                assert!(block.lock().expect("block").is_activated());
+                Self {
+                    transport,
+                    block,
+                    memory,
+                    kick,
+                    used_index,
+                    available_index,
+                    available_ring,
+                    path: path.to_owned(),
+                }
+            }
+
+            fn prepare(&self, index: u16, request: u32, fill: u8) {
+                self.memory
+                    .write_obj(request, GuestAddress(0x1000))
+                    .expect("request type");
+                self.memory
+                    .write_obj(0_u32, GuestAddress(0x1004))
+                    .expect("reserved");
+                self.memory
+                    .write_obj(0_u64, GuestAddress(0x1008))
+                    .expect("sector");
+                let flags = if request == VIRTIO_BLK_T_IN {
+                    3_u16
+                } else {
+                    1_u16
+                };
+                self.memory
+                    .write_obj(flags, GuestAddress(28))
+                    .expect("data descriptor direction");
+                self.memory
+                    .write_slice(&[fill; 512], GuestAddress(0x1100))
+                    .expect("request payload");
+                self.memory
+                    .write_obj(0xff_u8, GuestAddress(0x1400))
+                    .expect("initial status");
+                self.memory
+                    .write_obj(
+                        0_u16,
+                        GuestAddress(self.available_ring.0 + u64::from((index - 1) % 8) * 2),
+                    )
+                    .expect("available head");
+                self.memory
+                    .write_obj(index, self.available_index)
+                    .expect("publish request");
+            }
+
+            fn wait(&self, index: u16) {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while self
+                    .memory
+                    .read_obj::<u16>(self.used_index)
+                    .expect("used index")
+                    != index
+                    || self.transport.interrupt.status().load(Ordering::SeqCst) & 1 == 0
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "real block request did not complete"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(
+                    self.memory
+                        .read_obj::<u8>(GuestAddress(0x1400))
+                        .expect("status"),
+                    0
+                );
+            }
+
+            fn status(&mut self) -> u32 {
+                let mut bytes = [0; 4];
+                self.transport.read(0, 0x60, &mut bytes);
+                u32::from_le_bytes(bytes)
+            }
+
+            fn acknowledge(&mut self) {
+                self.transport.write(0, 0x64, &1_u32.to_le_bytes());
+            }
+        }
+
+        impl Drop for RunningRaw {
+            fn drop(&mut self) {
+                self.block
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .reset();
+            }
+        }
+
+        fn notification(line: &EventFd) {
+            // SAFETY: line owns the descriptor throughout poll and read, and
+            // the borrowed descriptor does not escape this function.
+            let descriptor = unsafe { BorrowedFd::borrow_raw(line.as_raw_fd()) };
+            let mut ready = [PollFd::new(descriptor, PollFlags::POLLIN)];
+            assert_eq!(
+                poll(&mut ready, 5000_u16).expect("shared line readiness"),
+                1
+            );
+            assert!(line.read().expect("one shared notification source") > 0);
+        }
+
+        let backing = [
+            TempFile::new().expect("first backing"),
+            TempFile::new().expect("second backing"),
+        ];
+        let line_owner = Arc::new(EventFd::new(EFD_NONBLOCK).expect("manager-owned shared line"));
+        let mut devices = [
+            RunningRaw::new(backing[0].as_path(), line_owner.clone()),
+            RunningRaw::new(backing[1].as_path(), line_owner.clone()),
+        ];
+        for index in 1..=32_u16 {
+            for (device_index, device) in devices.iter().enumerate() {
+                device.prepare(index, VIRTIO_BLK_T_OUT, index as u8 + device_index as u8);
+            }
+            let first = devices[0].kick.clone();
+            let second = devices[1].kick.clone();
+            let barrier = Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    first.write(1).expect("first concurrent request");
+                });
+                scope.spawn(|| {
+                    barrier.wait();
+                    second.write(1).expect("second concurrent request");
+                });
+            });
+            for device in &devices {
+                device.wait(index);
+            }
+            notification(&line_owner);
+            assert_eq!(devices[0].status(), 1);
+            assert_eq!(devices[1].status(), 1);
+            devices[0].acknowledge();
+            assert_eq!(devices[0].status(), 0);
+            assert_eq!(
+                devices[1].status(),
+                1,
+                "ACK of first device must not clear second"
+            );
+            devices[1].acknowledge();
+            assert_eq!(devices[1].status(), 0);
+            for (device_index, device) in devices.iter().enumerate() {
+                let mut expected = [0xa5; 4096];
+                expected[..512].fill(index as u8 + device_index as u8);
+                assert_eq!(fs::read(&device.path).expect("actual Raw bytes"), expected);
+            }
+        }
+        let [first, mut survivor] = devices;
+        drop(first);
+        survivor.prepare(33, VIRTIO_BLK_T_IN, 0xcc);
+        survivor.kick.write(1).expect("surviving device request");
+        survivor.wait(33);
+        notification(&line_owner);
+        let mut read_back = [0; 512];
+        survivor
+            .memory
+            .read_slice(&mut read_back, GuestAddress(0x1100))
+            .expect("Raw read response");
+        assert_eq!(read_back, [33; 512]);
+        survivor.acknowledge();
+        assert_eq!(survivor.status(), 0);
+        drop(survivor);
+        for file in &backing {
+            assert_eq!(
+                fs::metadata(file.as_path())
+                    .expect("reopened backing")
+                    .len(),
+                4096
+            );
+        }
     }
 }

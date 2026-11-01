@@ -12,11 +12,10 @@ use std::{fmt, io};
 use devices::DeviceType;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::fdt::DeviceInfoForFDT;
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::legacy::IrqChip;
 use kernel::cmdline as kernel_cmdline;
 use kvm_ioctls::{IoEventAddress, VmFd};
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use utils::eventfd::EventFd;
 
 /// Errors for MMIO device manager.
@@ -77,6 +76,14 @@ type Result<T> = ::std::result::Result<T, Error>;
 /// Currently hardcoded to 4K.
 const MMIO_LEN: u64 = 0x1000;
 
+#[cfg(target_arch = "x86_64")]
+// One eventfd is registered once with KVM for all transports on this line.
+// Manager ownership keeps it alive independently of any individual device.
+struct SharedInterruptLine {
+    event: Arc<EventFd>,
+    registered: bool,
+}
+
 /// Manages the complexities of registering a MMIO device.
 pub struct MMIODeviceManager {
     pub bus: devices::Bus,
@@ -84,6 +91,8 @@ pub struct MMIODeviceManager {
     irq: u32,
     last_irq: u32,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    #[cfg(target_arch = "x86_64")]
+    shared_irq: Option<SharedInterruptLine>,
 }
 
 impl MMIODeviceManager {
@@ -98,6 +107,8 @@ impl MMIODeviceManager {
             last_irq: irq_interval.1,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
+            #[cfg(target_arch = "x86_64")]
+            shared_irq: None,
         }
     }
 
@@ -118,17 +129,37 @@ impl MMIODeviceManager {
         Ok(())
     }
 
-    /// Register an already created MMIO device to be used via MMIO transport.
+    /// Construct and register a device with its manager-owned IRQ notification.
     pub fn register_mmio_device(
         &mut self,
         vm: &VmFd,
-        mut mmio_device: devices::virtio::MmioTransport,
-        type_id: u32,
+        memory: devices::virtio::RuntimeGuestMemory,
+        intc: IrqChip,
+        device: Arc<Mutex<dyn devices::virtio::VirtioDevice>>,
         device_id: String,
     ) -> Result<(u64, u32)> {
         if self.irq > self.last_irq {
             return Err(Error::IrqsExhausted);
         }
+
+        #[cfg(target_arch = "x86_64")]
+        let shared_event = if self.irq == self.last_irq {
+            if self.shared_irq.is_none() {
+                self.shared_irq = Some(SharedInterruptLine {
+                    event: Arc::new(EventFd::new(0).map_err(Error::EventFd)?),
+                    registered: false,
+                });
+            }
+            self.shared_irq.as_ref().map(|line| line.event.clone())
+        } else {
+            None
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let shared_event = None;
+        let mut mmio_device =
+            devices::virtio::MmioTransport::new(memory, intc, device, shared_event)
+                .map_err(Error::CreateMmioTransport)?;
+        let type_id = mmio_device.locked_device().device_type();
 
         for (i, queue_evt) in mmio_device.queue_evts().iter().enumerate() {
             let io_addr = IoEventAddress::Mmio(
@@ -139,8 +170,21 @@ impl MMIODeviceManager {
                 .map_err(Error::RegisterIoEvent)?;
         }
 
-        vm.register_irqfd(mmio_device.interrupt_evt(), self.irq)
-            .map_err(Error::RegisterIrqFd)?;
+        #[cfg(target_arch = "x86_64")]
+        let register_irq = self.irq != self.last_irq
+            || self.shared_irq.as_ref().is_none_or(|line| !line.registered);
+        #[cfg(not(target_arch = "x86_64"))]
+        let register_irq = true;
+        if register_irq {
+            vm.register_irqfd(mmio_device.interrupt_evt(), self.irq)
+                .map_err(Error::RegisterIrqFd)?;
+            #[cfg(target_arch = "x86_64")]
+            if self.irq == self.last_irq
+                && let Some(line) = &mut self.shared_irq
+            {
+                line.registered = true;
+            }
+        }
 
         mmio_device.set_irq_line(self.irq);
 
@@ -157,7 +201,14 @@ impl MMIODeviceManager {
             },
         );
         self.mmio_base += MMIO_LEN;
-        self.irq += 1;
+        #[cfg(target_arch = "x86_64")]
+        if self.irq < self.last_irq {
+            self.irq += 1;
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.irq += 1;
+        }
 
         Ok(ret)
     }
@@ -324,14 +375,15 @@ mod tests {
             guest_mem: GuestMemoryMmap,
             device: Arc<Mutex<dyn devices::virtio::VirtioDevice>>,
             _cmdline: &mut kernel_cmdline::Cmdline,
-            type_id: u32,
             device_id: &str,
         ) -> Result<u64> {
-            let mmio_device =
-                devices::virtio::MmioTransport::new(guest_mem, DummyIrqChip::new().into(), device)
-                    .unwrap();
-            let (mmio_base, _irq) =
-                self.register_mmio_device(vm, mmio_device, type_id, device_id.to_string())?;
+            let (mmio_base, _irq) = self.register_mmio_device(
+                vm,
+                guest_mem.into(),
+                DummyIrqChip::new().into(),
+                device,
+                device_id.to_string(),
+            )?;
             #[cfg(target_arch = "x86_64")]
             self.add_device_to_cmdline(_cmdline, mmio_base, _irq)?;
             Ok(mmio_base)
@@ -415,11 +467,12 @@ mod tests {
 
         assert!(
             device_manager
-                .register_virtio_device(vm.fd(), guest_mem, dummy, &mut cmdline, 0, "dummy")
+                .register_virtio_device(vm.fd(), guest_mem, dummy, &mut cmdline, "dummy")
                 .is_ok()
         );
     }
 
+    #[cfg(not(target_arch = "x86_64"))]
     #[test]
     fn test_register_too_many_devices() {
         let start_addr1 = GuestAddress(0x0);
@@ -443,7 +496,6 @@ mod tests {
                     guest_mem.clone(),
                     Arc::new(Mutex::new(DummyDevice::new())),
                     &mut cmdline,
-                    0,
                     "dummy1",
                 )
                 .unwrap();
@@ -457,7 +509,6 @@ mod tests {
                         guest_mem,
                         Arc::new(Mutex::new(DummyDevice::new())),
                         &mut cmdline,
-                        0,
                         "dummy2"
                     )
                     .unwrap_err()
@@ -533,14 +584,9 @@ mod tests {
 
         let type_id = 0;
         let id = String::from("foo");
-        if let Ok(addr) = device_manager.register_virtio_device(
-            vm.fd(),
-            guest_mem,
-            dummy,
-            &mut cmdline,
-            type_id,
-            &id,
-        ) {
+        if let Ok(addr) =
+            device_manager.register_virtio_device(vm.fd(), guest_mem, dummy, &mut cmdline, &id)
+        {
             assert_eq!(
                 addr,
                 device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())].addr

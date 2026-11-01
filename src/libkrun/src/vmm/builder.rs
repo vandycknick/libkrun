@@ -48,7 +48,9 @@ use devices::legacy::{IoApic, IrqChipT};
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
-use devices::virtio::{MmioTransport, RuntimeGuestMemory, VirtioDevice};
+#[cfg(target_os = "macos")]
+use devices::virtio::MmioTransport;
+use devices::virtio::{RuntimeGuestMemory, VirtioDevice};
 
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
@@ -2279,19 +2281,23 @@ pub(crate) fn attach_mmio_device(
     // Host reclaim never guards device access: the host mapping stays valid
     // across a release cycle, so devices use guest memory directly.
     let runtime_memory = RuntimeGuestMemory::passthrough(vmm.guest_memory().clone());
-    let mmio_device = MmioTransport::new(runtime_memory, intc, device)?;
-
-    let type_id = mmio_device.locked_device().device_type();
     let _cmdline = &mut vmm.kernel_cmdline;
 
     #[cfg(target_os = "linux")]
-    let (_mmio_base, _irq) =
-        vmm.mmio_device_manager
-            .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
+    let (_mmio_base, _irq) = vmm.mmio_device_manager.register_mmio_device(
+        vmm.vm.fd(),
+        runtime_memory,
+        intc,
+        device,
+        id,
+    )?;
     #[cfg(target_os = "macos")]
-    let (_mmio_base, _irq) =
+    let (_mmio_base, _irq) = {
+        let mmio_device = MmioTransport::new(runtime_memory, intc, device, None)?;
+        let type_id = mmio_device.locked_device().device_type();
         vmm.mmio_device_manager
-            .register_mmio_device(mmio_device, type_id, id)?;
+            .register_mmio_device(mmio_device, type_id, id)?
+    };
 
     #[cfg(target_arch = "x86_64")]
     vmm.mmio_device_manager

@@ -132,6 +132,18 @@ address below the MMIO gap, even when guest RAM extends above that gap. Its boot
 header retains the exact payload byte length; callers do not need to pad the
 initramfs to a page boundary.
 
+On x86_64 KVM, MMIO transports use the existing routed IRQ range. The last IRQ
+is a shared line: its manager-owned eventfd is registered with KVM once, and
+additional transports retain references to that same notifier. Each transport
+keeps independent interrupt status and acknowledgement state. Dropping or
+resetting one device does not close or drain another device's shared notifier.
+Other architectures and host backends retain their existing allocation policy.
+
+Future device-state capture must retain this notifier-sharing topology and
+restore one KVM irqfd registration per shared line, not one per device.
+Per-transport pending status remains separate; quiescing or draining a shared
+notification source requires coordinating every device attached to that line.
+
 #### Requirements
 
 * [libkrunfw](https://github.com/containers/libkrunfw)
