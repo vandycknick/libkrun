@@ -15,7 +15,7 @@ tdx = [ "tee", "dep:tdx" ]
 [dependencies]
 libc = ">=0.2.39"
 vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap"] }
-vmm-sys-util = "0.15"
+vmm-sys-util = ">=0.14, <=0.15"
 
 arch_gen = { package = "krun-arch-gen", version = "=0.1.0-2.0.0-dev", path = "../arch_gen" }
 utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }

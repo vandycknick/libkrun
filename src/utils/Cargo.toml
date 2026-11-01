@@ -14,7 +14,7 @@ log = "0.4.0"
 [target.'cfg(unix)'.dependencies]
 libc = ">=0.2.85"
 nix = "0.30.1"
-vmm-sys-util = "0.15"
+vmm-sys-util = ">=0.14, <=0.15"
 crossbeam-channel = ">=0.5.15"
 
 [target.'cfg(target_os = "linux")'.dependencies]

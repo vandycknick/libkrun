@@ -119,6 +119,12 @@ When TSI is enabled, the VMM acts as a proxy for AF_INET, AF_INET6 and AF_UNIX s
 
 ## Building and installing
 
+The direct `vmm-sys-util` dependencies used by the KVM path share the version
+requirement of `kvm-bindings` and `kvm-ioctls`. Keep these requirements aligned:
+FAM errors, eventfds and errno values cross crate boundaries and must use the
+same resolved utility version. A consuming application's lockfile can select
+0.14 or 0.15; the optional vhost-user dependency separately requires 0.15.
+
 ### Linux
 
 #### Requirements

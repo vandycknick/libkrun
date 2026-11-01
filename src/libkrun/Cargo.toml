@@ -41,7 +41,7 @@ serde = { version = "1.0.125", optional = true }
 serde_json = { version = "1.0.64", optional = true }
 thiserror = "2"
 vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap"] }
-vmm-sys-util = "0.15"
+vmm-sys-util = ">=0.14, <=0.15"
 krun_display = { package = "krun-display", version = "0.1.0", path = "../display", optional = true, features = ["bindgen_clang_runtime"] }
 krun_input = { package = "krun-input", version = "0.1.0", path = "../input", optional = true, features = ["bindgen_clang_runtime"] }
 
