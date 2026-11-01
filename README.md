@@ -62,6 +62,13 @@ Each variant generates a dynamic library with a different name (and ```soname```
 * virtio-balloon (only free-page reporting)
 * virtio-rng
 
+The Silo fork completes successful virtio-block DISCARD and WRITE_ZEROES requests
+with the entire requested range reading as zero, including partial host blocks
+and the device tail, without changing logical length or capacity. DISCARD uses
+Imago's zero-preserving operation, including its explicit-zero fallback when
+hole punching is unavailable. Hypervisor-free real Raw-device regressions run
+with `cargo test --locked -p krun-devices --features blk zero_range`.
+
 
 ## Networking
 

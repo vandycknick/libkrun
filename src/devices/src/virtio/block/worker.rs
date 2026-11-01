@@ -270,7 +270,7 @@ impl BlockWorker {
                     .file
                     .lock()
                     .unwrap()
-                    .discard_to_any(
+                    .discard_to_zero(
                         discard_write_data.sector * 512,
                         discard_write_data.num_sectors as u64 * 512,
                     )
@@ -306,6 +306,226 @@ impl BlockWorker {
                 Ok(0)
             }
             _ => Err(RequestError::UnknownRequest),
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod tests {
+    use std::fs;
+    use std::os::fd::{AsRawFd, BorrowedFd};
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use imago::{
+        DynStorage, FormatAccess, Storage, StorageOpenOptions, file::File as ImagoFile, raw::Raw,
+    };
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use utils::eventfd::{EFD_NONBLOCK, EventFd};
+    use utils::tempfile::TempFile;
+    use virtio_bindings::virtio_blk::{
+        VIRTIO_BLK_S_OK, VIRTIO_BLK_T_DISCARD, VIRTIO_BLK_T_WRITE_ZEROES,
+        VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP,
+    };
+    use vm_memory::GuestAddress;
+
+    use crate::legacy::{IrqChipDevice, KvmIoapic};
+    use crate::virtio::block::device::{CacheType, DiskProperties};
+    use crate::virtio::block::worker::{BlockWorker, DiscardWriteData, RequestHeader};
+    use crate::virtio::queue::tests::VirtQueue;
+    use crate::virtio::{DeviceQueue, InterruptTransport, RuntimeGuestMemory};
+
+    #[derive(Clone, Copy, Debug)]
+    enum ZeroRange {
+        MiddleSector,
+        MiddleEdges,
+        MiddleAligned,
+        Tail,
+        Whole,
+    }
+
+    fn open_raw(path: &Path) -> (DiskProperties, usize) {
+        let file = ImagoFile::open(StorageOpenOptions::new().filename(path).write(true))
+            .expect("open real writable backing");
+        let alignment = file.discard_align();
+        let storage: Box<dyn DynStorage> = Box::new(file);
+        let raw = Raw::open_image(storage, true).expect("open Raw image");
+        let disk = DiskProperties::new(
+            Arc::new(Mutex::new(FormatAccess::new(raw))),
+            b"discard-regression".to_vec(),
+            CacheType::Writeback,
+        )
+        .expect("derive Raw capacity");
+        (disk, alignment)
+    }
+
+    fn assert_zero_range(request_type: u32, flags: u32, range: ZeroRange) {
+        let backing = TempFile::new().expect("private backing");
+        backing
+            .as_file()
+            .set_len(4096)
+            .expect("initial backing length");
+        let (disk, alignment) = open_raw(backing.as_path());
+        assert!(alignment.is_power_of_two() && alignment >= 4096);
+        drop(disk);
+
+        let length = 8 * alignment + 512;
+        let mut expected = (0..length)
+            .map(|index| (index % 251 + 1) as u8)
+            .collect::<Vec<_>>();
+        fs::write(backing.as_path(), &expected).expect("populate every backing byte");
+        let (offset, count) = match range {
+            ZeroRange::MiddleSector => (512, 512),
+            ZeroRange::MiddleEdges => (512, 2 * alignment),
+            ZeroRange::MiddleAligned => (alignment, alignment),
+            ZeroRange::Tail => (alignment + 512, length - alignment - 512),
+            ZeroRange::Whole => (0, length),
+        };
+        assert_eq!(offset % 512, 0);
+        assert_eq!(count % 512, 0);
+        expected[offset..offset + count].fill(0);
+
+        let (disk, _) = open_raw(backing.as_path());
+        assert_eq!(disk.nsectors(), length as u64 / 512);
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x2000)])
+            .expect("real guest memory");
+        let queue = VirtQueue::new(GuestAddress(0), &memory, 8);
+        queue.dtable[0].set(0x1000, 16, 1, 1);
+        queue.dtable[1].set(0x1100, 16, 1, 2);
+        queue.dtable[2].set(0x1200, 1, 2, 0);
+        queue.avail.ring[0].set(0);
+        queue.avail.idx.set(1);
+        memory
+            .write_obj(
+                RequestHeader {
+                    request_type,
+                    _reserved: 0,
+                    sector: 0,
+                },
+                GuestAddress(0x1000),
+            )
+            .expect("request header");
+        memory
+            .write_obj(
+                DiscardWriteData {
+                    sector: offset as u64 / 512,
+                    num_sectors: u32::try_from(count / 512).expect("bounded request"),
+                    flags,
+                },
+                GuestAddress(0x1100),
+            )
+            .expect("request range");
+        memory
+            .write_obj(0xff_u8, GuestAddress(0x1200))
+            .expect("initial status");
+
+        // This production IRQ implementation only writes eventfd for used-queue
+        // notifications; no VM or in-kernel IRQ setup is needed to exercise it.
+        let irqchip = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(KvmIoapic {}))));
+        let interrupt = InterruptTransport::new(irqchip, "block-zero-range".into())
+            .expect("eventfd interrupt transport");
+        let completion = interrupt.event().try_clone().expect("completion event");
+        let event = Arc::new(EventFd::new(EFD_NONBLOCK).expect("queue event"));
+        let mut worker = BlockWorker::new(
+            DeviceQueue::new(queue.create_queue(), event.clone()),
+            interrupt,
+            memory.clone(),
+            disk,
+            EventFd::new(EFD_NONBLOCK).expect("stop event"),
+        );
+        event.write(1).expect("submit request");
+        worker.process_queue_event();
+        // SAFETY: completion owns this fd and remains alive through poll and
+        // the readiness check; the borrowed descriptor never escapes.
+        let completion_fd = unsafe { BorrowedFd::borrow_raw(completion.as_raw_fd()) };
+        let mut ready = [PollFd::new(completion_fd, PollFlags::POLLIN)];
+        assert_eq!(
+            poll(&mut ready, PollTimeout::ZERO).expect("completion readiness"),
+            1
+        );
+        assert_eq!(completion.read().expect("real completion notification"), 1);
+        assert_eq!(queue.used.idx.get(), 1);
+        let status: u8 = memory
+            .read_obj(GuestAddress(0x1200))
+            .expect("request status");
+        assert_eq!(u32::from(status), VIRTIO_BLK_S_OK, "{range:?}");
+        {
+            let file = worker.disk.file.lock().expect("disk lock");
+            file.flush().expect("flush backing");
+            file.sync().expect("sync backing");
+        }
+        assert_eq!(worker.disk.nsectors(), length as u64 / 512);
+        assert_eq!(
+            backing
+                .as_file()
+                .metadata()
+                .expect("backing metadata")
+                .len(),
+            length as u64
+        );
+        drop(worker);
+
+        let (reopened, _) = open_raw(backing.as_path());
+        assert_eq!(
+            reopened.nsectors(),
+            length as u64 / 512,
+            "{range:?} reopened capacity"
+        );
+        drop(reopened);
+        let observed = fs::read(backing.as_path()).expect("read reopened backing");
+        assert_eq!(observed.len(), length, "{range:?} reopened length");
+        if let Some(index) = observed
+            .iter()
+            .zip(&expected)
+            .position(|(actual, expected)| actual != expected)
+        {
+            panic!(
+                "{range:?} request_type={request_type} flags={flags} host_alignment={alignment} \
+                 range={offset}..{} byte={index}: observed={} expected={}",
+                offset + count,
+                observed[index],
+                expected[index],
+            );
+        }
+    }
+
+    #[test]
+    fn discard_zero_range_middle_sector_preserves_bytes_and_reopened_capacity() {
+        assert_zero_range(VIRTIO_BLK_T_DISCARD, 0, ZeroRange::MiddleSector);
+    }
+
+    #[test]
+    fn discard_zero_range_middle_edges_preserves_bytes_and_reopened_capacity() {
+        assert_zero_range(VIRTIO_BLK_T_DISCARD, 0, ZeroRange::MiddleEdges);
+    }
+
+    #[test]
+    fn discard_zero_range_aligned_middle_preserves_bytes_and_reopened_capacity() {
+        assert_zero_range(VIRTIO_BLK_T_DISCARD, 0, ZeroRange::MiddleAligned);
+    }
+
+    #[test]
+    fn discard_zero_range_tail_preserves_bytes_and_reopened_capacity() {
+        assert_zero_range(VIRTIO_BLK_T_DISCARD, 0, ZeroRange::Tail);
+    }
+
+    #[test]
+    fn discard_zero_range_whole_preserves_reopened_capacity() {
+        assert_zero_range(VIRTIO_BLK_T_DISCARD, 0, ZeroRange::Whole);
+    }
+
+    #[test]
+    fn write_zeroes_zero_range_preserves_bytes_and_reopened_capacity() {
+        for flags in [0, VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP] {
+            for range in [
+                ZeroRange::MiddleSector,
+                ZeroRange::MiddleEdges,
+                ZeroRange::MiddleAligned,
+                ZeroRange::Tail,
+                ZeroRange::Whole,
+            ] {
+                assert_zero_range(VIRTIO_BLK_T_WRITE_ZEROES, flags, range);
+            }
         }
     }
 }
