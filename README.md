@@ -127,6 +127,11 @@ same resolved utility version. A consuming application's lockfile can select
 
 ### Linux
 
+For non-TEE x86_64 direct boot, an external initramfs is placed at a page-aligned
+address below the MMIO gap, even when guest RAM extends above that gap. Its boot
+header retains the exact payload byte length; callers do not need to pad the
+initramfs to a page boundary.
+
 #### Requirements
 
 * [libkrunfw](https://github.com/containers/libkrunfw)

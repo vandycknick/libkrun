@@ -196,7 +196,7 @@ pub fn arch_memory_regions(
         ram_last_addr,
         shm_start_addr,
         page_size,
-        initrd_addr: ram_last_addr.min(MMIO_MEM_START) - initrd_size,
+        initrd_addr: (ram_last_addr.min(MMIO_MEM_START) - initrd_size) & !(page_size as u64 - 1),
         firmware_addr,
     };
     (info, regions)
@@ -550,22 +550,43 @@ mod tests {
 
     #[cfg(not(feature = "tee"))]
     fn assert_initrd_in_low_ram(memory_size: usize, initrd_size: u64) {
-        let (info, regions) = arch_memory_regions(
-            memory_size,
-            Some(KERNEL_LOAD_ADDR),
-            KERNEL_SIZE,
-            initrd_size,
-            None,
-        );
-        let initrd_end = info.initrd_addr + initrd_size;
+        for kernel_load_addr in [None, Some(KERNEL_LOAD_ADDR)] {
+            let (info, regions) = arch_memory_regions(
+                memory_size,
+                kernel_load_addr,
+                KERNEL_SIZE,
+                initrd_size,
+                None,
+            );
+            let initrd_end = info.initrd_addr + initrd_size;
+            let low_ram_end = info.ram_last_addr.min(MMIO_MEM_START);
 
-        assert_eq!(info.initrd_addr, MMIO_MEM_START - initrd_size);
-        assert!(regions.iter().any(|(start, size)| {
-            let start = start.raw_value();
-            let end = start + *size as u64;
+            assert_eq!(info.initrd_addr % info.page_size as u64, 0);
+            assert!(initrd_end <= low_ram_end);
+            assert!(low_ram_end - initrd_end < info.page_size as u64);
+            assert!(regions.iter().any(|(start, size)| {
+                let start = start.raw_value();
+                let end = start + *size as u64;
 
-            info.initrd_addr >= start && initrd_end <= end
-        }));
+                info.initrd_addr >= start && initrd_end <= end
+            }));
+
+            let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)])
+                .expect("boot header memory");
+            let initrd = Some(InitrdConfig {
+                address: GuestAddress(info.initrd_addr),
+                size: usize::try_from(initrd_size).expect("bounded initrd size"),
+            });
+            configure_64bit_boot(&memory, &info, GuestAddress(0), 0, &initrd, 1)
+                .expect("configure exact ramdisk boot header");
+            let params: BootParamsWrapper = memory
+                .read_obj(GuestAddress(layout::ZERO_PAGE_START))
+                .expect("read boot header");
+            let address = params.0.hdr.ramdisk_image;
+            let size = params.0.hdr.ramdisk_size;
+            assert_eq!(u64::from(address), info.initrd_addr);
+            assert_eq!(u64::from(size), initrd_size);
+        }
     }
 
     #[cfg(not(feature = "tee"))]
@@ -575,6 +596,16 @@ mod tests {
 
         assert_initrd_in_low_ram(3330usize << 20, INITRD_SIZE);
         assert_initrd_in_low_ram(4096usize << 20, INITRD_SIZE);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn initrd_with_partial_page_is_aligned_without_padding_payload() {
+        for initrd_size in [(32 << 20) + 1, (32 << 20) + 13, (32 << 20) + 4095] {
+            for memory_size in [512usize << 20, 3330usize << 20, 4096usize << 20] {
+                assert_initrd_in_low_ram(memory_size, initrd_size);
+            }
+        }
     }
 
     #[test]
