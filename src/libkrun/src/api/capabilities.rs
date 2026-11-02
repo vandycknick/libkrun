@@ -354,6 +354,7 @@ pub enum QueryOperation {
     OpenKvm,
     KvmApiVersion,
     KvmCheckExtension(KvmCapability),
+    LoadHvfFramework,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -503,10 +504,197 @@ pub fn reduce_kvm_prerequisites(lane: NativeLane, facts: &KvmHostFacts) -> KvmPr
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HvfGicSymbol {
+    StateCreate,
+    StateGetSize,
+    StateGetData,
+    SetState,
+    GetIccReg,
+    SetIccReg,
+}
+
+impl HvfGicSymbol {
+    pub const ALL: [Self; 6] = [
+        Self::StateCreate,
+        Self::StateGetSize,
+        Self::StateGetData,
+        Self::SetState,
+        Self::GetIccReg,
+        Self::SetIccReg,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::StateCreate => "hv_gic_state_create",
+            Self::StateGetSize => "hv_gic_state_get_size",
+            Self::StateGetData => "hv_gic_state_get_data",
+            Self::SetState => "hv_gic_set_state",
+            Self::GetIccReg => "hv_gic_get_icc_reg",
+            Self::SetIccReg => "hv_gic_set_icc_reg",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HvfSymbolGroup {
+    Available,
+    Missing(HvfGicSymbol),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HvfGicSymbols {
+    presence: [bool; 6],
+}
+
+impl HvfGicSymbols {
+    /// Order follows HvfGicSymbol::ALL. Pure input, not a native execution probe.
+    pub const fn from_presence(presence: [bool; 6]) -> Self {
+        Self { presence }
+    }
+
+    pub fn contains(self, symbol: HvfGicSymbol) -> bool {
+        self.presence[symbol as usize]
+    }
+
+    pub fn blob_group(self) -> HvfSymbolGroup {
+        self.group(&HvfGicSymbol::ALL[..4])
+    }
+
+    pub fn icc_group(self) -> HvfSymbolGroup {
+        self.group(&HvfGicSymbol::ALL[4..])
+    }
+
+    fn group(self, symbols: &[HvfGicSymbol]) -> HvfSymbolGroup {
+        symbols
+            .iter()
+            .find(|symbol| !self.contains(**symbol))
+            .map_or(HvfSymbolGroup::Available, |symbol| {
+                HvfSymbolGroup::Missing(*symbol)
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HvfGicModel {
+    NativeGicV3,
+    UserspaceGicV3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HvfVmFacts {
+    pub gic_model: Observation<HvfGicModel>,
+    pub nested: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HvfGicAdmission {
+    /// GIC prerequisites only, never a live operation or qualification grant.
+    PrerequisitesAvailable,
+    NotApplicable,
+    Incomplete,
+    FrameworkUnavailable(NativeQueryError),
+    MissingSymbol(HvfGicSymbol),
+    UserspaceGic,
+    NestedProfile,
+    ProvidersNotImplemented,
+}
+
+pub fn reduce_hvf_gic_admission(
+    lane: NativeLane,
+    host: &HvfHostFacts,
+    vm: HvfVmFacts,
+    providers_complete: bool,
+) -> HvfGicAdmission {
+    if lane != NativeLane::HvfArm64GicV3 {
+        return HvfGicAdmission::NotApplicable;
+    }
+    match host.framework {
+        Observation::Observed(()) => {}
+        Observation::Unavailable(error) => return HvfGicAdmission::FrameworkUnavailable(error),
+        _ => return HvfGicAdmission::Incomplete,
+    }
+    let Observation::Observed(symbols) = host.gic_symbols else {
+        return HvfGicAdmission::Incomplete;
+    };
+    for group in [symbols.blob_group(), symbols.icc_group()] {
+        if let HvfSymbolGroup::Missing(symbol) = group {
+            return HvfGicAdmission::MissingSymbol(symbol);
+        }
+    }
+    if host.gic_blob_symbols != Observation::Observed(symbols.blob_group())
+        || host.gic_icc_symbols != Observation::Observed(symbols.icc_group())
+    {
+        return HvfGicAdmission::Incomplete;
+    }
+    match vm.gic_model {
+        Observation::Observed(HvfGicModel::NativeGicV3) => {}
+        Observation::Observed(HvfGicModel::UserspaceGicV3) => return HvfGicAdmission::UserspaceGic,
+        _ => return HvfGicAdmission::Incomplete,
+    }
+    if vm.nested {
+        return HvfGicAdmission::NestedProfile;
+    }
+    if !providers_complete {
+        return HvfGicAdmission::ProvidersNotImplemented;
+    }
+    HvfGicAdmission::PrerequisitesAvailable
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HvfHostFacts {
     pub framework: Observation<()>,
     pub vm_admission: Observation<()>,
     pub gic_model: Observation<()>,
+    pub gic_symbols: Observation<HvfGicSymbols>,
+    pub gic_blob_symbols: Observation<HvfSymbolGroup>,
+    pub gic_icc_symbols: Observation<HvfSymbolGroup>,
+}
+
+impl HvfHostFacts {
+    fn not_queried(applicable: bool) -> Self {
+        Self {
+            framework: if applicable {
+                Observation::NotEvaluated
+            } else {
+                Observation::NotApplicable
+            },
+            vm_admission: if applicable {
+                Observation::NotEvaluated
+            } else {
+                Observation::NotApplicable
+            },
+            gic_model: if applicable {
+                Observation::NotEvaluated
+            } else {
+                Observation::NotApplicable
+            },
+            gic_symbols: if applicable {
+                Observation::NotEvaluated
+            } else {
+                Observation::NotApplicable
+            },
+            gic_blob_symbols: if applicable {
+                Observation::NotEvaluated
+            } else {
+                Observation::NotApplicable
+            },
+            gic_icc_symbols: if applicable {
+                Observation::NotEvaluated
+            } else {
+                Observation::NotApplicable
+            },
+        }
+    }
+
+    pub fn from_symbols(symbols: HvfGicSymbols) -> Self {
+        Self {
+            framework: Observation::Observed(()),
+            gic_symbols: Observation::Observed(symbols),
+            gic_blob_symbols: Observation::Observed(symbols.blob_group()),
+            gic_icc_symbols: Observation::Observed(symbols.icc_group()),
+            ..Self::not_queried(true)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -569,7 +757,7 @@ pub struct NativeHostReport {
     pub operations: NativeLiveOperations,
 }
 
-/// Opens only a Linux system KVM fd. Never constructs a VM, vCPU, GIC or guest workload.
+/// Observes system APIs only, never constructing a VM, vCPU, GIC or guest workload.
 pub fn query_live_host() -> NativeHostReport {
     let build = compiled_live_build();
     let lane = NativeLane::from_build(build);
@@ -578,23 +766,44 @@ pub fn query_live_host() -> NativeHostReport {
     } else {
         KvmHostFacts::not_queried(false)
     };
-    let hvf_observation = if lane == NativeLane::HvfArm64GicV3 {
-        Observation::NotEvaluated
+    let hvf = if lane == NativeLane::HvfArm64GicV3 {
+        query_hvf()
     } else {
-        Observation::NotApplicable
+        HvfHostFacts::not_queried(false)
     };
     NativeHostReport {
         build,
         lane,
         kvm_prerequisites: reduce_kvm_prerequisites(lane, &kvm),
         kvm,
-        hvf: HvfHostFacts {
-            framework: hvf_observation,
-            vm_admission: hvf_observation,
-            gic_model: hvf_observation,
-        },
+        hvf,
         operations: NativeLiveOperations::for_lane(lane),
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn query_hvf() -> HvfHostFacts {
+    match hvf::framework::HvfFramework::load() {
+        Ok(framework) => {
+            HvfHostFacts::from_symbols(HvfGicSymbols::from_presence(framework.gic_symbols()))
+        }
+        Err(error) => {
+            log::debug!("HVF framework observation unavailable: {error}");
+            HvfHostFacts {
+                framework: Observation::Unavailable(NativeQueryError {
+                    operation: QueryOperation::LoadHvfFramework,
+                    raw_os_error: None,
+                    kind: std::io::ErrorKind::Other,
+                }),
+                ..HvfHostFacts::not_queried(true)
+            }
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn query_hvf() -> HvfHostFacts {
+    HvfHostFacts::not_queried(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -1164,5 +1373,160 @@ mod tests {
                 KvmPrerequisites::MissingCapability(capability)
             );
         }
+    }
+
+    #[test]
+    fn native_live_hvf_symbol_presence_exhausts_both_independent_groups() {
+        use crate::api::capabilities::{HvfGicSymbol, HvfGicSymbols, HvfSymbolGroup};
+        let names = [
+            "hv_gic_state_create",
+            "hv_gic_state_get_size",
+            "hv_gic_state_get_data",
+            "hv_gic_set_state",
+            "hv_gic_get_icc_reg",
+            "hv_gic_set_icc_reg",
+        ];
+        for bits in 0_u8..64 {
+            let presence = std::array::from_fn(|index| bits & (1 << index) != 0);
+            let symbols = HvfGicSymbols::from_presence(presence);
+            for (index, symbol) in HvfGicSymbol::ALL.into_iter().enumerate() {
+                assert_eq!(symbol.name(), names[index]);
+                assert_eq!(symbols.contains(symbol), presence[index]);
+            }
+            let expected = |mut range: std::ops::Range<usize>| {
+                range
+                    .find(|index| !presence[*index])
+                    .map_or(HvfSymbolGroup::Available, |index| {
+                        HvfSymbolGroup::Missing(HvfGicSymbol::ALL[index])
+                    })
+            };
+            assert_eq!(symbols.blob_group(), expected(0..4));
+            assert_eq!(symbols.icc_group(), expected(4..6));
+        }
+    }
+
+    #[test]
+    fn native_live_hvf_admission_exhausts_model_profile_provider_and_symbol_predicates() {
+        use crate::api::capabilities::{
+            HvfGicAdmission, HvfGicModel, HvfGicSymbol, HvfGicSymbols, HvfHostFacts, HvfVmFacts,
+            reduce_hvf_gic_admission,
+        };
+        for bits in 0_u8..64 {
+            let presence = std::array::from_fn(|index| bits & (1 << index) != 0);
+            let symbols = HvfGicSymbols::from_presence(presence);
+            let host = HvfHostFacts::from_symbols(symbols);
+            assert_eq!(host.vm_admission, Observation::NotEvaluated);
+            assert_eq!(host.gic_model, Observation::NotEvaluated);
+            for lane in [
+                NativeLane::Unsupported,
+                NativeLane::KvmX86_64,
+                NativeLane::KvmArm64GicV3,
+                NativeLane::HvfArm64GicV3,
+            ] {
+                for model in [
+                    Observation::NotEvaluated,
+                    Observation::NotApplicable,
+                    Observation::Observed(HvfGicModel::NativeGicV3),
+                    Observation::Observed(HvfGicModel::UserspaceGicV3),
+                ] {
+                    for nested in [false, true] {
+                        for providers in [false, true] {
+                            let vm = HvfVmFacts {
+                                gic_model: model,
+                                nested,
+                            };
+                            let missing = HvfGicSymbol::ALL
+                                .into_iter()
+                                .find(|symbol| !symbols.contains(*symbol));
+                            let expected = if lane != NativeLane::HvfArm64GicV3 {
+                                HvfGicAdmission::NotApplicable
+                            } else if let Some(symbol) = missing {
+                                HvfGicAdmission::MissingSymbol(symbol)
+                            } else {
+                                match model {
+                                    Observation::Observed(HvfGicModel::UserspaceGicV3) => {
+                                        HvfGicAdmission::UserspaceGic
+                                    }
+                                    Observation::Observed(HvfGicModel::NativeGicV3) if nested => {
+                                        HvfGicAdmission::NestedProfile
+                                    }
+                                    Observation::Observed(HvfGicModel::NativeGicV3)
+                                        if !providers =>
+                                    {
+                                        HvfGicAdmission::ProvidersNotImplemented
+                                    }
+                                    Observation::Observed(HvfGicModel::NativeGicV3) => {
+                                        HvfGicAdmission::PrerequisitesAvailable
+                                    }
+                                    _ => HvfGicAdmission::Incomplete,
+                                }
+                            };
+                            assert_eq!(
+                                reduce_hvf_gic_admission(lane, &host, vm, providers),
+                                expected
+                            );
+                            let operations = NativeLiveOperations::for_lane(lane);
+                            assert!(!operations.pause.is_supported());
+                            assert!(!operations.capture.is_supported());
+                            assert!(!operations.restore.is_supported());
+                            assert!(!operations.fork.is_supported());
+                            assert!(!operations.incremental.is_supported());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_live_hvf_admission_refuses_unknown_framework_and_partial_inventory() {
+        use crate::api::capabilities::{
+            HvfGicAdmission, HvfGicModel, HvfGicSymbols, HvfHostFacts, HvfVmFacts,
+            reduce_hvf_gic_admission,
+        };
+        let vm = HvfVmFacts {
+            gic_model: Observation::Observed(HvfGicModel::NativeGicV3),
+            nested: false,
+        };
+        let lane = NativeLane::HvfArm64GicV3;
+        let mut host = HvfHostFacts::not_queried(true);
+        assert_eq!(
+            reduce_hvf_gic_admission(lane, &host, vm, true),
+            HvfGicAdmission::Incomplete
+        );
+        let error = NativeQueryError {
+            operation: QueryOperation::LoadHvfFramework,
+            raw_os_error: None,
+            kind: ErrorKind::Other,
+        };
+        host.framework = Observation::Unavailable(error);
+        assert_eq!(
+            reduce_hvf_gic_admission(lane, &host, vm, true),
+            HvfGicAdmission::FrameworkUnavailable(error)
+        );
+        host.framework = Observation::Observed(());
+        assert_eq!(
+            reduce_hvf_gic_admission(lane, &host, vm, true),
+            HvfGicAdmission::Incomplete
+        );
+        host = HvfHostFacts::from_symbols(HvfGicSymbols::from_presence([true; 6]));
+        host.gic_blob_symbols = Observation::NotEvaluated;
+        assert_eq!(
+            reduce_hvf_gic_admission(lane, &host, vm, true),
+            HvfGicAdmission::Incomplete
+        );
+        host = HvfHostFacts::from_symbols(HvfGicSymbols::from_presence([true; 6]));
+        host.gic_icc_symbols = Observation::NotEvaluated;
+        assert_eq!(
+            reduce_hvf_gic_admission(lane, &host, vm, true),
+            HvfGicAdmission::Incomplete
+        );
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn native_live_hvf_non_hvf_target_is_not_applicable_without_loading_framework() {
+        use crate::api::capabilities::{HvfHostFacts, query_hvf};
+        assert_eq!(query_hvf(), HvfHostFacts::not_queried(false));
     }
 }

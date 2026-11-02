@@ -829,7 +829,7 @@ pub fn build_microvm(
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
 
     #[cfg(all(not(feature = "tee"), target_os = "macos"))]
-    let vm = setup_vm(
+    let mut vm = setup_vm(
         &guest_memory,
         &arch_memory_info,
         vm_resources.nested_enabled,
@@ -1126,10 +1126,24 @@ pub fn build_microvm(
         intc = {
             // If the system supports the in-kernel GIC, use it. Otherwise, fall back to the
             // userspace implementation.
-            let gic = match HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64) {
-                Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
-                Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
+            use crate::api::capabilities::HvfGicModel;
+            let vcpu_count = u64::from(vm_resources.vm_config().vcpu_count.ok_or(
+                StartMicrovmError::Internal(Error::Vm(VstateError::VcpuCountNotInitialized)),
+            )?);
+            let (gic, model) = match HvfGicV3::new(vcpu_count, vm.framework()) {
+                Ok(hvfgic) => (
+                    IrqChipDevice::new(Box::new(hvfgic)),
+                    HvfGicModel::NativeGicV3,
+                ),
+                Err(error) => {
+                    log::debug!("HVF native GIC unavailable, selecting userspace GIC: {error}");
+                    (
+                        IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
+                        HvfGicModel::UserspaceGicV3,
+                    )
+                }
             };
+            vm.record_gic_model(model);
             Arc::new(Mutex::new(gic))
         };
 

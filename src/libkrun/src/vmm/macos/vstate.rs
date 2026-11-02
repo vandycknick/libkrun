@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crate::api::capabilities::{HvfGicModel, HvfVmFacts, Observation};
 use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
 use crate::vmm::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 
@@ -108,6 +109,7 @@ pub type Result<T> = result::Result<T, Error>;
 pub struct Vm {
     hvf_vm: HvfVm,
     remapper: Option<Arc<hvf::remap::HostMemoryRemapper>>,
+    live_facts: HvfVmFacts,
 }
 
 impl Vm {
@@ -118,9 +120,24 @@ impl Vm {
         Ok(Vm {
             hvf_vm,
             remapper: None,
+            live_facts: HvfVmFacts {
+                gic_model: Observation::NotEvaluated,
+                nested: nested_enabled,
+            },
         })
     }
 
+    pub fn framework(&self) -> Arc<hvf::framework::HvfFramework> {
+        self.hvf_vm.framework()
+    }
+
+    pub fn record_gic_model(&mut self, model: HvfGicModel) {
+        self.live_facts.gic_model = Observation::Observed(model);
+    }
+
+    pub fn live_facts(&self) -> HvfVmFacts {
+        self.live_facts
+    }
     /// Initializes the guest memory.
     pub fn memory_init(
         &mut self,

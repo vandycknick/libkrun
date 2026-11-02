@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
-use std::sync::LazyLock;
+use std::sync::Arc;
 
 use crate::Error as DeviceError;
 use crate::bus::BusDevice;
@@ -11,24 +11,23 @@ use crate::legacy::irqchip::IrqChipT;
 
 use hvf::Error;
 use hvf::bindings::{HV_SUCCESS, hv_gic_config_t, hv_ipa_t, hv_return_t};
+use hvf::framework::{HvfFramework, OwnedConfig};
 use utils::eventfd::EventFd;
 
 // Device trees specific constants
 const ARCH_GIC_V3_MAINT_IRQ: u32 = 9;
 
-pub struct HvfGicBindings {
-    hv_gic_create:
-        libloading::Symbol<'static, unsafe extern "C" fn(hv_gic_config_t) -> hv_return_t>,
-    hv_gic_config_create: libloading::Symbol<'static, unsafe extern "C" fn() -> hv_gic_config_t>,
+struct HvfGicBindings {
+    hv_gic_create: unsafe extern "C" fn(hv_gic_config_t) -> hv_return_t,
+    hv_gic_config_create: unsafe extern "C" fn() -> hv_gic_config_t,
     hv_gic_config_set_distributor_base:
-        libloading::Symbol<'static, unsafe extern "C" fn(hv_gic_config_t, hv_ipa_t) -> hv_return_t>,
+        unsafe extern "C" fn(hv_gic_config_t, hv_ipa_t) -> hv_return_t,
     hv_gic_config_set_redistributor_base:
-        libloading::Symbol<'static, unsafe extern "C" fn(hv_gic_config_t, hv_ipa_t) -> hv_return_t>,
-    hv_gic_get_distributor_size:
-        libloading::Symbol<'static, unsafe extern "C" fn(*mut usize) -> hv_return_t>,
-    hv_gic_get_redistributor_size:
-        libloading::Symbol<'static, unsafe extern "C" fn(*mut usize) -> hv_return_t>,
-    hv_gic_set_spi: libloading::Symbol<'static, unsafe extern "C" fn(u32, bool) -> hv_return_t>,
+        unsafe extern "C" fn(hv_gic_config_t, hv_ipa_t) -> hv_return_t,
+    hv_gic_get_distributor_size: unsafe extern "C" fn(*mut usize) -> hv_return_t,
+    hv_gic_get_redistributor_size: unsafe extern "C" fn(*mut usize) -> hv_return_t,
+    hv_gic_set_spi: unsafe extern "C" fn(u32, bool) -> hv_return_t,
+    framework: Arc<HvfFramework>,
 }
 
 pub struct HvfGicV3 {
@@ -41,73 +40,83 @@ pub struct HvfGicV3 {
     vcpu_count: u64,
 }
 
-static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
-    libloading::Library::new(
-        "/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor",
-    )
-    .unwrap()
-});
-
 impl HvfGicV3 {
-    pub fn new(vcpu_count: u64) -> Result<Self, Error> {
+    pub fn new(vcpu_count: u64, framework: Arc<HvfFramework>) -> Result<Self, Error> {
         let bindings = unsafe {
             HvfGicBindings {
-                hv_gic_create: HVF.get(b"hv_gic_create").map_err(Error::FindSymbol)?,
-                hv_gic_config_create: HVF
-                    .get(b"hv_gic_config_create")
-                    .map_err(Error::FindSymbol)?,
-                hv_gic_config_set_distributor_base: HVF
-                    .get(b"hv_gic_config_set_distributor_base")
-                    .map_err(Error::FindSymbol)?,
-                hv_gic_config_set_redistributor_base: HVF
-                    .get(b"hv_gic_config_set_redistributor_base")
-                    .map_err(Error::FindSymbol)?,
-                hv_gic_get_distributor_size: HVF
-                    .get(b"hv_gic_get_distributor_size")
-                    .map_err(Error::FindSymbol)?,
-                hv_gic_get_redistributor_size: HVF
-                    .get(b"hv_gic_get_redistributor_size")
-                    .map_err(Error::FindSymbol)?,
-                hv_gic_set_spi: HVF.get(b"hv_gic_set_spi").map_err(Error::FindSymbol)?,
+                hv_gic_create: *framework.symbol(b"hv_gic_create\0")?,
+                hv_gic_config_create: *framework.symbol(b"hv_gic_config_create\0")?,
+                hv_gic_config_set_distributor_base: *framework
+                    .symbol(b"hv_gic_config_set_distributor_base\0")?,
+                hv_gic_config_set_redistributor_base: *framework
+                    .symbol(b"hv_gic_config_set_redistributor_base\0")?,
+                hv_gic_get_distributor_size: *framework.symbol(b"hv_gic_get_distributor_size\0")?,
+                hv_gic_get_redistributor_size: *framework
+                    .symbol(b"hv_gic_get_redistributor_size\0")?,
+                hv_gic_set_spi: *framework.symbol(b"hv_gic_set_spi\0")?,
+                framework,
             }
         };
 
         let mut dist_size: usize = 0;
         let ret = unsafe { (bindings.hv_gic_get_distributor_size)(&mut dist_size) };
         if ret != HV_SUCCESS {
-            return Err(Error::VmCreate);
+            return Err(Error::NativeCall {
+                symbol: "hv_gic_get_distributor_size",
+                status: ret,
+            });
         }
         let dist_size = dist_size as u64;
 
         let mut redist_size: usize = 0;
         let ret = unsafe { (bindings.hv_gic_get_redistributor_size)(&mut redist_size) };
         if ret != HV_SUCCESS {
-            return Err(Error::VmCreate);
+            return Err(Error::NativeCall {
+                symbol: "hv_gic_get_redistributor_size",
+                status: ret,
+            });
         }
 
         let redists_size = redist_size as u64 * vcpu_count;
         let dist_addr = arch::MMIO_MEM_START - dist_size - redists_size;
         let redists_addr = arch::MMIO_MEM_START - redists_size;
 
-        let gic_config = unsafe { (bindings.hv_gic_config_create)() };
-        let ret = unsafe { (bindings.hv_gic_config_set_distributor_base)(gic_config, dist_addr) };
+        let gic_config = unsafe {
+            OwnedConfig::new(
+                (bindings.hv_gic_config_create)(),
+                Arc::clone(&bindings.framework),
+                "hv_gic_config_create",
+            )?
+        };
+        let ret = unsafe {
+            (bindings.hv_gic_config_set_distributor_base)(gic_config.as_ptr(), dist_addr)
+        };
         if ret != HV_SUCCESS {
-            return Err(Error::VmCreate);
+            return Err(Error::NativeCall {
+                symbol: "hv_gic_config_set_distributor_base",
+                status: ret,
+            });
         }
 
         let ret = unsafe {
             (bindings.hv_gic_config_set_redistributor_base)(
-                gic_config,
+                gic_config.as_ptr(),
                 arch::MMIO_MEM_START - redists_size,
             )
         };
         if ret != HV_SUCCESS {
-            return Err(Error::VmCreate);
+            return Err(Error::NativeCall {
+                symbol: "hv_gic_config_set_redistributor_base",
+                status: ret,
+            });
         }
 
-        let ret = unsafe { (bindings.hv_gic_create)(gic_config) };
+        let ret = unsafe { (bindings.hv_gic_create)(gic_config.as_ptr()) };
         if ret != HV_SUCCESS {
-            return Err(Error::VmCreate);
+            return Err(Error::NativeCall {
+                symbol: "hv_gic_create",
+                status: ret,
+            });
         }
 
         Ok(Self {

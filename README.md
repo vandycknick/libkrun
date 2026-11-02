@@ -185,9 +185,36 @@ returns `SystemQueriesAvailable`, `NotApplicable`, `Incomplete`,
 `MissingCapability(capability)`. Successful system queries do not establish
 that VM construction will succeed.
 
-`HvfHostFacts` has `framework`, `vm_admission` and `gic_model`, each
-`Observation<()>`. They remain `NotEvaluated` on HVF, and `NotApplicable`
-elsewhere. Optional GIC symbol resolution is not part of this surface yet.
+`HvfHostFacts` retains `framework`, `vm_admission` and `gic_model`, each
+`Observation<()>`. On an eligible arm64 macOS lane the query fallibly loads
+Hypervisor.framework and resolves addresses only. Framework load failure is
+`Unavailable` with `QueryOperation::LoadHvfFramework`, unknown errno and
+`ErrorKind::Other`; detailed loader diagnostics are logged. Excluded profiles
+and non-HVF targets report `NotApplicable` without framework access.
+VM admission and the selected model remain `NotEvaluated` in this machine-less query.
+
+The additional `gic_symbols: Observation<HvfGicSymbols>` records all six
+addresses, individually accessible through `contains(HvfGicSymbol)`.
+`gic_blob_symbols` and `gic_icc_symbols` separately report
+`Observation<HvfSymbolGroup>` (`Available` or the first `Missing(symbol)`).
+The blob group is exactly `hv_gic_state_create`, `hv_gic_state_get_size`,
+`hv_gic_state_get_data`, `hv_gic_set_state`. CPU registers are excluded from
+the blob and require both `hv_gic_get_icc_reg` and `hv_gic_set_icc_reg`.
+All six are optional runtime lookups; none is invoked during discovery.
+The owned framework context retains copied function pointers, and touched
+VM/GIC configuration constructors release their OS objects on every path.
+
+On macOS arm64, the Rust-only `VmmHandle::hvf_vm_facts()` reports the actual
+builder-selected `Observation<HvfGicModel>` (`NativeGicV3` or
+`UserspaceGicV3`) and the VM's nested setting. Missing optional state APIs
+do not prevent cold boot or change its existing userspace-GIC fallback.
+`reduce_hvf_gic_admission(lane, host, vm, providers_complete)` is a pure
+prerequisite reducer: it refuses unknown facts, missing symbols, userspace
+GICs, nested profiles and incomplete providers. Even
+`HvfGicAdmission::PrerequisitesAvailable` grants no live operation or host
+qualification. Providers remain incomplete through Phase 8.
+Actual macOS compile/link/optional-import checks and older-host cold boot
+remain unverified, owner Phase 25 (`pending-lane:hvf`).
 No query creates a VM/vCPU/GIC, installs signals, allocates guest RAM,
 executes guest code, or performs capture/restore/reclaim probes.
 

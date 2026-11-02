@@ -162,6 +162,8 @@ pub struct VmmHandle {
     shutdown_efd: Option<EventFd>,
     #[cfg(target_os = "macos")]
     reclaim_state: std::sync::Arc<hvf::reclaim::ReclaimState>,
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    hvf_vm_facts: crate::api::capabilities::HvfVmFacts,
 }
 
 /// Outcome of the per-VM host reclaim qualification probe.
@@ -197,6 +199,11 @@ pub struct HostReclaimStatus {
 
 #[cfg(target_os = "macos")]
 impl VmmHandle {
+    #[cfg(target_arch = "aarch64")]
+    pub fn hvf_vm_facts(&self) -> crate::api::capabilities::HvfVmFacts {
+        self.hvf_vm_facts
+    }
+
     /// Snapshot of host memory reclaim for this VM.
     pub fn host_reclaim_status(&self) -> HostReclaimStatus {
         use hvf::reclaim::ReclaimQualification;
@@ -305,6 +312,8 @@ impl<'a> Vmm<'a> {
                     vm_ctl_tx: inner.vm_ctl_sender(),
                     #[cfg(target_os = "macos")]
                     reclaim_state: inner.vm.reclaim_state(),
+                    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                    hvf_vm_facts: inner.vm.live_facts(),
                     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
                     shutdown_efd: shutdown_efd
                         .as_ref()

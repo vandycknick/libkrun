@@ -15,6 +15,8 @@ pub mod build_facts {
 pub mod bindings;
 mod discard;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub mod framework;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 mod probe;
 pub mod reclaim;
 pub mod remap;
@@ -30,10 +32,12 @@ use std::cell::Cell;
 
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+use crate::framework::{HvfFramework, OwnedConfig};
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name};
 use arch::guest_memory::RamLayout;
@@ -119,15 +123,19 @@ const EC_AA64_BKPT: u64 = 0x3c;
 
 #[derive(Debug)]
 pub enum Error {
-    EnableEL2,
     FindSymbol(libloading::Error),
+    LoadFramework(libloading::Error),
+    NullObject(&'static str),
+    NativeCall {
+        symbol: &'static str,
+        status: hv_return_t,
+    },
     MemoryMap,
     MemorySize,
     MemoryUnmap,
     InvalidMemoryFault,
     ReclaimState(ReclaimStateError),
     ReclaimProbeCleanup(String),
-    NestedCheck,
     VcpuCreate,
     VcpuInitialRegisters,
     VcpuReadRegister,
@@ -139,7 +147,6 @@ pub enum Error {
     VcpuSetSystemRegister(u16, u64),
     VcpuSetVtimerMask,
     VmBusy,
-    VmCreate,
     VmDestroy,
 }
 
@@ -148,18 +155,16 @@ impl Display for Error {
         use self::Error::*;
 
         match self {
-            EnableEL2 => write!(f, "Error enabling EL2 mode in HVF"),
             FindSymbol(err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
+            LoadFramework(err) => write!(f, "Couldn't load HVF framework: {err}"),
+            NullObject(symbol) => write!(f, "{symbol} returned a null object"),
+            NativeCall { symbol, status } => write!(f, "{symbol} failed: {status}"),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
             MemorySize => write!(f, "Memory region size is not representable by HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
             InvalidMemoryFault => write!(f, "Invalid fault in mapped guest RAM"),
             ReclaimState(err) => write!(f, "Error tracking guest RAM in HVF: {err}"),
             ReclaimProbeCleanup(err) => write!(f, "Error cleaning up HVF reclaim probe: {err}"),
-            NestedCheck => write!(
-                f,
-                "Nested virtualization was requested but it's not support in this system"
-            ),
             VcpuCreate => write!(f, "Error creating HVF vCPU instance"),
             VcpuInitialRegisters => write!(f, "Error setting up initial HVF vCPU registers"),
             VcpuReadRegister => write!(f, "Error reading HVF vCPU register"),
@@ -174,7 +179,6 @@ impl Display for Error {
             ),
             VcpuSetVtimerMask => write!(f, "Error setting HVF vCPU vtimer mask"),
             VmBusy => write!(f, "HVF VM is still owned by a cleanup worker"),
-            VmCreate => write!(f, "Error creating HVF VM instance"),
             VmDestroy => write!(f, "Error destroying HVF VM instance"),
         }
     }
@@ -236,24 +240,26 @@ pub fn vcpu_set_vtimer_mask(vcpuid: u64, masked: bool) -> Result<(), Error> {
 
 /// Checks if Nested Virtualization is supported on the current system. Only
 /// M3 or newer chips on macOS 15+ will satisfy the requirements.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub fn check_nested_virt() -> Result<bool, Error> {
-    type GetEL2Supported =
-        libloading::Symbol<'static, unsafe extern "C" fn(*mut bool) -> hv_return_t>;
-
-    let get_el2_supported: Result<GetEL2Supported, libloading::Error> =
-        unsafe { HVF.get(b"hv_vm_config_get_el2_supported") };
-    if get_el2_supported.is_err() {
-        info!("cannot find hv_vm_config_get_el2_supported symbol");
-        return Ok(false);
-    }
-
-    let mut el2_supported: bool = false;
-    let ret = unsafe { (get_el2_supported.unwrap())(&mut el2_supported) };
+    let framework = HvfFramework::load()?;
+    let get_el2_supported = match unsafe {
+        framework.symbol::<unsafe extern "C" fn(*mut bool) -> hv_return_t>(
+            b"hv_vm_config_get_el2_supported\0",
+        )
+    } {
+        Ok(symbol) => symbol,
+        Err(Error::FindSymbol(_)) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut el2_supported = false;
+    let ret = unsafe { get_el2_supported(&mut el2_supported) };
     if ret != HV_SUCCESS {
-        error!("hv_vm_config_get_el2_supported failed: {ret:?}");
-        return Err(Error::NestedCheck);
+        return Err(Error::NativeCall {
+            symbol: "hv_vm_config_get_el2_supported",
+            status: ret,
+        });
     }
-
     Ok(el2_supported)
 }
 
@@ -262,6 +268,8 @@ pub struct HvfVm {
     nested_enabled: bool,
     ipa_bits: Option<u32>,
     lifetime: Arc<HvfVmLifetime>,
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    framework: Arc<HvfFramework>,
 }
 
 pub(crate) struct HvfVmLifetime {
@@ -297,51 +305,61 @@ impl Drop for HvfVmLifetime {
     }
 }
 
-static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
-    libloading::Library::new(
-        "/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor",
-    )
-    .unwrap()
-});
-
 impl HvfVm {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     pub fn new(nested_enabled: bool) -> Result<Self, Error> {
+        let framework = HvfFramework::load()?;
         let reclaim_state = Arc::new(ReclaimState::new());
-        let config = unsafe { hv_vm_config_create() };
-        let mut ipa_bits = 0;
-        let ipa_bits = if unsafe { hv_vm_config_get_ipa_size(config, &mut ipa_bits) } == HV_SUCCESS
-        {
-            Some(ipa_bits)
-        } else {
-            None
+        let config = unsafe {
+            OwnedConfig::new(
+                hv_vm_config_create(),
+                Arc::clone(&framework),
+                "hv_vm_config_create",
+            )?
         };
-        if nested_enabled {
-            let set_el2_enabled: libloading::Symbol<
-                'static,
-                unsafe extern "C" fn(hv_vm_config_t, bool) -> hv_return_t,
-            > = unsafe {
-                HVF.get(b"hv_vm_config_set_el2_enabled")
-                    .map_err(Error::FindSymbol)?
+        let mut ipa_bits = 0;
+        let ipa_bits =
+            if unsafe { hv_vm_config_get_ipa_size(config.as_ptr(), &mut ipa_bits) } == HV_SUCCESS {
+                Some(ipa_bits)
+            } else {
+                None
             };
-
-            let ret = unsafe { (set_el2_enabled)(config, true) };
+        if nested_enabled {
+            let set_el2_enabled = unsafe {
+                framework.symbol::<unsafe extern "C" fn(hv_vm_config_t, bool) -> hv_return_t>(
+                    b"hv_vm_config_set_el2_enabled\0",
+                )?
+            };
+            let ret = unsafe { set_el2_enabled(config.as_ptr(), true) };
             if ret != HV_SUCCESS {
-                return Err(Error::EnableEL2);
+                return Err(Error::NativeCall {
+                    symbol: "hv_vm_config_set_el2_enabled",
+                    status: ret,
+                });
             }
         }
 
-        let ret = unsafe { hv_vm_create(config) };
+        let ret = unsafe { hv_vm_create(config.as_ptr()) };
 
         if ret != HV_SUCCESS {
-            Err(Error::VmCreate)
+            Err(Error::NativeCall {
+                symbol: "hv_vm_create",
+                status: ret,
+            })
         } else {
             Ok(Self {
                 reclaim_state,
                 nested_enabled,
                 ipa_bits,
                 lifetime: Arc::new(HvfVmLifetime::new()),
+                framework,
             })
         }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub fn framework(&self) -> Arc<HvfFramework> {
+        Arc::clone(&self.framework)
     }
 
     pub fn map_memory(
