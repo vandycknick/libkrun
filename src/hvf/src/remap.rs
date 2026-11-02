@@ -1,6 +1,7 @@
 //! Host mapping maintenance, independent of balloon attachment and reporting qualification.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use crate::reclaim::{ReclaimState, ReclaimStateError};
@@ -49,6 +50,7 @@ impl Schedule {
 pub struct HostMemoryRemapper {
     ram: Arc<ReclaimState>,
     schedule: Mutex<Schedule>,
+    admission_closed: AtomicBool,
 }
 
 impl HostMemoryRemapper {
@@ -56,10 +58,31 @@ impl HostMemoryRemapper {
         ram.is_eligible().then(|| Self {
             ram,
             schedule: Mutex::new(Schedule::new(Instant::now())),
+            admission_closed: AtomicBool::new(false),
         })
     }
 
+    // Barrier identities and transition ownership belong to the VMM journal.
+    pub fn close_admission(&self) {
+        self.admission_closed.store(true, Ordering::Release);
+    }
+
+    pub fn poll_quiesced(&self) -> Result<bool, ReclaimStateError> {
+        match self.schedule.try_lock() {
+            Ok(_schedule) => Ok(self.admission_closed.load(Ordering::Acquire)),
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Poisoned(_)) => Err(ReclaimStateError::RemapperLockPoisoned),
+        }
+    }
+
+    pub fn reopen_admission(&self) {
+        self.admission_closed.store(false, Ordering::Release);
+    }
+
     pub fn timeout_millis(&self) -> Result<i32, ReclaimStateError> {
+        if self.admission_closed.load(Ordering::Acquire) {
+            return Ok(i32::MAX);
+        }
         let schedule = self
             .schedule
             .lock()
@@ -74,6 +97,9 @@ impl HostMemoryRemapper {
             .schedule
             .lock()
             .map_err(|_| ReclaimStateError::RemapperLockPoisoned)?;
+        if self.admission_closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let started = Instant::now();
         if schedule.before_reports(started) {
             unsafe { self.ram.normalize_host_mappings()? };
@@ -89,6 +115,9 @@ impl HostMemoryRemapper {
             .schedule
             .lock()
             .map_err(|_| ReclaimStateError::RemapperLockPoisoned)?;
+        if self.admission_closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let started = Instant::now();
         if started >= schedule.deadline {
             unsafe { self.ram.normalize_host_mappings()? };
@@ -130,5 +159,58 @@ mod tests {
         assert_eq!(schedule.deadline, now + REPORT_THROTTLE + PERIOD);
         assert!(!schedule.before_reports(now + Duration::from_millis(300)));
         assert_eq!(schedule.deadline, now + Duration::from_millis(500));
+    }
+
+    #[test]
+    fn maintenance_admission_drains_real_lock_ownership_and_preserves_schedule() {
+        use crate::reclaim::ReclaimState;
+        use crate::remap::HostMemoryRemapper;
+        use crossbeam_channel::bounded;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        let now = Instant::now();
+        let remapper = Arc::new(HostMemoryRemapper {
+            ram: Arc::new(ReclaimState::new()),
+            schedule: Mutex::new(Schedule::new(now)),
+            admission_closed: AtomicBool::new(false),
+        });
+        let (entered_tx, entered_rx) = bounded(1);
+        let (finish_tx, finish_rx) = bounded(1);
+        let worker_remapper = Arc::clone(&remapper);
+        let worker = std::thread::spawn(move || {
+            let Ok(_owned) = worker_remapper.schedule.lock() else {
+                panic!("maintenance schedule lock poisoned");
+            };
+            entered_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+        });
+        entered_rx.recv().unwrap();
+        remapper.close_admission();
+        assert!(!remapper.poll_quiesced().unwrap());
+        assert_eq!(remapper.timeout_millis().unwrap(), i32::MAX);
+        finish_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(remapper.poll_quiesced().unwrap());
+        unsafe { remapper.before_reports() }.unwrap();
+        unsafe { remapper.poll() }.unwrap();
+        assert_eq!(
+            remapper
+                .schedule
+                .lock()
+                .map(|schedule| schedule.deadline)
+                .unwrap(),
+            now + PERIOD,
+        );
+        remapper.reopen_admission();
+        assert!(!remapper.poll_quiesced().unwrap());
+        assert_eq!(
+            remapper
+                .schedule
+                .lock()
+                .map(|schedule| schedule.deadline)
+                .unwrap(),
+            now + PERIOD,
+        );
     }
 }

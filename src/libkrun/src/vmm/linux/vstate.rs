@@ -21,20 +21,21 @@ use std::os::unix::io::RawFd;
 #[cfg(target_arch = "x86_64")]
 use std::env;
 use std::result;
-#[cfg(not(test))]
-use std::sync::Barrier;
+use std::sync::Arc;
 use std::sync::atomic::{Ordering, fence};
 use std::thread;
 #[cfg(target_arch = "x86_64")]
 use std::time::Duration;
 
-use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
+use crate::vmm::control::{CpuAck, CpuCommand, CpuSubmission};
+use crate::vmm::linux::cpu_control::{CpuDisposition, CpuMailbox, submit_command};
+use crate::vmm::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 
 #[cfg(feature = "amd-sev")]
-use super::tee::amdsnp::{AmdSnp, Error as SnpError};
+use crate::vmm::linux::tee::amdsnp::{AmdSnp, Error as SnpError};
 
 #[cfg(feature = "tdx")]
-use super::tee::inteltdx::{Error as TdxError, IntelTdx};
+use crate::vmm::linux::tee::inteltdx::{Error as TdxError, IntelTdx};
 
 #[cfg(feature = "amd-sev")]
 use kbs_types::Tee;
@@ -72,7 +73,7 @@ use vm_memory::{
 };
 
 #[cfg(feature = "amd-sev")]
-use super::tee::amdsnp::launch as snp;
+use crate::vmm::linux::tee::amdsnp::launch as snp;
 
 /// Signal number (SIGRTMIN) used to kick Vcpus.
 pub(crate) const VCPU_RTSIG_OFFSET: i32 = 0;
@@ -81,6 +82,8 @@ pub(crate) const VCPU_RTSIG_OFFSET: i32 = 0;
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum Error {
+    ControlChannel,
+    SignalHandler(utils::errno::Error),
     #[cfg(target_arch = "x86_64")]
     /// A call to cpuid instruction failed.
     CpuId(cpuid::Error),
@@ -255,6 +258,8 @@ impl Display for Error {
         use self::Error::*;
 
         match self {
+            ControlChannel => write!(f, "vCPU control channel unavailable"),
+            SignalHandler(e) => write!(f, "Failed to register vCPU kick handler: {e}"),
             #[cfg(target_arch = "x86_64")]
             CpuId(e) => write!(f, "Cpuid error: {e:?}"),
             CreateGuestMemfd(e) => write!(f, "Unable to create KVM guest_memfd: {e:?}"),
@@ -469,7 +474,7 @@ impl KvmContext {
 
 /// A wrapper around creating and using a VM.
 pub struct Vm {
-    fd: VmFd,
+    fd: Arc<VmFd>,
     next_mem_slot: u32,
 
     // X86 specific fields.
@@ -504,7 +509,7 @@ impl Vm {
             arch::x86_64::msr::supported_guest_msrs(kvm).map_err(Error::GuestMSRs)?;
 
         Ok(Vm {
-            fd: vm_fd,
+            fd: Arc::new(vm_fd),
             next_mem_slot: 0,
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             supported_cpuid,
@@ -542,7 +547,7 @@ impl Vm {
         };
 
         Ok(Vm {
-            fd: vm_fd,
+            fd: Arc::new(vm_fd),
             next_mem_slot: 0,
             supported_cpuid,
             supported_msrs,
@@ -586,7 +591,7 @@ impl Vm {
         vm_fd.enable_cap(&cap).map_err(Error::VmApicBusClockRate)?;
 
         Ok(Vm {
-            fd: vm_fd,
+            fd: Arc::new(vm_fd),
             next_mem_slot: 0,
             supported_cpuid,
             supported_msrs,
@@ -841,6 +846,10 @@ impl Vm {
         &self.fd
     }
 
+    pub fn fd_owner(&self) -> Arc<VmFd> {
+        Arc::clone(&self.fd)
+    }
+
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
     /// Saves and returns the Kvm Vm state.
@@ -954,13 +963,19 @@ pub struct Vcpu {
     mpidr: u64,
 
     // The receiving end of events channel owned by the vcpu side.
-    event_receiver: Receiver<VcpuEvent>,
+    event_receiver: Receiver<CpuCommand>,
     // The transmitting end of the events channel which will be given to the handler.
-    event_sender: Option<Sender<VcpuEvent>>,
+    event_sender: Option<Sender<CpuCommand>>,
     // The receiving end of the responses channel which will be given to the handler.
     response_receiver: Option<Receiver<VcpuResponse>>,
     // The transmitting end of the responses channel owned by the vcpu side.
     response_sender: Sender<VcpuResponse>,
+    control_sender: Sender<CpuAck>,
+    control_receiver: Option<Receiver<CpuAck>>,
+    mailbox: CpuMailbox,
+    retained_resources: Option<(GuestMemoryMmap, Arc<VmFd>)>,
+    #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+    probe_park_state: ProbeParkJournal,
 
     #[cfg(feature = "tee")]
     pm_sender: Sender<WorkerMessage>,
@@ -1035,7 +1050,7 @@ impl Vcpu {
 
     /// Registers a signal handler which makes use of TLS and kvm immediate exit to
     /// kick the vcpu running on the current thread, if there is one.
-    pub fn register_kick_signal_handler() {
+    pub fn register_kick_signal_handler() -> Result<()> {
         extern "C" fn handle_signal(_: c_int, _: *mut siginfo_t, _: *mut c_void) {
             // This is safe because it's temporarily aliasing the `Vcpu` object, but we are
             // only reading `vcpu.fd` which does not change for the lifetime of the `Vcpu`.
@@ -1048,7 +1063,7 @@ impl Vcpu {
         }
 
         register_signal_handler(sigrtmin() + VCPU_RTSIG_OFFSET, handle_signal)
-            .expect("Failed to register vcpu signal handler");
+            .map_err(Error::SignalHandler)
     }
 
     /// Constructs a new VCPU for `vm`.
@@ -1074,6 +1089,7 @@ impl Vcpu {
         let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
         let (event_sender, event_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
+        let (control_sender, control_receiver) = unbounded();
 
         let kernel_enomem_workaround = if env::var_os("KRUN_ENOMEM_WORKAROUND").is_some() {
             debug!("Enabling ENOMEM workaround");
@@ -1096,6 +1112,12 @@ impl Vcpu {
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
             response_sender,
+            control_sender,
+            control_receiver: Some(control_receiver),
+            mailbox: CpuMailbox::new(),
+            retained_resources: None,
+            #[cfg(feature = "native-control-probe")]
+            probe_park_state: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "tee")]
             pm_sender,
         })
@@ -1114,6 +1136,7 @@ impl Vcpu {
         let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
         let (event_sender, event_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
+        let (control_sender, control_receiver) = unbounded();
 
         Ok(Vcpu {
             fd: kvm_vcpu,
@@ -1125,6 +1148,10 @@ impl Vcpu {
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
             response_sender,
+            control_sender,
+            control_receiver: Some(control_receiver),
+            mailbox: CpuMailbox::new(),
+            retained_resources: None,
         })
     }
 
@@ -1141,6 +1168,7 @@ impl Vcpu {
         let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
         let (event_sender, event_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
+        let (control_sender, control_receiver) = unbounded();
 
         Ok(Vcpu {
             fd: kvm_vcpu,
@@ -1151,6 +1179,10 @@ impl Vcpu {
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
             response_sender,
+            control_sender,
+            control_receiver: Some(control_receiver),
+            mailbox: CpuMailbox::new(),
+            retained_resources: None,
         })
     }
 
@@ -1303,34 +1335,88 @@ impl Vcpu {
         Ok(())
     }
 
+    #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+    pub(crate) fn configure_control_probe(
+        &mut self,
+        memory: GuestMemoryMmap,
+        vm: Arc<VmFd>,
+        entry: u64,
+        data_segment: u16,
+        mmio_bus: devices::Bus,
+    ) -> Result<()> {
+        self.retained_resources = Some((memory, vm));
+        self.mmio_bus = Some(mmio_bus);
+        self.fd
+            .set_cpuid2(&self.cpuid)
+            .map_err(Error::VcpuSetCpuid)?;
+        arch::x86_64::interrupts::set_lint(&self.fd).map_err(Error::LocalIntConfiguration)?;
+        let mut sregs = self.fd.get_sregs().map_err(Error::VcpuGetSregs)?;
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        for segment in [&mut sregs.ds, &mut sregs.es, &mut sregs.ss] {
+            segment.base = u64::from(data_segment) << 4;
+            segment.selector = data_segment;
+        }
+        self.fd.set_sregs(&sregs).map_err(Error::VcpuSetSregs)?;
+        self.fd
+            .set_regs(&kvm_bindings::kvm_regs {
+                rip: entry,
+                rflags: 2,
+                rsp: 0xff0,
+                ..Default::default()
+            })
+            .map_err(Error::VcpuSetRegs)?;
+        self.fd
+            .set_mp_state(kvm_bindings::kvm_mp_state {
+                mp_state: kvm_bindings::KVM_MP_STATE_RUNNABLE,
+            })
+            .map_err(Error::VcpuSetMpState)
+    }
+
+    pub fn retain_resources(&mut self, memory: GuestMemoryMmap, vm: &Vm) {
+        self.retained_resources = Some((memory, vm.fd_owner()));
+    }
+
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.
     /// The handle can be used to control the remote vcpu.
     pub fn start_threaded(mut self) -> Result<VcpuHandle> {
-        let event_sender = self.event_sender.take().unwrap();
-        let response_receiver = self.response_receiver.take().unwrap();
+        let event_sender = self.event_sender.take().ok_or(Error::ControlChannel)?;
+        let response_receiver = self.response_receiver.take().ok_or(Error::ControlChannel)?;
+        let control_receiver = self.control_receiver.take().ok_or(Error::ControlChannel)?;
         let (init_tls_sender, init_tls_receiver) = unbounded();
+        #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+        let probe_park_state = Arc::clone(&self.probe_park_state);
         let vcpu_thread = thread::Builder::new()
             .name(format!("fc_vcpu {}", self.cpu_index()))
             .spawn(move || {
-                self.init_thread_local_data()
-                    .expect("Cannot cleanly initialize vcpu TLS.");
-
-                init_tls_sender
-                    .send(true)
-                    .expect("Cannot notify vcpu TLS initialization.");
+                let initialized = self.init_thread_local_data();
+                let ready = initialized.is_ok();
+                if init_tls_sender.send(initialized).is_err() || !ready {
+                    return;
+                }
 
                 self.run();
             })
             .map_err(Error::VcpuSpawn)?;
 
-        init_tls_receiver
-            .recv()
-            .expect("Error waiting for TLS initialization.");
+        match init_tls_receiver.recv() {
+            Ok(Ok(())) => (),
+            result => {
+                let _ = vcpu_thread.join();
+                return match result {
+                    Ok(Err(error)) => Err(error),
+                    _ => Err(Error::ControlChannel),
+                };
+            }
+        }
 
         Ok(VcpuHandle::new(
             event_sender,
             response_receiver,
+            control_receiver,
             vcpu_thread,
+            #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+            probe_park_state,
         ))
     }
 
@@ -1584,7 +1670,7 @@ impl Vcpu {
                 match e.errno() {
                     libc::EAGAIN => Ok(VcpuEmulation::Handled),
                     libc::EINTR => {
-                        self.fd.set_kvm_immediate_exit(0);
+                        // KVM_RUN has now completed any pending IO/MMIO instruction.
                         // Notify that this KVM_RUN was interrupted.
                         Ok(VcpuEmulation::Interrupted)
                     }
@@ -1607,125 +1693,99 @@ impl Vcpu {
         StateMachine::run(self, Self::paused);
     }
 
-    // This is the main loop of the `Running` state.
+    // Clear before checking the authoritative mailbox, never before completing an exit.
+    // A kick racing the final mailbox check then remains set for the next KVM_RUN.
     fn running(&mut self) -> StateMachine<Self> {
-        // This loop is here just for optimizing the emulation path.
-        // No point in ticking the state machine if there are no external events.
+        self.fd.set_kvm_immediate_exit(0);
+        match self.event_receiver.try_recv() {
+            Ok(command) => return self.control(command),
+            Err(TryRecvError::Disconnected) => return StateMachine::finish(),
+            Err(TryRecvError::Empty) => (),
+        }
         loop {
             match self.run_emulation() {
-                // Emulation ran successfully, continue.
                 Ok(VcpuEmulation::Handled) => (),
-                // Emulation was interrupted, check external events.
-                Ok(VcpuEmulation::Interrupted) => break,
-                // If the guest was rebooted or halted:
-                // - vCPU0 will always exit out of `KVM_RUN` with KVM_EXIT_SHUTDOWN or
-                //   KVM_EXIT_HLT.
-                // - the other vCPUs won't ever exit out of `KVM_RUN`, but they won't consume CPU.
-                // Moreover if we allow the vCPU0 thread to finish execution, this might generate a
-                // seccomp failure because musl calls `sigprocmask` as part of `pthread_exit`.
-                // So we pause vCPU0 and send a signal to the emulation thread to stop the VMM.
+                Ok(VcpuEmulation::Interrupted) => return StateMachine::next(Self::running),
                 Ok(VcpuEmulation::Stopped) => return self.exit(FC_EXIT_CODE_OK),
-                // Emulation errors lead to vCPU exit.
                 Err(_) => return self.exit(FC_EXIT_CODE_GENERIC_ERROR),
             }
         }
-
-        // By default don't change state.
-        let mut state = StateMachine::next(Self::running);
-
-        // Break this emulation loop on any transition request/external event.
-        match self.event_receiver.try_recv() {
-            // Running ---- Pause ----> Paused
-            Ok(VcpuEvent::Pause) => {
-                // Nothing special to do.
-                self.response_sender
-                    .send(VcpuResponse::Paused)
-                    .expect("failed to send pause status");
-
-                // TODO: we should call `KVM_KVMCLOCK_CTRL` here to make sure
-                // TODO continued: the guest soft lockup watchdog does not panic on Resume.
-
-                // Move to 'paused' state.
-                state = StateMachine::next(Self::paused);
-            }
-            Ok(VcpuEvent::Resume) => {
-                self.response_sender
-                    .send(VcpuResponse::Resumed)
-                    .expect("failed to send resume status");
-            }
-            // Unhandled exit of the other end.
-            Err(TryRecvError::Disconnected) => {
-                // Move to 'exited' state.
-                state = self.exit(FC_EXIT_CODE_GENERIC_ERROR);
-            }
-            // All other events or lack thereof have no effect on current 'running' state.
-            Err(TryRecvError::Empty) => (),
-        }
-
-        state
     }
 
-    // This is the main loop of the `Paused` state.
+    fn control(&mut self, command: CpuCommand) -> StateMachine<Self> {
+        let ack = self.mailbox.apply(self.id, command);
+        #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+        let ack = {
+            let mut ack = ack;
+            if command.kind == crate::vmm::control::CpuCommandKind::Park && ack.result.is_ok() {
+                let state = self
+                    .fd
+                    .get_regs()
+                    .map(|regs| ProbeParkState {
+                        request: command.request,
+                        key: command.barrier.key,
+                        cpu_id: self.id,
+                        rip: regs.rip,
+                        rax: regs.rax,
+                    })
+                    .map_err(|error| format!("park register observation failed: {error}"));
+                if let Err(error) = &state {
+                    ack.result = Err(error.clone());
+                }
+                match self.probe_park_state.lock() {
+                    Ok(mut snapshot) => *snapshot = Some(state),
+                    Err(_) => ack.result = Err("park observation journal poisoned".to_owned()),
+                }
+            }
+            ack
+        };
+        // The VM journal, not the presence of a waiting API caller, owns this transition.
+        let _ = self.control_sender.send(ack);
+        match self.mailbox.disposition() {
+            CpuDisposition::Running => StateMachine::next(Self::running),
+            CpuDisposition::Parked | CpuDisposition::Prepared => StateMachine::next(Self::paused),
+            CpuDisposition::Stopped => StateMachine::finish(),
+        }
+    }
+
     fn paused(&mut self) -> StateMachine<Self> {
         match self.event_receiver.recv() {
-            // Paused ---- Resume ----> Running
-            Ok(VcpuEvent::Resume) => {
-                // Nothing special to do.
-                self.response_sender
-                    .send(VcpuResponse::Resumed)
-                    .expect("failed to send resume status");
-                // Move to 'running' state.
-                StateMachine::next(Self::running)
-            }
-            // All other events have no effect on current 'paused' state.
-            Ok(_) => StateMachine::next(Self::paused),
-            // Unhandled exit of the other end.
-            Err(_) => {
-                // Move to 'exited' state.
-                self.exit(FC_EXIT_CODE_GENERIC_ERROR)
-            }
+            Ok(command) => self.control(command),
+            Err(_) => StateMachine::finish(),
         }
     }
 
-    #[cfg(not(test))]
-    // Transition to the exited state.
     fn exit(&mut self, exit_code: u8) -> StateMachine<Self> {
-        self.response_sender
-            .send(VcpuResponse::Exited(exit_code))
-            .expect("failed to send Exited status");
-
-        if let Err(e) = self.exit_evt.write(1) {
-            error!("Failed signaling vcpu exit event: {e}");
+        self.mailbox.halt();
+        let _ = self.response_sender.send(VcpuResponse::Exited(exit_code));
+        if let Err(error) = self.exit_evt.write(1) {
+            log::error!("Failed signaling vCPU exit event: {error}");
         }
-
-        // State machine reached its end.
-        StateMachine::next(Self::exited)
+        // musl pthread_exit may be forbidden by the process sandbox on guest shutdown.
+        StateMachine::next(Self::halted)
     }
 
-    #[cfg(not(test))]
-    // This is the main loop of the `Exited` state.
-    fn exited(&mut self) -> StateMachine<Self> {
-        // Wait indefinitely.
-        // The VMM thread will kill the entire process.
-        let barrier = Barrier::new(2);
-        barrier.wait();
-
-        StateMachine::finish()
+    fn halted(&mut self) -> StateMachine<Self> {
+        match self.event_receiver.recv() {
+            Ok(command) => {
+                let stop = command.kind == crate::vmm::control::CpuCommandKind::Stop;
+                let _ = self
+                    .control_sender
+                    .send(self.mailbox.apply(self.id, command));
+                if stop {
+                    StateMachine::finish()
+                } else {
+                    StateMachine::next(Self::halted)
+                }
+            }
+            Err(_) => StateMachine::finish(),
+        }
     }
 
     #[cfg(feature = "tdx")]
     pub fn tdx_secure_virt_prepare(&self, launcher: &mut tdx::launch::Launcher) {
         use std::os::fd::AsRawFd;
         launcher.add_vcpu_fd(self.fd.as_raw_fd());
-    }
-
-    #[cfg(test)]
-    // In tests the main/vmm thread exits without 'exit()'ing the whole process.
-    // All channels get closed on the other side while this Vcpu thread is still running.
-    // This Vcpu thread should just do a clean finish without reporting back to the main thread.
-    fn exit(&mut self, _: u8) -> StateMachine<Self> {
-        // State machine reached its end.
-        StateMachine::finish()
     }
 }
 
@@ -1750,69 +1810,211 @@ pub struct VcpuState {
     xsave: kvm_xsave,
 }
 
-// Allow currently unused Pause and Exit events. These will be used by the vmm later on.
-#[allow(unused)]
-#[derive(Debug)]
-/// List of events that the Vcpu can receive.
-pub enum VcpuEvent {
-    /// Pause the Vcpu.
-    Pause,
-    /// Event that should resume the Vcpu.
-    Resume,
-    // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
-}
+// Lifecycle exits are separate from correlated control acknowledgements.
 
 #[derive(Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
-    /// Vcpu is paused.
-    Paused,
-    /// Vcpu is resumed.
-    Resumed,
+    // Control acknowledgements are delivered through the control mailbox.
     /// Vcpu is stopped.
     Exited(u8),
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
 pub struct VcpuHandle {
-    event_sender: Sender<VcpuEvent>,
+    event_sender: Sender<CpuCommand>,
     response_receiver: Receiver<VcpuResponse>,
+    control_receiver: Receiver<CpuAck>,
     // Rust JoinHandles have to be wrapped in Option if you ever plan on 'join()'ing them.
     // We want to be able to join these threads in tests.
     vcpu_thread: Option<thread::JoinHandle<()>>,
+    #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+    probe_ack_hold: std::sync::Mutex<ProbeAckHold>,
+    #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+    probe_park_state: ProbeParkJournal,
 }
 
 impl VcpuHandle {
-    pub fn new(
-        event_sender: Sender<VcpuEvent>,
+    fn new(
+        event_sender: Sender<CpuCommand>,
         response_receiver: Receiver<VcpuResponse>,
+        control_receiver: Receiver<CpuAck>,
         vcpu_thread: thread::JoinHandle<()>,
+        #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+        probe_park_state: ProbeParkJournal,
     ) -> Self {
         Self {
             event_sender,
             response_receiver,
+            control_receiver,
             vcpu_thread: Some(vcpu_thread),
+            #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+            probe_ack_hold: std::sync::Mutex::new(ProbeAckHold::default()),
+            #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+            probe_park_state,
         }
     }
 
-    pub fn send_event(&self, event: VcpuEvent) -> Result<()> {
-        // Use expect() to crash if the other thread closed this channel.
-        self.event_sender
-            .send(event)
-            .expect("event sender channel closed on vcpu end.");
-        // Kick the vcpu so it picks up the message.
+    pub fn send_control(&self, command: CpuCommand) -> CpuSubmission {
+        #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+        if command.kind == crate::vmm::control::CpuCommandKind::Stop {
+            match self.probe_ack_hold.lock() {
+                Ok(mut hold) => hold.kind = None,
+                Err(_) => return CpuSubmission::Rejected("probe ACK gate poisoned".to_owned()),
+            }
+        }
+        submit_command(&self.event_sender, command, || {
+            match self.vcpu_thread.as_ref() {
+                Some(thread) => thread
+                    .kill(sigrtmin() + VCPU_RTSIG_OFFSET)
+                    .map_err(|error| error.to_string()),
+                None => Err("vCPU thread already reaped".to_owned()),
+            }
+        })
+    }
+
+    pub fn try_control_ack(&self) -> std::result::Result<Option<CpuAck>, String> {
+        #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+        {
+            let mut hold = self
+                .probe_ack_hold
+                .lock()
+                .map_err(|_| "probe ACK gate poisoned".to_owned())?;
+            if let Some(ack) = hold.pending.as_ref() {
+                if hold.kind == Some(ack.kind) {
+                    return Ok(None);
+                }
+                return Ok(hold.pending.take());
+            }
+            if let Some(ack) = self.receive_control_ack()? {
+                if hold.kind == Some(ack.kind) {
+                    hold.pending = Some(ack);
+                    return Ok(None);
+                }
+                return Ok(Some(ack));
+            }
+            Ok(None)
+        }
+        #[cfg(not(all(feature = "native-control-probe", target_arch = "x86_64")))]
+        self.receive_control_ack()
+    }
+
+    fn receive_control_ack(&self) -> std::result::Result<Option<CpuAck>, String> {
+        match self.control_receiver.try_recv() {
+            Ok(ack) => Ok(Some(ack)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err("vCPU ack channel closed".to_owned()),
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
         self.vcpu_thread
             .as_ref()
-            // Safe to unwrap since constructor make this 'Some'.
-            .unwrap()
-            .kill(sigrtmin() + VCPU_RTSIG_OFFSET)
-            .map_err(Error::SignalVcpu)?;
+            .is_none_or(thread::JoinHandle::is_finished)
+    }
+
+    pub fn reap(&mut self) -> std::result::Result<bool, String> {
+        if !self.is_finished() {
+            return Ok(false);
+        }
+        if let Some(thread) = self.vcpu_thread.take() {
+            thread
+                .join()
+                .map_err(|_| "vCPU owner thread panicked".to_owned())?;
+        }
+        Ok(true)
+    }
+
+    #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+    pub(crate) fn set_probe_ack_hold(
+        &self,
+        kind: Option<crate::vmm::control::CpuCommandKind>,
+    ) -> std::result::Result<(), String> {
+        use crate::vmm::control::{CpuAckKind, CpuCommandKind};
+        let mut hold = self
+            .probe_ack_hold
+            .lock()
+            .map_err(|_| "probe ACK gate poisoned".to_owned())?;
+        hold.kind = kind.map(|kind| match kind {
+            CpuCommandKind::Park => CpuAckKind::Parked,
+            CpuCommandKind::PrepareResume { .. } => CpuAckKind::Prepared,
+            CpuCommandKind::Release => CpuAckKind::Released,
+            CpuCommandKind::Stop => CpuAckKind::Stopped,
+        });
         Ok(())
+    }
+
+    #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+    pub(crate) fn probe_held_ack(&self) -> std::result::Result<Option<CpuAck>, String> {
+        let hold = self
+            .probe_ack_hold
+            .lock()
+            .map_err(|_| "probe ACK gate poisoned".to_owned())?;
+        Ok(hold.pending.clone())
+    }
+
+    #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+    pub(crate) fn probe_park_state(&self) -> std::result::Result<Option<ProbeParkState>, String> {
+        let snapshot = self
+            .probe_park_state
+            .lock()
+            .map_err(|_| "park observation journal poisoned".to_owned())?;
+        snapshot.clone().transpose()
     }
 
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
         &self.response_receiver
+    }
+}
+
+#[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+type ProbeParkJournal = Arc<std::sync::Mutex<Option<std::result::Result<ProbeParkState, String>>>>;
+
+#[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+#[derive(Clone, Debug)]
+pub(crate) struct ProbeParkState {
+    pub request: crate::vmm::control::RequestId,
+    pub key: polly::event_manager::BarrierKey,
+    pub cpu_id: u8,
+    pub rip: u64,
+    pub rax: u64,
+}
+
+#[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+#[derive(Default)]
+struct ProbeAckHold {
+    kind: Option<crate::vmm::control::CpuAckKind>,
+    pending: Option<CpuAck>,
+}
+
+impl Drop for VcpuHandle {
+    fn drop(&mut self) {
+        if let Some(thread) = self.vcpu_thread.take() {
+            if !thread.is_finished() {
+                use crate::vmm::control::{CpuCommandKind, RequestId};
+                use polly::event_manager::{
+                    BarrierGeneration, BarrierKey, BarrierRequest, OperationId,
+                };
+                let _ = self.event_sender.send(CpuCommand {
+                    request: RequestId(u64::MAX),
+                    barrier: BarrierRequest {
+                        key: BarrierKey {
+                            operation: OperationId(0),
+                            generation: BarrierGeneration(0),
+                        },
+                        deadline: std::time::Instant::now(),
+                    },
+                    kind: CpuCommandKind::Stop,
+                });
+                let _ = thread.kill(sigrtmin() + VCPU_RTSIG_OFFSET);
+            }
+            // Event-owner cleanup reaps asynchronously. This is the fallback for
+            // construction failure or an API owner dropped outside that loop.
+            if thread.join().is_err() {
+                log::error!("vCPU owner thread panicked during terminal cleanup");
+            }
+        }
     }
 }
 
@@ -1824,32 +2026,18 @@ enum VcpuEmulation {
 
 #[cfg(test)]
 mod tests {
-    use crossbeam_channel::unbounded;
     use std::sync::{Arc, Barrier};
 
-    use super::*;
     #[cfg(target_arch = "aarch64")]
     use crate::vmm::builder::Payload;
     #[cfg(target_arch = "aarch64")]
     use crate::vmm::builder::create_guest_memory;
+    use crate::vmm::linux::vstate::*;
     use devices;
     #[cfg(target_arch = "x86_64")]
     use devices::legacy::KvmIoapic;
 
     use utils::signal::validate_signal_num;
-
-    // In tests we need to close any pending Vcpu threads on test completion.
-    impl Drop for VcpuHandle {
-        fn drop(&mut self) {
-            // Make sure the Vcpu is out of KVM_RUN.
-            self.send_event(VcpuEvent::Pause).unwrap();
-            // Close the original channel so that the Vcpu thread errors and goes to exit state.
-            let (event_sender, _event_receiver) = unbounded();
-            self.event_sender = event_sender;
-            // Wait for the Vcpu thread to finish execution
-            self.vcpu_thread.take().unwrap().join().unwrap();
-        }
-    }
 
     // Auxiliary function being used throughout the tests.
     fn setup_vcpu(mem_size: usize) -> (Vm, Vcpu, GuestMemoryMmap) {
@@ -2048,7 +2236,7 @@ mod tests {
 
     #[test]
     fn test_vcpu_kick() {
-        Vcpu::register_kick_signal_handler();
+        Vcpu::register_kick_signal_handler().unwrap();
         let (vm, mut vcpu, _mem) = setup_vcpu(0x1000);
 
         let mut kvm_run =

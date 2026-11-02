@@ -21,6 +21,7 @@ aws-nitro = ["devices/aws-nitro", "dep:aws-nitro", "aws-nitro/aws-nitro", "dep:n
 vhost-user = ["devices/vhost-user", "krun_display"]
 timesync = ["devices/timesync"]
 ffi = ["serde_json", "dep:ffier", "dep:ffier-builtins", "devices/ffi"]
+native-control-probe = []
 
 [dependencies]
 bitfield = { version = "0.19.4", optional = true }
@@ -82,3 +83,10 @@ devices = { package = "krun-devices", version = "=0.1.0-2.0.0-dev", path = "../d
 [lib]
 name = "krun"
 crate-type = ["cdylib", "lib"]
+
+[[example]]
+name = "native-control-probe"
+path = "examples/native_control_probe.rs"
+required-features = ["native-control-probe"]
+test = false
+bench = false

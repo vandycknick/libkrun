@@ -332,6 +332,16 @@ impl EventManager {
         Self::check_deadline(request)
     }
 
+    /// Safety closure cannot be refused merely because an operation timed out.
+    /// Per-callback admission closes before any fallible epoll modification.
+    pub fn fail_closed(&mut self, request: BarrierRequest) -> Result<()> {
+        self.fence = Some(DispatchFence {
+            request,
+            phase: DispatchPhase::Parked,
+        });
+        self.suspend_disallowed()
+    }
+
     /// Call only after source routes and producers are prepared, before CPU release.
     /// A cancellation has its own request/deadline and names the original fence.
     pub fn reopen_ingress(&mut self, key: BarrierKey, request: BarrierRequest) -> Result<()> {
@@ -948,5 +958,43 @@ mod tests {
             .unwrap();
         manager.run_with_timeout(0).unwrap();
         assert_eq!(subscriber.lock().unwrap().consumed, 9);
+    }
+
+    #[test]
+    fn callback_failed_release_fences_expired_cached_readiness() {
+        let mut manager = EventManager::new().unwrap();
+        let ingress = consumer(&mut manager, DispatchRole::Ingress);
+        let completion = consumer(&mut manager, DispatchRole::Completion);
+        let control = consumer(&mut manager, DispatchRole::Control);
+        let write_event = |subscriber: &Arc<Mutex<EventConsumer>>| match subscriber.lock() {
+            Ok(subscriber) => subscriber.event.write(1).unwrap(),
+            Err(error) => panic!("event subscriber poisoned: {error}"),
+        };
+        write_event(&ingress);
+        write_event(&completion);
+        write_event(&control);
+        let count = manager
+            .epoll
+            .wait(128, 0, &mut manager.ready_events)
+            .unwrap();
+        assert_eq!(count, 3);
+        let request = BarrierRequest {
+            deadline: Instant::now(),
+            ..barrier_request(8)
+        };
+        manager.fail_closed(request).unwrap();
+        manager.dispatch_events(count).unwrap();
+        let consumed = |subscriber: &Arc<Mutex<EventConsumer>>| match subscriber.lock() {
+            Ok(subscriber) => subscriber.consumed,
+            Err(error) => panic!("event subscriber poisoned: {error}"),
+        };
+        assert_eq!(consumed(&ingress), 0);
+        assert_eq!(consumed(&completion), 0);
+        assert_eq!(consumed(&control), 1);
+        assert_eq!(manager.run_with_timeout(0).unwrap(), 0);
+        assert_eq!(
+            manager.dispatch_fence(),
+            Some((request, DispatchPhase::Parked))
+        );
     }
 }

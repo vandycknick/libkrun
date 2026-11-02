@@ -11,11 +11,6 @@ extern crate krun_init_cdylib as krun_init;
 mod test_vm_config;
 use test_vm_config::TestVmConfig;
 
-#[cfg(any(feature = "guest", target_os = "macos"))]
-mod test_vm_pause;
-#[cfg(any(feature = "guest", target_os = "macos"))]
-use test_vm_pause::TestVmPause;
-
 #[cfg(any(feature = "host", target_os = "linux"))]
 mod test_vsock_guest_connect;
 #[cfg(any(feature = "host", target_os = "linux"))]
@@ -111,8 +106,6 @@ pub fn test_cases() -> Vec<TestCase> {
                 ram_mib: 1024,
             }),
         ),
-        #[cfg(any(feature = "guest", target_os = "macos"))]
-        TestCase::new("vm-pause", Box::new(TestVmPause)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("vsock-guest-connect", Box::new(TestVsockGuestConnect)),
         #[cfg(any(feature = "host", target_os = "linux"))]

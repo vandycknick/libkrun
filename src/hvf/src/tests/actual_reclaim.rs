@@ -19,8 +19,8 @@ use crate::bindings::{
     HV_SUCCESS, hv_reg_t_HV_REG_CPSR, hv_reg_t_HV_REG_PC, hv_reg_t_HV_REG_X0, hv_reg_t_HV_REG_X1,
     hv_reg_t_HV_REG_X2, hv_reg_t_HV_REG_X3, hv_reg_t_HV_REG_X4, hv_reg_t_HV_REG_X5,
     hv_reg_t_HV_REG_X6, hv_reg_t_HV_REG_X7, hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1,
-    hv_sys_reg_t_HV_SYS_REG_VBAR_EL1, hv_vcpu_destroy, hv_vcpu_get_reg, hv_vcpu_get_sys_reg,
-    hv_vcpu_set_reg, hv_vcpu_set_sys_reg, hv_vcpu_set_trap_debug_exceptions,
+    hv_sys_reg_t_HV_SYS_REG_VBAR_EL1, hv_vcpu_get_reg, hv_vcpu_get_sys_reg, hv_vcpu_set_reg,
+    hv_vcpu_set_sys_reg, hv_vcpu_set_trap_debug_exceptions,
 };
 use crate::discard::PageState;
 use crate::probe::{
@@ -205,7 +205,8 @@ fn get_reg(vcpu: &HvfVcpu<'_>, register: u32) -> u64 {
 /// Creates a vCPU on the calling thread (HVF vCPUs are thread-bound) that
 /// starts at `pc` with the MMU disabled and breakpoints trapped to the host.
 fn create_vcpu(mpidr: u64, pc: u64) -> HvfVcpu<'static> {
-    let vcpu = HvfVcpu::new(mpidr, false).expect("create vCPU");
+    let vcpu = HvfVcpu::new(false).expect("create vCPU");
+    vcpu.initialize(mpidr).expect("initialize MPIDR");
     vcpu.set_initial_state(pc, 0).expect("initialize vCPU");
     let mut sctlr = 0;
     assert_eq!(
@@ -227,8 +228,8 @@ fn create_vcpu(mpidr: u64, pc: u64) -> HvfVcpu<'static> {
     vcpu
 }
 
-fn destroy_vcpu(vcpu: HvfVcpu<'_>) {
-    assert_eq!(unsafe { hv_vcpu_destroy(vcpu.id()) }, HV_SUCCESS);
+fn destroy_vcpu(mut vcpu: HvfVcpu<'_>) {
+    vcpu.destroy().expect("destroy vCPU on its owner thread");
 }
 
 struct TouchRun {
@@ -444,8 +445,11 @@ fn fault_during_transition_scenario() {
             .expect("first run");
         let wait_time = waited.elapsed();
         let first_retry = matches!(first, VcpuExit::MemoryRetry);
-        let syndrome = vcpu.vcpu_exit.exception.syndrome;
-        let pa = vcpu.vcpu_exit.exception.physical_address;
+        let exit = vcpu
+            .vcpu_exit
+            .expect("initialized native vCPU has an exit record");
+        let syndrome = exit.exception.syndrome;
+        let pa = exit.exception.physical_address;
         let pc = get_reg(&vcpu, hv_reg_t_HV_REG_PC);
         let registers: Vec<u64> = sentinels
             .iter()

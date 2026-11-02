@@ -260,6 +260,7 @@ impl NativeBuildFacts {
                                 | "CARGO_FEATURE_AMD_SEV"
                                 | "CARGO_FEATURE_TDX"
                                 | "CARGO_FEATURE_AWS_NITRO"
+                                | "CARGO_FEATURE_NATIVE_CONTROL_PROBE"
                         )
                     })
                 })
@@ -293,7 +294,7 @@ macro_rules! package {
 
 static BUILD: NativeBuildFacts = NativeBuildFacts {
     query_abi: LIVE_QUERY_ABI,
-    control_abi: None,
+    control_abi: Some(1),
     backend: if cfg!(target_os = "linux") {
         NativeBackend::Kvm
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -1129,7 +1130,7 @@ mod tests {
         assert!(std::ptr::eq(build, compiled_live_build()));
         assert_eq!(build.query_abi, LIVE_QUERY_ABI);
         assert_eq!(build.query_abi, 1);
-        assert_eq!(build.control_abi, None);
+        assert_eq!(build.control_abi, Some(1));
         assert_eq!(
             build.packages.first().map(|package| package.name),
             Some("libkrun")
@@ -1215,6 +1216,7 @@ mod tests {
             profile_packages!(Some(&["CARGO_FEATURE_AMD_SEV"])),
             profile_packages!(Some(&["CARGO_FEATURE_TDX"])),
             profile_packages!(Some(&["CARGO_FEATURE_AWS_NITRO"])),
+            profile_packages!(Some(&["CARGO_FEATURE_NATIVE_CONTROL_PROBE"])),
             profile_packages!(None),
         ];
         for packages in PROFILES {

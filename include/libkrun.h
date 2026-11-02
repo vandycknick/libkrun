@@ -436,10 +436,6 @@ typedef void (*krun_vmm_destroy_fn)(KrunVmm handle);
 
 /* VmmHandle --------------------------------------------------------- */
 
-KrunResult krun_vmm_handle_pause(KrunVmmHandle handle, KrunError* err_out);
-typedef KrunResult (*krun_vmm_handle_pause_fn)(KrunVmmHandle handle, KrunError* err_out);
-KrunResult krun_vmm_handle_resume(KrunVmmHandle handle, KrunError* err_out);
-typedef KrunResult (*krun_vmm_handle_resume_fn)(KrunVmmHandle handle, KrunError* err_out);
 /**
  * Signal the guest to perform an orderly ACPI shutdown.
  *
@@ -483,6 +479,12 @@ typedef KrunResult (*krun_vsock_device_add_port_forward_fn)(KrunVsockDevice hand
 /** Add a Unix socket port mapping. */
 void krun_vsock_device_add_unix_port(KrunVsockDevice handle, uint32_t port, KrunStr path, bool listen);
 typedef void (*krun_vsock_device_add_unix_port_fn)(KrunVsockDevice handle, uint32_t port, KrunStr path, bool listen);
+/** Use an inherited Unix stream socket as the private dynamic vsock mux. */
+void krun_vsock_device_set_unix_mux_fd(KrunVsockDevice handle, int fd);
+typedef void (*krun_vsock_device_set_unix_mux_fd_fn)(KrunVsockDevice handle, int fd);
+/** Reject connection descriptors aliasing this known socket endpoint. */
+KrunResult krun_vsock_device_add_unix_mux_protected_fd(KrunVsockDevice handle, int fd, KrunError* err_out);
+typedef KrunResult (*krun_vsock_device_add_unix_mux_protected_fd_fn)(KrunVsockDevice handle, int fd, KrunError* err_out);
 void krun_vsock_device_destroy(KrunVsockDevice handle);
 typedef void (*krun_vsock_device_destroy_fn)(KrunVsockDevice handle);
 

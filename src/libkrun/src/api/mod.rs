@@ -2,8 +2,16 @@ pub mod capabilities;
 pub mod device_builders;
 pub mod error;
 pub mod logging;
+#[cfg(all(
+    feature = "native-control-probe",
+    target_os = "linux",
+    target_arch = "x86_64",
+    not(feature = "tee")
+))]
+pub mod native_control_probe;
 pub mod payload;
 pub mod vmm_builder;
+pub use crate::vmm::control;
 
 #[cfg(feature = "ffi")]
 pub(crate) use ffier::export_bitflags;

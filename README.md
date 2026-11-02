@@ -69,6 +69,60 @@ Imago's zero-preserving operation, including its explicit-zero fallback when
 hole punching is unavailable. Hypervisor-free real Raw-device regressions run
 with `cargo test --locked -p krun-devices --features blk zero_range`.
 
+## Native completed control (Rust)
+
+`krun::api::VmmHandle` provides exact-token control outside generated FFI.
+Types and the dependency-owned barrier identities are available from
+`krun::api::control`:
+
+```rust,ignore
+pause(owner: PauseOwner, operation: OperationId, deadline: Instant) -> Result<PauseToken, ControlFailure>
+resume(token: PauseToken, operation: OperationId, deadline: Instant) -> Result<(), ControlFailure>
+cancel_pause(pausing: OperationId, operation: OperationId, deadline: Instant) -> Result<(), ControlFailure>
+control_state(deadline: Instant) -> Result<ControlState, ControlFailure>
+stop(operation: OperationId, deadline: Instant) -> Result<(), ControlFailure>
+```
+
+Call from another thread while `Vmm::run` services the owner loop. Mutation
+operation IDs must strictly increase; request IDs and pause generations are
+separate. Each operation uses one absolute deadline. A caller timeout, dropped
+reply receiver, or accepted command followed by a failed kick never cancels
+VM-owned work. Observe the actual state, explicitly cancel the named incomplete
+pause, or stop. A completed pause requires its opaque run-bound token; stale,
+foreign, wrong-owner and consumed tokens cannot authorize release. There is no
+implicit resume on drop.
+
+Pause preflights the existing device/legacy inventory before mutation. CPUs
+complete exit emulation before acknowledging park; device queues, callbacks,
+host maintenance and actual interrupt routes must also finish before any
+whole-machine token can issue. Resume prepares routes, devices and common
+timer control before the correlated CPU release acknowledgements. Ambiguous
+release becomes stop-only `FailedFenced`, not a claim that CPUs stayed parked.
+Stop polls and reaps real CPU owner threads and route workers, then uses the
+existing whole-machine process exit/observer boundary. It does not grant a
+reusable in-process stopped VM while concrete device termination providers
+remain unavailable. Terminal cleanup outside event callbacks may wait for
+native termination rather than free RAM or detach a still-running owner thread
+when a caller's deadline expires.
+
+Phase 8 does **not** supply production device providers. Ordinary attached
+devices and uncovered legacy topology therefore refuse whole-machine pause;
+all native live-operation bits remain false and public operations remain
+not delivered. The former enqueue-only FFI pause/resume methods and their
+idempotent-success test are removed, with no compatibility aliases.
+
+The developer-only [`native-control-probe`](docs/native-control-probe.md)
+uses the same CPU controller and native mailbox/completion loop, without
+granting whole-machine support:
+
+```sh
+cargo run --locked -p libkrun --features native-control-probe --example native-control-probe
+```
+
+That diagnostic feature is recorded in actual package build facts and excluded
+from production qualification. CPU-only evidence is not device-barrier or
+macOS/arm64 qualification.
+
 ## Native live-state observations (Rust)
 
 The Silo fork exposes a Rust-only, machine-less query in
@@ -80,7 +134,8 @@ pub fn query_live_host() -> NativeHostReport;
 ```
 
 Query ABI `LIVE_QUERY_ABI = 1` is distinct from the package/C ABI and the
-scratch checkpoint format. The compiled `control_abi` is currently `None`.
+scratch checkpoint format. The compiled `control_abi` is `Some(1)`, describing
+the Rust control protocol, not granting live operation support.
 The adapter-facing types are:
 
 ```rust

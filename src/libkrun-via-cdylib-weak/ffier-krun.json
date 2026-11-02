@@ -1544,30 +1544,6 @@
       "is_builder_type": false,
       "methods": [
         {
-          "name": "pause",
-          "receiver": "ref",
-          "params": [],
-          "ret": {
-            "return_kind": "result",
-            "ok": null,
-            "err_type": "VmmError",
-            "c_convention": "out_param"
-          },
-          "ffi_name": "krun_vmm_handle_pause"
-        },
-        {
-          "name": "resume",
-          "receiver": "ref",
-          "params": [],
-          "ret": {
-            "return_kind": "result",
-            "ok": null,
-            "err_type": "VmmError",
-            "c_convention": "out_param"
-          },
-          "ffi_name": "krun_vmm_handle_resume"
-        },
-        {
           "name": "shutdown",
           "doc": [
             " Signal the guest to perform an orderly ACPI shutdown.",
@@ -1719,6 +1695,50 @@
             "return_kind": "void"
           },
           "ffi_name": "krun_vsock_device_add_unix_port"
+        },
+        {
+          "name": "set_unix_mux_fd",
+          "doc": [
+            " Use an inherited Unix stream socket as the private dynamic vsock mux."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "fd",
+              "param_kind": "regular",
+              "type": "OwnedFd"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_vsock_device_set_unix_mux_fd",
+          "cfg": "unix"
+        },
+        {
+          "name": "add_unix_mux_protected_fd",
+          "doc": [
+            " Reject connection descriptors aliasing this known socket endpoint."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "fd",
+              "param_kind": "regular",
+              "type": "BorrowedFd",
+              "type_args": [
+                "_"
+              ]
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vsock_device_add_unix_mux_protected_fd",
+          "cfg": "unix"
         }
       ]
     },

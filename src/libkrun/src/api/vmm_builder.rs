@@ -3,19 +3,20 @@ use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "macos")]
-use crate::vmm::VmCtl;
 use crate::vmm::Vmm as InnerVmm;
+use crate::vmm::control::{
+    ControlClient, ControlFailure, ControlReply, ControlState, PauseOwner, PauseToken, RequestKind,
+};
 #[cfg(unix)]
 use crate::vmm::resources::SerialConsoleConfig;
 use crate::vmm::resources::VmResources;
 use crate::vmm::vmm_config::machine_config::VmConfig;
 use crossbeam_channel::unbounded;
 use polly::event_manager::EventManager;
+use polly::event_manager::OperationId;
+use std::time::{Duration, Instant};
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use utils::eventfd::EventFd;
-#[cfg(target_os = "macos")]
-use utils::pollable_channel::PollableChannelSender;
 
 use crate::api::device_builders::{DeviceManager, MmioDeviceManager};
 use crate::api::error::VmmError;
@@ -131,7 +132,6 @@ impl<'a> VmmBuilder<'a> {
 
 enum VmmInner {
     Vmm {
-        #[allow(dead_code)]
         vmm: Arc<Mutex<InnerVmm>>,
         event_manager: EventManager,
         #[allow(dead_code)]
@@ -156,10 +156,9 @@ pub struct Vmm<'a> {
 // so that run() returns a RunningVmm with wait(). Then this handle
 // can be obtained from RunningVmm instead of requiring a pre-run call.
 pub struct VmmHandle {
-    #[cfg(target_os = "macos")]
-    vm_ctl_tx: PollableChannelSender<VmCtl>,
+    control: ControlClient,
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    shutdown_efd: Option<EventFd>,
+    shutdown_efd: Option<Arc<EventFd>>,
     #[cfg(target_os = "macos")]
     reclaim_state: std::sync::Arc<hvf::reclaim::ReclaimState>,
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -229,43 +228,84 @@ impl VmmHandle {
 impl Clone for VmmHandle {
     fn clone(&self) -> Self {
         Self {
-            #[cfg(target_os = "macos")]
-            vm_ctl_tx: self.vm_ctl_tx.clone(),
+            control: self.control.clone(),
             #[cfg(target_os = "macos")]
             reclaim_state: std::sync::Arc::clone(&self.reclaim_state),
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-            shutdown_efd: self
-                .shutdown_efd
-                .as_ref()
-                .map(|efd| efd.try_clone().expect("dup shutdown_efd")),
+            hvf_vm_facts: self.hvf_vm_facts,
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            shutdown_efd: self.shutdown_efd.clone(),
+        }
+    }
+}
+
+impl VmmHandle {
+    /// Wait for the complete machine barrier. Caller timeout/drop is not cancellation.
+    pub fn pause(
+        &self,
+        owner: PauseOwner,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<PauseToken, ControlFailure> {
+        match self
+            .control
+            .call(operation, deadline, RequestKind::Pause(owner))?
+        {
+            ControlReply::Paused(token) => Ok(token),
+            _ => Err(ControlFailure::OwnerUnavailable),
+        }
+    }
+
+    pub fn resume(
+        &self,
+        token: PauseToken,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<(), ControlFailure> {
+        match self
+            .control
+            .call(operation, deadline, RequestKind::Resume(token))?
+        {
+            ControlReply::Complete => Ok(()),
+            _ => Err(ControlFailure::OwnerUnavailable),
+        }
+    }
+
+    pub fn cancel_pause(
+        &self,
+        pausing: OperationId,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<(), ControlFailure> {
+        match self
+            .control
+            .call(operation, deadline, RequestKind::CancelPause(pausing))?
+        {
+            ControlReply::Complete => Ok(()),
+            _ => Err(ControlFailure::OwnerUnavailable),
+        }
+    }
+
+    pub fn control_state(&self, deadline: Instant) -> Result<ControlState, ControlFailure> {
+        match self
+            .control
+            .call(OperationId(0), deadline, RequestKind::Status)?
+        {
+            ControlReply::State(state) => Ok(state),
+            _ => Err(ControlFailure::OwnerUnavailable),
+        }
+    }
+
+    pub fn stop(&self, operation: OperationId, deadline: Instant) -> Result<(), ControlFailure> {
+        match self.control.call(operation, deadline, RequestKind::Stop)? {
+            ControlReply::Complete => Ok(()),
+            _ => Err(ControlFailure::OwnerUnavailable),
         }
     }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export)]
 impl VmmHandle {
-    pub fn pause(&self) -> Result<(), VmmError> {
-        #[cfg(target_os = "macos")]
-        {
-            self.vm_ctl_tx
-                .send(VmCtl::Pause)
-                .map_err(|e| VmmError::Internal(format!("pause: {e}")))
-        }
-        #[cfg(not(target_os = "macos"))]
-        Err(VmmError::FeatureDisabled())
-    }
-
-    pub fn resume(&self) -> Result<(), VmmError> {
-        #[cfg(target_os = "macos")]
-        {
-            self.vm_ctl_tx
-                .send(VmCtl::Resume)
-                .map_err(|e| VmmError::Internal(format!("resume: {e}")))
-        }
-        #[cfg(not(target_os = "macos"))]
-        Err(VmmError::FeatureDisabled())
-    }
-
     /// Signal the guest to perform an orderly ACPI shutdown.
     ///
     /// This requires [`VmmBuilder::shutdown_support`] to have been enabled
@@ -297,7 +337,6 @@ impl<'a> Vmm<'a> {
     pub fn handle(&self) -> Result<VmmHandle, VmmError> {
         match &self.inner {
             VmmInner::Vmm {
-                #[cfg(target_os = "macos")]
                 vmm,
                 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
                 shutdown_efd,
@@ -305,11 +344,11 @@ impl<'a> Vmm<'a> {
             } => {
                 // Lock once: a second `lock()` while the first guard is still
                 // alive within one expression would deadlock the caller.
-                #[cfg(target_os = "macos")]
-                let inner = vmm.lock().unwrap();
+                let inner = vmm
+                    .lock()
+                    .map_err(|error| VmmError::Internal(error.to_string()))?;
                 Ok(VmmHandle {
-                    #[cfg(target_os = "macos")]
-                    vm_ctl_tx: inner.vm_ctl_sender(),
+                    control: inner.control.client.clone(),
                     #[cfg(target_os = "macos")]
                     reclaim_state: inner.vm.reclaim_state(),
                     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -317,7 +356,9 @@ impl<'a> Vmm<'a> {
                     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
                     shutdown_efd: shutdown_efd
                         .as_ref()
-                        .map(|efd| efd.try_clone().expect("dup shutdown_efd")),
+                        .map(|efd| efd.try_clone().map(Arc::new))
+                        .transpose()
+                        .map_err(|error| VmmError::Internal(error.to_string()))?,
                 })
             }
             #[cfg(feature = "aws-nitro")]
@@ -328,22 +369,30 @@ impl<'a> Vmm<'a> {
     pub fn run(self) {
         match self.inner {
             VmmInner::Vmm {
-                #[cfg(target_os = "macos")]
                 vmm,
                 mut event_manager,
                 ..
             } => {
                 #[cfg(target_os = "macos")]
-                let remapper = match vmm.lock() {
-                    Ok(inner) => inner.vm.host_memory_remapper(),
-                    Err(error) => {
-                        log::error!("cannot initialize host mapping maintenance: {error}");
-                        return;
+                let remapper = {
+                    match vmm.lock() {
+                        Ok(inner) => inner.vm.host_memory_remapper(),
+                        Err(error) => {
+                            log::error!("cannot initialize host mapping maintenance: {error}");
+                            None
+                        }
                     }
                 };
                 loop {
+                    let pending = match vmm.lock() {
+                        Ok(inner) => inner.control_pending(),
+                        Err(error) => {
+                            log::error!("cannot service native control: {error}");
+                            break;
+                        }
+                    };
                     #[cfg(target_os = "macos")]
-                    let timeout = match remapper
+                    let maintenance_timeout = match remapper
                         .as_ref()
                         .map(|worker| worker.timeout_millis())
                         .transpose()
@@ -351,26 +400,48 @@ impl<'a> Vmm<'a> {
                         Ok(timeout) => timeout.unwrap_or(-1),
                         Err(error) => {
                             log::error!("fatal HostMemoryRemapper error: {error}");
-                            return;
+                            break;
                         }
                     };
-                    #[cfg(target_os = "macos")]
-                    let result = event_manager.run_with_timeout(timeout);
                     #[cfg(not(target_os = "macos"))]
-                    let result = event_manager.run();
-                    if let Err(e) = result {
-                        log::error!("fatal event loop error: {e:?}");
-                        return;
+                    let maintenance_timeout = -1;
+                    let timeout = if pending {
+                        if maintenance_timeout < 0 {
+                            1
+                        } else {
+                            maintenance_timeout.min(1)
+                        }
+                    } else if maintenance_timeout < 0 {
+                        50
+                    } else {
+                        maintenance_timeout.min(50)
+                    };
+                    if let Err(error) = event_manager.run_with_timeout(timeout) {
+                        log::error!("fatal event loop error: {error:?}");
+                        break;
+                    }
+                    match vmm.lock() {
+                        Ok(mut inner) => {
+                            inner.service_control(&mut event_manager);
+                            if inner.control.state == ControlState::Stopped {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            log::error!("cannot service native control: {error}");
+                            break;
+                        }
                     }
                     #[cfg(target_os = "macos")]
                     if let Some(remapper) = &remapper {
                         // This scope retains the owning VMM and its guest_memory.
                         if let Err(error) = unsafe { remapper.poll() } {
                             log::error!("fatal HostMemoryRemapper error: {error}");
-                            return;
+                            break;
                         }
                     }
                 }
+                terminal_cleanup(&vmm);
             }
             #[cfg(feature = "aws-nitro")]
             VmmInner::Nitro(enclave) => {
@@ -382,6 +453,52 @@ impl<'a> Vmm<'a> {
             }
         }
     }
+}
+
+/// Terminal cleanup runs after dispatch has stopped, never while holding a VM
+/// or device mutex. Native termination may outlive a caller's deadline; owners
+/// and RAM cannot be released until the native threads actually finish.
+fn terminal_cleanup(vmm: &Arc<Mutex<InnerVmm>>) {
+    use crate::vmm::control::{CpuCommandKind, CpuController, RequestId};
+    use polly::event_manager::{BarrierGeneration, BarrierKey, BarrierRequest};
+    let mut handles = {
+        let mut inner = match vmm.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        inner.control.state = ControlState::Stopping;
+        std::mem::take(&mut inner.vcpus_handles)
+    };
+    let mut cpus = CpuController::new(handles.len());
+    let barrier = BarrierRequest {
+        key: BarrierKey {
+            operation: OperationId(u64::MAX),
+            generation: BarrierGeneration(u64::MAX),
+        },
+        deadline: Instant::now() + Duration::from_secs(1),
+    };
+    let _ = cpus.begin(RequestId(u64::MAX), barrier, CpuCommandKind::Stop, &handles);
+    loop {
+        let _ = cpus.poll(&mut handles);
+        let routes_settled = {
+            let mut inner = match vmm.lock() {
+                Ok(inner) => inner,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            inner.mmio_device_manager.poll_irq_cleanup()
+        };
+        if handles.iter().all(|handle| handle.is_finished()) && routes_settled {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Drop's stop/join fallback is terminal-only, outside the VM lock.
+    drop(handles);
+    let mut inner = match vmm.lock() {
+        Ok(inner) => inner,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    inner.control.state = ControlState::Stopped;
 }
 
 #[cfg_attr(feature = "ffi", ffier::export)]
@@ -538,6 +655,11 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         device_manager,
     )
     .map_err(|e| VmmError::BootError(format!("{e:?}")))?;
+    inner
+        .lock()
+        .map_err(|error| VmmError::Internal(error.to_string()))?
+        .register_control_roles(&mut event_manager)
+        .map_err(|error| VmmError::Internal(format!("{error:?}")))?;
 
     let needs_worker = {
         #[cfg(any(feature = "amd-sev", feature = "tdx"))]

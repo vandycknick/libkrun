@@ -21,7 +21,7 @@ use polly::event_manager::{BarrierKey, BarrierRequest, EventManager};
 use utils::eventfd::EventFd;
 
 use crate::vmm::device_manager::quiescence::{
-    AttachmentIdentity, DeviceQuiescence, LegacyAttachment, LegacyDevice, LegacyKind, ManagerError,
+    AttachmentIdentity, DeviceQuiescence, LegacyAttachment, LegacyKind, ManagerError,
 };
 use crate::vmm::vstate::Vm;
 
@@ -162,6 +162,15 @@ impl MMIODeviceManager {
 
     pub fn preflight_quiesce(&self) -> std::result::Result<(), ManagerError> {
         self.quiescence.preflight_quiesce()
+    }
+
+    pub fn irq_barrier_key(&self) -> Option<BarrierKey> {
+        self.route_request.map(|request| request.key)
+    }
+
+    /// HVF publication is owner-synchronous and has no in-flight route worker.
+    pub fn poll_irq_cleanup(&mut self) -> bool {
+        true
     }
 
     pub fn begin_irq_fence(
@@ -378,16 +387,13 @@ impl MMIODeviceManager {
         }
 
         self.bus
-            .insert(serial.clone(), self.mmio_base, MMIO_LEN)
+            .insert(serial, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
-        self.quiescence.retain_legacy(
-            LegacyAttachment {
-                kind: LegacyKind::Serial,
-                address: self.mmio_base,
-                irq: Some(self.irq),
-            },
-            LegacyDevice::Serial(serial),
-        );
+        self.quiescence.retain_legacy(LegacyAttachment {
+            kind: LegacyKind::Serial,
+            address: self.mmio_base,
+            irq: Some(self.irq),
+        });
 
         cmdline
             .insert(
@@ -426,16 +432,13 @@ impl MMIODeviceManager {
         )));
 
         self.bus
-            .insert(device.clone(), self.mmio_base, MMIO_LEN)
+            .insert(device, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
-        self.quiescence.retain_legacy(
-            LegacyAttachment {
-                kind: LegacyKind::Rtc,
-                address: self.mmio_base,
-                irq: Some(self.irq),
-            },
-            LegacyDevice::Rtc(device),
-        );
+        self.quiescence.retain_legacy(LegacyAttachment {
+            kind: LegacyKind::Rtc,
+            address: self.mmio_base,
+            irq: Some(self.irq),
+        });
 
         let ret = self.mmio_base;
         self.id_to_dev_info.insert(
@@ -484,16 +487,13 @@ impl MMIODeviceManager {
         }
 
         self.bus
-            .insert(gpio.clone(), self.mmio_base, MMIO_LEN)
+            .insert(gpio, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
-        self.quiescence.retain_legacy(
-            LegacyAttachment {
-                kind: LegacyKind::Gpio,
-                address: self.mmio_base,
-                irq: Some(self.irq),
-            },
-            LegacyDevice::Gpio(gpio),
-        );
+        self.quiescence.retain_legacy(LegacyAttachment {
+            kind: LegacyKind::Gpio,
+            address: self.mmio_base,
+            irq: Some(self.irq),
+        });
 
         let ret = self.mmio_base;
         self.id_to_dev_info.insert(
@@ -523,17 +523,14 @@ impl MMIODeviceManager {
         // anything in the guest.
         if mmio_size != 0 {
             self.bus
-                .insert(intc.clone(), mmio_addr, mmio_size)
+                .insert(intc, mmio_addr, mmio_size)
                 .map_err(Error::BusError)?;
         }
-        self.quiescence.retain_legacy(
-            LegacyAttachment {
-                kind: LegacyKind::InterruptController,
-                address: mmio_addr,
-                irq: None,
-            },
-            LegacyDevice::InterruptController(intc),
-        );
+        self.quiescence.retain_legacy(LegacyAttachment {
+            kind: LegacyKind::InterruptController,
+            address: mmio_addr,
+            irq: None,
+        });
 
         Ok(())
     }

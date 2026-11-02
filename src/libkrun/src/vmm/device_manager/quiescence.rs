@@ -42,24 +42,6 @@ pub struct LegacyAttachment {
     pub irq: Option<u32>,
 }
 
-pub enum LegacyDevice {
-    Serial(Arc<Mutex<devices::legacy::Serial>>),
-    #[cfg(target_arch = "x86_64")]
-    Cmos(Arc<Mutex<devices::legacy::Cmos>>),
-    #[cfg(target_arch = "x86_64")]
-    I8042(Arc<Mutex<devices::legacy::I8042Device>>),
-    #[cfg(target_arch = "aarch64")]
-    Rtc(Arc<Mutex<devices::legacy::RTC>>),
-    #[cfg(target_arch = "aarch64")]
-    Gpio(Arc<Mutex<devices::legacy::Gpio>>),
-    InterruptController(devices::legacy::IrqChip),
-}
-
-pub struct LegacyOwner {
-    pub attachment: LegacyAttachment,
-    pub device: LegacyDevice,
-}
-
 #[derive(Clone, Debug)]
 pub enum ManagerFault {
     Provider(ProviderFault),
@@ -70,6 +52,34 @@ pub enum ManagerFault {
     Deadline,
     LockBusy,
     LockPoisoned,
+}
+
+impl std::fmt::Display for ManagerFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provider(fault) => write!(f, "provider admission failed: {fault:?}"),
+            Self::Lifecycle(error) => write!(f, "provider transition failed: {error}"),
+            Self::MissingLegacyProvider(attachment) => write!(
+                f,
+                "missing {:?} provider at {:#x}, IRQ {:?}",
+                attachment.kind, attachment.address, attachment.irq
+            ),
+            Self::ForeignBarrier => write!(f, "foreign barrier"),
+            Self::InvalidTransition => write!(f, "invalid transition"),
+            Self::Deadline => write!(f, "deadline expired"),
+            Self::LockBusy => write!(f, "participant lock busy"),
+            Self::LockPoisoned => write!(f, "participant lock poisoned"),
+        }
+    }
+}
+
+impl std::error::Error for ManagerFault {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Lifecycle(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -83,13 +93,17 @@ impl std::fmt::Display for ManagerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "device barrier {:?}: {:?} at {:?}",
+            "device barrier {:?}: {} at {:?}",
             self.key, self.fault, self.attachment
         )
     }
 }
 
-impl std::error::Error for ManagerError {}
+impl std::error::Error for ManagerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.fault)
+    }
+}
 
 pub struct TransportAttachment {
     pub identity: AttachmentIdentity,
@@ -110,7 +124,7 @@ enum Transition {
 
 pub struct DeviceQuiescence {
     attachments: Vec<TransportAttachment>,
-    legacy: Vec<LegacyOwner>,
+    legacy: Vec<LegacyAttachment>,
     request: Option<BarrierRequest>,
     transition: Transition,
 }
@@ -127,11 +141,12 @@ impl Default for DeviceQuiescence {
 }
 
 impl DeviceQuiescence {
-    pub fn attachments(&self) -> &[TransportAttachment] {
-        &self.attachments
+    pub fn request(&self) -> Option<BarrierRequest> {
+        self.request
     }
 
-    pub fn legacy_attachments(&self) -> &[LegacyOwner] {
+    #[cfg(all(test, target_arch = "x86_64"))]
+    pub fn legacy_attachments(&self) -> &[LegacyAttachment] {
         &self.legacy
     }
 
@@ -151,13 +166,13 @@ impl DeviceQuiescence {
         });
     }
 
-    pub fn retain_legacy(&mut self, attachment: LegacyAttachment, device: LegacyDevice) {
-        self.legacy.push(LegacyOwner { attachment, device });
+    pub fn retain_legacy(&mut self, attachment: LegacyAttachment) {
+        self.legacy.push(attachment);
     }
 
     pub fn preflight_quiesce(&self) -> Result<(), ManagerError> {
         if let Some(legacy) = self.legacy.first() {
-            return Err(self.error(None, ManagerFault::MissingLegacyProvider(legacy.attachment)));
+            return Err(self.error(None, ManagerFault::MissingLegacyProvider(*legacy)));
         }
         for (index, attachment) in self.attachments.iter().enumerate() {
             let transport = attachment
@@ -395,13 +410,7 @@ mod tests {
             address: 0x3e8,
             irq: Some(4),
         };
-        let owner = std::sync::Arc::new(std::sync::Mutex::new(devices::legacy::Serial::new_sink(
-            utils::eventfd::EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
-        )));
-        inventory.retain_legacy(
-            serial,
-            crate::vmm::device_manager::quiescence::LegacyDevice::Serial(owner),
-        );
+        inventory.retain_legacy(serial);
         assert!(matches!(inventory.preflight_quiesce().unwrap_err().fault,
             ManagerFault::MissingLegacyProvider(actual) if actual == serial));
     }
@@ -446,8 +455,50 @@ mod tests {
         };
         let error = inventory.begin_quiesce(request).unwrap_err();
         assert_eq!(error.attachment, Some(identity));
-        assert!(!inventory.attachments()[0].attempted);
-        assert!(!inventory.attachments()[0].accepted);
+        assert!(!inventory.attachments[0].attempted);
+        assert!(!inventory.attachments[0].accepted);
         assert!(inventory.request.is_none());
+    }
+
+    #[test]
+    fn manager_errors_preserve_nested_transition_and_attachment_details() {
+        use crate::vmm::device_manager::quiescence::ManagerError;
+        use devices::virtio::lifecycle::{LifecycleError, ProviderFault, ProviderStage};
+        use polly::event_manager::{BarrierGeneration, BarrierKey, OperationId};
+        use std::error::Error;
+
+        let lifecycle = LifecycleError {
+            key: BarrierKey {
+                operation: OperationId(7),
+                generation: BarrierGeneration(3),
+            },
+            stage: ProviderStage::Quiescing,
+            accepted: true,
+            fault: ProviderFault::Worker,
+        };
+        let error = ManagerError {
+            key: Some(lifecycle.key),
+            attachment: None,
+            fault: ManagerFault::Lifecycle(lifecycle),
+        };
+        assert!(error.to_string().contains(&lifecycle.to_string()));
+        assert_eq!(
+            error.source().unwrap().source().unwrap().to_string(),
+            lifecycle.to_string()
+        );
+        let legacy = ManagerFault::MissingLegacyProvider(LegacyAttachment {
+            kind: LegacyKind::Serial,
+            address: 0x3e8,
+            irq: Some(4),
+        });
+        let detail = legacy.to_string();
+        assert!(detail.contains("Serial"));
+        assert!(detail.contains("0x3e8"));
+        assert!(detail.contains("Some(4)"));
+        assert!(
+            ManagerFault::Provider(ProviderFault::Unsupported)
+                .to_string()
+                .contains("Unsupported")
+        );
     }
 }

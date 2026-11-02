@@ -12,9 +12,7 @@ use std::sync::{Arc, Mutex};
 use devices;
 use utils::eventfd::EventFd;
 
-use crate::vmm::device_manager::quiescence::{
-    DeviceQuiescence, LegacyAttachment, LegacyDevice, LegacyKind,
-};
+use crate::vmm::device_manager::quiescence::{DeviceQuiescence, LegacyAttachment, LegacyKind};
 
 /// Errors corresponding to the `PortIODeviceManager`.
 #[derive(Debug)]
@@ -54,7 +52,7 @@ pub struct PortIODeviceManager {
     pub com_evt_3: EventFd,
     pub com_evt_4: EventFd,
     pub kbd_evt: EventFd,
-    attached_serial: Vec<(u64, Arc<Mutex<devices::legacy::Serial>>)>,
+    attached_serial: Vec<u64>,
     cmos_attached: bool,
     i8042_attached: bool,
 }
@@ -115,7 +113,7 @@ impl PortIODeviceManager {
             self.io_bus
                 .insert(serial.clone(), 0x3f8, 0x8)
                 .map_err(Error::BusError)?;
-            self.attached_serial.push((0x3f8, serial.clone()));
+            self.attached_serial.push(0x3f8);
         }
         for (index, address, event) in [
             (1, 0x2f8, &self.com_evt_2),
@@ -129,9 +127,9 @@ impl PortIODeviceManager {
                 ))),
             };
             self.io_bus
-                .insert(serial.clone(), address, 0x8)
+                .insert(serial, address, 0x8)
                 .map_err(Error::BusError)?;
-            self.attached_serial.push((address, serial));
+            self.attached_serial.push(address);
         }
         self.io_bus
             .insert(self.i8042.clone(), 0x060, 0x5)
@@ -153,38 +151,29 @@ impl PortIODeviceManager {
 
     pub fn retain_live_inventory(&self, inventory: &mut DeviceQuiescence) {
         if self.cmos_attached {
-            inventory.retain_legacy(
-                LegacyAttachment {
-                    kind: LegacyKind::Cmos,
-                    address: 0x70,
-                    irq: None,
-                },
-                LegacyDevice::Cmos(self.cmos.clone()),
-            );
+            inventory.retain_legacy(LegacyAttachment {
+                kind: LegacyKind::Cmos,
+                address: 0x70,
+                irq: None,
+            });
         }
-        for (address, serial) in &self.attached_serial {
+        for address in &self.attached_serial {
             let irq = match address {
                 0x3f8 | 0x3e8 => 4,
                 _ => 3,
             };
-            inventory.retain_legacy(
-                LegacyAttachment {
-                    kind: LegacyKind::Serial,
-                    address: *address,
-                    irq: Some(irq),
-                },
-                LegacyDevice::Serial(serial.clone()),
-            );
+            inventory.retain_legacy(LegacyAttachment {
+                kind: LegacyKind::Serial,
+                address: *address,
+                irq: Some(irq),
+            });
         }
         if self.i8042_attached {
-            inventory.retain_legacy(
-                LegacyAttachment {
-                    kind: LegacyKind::I8042,
-                    address: 0x60,
-                    irq: Some(1),
-                },
-                LegacyDevice::I8042(self.i8042.clone()),
-            );
+            inventory.retain_legacy(LegacyAttachment {
+                kind: LegacyKind::I8042,
+                address: 0x60,
+                irq: Some(1),
+            });
         }
     }
 }
@@ -241,7 +230,7 @@ mod tests {
         let addresses: Vec<_> = inventory
             .legacy_attachments()
             .iter()
-            .map(|owner| owner.attachment.address)
+            .map(|attachment| attachment.address)
             .collect();
         assert_eq!(addresses, [0x70, 0x2f8, 0x3e8, 0x2e8, 0x60]);
         assert!(inventory.preflight_quiesce().is_err());

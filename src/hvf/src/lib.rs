@@ -21,9 +21,6 @@ mod probe;
 pub mod reclaim;
 pub mod remap;
 
-#[macro_use]
-extern crate log;
-
 use bindings::*;
 
 #[cfg(target_arch = "aarch64")]
@@ -32,6 +29,8 @@ use std::cell::Cell;
 
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -41,8 +40,9 @@ use crate::framework::{HvfFramework, OwnedConfig};
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name};
 use arch::guest_memory::RamLayout;
-use log::debug;
-use reclaim::{FaultResolution, ReclaimQualification, ReclaimState, ReclaimStateError};
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+use reclaim::ReclaimQualification;
+use reclaim::{FaultResolution, ReclaimState, ReclaimStateError};
 
 unsafe extern "C" {
     pub fn mach_absolute_time() -> u64;
@@ -136,23 +136,23 @@ pub enum Error {
     InvalidMemoryFault,
     ReclaimState(ReclaimStateError),
     ReclaimProbeCleanup(String),
-    VcpuCreate,
-    VcpuInitialRegisters,
-    VcpuReadRegister,
-    VcpuReadSystemRegister,
-    VcpuRequestExit,
-    VcpuRun,
-    VcpuSetPendingIrq,
-    VcpuSetRegister,
-    VcpuSetSystemRegister(u16, u64),
-    VcpuSetVtimerMask,
+    UnsupportedPsci(u64),
+    UnsupportedSystemRegister {
+        register: u32,
+        write: bool,
+    },
+    UnexpectedExit {
+        reason: hv_exit_reason_t,
+        pc: u64,
+    },
+    UnsupportedException(u64),
     VmBusy,
     VmDestroy,
 }
 
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        use self::Error::*;
+        use crate::Error::*;
 
         match self {
             FindSymbol(err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
@@ -165,19 +165,17 @@ impl Display for Error {
             InvalidMemoryFault => write!(f, "Invalid fault in mapped guest RAM"),
             ReclaimState(err) => write!(f, "Error tracking guest RAM in HVF: {err}"),
             ReclaimProbeCleanup(err) => write!(f, "Error cleaning up HVF reclaim probe: {err}"),
-            VcpuCreate => write!(f, "Error creating HVF vCPU instance"),
-            VcpuInitialRegisters => write!(f, "Error setting up initial HVF vCPU registers"),
-            VcpuReadRegister => write!(f, "Error reading HVF vCPU register"),
-            VcpuReadSystemRegister => write!(f, "Error reading HVF vCPU system register"),
-            VcpuRequestExit => write!(f, "Error requesting HVF vCPU exit"),
-            VcpuRun => write!(f, "Error running HVF vCPU"),
-            VcpuSetPendingIrq => write!(f, "Error setting HVF vCPU pending irq"),
-            VcpuSetRegister => write!(f, "Error setting HVF vCPU register"),
-            VcpuSetSystemRegister(reg, val) => write!(
-                f,
-                "Error setting HVF vCPU system register 0x{reg:#x} to 0x{val:#x}"
-            ),
-            VcpuSetVtimerMask => write!(f, "Error setting HVF vCPU vtimer mask"),
+            UnsupportedPsci(function) => write!(f, "Unsupported PSCI function {function:#x}"),
+            UnsupportedSystemRegister { register, write } => {
+                write!(
+                    f,
+                    "Unsupported system register {register:#x}, write={write}"
+                )
+            }
+            UnexpectedExit { reason, pc } => {
+                write!(f, "Unexpected HVF exit {reason:#x} at {pc:#x}")
+            }
+            UnsupportedException(class) => write!(f, "Unsupported exception class {class:#x}"),
             VmBusy => write!(f, "HVF VM is still owned by a cleanup worker"),
             VmDestroy => write!(f, "Error destroying HVF VM instance"),
         }
@@ -203,7 +201,10 @@ pub fn vcpu_request_exit(vcpuid: u64) -> Result<(), Error> {
     let ret = unsafe { hv_vcpus_exit(&mut vcpu, 1) };
 
     if ret != HV_SUCCESS {
-        Err(Error::VcpuRequestExit)
+        Err(Error::NativeCall {
+            symbol: "hv_vcpus_exit",
+            status: ret,
+        })
     } else {
         Ok(())
     }
@@ -222,7 +223,10 @@ pub fn vcpu_set_pending_irq(
     let ret = unsafe { hv_vcpu_set_pending_interrupt(vcpuid, _type, pending) };
 
     if ret != HV_SUCCESS {
-        Err(Error::VcpuSetPendingIrq)
+        Err(Error::NativeCall {
+            symbol: "hv_vcpu_set_pending_interrupt",
+            status: ret,
+        })
     } else {
         Ok(())
     }
@@ -232,7 +236,10 @@ pub fn vcpu_set_vtimer_mask(vcpuid: u64, masked: bool) -> Result<(), Error> {
     let ret = unsafe { hv_vcpu_set_vtimer_mask(vcpuid, masked) };
 
     if ret != HV_SUCCESS {
-        Err(Error::VcpuSetVtimerMask)
+        Err(Error::NativeCall {
+            symbol: "hv_vcpu_set_vtimer_mask",
+            status: ret,
+        })
     } else {
         Ok(())
     }
@@ -272,6 +279,13 @@ pub struct HvfVm {
     framework: Arc<HvfFramework>,
 }
 
+/// Keeps the VM and its resolved framework alive on a vCPU owner thread.
+pub struct HvfCpuResources {
+    _lifetime: Arc<HvfVmLifetime>,
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    _framework: Arc<HvfFramework>,
+}
+
 pub(crate) struct HvfVmLifetime {
     destroyed: AtomicBool,
 }
@@ -306,6 +320,14 @@ impl Drop for HvfVmLifetime {
 }
 
 impl HvfVm {
+    pub fn cpu_resources(&self) -> HvfCpuResources {
+        HvfCpuResources {
+            _lifetime: Arc::clone(&self.lifetime),
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            _framework: Arc::clone(&self.framework),
+        }
+    }
+
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     pub fn new(nested_enabled: bool) -> Result<Self, Error> {
         let framework = HvfFramework::load()?;
@@ -488,8 +510,8 @@ pub enum VcpuExit<'a> {
     WaitForEventTimeout(Duration),
 }
 
+#[derive(Clone, Copy)]
 struct MmioRead {
-    addr: u64,
     len: usize,
     srt: u32,
 }
@@ -501,9 +523,36 @@ struct MmioAccess {
     register: u32,
 }
 
+/// A single same-VM resume target, retained even when the native setter fails.
+pub struct VtimerResume {
+    baseline: u64,
+    target: Option<u64>,
+}
+
+impl VtimerResume {
+    pub fn new(baseline: u64) -> Self {
+        Self {
+            baseline,
+            target: None,
+        }
+    }
+
+    pub fn prepare(&mut self, paused_ticks: u64) -> Result<u64, String> {
+        let target = self
+            .baseline
+            .checked_add(paused_ticks)
+            .ok_or_else(|| "HVF timer offset overflow".to_owned())?;
+        if self.target.is_some_and(|previous| previous != target) {
+            return Err("HVF timer preparation target changed".to_owned());
+        }
+        self.target = Some(target);
+        Ok(target)
+    }
+}
+
 pub struct HvfVcpu<'a> {
     vcpuid: hv_vcpu_t,
-    vcpu_exit: &'a hv_vcpu_exit_t,
+    vcpu_exit: Option<&'a hv_vcpu_exit_t>,
     cntfrq: u64,
     mmio_buf: [u8; 8],
     pending_mmio_read: Option<MmioRead>,
@@ -513,10 +562,12 @@ pub struct HvfVcpu<'a> {
     // Cached copy of the HVF vtimer offset (0 until a live pause advances it),
     // so the WFE deadline check doesn't issue a syscall on every wait.
     vtimer_offset: Cell<u64>,
+    destroyed: bool,
+    _owner_thread: PhantomData<Rc<()>>,
 }
 
 impl HvfVcpu<'_> {
-    pub fn new(mpidr: u64, nested_enabled: bool) -> Result<Self, Error> {
+    pub fn new(nested_enabled: bool) -> Result<Self, Error> {
         let mut vcpuid: hv_vcpu_t = 0;
         let mut vcpu_exit_ptr: *mut hv_vcpu_exit_t = std::ptr::null_mut();
 
@@ -539,21 +590,15 @@ impl HvfVcpu<'_> {
             )
         };
         if ret != HV_SUCCESS {
-            return Err(Error::VcpuCreate);
+            return Err(Error::NativeCall {
+                symbol: "hv_vcpu_create",
+                status: ret,
+            });
         }
-
-        // We write vcpuid to Aff1 as otherwise it won't match the redistributor ID
-        // when using HVF in-kernel GICv3.
-        let ret = unsafe { hv_vcpu_set_sys_reg(vcpuid, hv_sys_reg_t_HV_SYS_REG_MPIDR_EL1, mpidr) };
-        if ret != HV_SUCCESS {
-            return Err(Error::VcpuCreate);
-        }
-
-        let vcpu_exit: &hv_vcpu_exit_t = unsafe { vcpu_exit_ptr.as_mut().unwrap() };
 
         Ok(Self {
             vcpuid,
-            vcpu_exit,
+            vcpu_exit: unsafe { vcpu_exit_ptr.as_ref() },
             cntfrq,
             mmio_buf: [0; 8],
             pending_mmio_read: None,
@@ -561,7 +606,24 @@ impl HvfVcpu<'_> {
             vtimer_masked: false,
             nested_enabled,
             vtimer_offset: Cell::new(0),
+            destroyed: false,
+            _owner_thread: PhantomData,
         })
+    }
+
+    pub fn initialize(&self, mpidr: u64) -> Result<(), Error> {
+        if self.vcpu_exit.is_none() {
+            return Err(Error::NullObject("hv_vcpu_create exit record"));
+        }
+        let ret =
+            unsafe { hv_vcpu_set_sys_reg(self.vcpuid, hv_sys_reg_t_HV_SYS_REG_MPIDR_EL1, mpidr) };
+        if ret != HV_SUCCESS {
+            return Err(Error::NativeCall {
+                symbol: "hv_vcpu_set_sys_reg(MPIDR_EL1)",
+                status: ret,
+            });
+        }
+        Ok(())
     }
 
     pub fn set_initial_state(&self, entry_addr: u64, fdt_addr: u64) -> Result<(), Error> {
@@ -570,14 +632,20 @@ impl HvfVcpu<'_> {
                 hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL2_FAULT_BITS_64)
             };
             if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
+                return Err(Error::NativeCall {
+                    symbol: "hv_vcpu_set_reg(CPSR)",
+                    status: ret,
+                });
             }
 
             let ret = unsafe {
                 hv_vcpu_set_sys_reg(self.vcpuid, hv_sys_reg_t_HV_SYS_REG_HCR_EL2, HCR_EL2_BITS)
             };
             if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
+                return Err(Error::NativeCall {
+                    symbol: "hv_vcpu_set_sys_reg(HCR_EL2)",
+                    status: ret,
+                });
             }
 
             let ret = unsafe {
@@ -588,7 +656,10 @@ impl HvfVcpu<'_> {
                 )
             };
             if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
+                return Err(Error::NativeCall {
+                    symbol: "hv_vcpu_set_sys_reg(CNTHCTL_EL2)",
+                    status: ret,
+                });
             }
 
             // Enable EL2 and GICv3 in ID_AA64PFR0_EL1
@@ -601,7 +672,10 @@ impl HvfVcpu<'_> {
                 )
             };
             if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
+                return Err(Error::NativeCall {
+                    symbol: "hv_vcpu_get_sys_reg(ID_AA64PFR0_EL1)",
+                    status: ret,
+                });
             }
             let ret = unsafe {
                 hv_vcpu_set_sys_reg(
@@ -611,7 +685,10 @@ impl HvfVcpu<'_> {
                 )
             };
             if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
+                return Err(Error::NativeCall {
+                    symbol: "hv_vcpu_set_sys_reg(ID_AA64PFR0_EL1)",
+                    status: ret,
+                });
             }
 
             // If SME is enabled in ID_AA64PFR1_EL1 in the VM, the guest will
@@ -625,7 +702,10 @@ impl HvfVcpu<'_> {
                 )
             };
             if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
+                return Err(Error::NativeCall {
+                    symbol: "hv_vcpu_get_sys_reg(ID_AA64PFR1_EL1)",
+                    status: ret,
+                });
             }
             let ret = unsafe {
                 hv_vcpu_set_sys_reg(
@@ -635,25 +715,37 @@ impl HvfVcpu<'_> {
                 )
             };
             if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
+                return Err(Error::NativeCall {
+                    symbol: "hv_vcpu_set_sys_reg(ID_AA64PFR1_EL1)",
+                    status: ret,
+                });
             }
         } else {
             let ret = unsafe {
                 hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL1_FAULT_BITS_64)
             };
             if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
+                return Err(Error::NativeCall {
+                    symbol: "hv_vcpu_set_reg(CPSR)",
+                    status: ret,
+                });
             }
         }
 
         let ret = unsafe { hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_PC, entry_addr) };
         if ret != HV_SUCCESS {
-            return Err(Error::VcpuInitialRegisters);
+            return Err(Error::NativeCall {
+                symbol: "hv_vcpu_set_reg(PC)",
+                status: ret,
+            });
         }
 
         let ret = unsafe { hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_X0, fdt_addr) };
         if ret != HV_SUCCESS {
-            return Err(Error::VcpuInitialRegisters);
+            return Err(Error::NativeCall {
+                symbol: "hv_vcpu_set_reg(X0)",
+                status: ret,
+            });
         }
 
         Ok(())
@@ -667,7 +759,10 @@ impl HvfVcpu<'_> {
         let mut val: u64 = 0;
         let ret = unsafe { hv_vcpu_get_reg(self.vcpuid, reg, &mut val as *mut _) };
         if ret != HV_SUCCESS {
-            Err(Error::VcpuReadRegister)
+            Err(Error::NativeCall {
+                symbol: "hv_vcpu_get_reg",
+                status: ret,
+            })
         } else {
             Ok(val)
         }
@@ -676,7 +771,10 @@ impl HvfVcpu<'_> {
     pub fn write_reg(&self, rt: u32, val: u64) -> Result<(), Error> {
         let ret = unsafe { hv_vcpu_set_reg(self.vcpuid, rt, val) };
         if ret != HV_SUCCESS {
-            Err(Error::VcpuSetRegister)
+            Err(Error::NativeCall {
+                symbol: "hv_vcpu_set_reg",
+                status: ret,
+            })
         } else {
             Ok(())
         }
@@ -686,43 +784,78 @@ impl HvfVcpu<'_> {
         let mut val: u64 = 0;
         let ret = unsafe { hv_vcpu_get_sys_reg(self.vcpuid, reg, &mut val as *mut _) };
         if ret != HV_SUCCESS {
-            Err(Error::VcpuReadSystemRegister)
+            Err(Error::NativeCall {
+                symbol: "hv_vcpu_get_sys_reg",
+                status: ret,
+            })
         } else {
             Ok(val)
         }
     }
 
-    /// Freeze the guest's CNTVCT across a live pause. The guest virtual counter
-    /// is `mach_absolute_time() - vtimer_offset`; while paused the host counter
-    /// keeps advancing, so on resume we add the ticks spent paused to the offset.
-    /// The guest's counter then resumes where it stopped and armed deadlines stay
-    /// in the near future instead of firing en masse to catch up the gap.
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    pub fn advance_vtimer_offset(&self, paused_ticks: u64) -> Result<(), Error> {
-        let offset = self.vtimer_offset.get().wrapping_add(paused_ticks);
-        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, offset) };
+    /// Applies an absolute target, so reconciliation cannot add paused time twice.
+    pub fn set_vtimer_offset(&self, target: u64) -> Result<(), Error> {
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, target) };
         if ret != HV_SUCCESS {
-            return Err(Error::VcpuSetRegister);
+            return Err(Error::NativeCall {
+                symbol: "hv_vcpu_set_vtimer_offset",
+                status: ret,
+            });
         }
-        self.vtimer_offset.set(offset);
+        self.vtimer_offset.set(target);
         Ok(())
     }
 
-    fn hvf_sync_vtimer(&mut self, vcpu_list: Arc<dyn Vcpus>) {
-        if !self.vtimer_masked {
-            return;
-        }
+    pub fn vtimer_offset(&self) -> u64 {
+        self.vtimer_offset.get()
+    }
 
-        let ctl = self
-            .read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0)
-            .unwrap();
+    pub fn destroy(&mut self) -> Result<(), Error> {
+        if self.destroyed {
+            return Ok(());
+        }
+        let ret = unsafe { hv_vcpu_destroy(self.vcpuid) };
+        if ret != HV_SUCCESS {
+            return Err(Error::NativeCall {
+                symbol: "hv_vcpu_destroy",
+                status: ret,
+            });
+        }
+        self.destroyed = true;
+        Ok(())
+    }
+
+    /// Completes host-side emulation only, without executing another guest instruction.
+    pub fn finish_pending_emulation(&mut self) -> Result<(), Error> {
+        if let Some(mmio_read) = self.pending_mmio_read {
+            if mmio_read.srt < 31 {
+                let value = mmio_value(&self.mmio_buf, mmio_read.len)?;
+                self.write_reg(mmio_read.srt, value)?;
+            }
+            self.pending_mmio_read = None;
+        }
+        if self.pending_advance_pc {
+            let pc = self.read_reg(hv_reg_t_HV_REG_PC)?;
+            let next = pc.checked_add(4).ok_or(Error::InvalidMemoryFault)?;
+            self.write_reg(hv_reg_t_HV_REG_PC, next)?;
+            self.pending_advance_pc = false;
+        }
+        Ok(())
+    }
+
+    fn hvf_sync_vtimer(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<(), Error> {
+        if !self.vtimer_masked {
+            return Ok(());
+        }
+        let ctl = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0)?;
         let irq_state = (ctl & (TMR_CTL_ENABLE | TMR_CTL_IMASK | TMR_CTL_ISTATUS))
             == (TMR_CTL_ENABLE | TMR_CTL_ISTATUS);
         vcpu_list.set_vtimer_irq(self.vcpuid);
         if !irq_state {
-            vcpu_set_vtimer_mask(self.vcpuid, false).unwrap();
+            vcpu_set_vtimer_mask(self.vcpuid, false)?;
             self.vtimer_masked = false;
         }
+        Ok(())
     }
 
     fn handle_psci_request(&self) -> Result<VcpuExit<'_>, Error> {
@@ -748,7 +881,7 @@ impl HvfVcpu<'_> {
                 self.write_reg(hv_reg_t_HV_REG_X0, 0)?;
                 Ok(VcpuExit::CpuOn(mpidr, entry, context_id))
             }
-            val => panic!("Unexpected val={val}")
+            val => Err(Error::UnsupportedPsci(val)),
         }
     }
 
@@ -757,30 +890,12 @@ impl HvfVcpu<'_> {
         vcpu_list: Arc<dyn Vcpus>,
         reclaim_state: &Arc<ReclaimState>,
     ) -> Result<VcpuExit<'_>, Error> {
+        self.finish_pending_emulation()?;
+        let exit = self
+            .vcpu_exit
+            .ok_or(Error::NullObject("hv_vcpu_create exit record"))?;
         let entered_generation = reclaim_state.vcpu_run_generation();
         let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
-        if let Some(mmio_read) = self.pending_mmio_read.take()
-            && mmio_read.srt < 31
-        {
-            let val = match mmio_read.len {
-                1 => u8::from_le_bytes(self.mmio_buf[0..1].try_into().unwrap()) as u64,
-                2 => u16::from_le_bytes(self.mmio_buf[0..2].try_into().unwrap()) as u64,
-                4 => u32::from_le_bytes(self.mmio_buf[0..4].try_into().unwrap()) as u64,
-                8 => u64::from_le_bytes(self.mmio_buf[0..8].try_into().unwrap()),
-                _ => panic!(
-                    "unsupported mmio pa={} len={}",
-                    mmio_read.addr, mmio_read.len
-                ),
-            };
-
-            self.write_reg(mmio_read.srt, val)?;
-        }
-
-        if self.pending_advance_pc {
-            let pc = self.read_reg(hv_reg_t_HV_REG_PC)?;
-            self.write_reg(hv_reg_t_HV_REG_PC, pc + 4)?;
-            self.pending_advance_pc = false;
-        }
 
         if pending_irq {
             vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, true)?;
@@ -788,10 +903,13 @@ impl HvfVcpu<'_> {
 
         let ret = unsafe { hv_vcpu_run(self.vcpuid) };
         if ret != HV_SUCCESS {
-            return Err(Error::VcpuRun);
+            return Err(Error::NativeCall {
+                symbol: "hv_vcpu_run",
+                status: ret,
+            });
         }
 
-        match self.vcpu_exit.reason {
+        match exit.reason {
             HV_EXIT_REASON_EXCEPTION => { /* This is the main one, handle below. */ }
             HV_EXIT_REASON_VTIMER_ACTIVATED => {
                 self.vtimer_masked = true;
@@ -800,26 +918,24 @@ impl HvfVcpu<'_> {
             HV_EXIT_REASON_CANCELED => return Ok(VcpuExit::Canceled),
             _ => {
                 let pc = self.read_reg(hv_reg_t_HV_REG_PC)?;
-                panic!(
-                    "unexpected exit reason: vcpuid={} 0x{:x} at pc=0x{:x}",
-                    self.id(),
-                    self.vcpu_exit.reason,
-                    pc
-                );
+                return Err(Error::UnexpectedExit {
+                    reason: exit.reason,
+                    pc,
+                });
             }
         }
 
-        self.hvf_sync_vtimer(vcpu_list.clone());
+        self.hvf_sync_vtimer(vcpu_list.clone())?;
 
-        let syndrome = self.vcpu_exit.exception.syndrome;
+        let syndrome = exit.exception.syndrome;
         let ec = (syndrome >> 26) & 0x3f;
         match ec {
             EC_AA64_BKPT => {
-                debug!("vcpu[{}]: BRK exit", self.vcpuid);
+                log::debug!("vcpu[{}]: BRK exit", self.vcpuid);
                 Ok(VcpuExit::Breakpoint)
             }
             EC_INSTRUCTIONABORT | EC_INSTRUCTIONABORT_CURRENT => {
-                let pa = self.vcpu_exit.exception.physical_address;
+                let pa = exit.exception.physical_address;
                 if is_translation_fault(syndrome)
                     && fault_address_is_valid(syndrome)
                     && let Some(generation) = entered_generation
@@ -841,7 +957,7 @@ impl HvfVcpu<'_> {
                 Err(Error::InvalidMemoryFault)
             }
             EC_DATAABORT | EC_DATAABORT_CURRENT => {
-                let pa = self.vcpu_exit.exception.physical_address;
+                let pa = exit.exception.physical_address;
                 if is_translation_fault(syndrome)
                     && fault_address_is_valid(syndrome)
                     && let Some(generation) = entered_generation
@@ -881,7 +997,6 @@ impl HvfVcpu<'_> {
                     Ok(VcpuExit::MmioWrite(pa, &self.mmio_buf[0..access.len]))
                 } else {
                     self.pending_mmio_read = Some(MmioRead {
-                        addr: pa,
                         srt: access.register,
                         len: access.len,
                     });
@@ -893,7 +1008,7 @@ impl HvfVcpu<'_> {
                 let isread: bool = (syndrome & 1) != 0;
                 let rt: u32 = ((syndrome >> 5) & 0x1f) as u32;
                 let reg: u32 = syndrome as u32 & SYSREG_MASK;
-                debug!(
+                log::debug!(
                     "EC_SYSTEMREGISTERTRAP isread={}, syndrome={}, rt={}, reg={}, reg_name={}",
                     isread as u32,
                     syndrome,
@@ -905,8 +1020,6 @@ impl HvfVcpu<'_> {
                 self.pending_advance_pc = true;
 
                 if isread {
-                    assert!(rt < 32);
-
                     // See https://developer.arm.com/documentation/dui0801/l/Overview-of-AArch64-state/Registers-in-AArch64-state
                     if rt == 31 {
                         return Ok(VcpuExit::SystemRegister);
@@ -917,27 +1030,22 @@ impl HvfVcpu<'_> {
                             self.write_reg(rt, val)?;
                             Ok(VcpuExit::SystemRegister)
                         }
-                        None => panic!(
-                            "UNKNOWN rt={}, reg={} name={}",
-                            rt,
-                            reg,
-                            sys_reg_name(reg).unwrap_or("unknown sysreg")
-                        ),
+                        None => Err(Error::UnsupportedSystemRegister {
+                            register: reg,
+                            write: false,
+                        }),
                     }
                 } else {
-                    assert!(rt < 32);
-
                     // See https://developer.arm.com/documentation/dui0801/l/Overview-of-AArch64-state/Registers-in-AArch64-state
                     let val = if rt == 31 { 0u64 } else { self.read_reg(rt)? };
 
                     if vcpu_list.handle_sysreg_write(self.vcpuid, reg, val) {
                         Ok(VcpuExit::SystemRegister)
                     } else {
-                        panic!(
-                            "unexpected write: {} name={}",
-                            reg,
-                            sys_reg_name(reg).unwrap_or("unknown sysreg")
-                        );
+                        Err(Error::UnsupportedSystemRegister {
+                            register: reg,
+                            write: true,
+                        })
                     }
                 }
             }
@@ -951,20 +1059,15 @@ impl HvfVcpu<'_> {
 
                 // Also CNTV_CVAL & CNTV_CVAL_EL0
                 let cval = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)?;
-                // The guest's deadline `cval` is in the CNTVCT domain, where
-                // CNTVCT = mach_absolute_time() - vtimer_offset. The offset is 0
-                // on a fresh boot but nonzero after a live pause (it keeps CNTVCT
-                // continuous across the paused interval). Compare against the
-                // corrected counter, not raw mach time — otherwise after a pause
-                // `now` runs ahead of every armed deadline and the vCPU busy-loops
-                // on WaitForEventExpired instead of parking, so the guest's virtual
-                // timer never fires and timed sleeps hang.
+                // This preserves the existing same-VM clock model. Mach/guest
+                // counter epoch and rate equivalence still require native qualification.
                 let now = unsafe { mach_absolute_time() }.saturating_sub(self.vtimer_offset.get());
                 if now > cval {
                     return Ok(VcpuExit::WaitForEventExpired);
                 }
 
-                let timeout = Duration::from_nanos((cval - now) * (1_000_000_000 / self.cntfrq));
+                let timeout =
+                    ticks_to_duration(cval - now, self.cntfrq).ok_or(Error::InvalidMemoryFault)?;
                 Ok(VcpuExit::WaitForEventTimeout(timeout))
             }
             EC_AA64_HVC => self.handle_psci_request(),
@@ -972,9 +1075,46 @@ impl HvfVcpu<'_> {
                 self.pending_advance_pc = true;
                 self.handle_psci_request()
             }
-            _ => panic!("unexpected exception: 0x{ec:x}"),
+            _ => Err(Error::UnsupportedException(ec)),
         }
     }
+}
+
+impl Drop for HvfVcpu<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.destroy() {
+            log::error!(
+                "HVF vCPU {} owner-thread cleanup failed: {error}",
+                self.vcpuid
+            );
+            // Unwinding cannot release the surrounding VM/RAM owners while
+            // this native CPU still exists. The process owner must reap us.
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+}
+
+fn mmio_value(bytes: &[u8; 8], len: usize) -> Result<u64, Error> {
+    match len {
+        1 | 2 | 4 | 8 => {
+            let mut value = [0; 8];
+            value[..len].copy_from_slice(&bytes[..len]);
+            Ok(u64::from_le_bytes(value))
+        }
+        _ => Err(Error::InvalidMemoryFault),
+    }
+}
+
+fn ticks_to_duration(ticks: u64, frequency: u64) -> Option<Duration> {
+    let nanos = u128::from(ticks)
+        .checked_mul(1_000_000_000)?
+        .checked_div(u128::from(frequency))?;
+    Some(Duration::new(
+        u64::try_from(nanos / 1_000_000_000).ok()?,
+        (nanos % 1_000_000_000) as u32,
+    ))
 }
 
 fn is_translation_fault(syndrome: u64) -> bool {
@@ -1008,6 +1148,7 @@ fn decode_mmio_access(syndrome: u64) -> Option<MmioAccess> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     mod actual_reclaim;
 
     use std::sync::Arc;
@@ -1017,6 +1158,43 @@ mod tests {
         Error, HvfVmLifetime, MmioAccess, decode_mmio_access, fault_address_is_valid,
         is_translation_fault, unique_vm_lifetime,
     };
+
+    #[test]
+    fn vtimer_resume_retries_one_absolute_target() {
+        let mut plan = crate::VtimerResume::new(200);
+        assert_eq!(plan.prepare(300).unwrap(), 500);
+        assert_eq!(plan.prepare(300).unwrap(), 500);
+        assert!(plan.prepare(301).is_err());
+        assert_eq!(plan.prepare(300).unwrap(), 500);
+        assert!(crate::VtimerResume::new(u64::MAX).prepare(1).is_err());
+    }
+
+    #[test]
+    fn deferred_mmio_value_and_timer_duration_are_bounded() {
+        let bytes = [1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(crate::mmio_value(&bytes, 1).unwrap(), 1);
+        assert_eq!(crate::mmio_value(&bytes, 2).unwrap(), 0x0201);
+        assert_eq!(crate::mmio_value(&bytes, 4).unwrap(), 0x0403_0201);
+        assert_eq!(
+            crate::mmio_value(&bytes, 8).unwrap(),
+            u64::from_le_bytes(bytes)
+        );
+        assert!(crate::mmio_value(&bytes, 0).is_err());
+        assert!(crate::mmio_value(&bytes, 3).is_err());
+        assert!(crate::mmio_value(&bytes, 9).is_err());
+        assert_eq!(
+            crate::ticks_to_duration(1, 24_000_000).unwrap().as_nanos(),
+            41
+        );
+        assert_eq!(
+            crate::ticks_to_duration(24_000_000, 24_000_000)
+                .unwrap()
+                .as_secs(),
+            1
+        );
+        assert!(crate::ticks_to_duration(1, 0).is_none());
+        assert!(crate::ticks_to_duration(u64::MAX, 1).is_some());
+    }
 
     #[test]
     fn explicit_destroy_requires_unique_lifetime_ownership() {

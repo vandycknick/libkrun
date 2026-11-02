@@ -13,7 +13,7 @@ use std::time::Instant;
 use std::{fmt, io};
 
 use crate::vmm::device_manager::quiescence::{
-    AttachmentIdentity, DeviceQuiescence, LegacyAttachment, LegacyDevice, LegacyKind, ManagerError,
+    AttachmentIdentity, DeviceQuiescence, LegacyAttachment, LegacyKind, ManagerError,
 };
 use devices::DeviceType;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -97,16 +97,6 @@ pub struct IrqRoute {
     registered: bool,
 }
 
-impl IrqRoute {
-    pub fn notifier(&self) -> &Arc<EventFd> {
-        &self.event
-    }
-
-    pub fn is_registered(&self) -> bool {
-        self.registered
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteTransition {
     Fence,
@@ -172,7 +162,7 @@ struct RouteWorker {
     handle: JoinHandle<()>,
 }
 
-fn run_route_work(vm: Arc<VmFd>, work: &Mutex<RouteWork>, completion: &EventFd) {
+fn run_route_work(vm: Arc<VmFd>, work: &Mutex<RouteWork>) {
     let mut work = match work.lock() {
         Ok(work) => work,
         Err(_) => return,
@@ -201,9 +191,6 @@ fn run_route_work(vm: Arc<VmFd>, work: &Mutex<RouteWork>, completion: &EventFd) 
             break;
         }
     }
-    if let Err(error) = completion.write(1) {
-        work.failure.get_or_insert(RouteFault::from(error));
-    }
 }
 
 /// Manages the complexities of registering a MMIO device.
@@ -220,7 +207,6 @@ pub struct MMIODeviceManager {
     route_request: Option<(BarrierRequest, RouteTransition)>,
     route_failure: Option<RouteError>,
     route_worker: Option<RouteWorker>,
-    route_completion: Option<Arc<EventFd>>,
     #[cfg(target_arch = "x86_64")]
     legacy_route_range: Option<std::ops::Range<usize>>,
 }
@@ -244,7 +230,6 @@ impl MMIODeviceManager {
             route_request: None,
             route_failure: None,
             route_worker: None,
-            route_completion: None,
             #[cfg(target_arch = "x86_64")]
             legacy_route_range: None,
         }
@@ -277,10 +262,6 @@ impl MMIODeviceManager {
         } else {
             Some(&self.routes)
         }
-    }
-
-    pub fn irq_completion_event(&self) -> Option<&EventFd> {
-        self.route_completion.as_deref()
     }
 
     pub fn preflight_quiesce(&self) -> std::result::Result<(), ManagerError> {
@@ -421,6 +402,19 @@ impl MMIODeviceManager {
         Ok(Poll::Ready(()))
     }
 
+    pub fn irq_barrier_key(&self) -> Option<BarrierKey> {
+        self.route_request.map(|(request, _)| request.key)
+    }
+
+    /// Terminal ownership progress, independent of an expired caller's key.
+    /// A retained transition error is not evidence that its worker has stopped.
+    pub fn poll_irq_cleanup(&mut self) -> bool {
+        if let Some((request, _)) = self.route_request {
+            let _ = self.poll_irq_routes(request.key);
+        }
+        self.route_worker.is_none()
+    }
+
     fn start_route_work(
         &mut self,
         vm: Arc<VmFd>,
@@ -437,17 +431,6 @@ impl MMIODeviceManager {
                 RouteFault::InvalidTransition,
             ));
         }
-        if self.route_completion.is_none() {
-            self.route_completion = Some(Arc::new(
-                EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(|error| {
-                    Self::route_error(request, transition, RouteFault::from(error))
-                })?,
-            ));
-        }
-        let completion = self
-            .route_completion
-            .clone()
-            .ok_or_else(|| Self::route_error(request, transition, RouteFault::InvalidTransition))?;
         let work = Arc::new(Mutex::new(RouteWork {
             routes: std::mem::take(&mut self.routes),
             request,
@@ -460,7 +443,7 @@ impl MMIODeviceManager {
         match thread::Builder::new()
             .name("irq-route-barrier".into())
             .spawn(move || {
-                run_route_work(vm, &worker_work, &completion);
+                run_route_work(vm, &worker_work);
             }) {
             Ok(handle) => {
                 self.route_worker = Some(RouteWorker { work, handle });
@@ -550,17 +533,12 @@ impl MMIODeviceManager {
                 let intc = intc.lock().map_err(|_| Error::DeviceLock)?;
                 (intc.get_mmio_addr(), intc.get_mmio_size())
             };
-            self.bus
-                .insert(intc.clone(), addr, size)
-                .map_err(Error::BusError)?;
-            self.quiescence.retain_legacy(
-                LegacyAttachment {
-                    kind: LegacyKind::InterruptController,
-                    address: addr,
-                    irq: None,
-                },
-                LegacyDevice::InterruptController(intc),
-            );
+            self.bus.insert(intc, addr, size).map_err(Error::BusError)?;
+            self.quiescence.retain_legacy(LegacyAttachment {
+                kind: LegacyKind::InterruptController,
+                address: addr,
+                irq: None,
+            });
         }
 
         Ok(())
@@ -706,16 +684,13 @@ impl MMIODeviceManager {
         }
 
         self.bus
-            .insert(serial.clone(), self.mmio_base, MMIO_LEN)
+            .insert(serial, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
-        self.quiescence.retain_legacy(
-            LegacyAttachment {
-                kind: LegacyKind::Serial,
-                address: self.mmio_base,
-                irq: Some(self.irq),
-            },
-            LegacyDevice::Serial(serial),
-        );
+        self.quiescence.retain_legacy(LegacyAttachment {
+            kind: LegacyKind::Serial,
+            address: self.mmio_base,
+            irq: Some(self.irq),
+        });
 
         cmdline
             .insert(
@@ -765,16 +740,13 @@ impl MMIODeviceManager {
         });
 
         self.bus
-            .insert(device.clone(), self.mmio_base, MMIO_LEN)
+            .insert(device, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
-        self.quiescence.retain_legacy(
-            LegacyAttachment {
-                kind: LegacyKind::Rtc,
-                address: self.mmio_base,
-                irq: Some(self.irq),
-            },
-            LegacyDevice::Rtc(device),
-        );
+        self.quiescence.retain_legacy(LegacyAttachment {
+            kind: LegacyKind::Rtc,
+            address: self.mmio_base,
+            irq: Some(self.irq),
+        });
 
         let ret = self.mmio_base;
         self.id_to_dev_info.insert(
@@ -1079,7 +1051,7 @@ mod tests {
             manager.irq = irq;
             let index = manager.virtio_route().unwrap();
             assert_eq!(manager.routes[index].gsi, irq);
-            assert!(!manager.routes[index].is_registered());
+            assert!(!manager.routes[index].registered);
         }
         manager.irq = 15;
         let first = manager.virtio_route().unwrap();
@@ -1087,18 +1059,15 @@ mod tests {
         assert_eq!(first, peer);
         assert_eq!(manager.routes.len(), 11);
         for dedicated in &manager.routes[..10] {
-            assert!(!Arc::ptr_eq(
-                dedicated.notifier(),
-                manager.routes[first].notifier()
-            ));
+            assert!(!Arc::ptr_eq(&dedicated.event, &manager.routes[first].event));
         }
-        let survivor = manager.routes[first].notifier().clone();
+        let survivor = manager.routes[first].event.clone();
         let dropped_peer = survivor.clone();
         dropped_peer.write(3).unwrap();
         drop(dropped_peer);
         survivor.write(4).unwrap();
-        assert_eq!(manager.routes[first].notifier().read().unwrap(), 7);
-        assert!(manager.routes.iter().all(|route| !route.is_registered()));
+        assert_eq!(manager.routes[first].event.read().unwrap(), 7);
+        assert!(manager.routes.iter().all(|route| !route.registered));
     }
 
     #[test]
@@ -1122,15 +1091,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             [4, 3, 4, 3, 1]
         );
-        assert!(manager.routes.iter().all(|route| !route.is_registered()));
+        assert!(manager.routes.iter().all(|route| !route.registered));
         assert!(!Arc::ptr_eq(
-            manager.routes[0].notifier(),
-            manager.routes[2].notifier()
+            &manager.routes[0].event,
+            &manager.routes[2].event
         ));
         legacy.com_evt_1.write(2).unwrap();
         legacy.com_evt_3.write(6).unwrap();
-        assert_eq!(manager.routes[0].notifier().read().unwrap(), 2);
-        assert_eq!(manager.routes[2].notifier().read().unwrap(), 6);
+        assert_eq!(manager.routes[0].event.read().unwrap(), 2);
+        assert_eq!(manager.routes[2].event.read().unwrap(), 6);
         assert!(manager.preflight_quiesce().is_err());
         assert!(manager.retain_legacy_routes(&legacy).is_err());
         assert_eq!(manager.routes.len(), 5);
@@ -1157,9 +1126,9 @@ mod tests {
             manager.poll_irq_routes(request.key).unwrap_err().fault,
             RouteFault::Deadline
         ));
-        assert!(!manager.routes[route].is_registered());
-        manager.routes[route].notifier().write(11).unwrap();
-        assert_eq!(manager.routes[route].notifier().read().unwrap(), 11);
+        assert!(!manager.routes[route].registered);
+        manager.routes[route].event.write(11).unwrap();
+        assert_eq!(manager.routes[route].event.read().unwrap(), 11);
         assert_eq!(
             manager.route_request,
             Some((request, RouteTransition::Fence))
