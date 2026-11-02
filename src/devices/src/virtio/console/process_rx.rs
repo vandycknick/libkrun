@@ -58,7 +58,9 @@ pub(crate) fn process_rx(
             control.port_open(port_id, false);
             return;
         } else if bytes_read == 0 {
-            queue.undo_pop();
+            if let Err(error) = queue.undo_pop(head_index) {
+                log::error!("failed to return unconsumed RX head: {error}");
+            }
             interrupt.signal_used_queue();
             input.wait_until_readable(Some(&stopfd));
         }

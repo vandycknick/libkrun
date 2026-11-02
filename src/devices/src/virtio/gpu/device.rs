@@ -95,7 +95,7 @@ impl Gpu {
             let mut written = 0;
             for desc in head.into_iter() {
                 error!("gpu: process_ctl() unimplemented");
-                self.queues[CTL_INDEX].go_to_previous_position();
+                self.queues[CTL_INDEX].record_processing_failure();
                 break;
             }
 
@@ -121,7 +121,7 @@ impl Gpu {
             let mut written = 0;
             for desc in head.into_iter() {
                 error!("gpu: process_cur() unimplemented");
-                self.queues[CTL_INDEX].go_to_previous_position();
+                self.queues[CTL_INDEX].record_processing_failure();
                 break;
             }
 

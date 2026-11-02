@@ -2068,24 +2068,22 @@ fn attach_legacy_devices(
             .map_err(StartMicrovmError::Internal)?;
     }
 
-    macro_rules! register_irqfd_evt {
-        ($evt: ident, $index: expr_2021) => {{
-            vm.fd()
-                .register_irqfd(&pio_device_manager.$evt, $index)
-                .map_err(|e| {
-                    Error::LegacyIOBus(device_manager::legacy::Error::EventFd(
-                        io::Error::from_raw_os_error(e.errno()),
-                    ))
-                })
-                .map_err(StartMicrovmError::Internal)?;
-        }};
+    #[cfg(target_os = "linux")]
+    mmio_device_manager
+        .register_legacy_irq_routes(vm.fd(), pio_device_manager)
+        .map_err(Error::RegisterMMIODevice)
+        .map_err(StartMicrovmError::Internal)?;
+    #[cfg(not(target_os = "linux"))]
+    for (gsi, event) in pio_device_manager.irq_events() {
+        vm.fd()
+            .register_irqfd(event, gsi)
+            .map_err(|error| {
+                Error::LegacyIOBus(device_manager::legacy::Error::EventFd(
+                    io::Error::from_raw_os_error(error.errno()),
+                ))
+            })
+            .map_err(StartMicrovmError::Internal)?;
     }
-
-    register_irqfd_evt!(com_evt_1, 4);
-    register_irqfd_evt!(com_evt_2, 3);
-    register_irqfd_evt!(com_evt_3, 4);
-    register_irqfd_evt!(com_evt_4, 3);
-    register_irqfd_evt!(kbd_evt, 1);
     Ok(())
 }
 

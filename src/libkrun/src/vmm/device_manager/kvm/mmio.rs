@@ -7,15 +7,21 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
 use std::{fmt, io};
 
+use crate::vmm::device_manager::quiescence::{
+    AttachmentIdentity, DeviceQuiescence, LegacyAttachment, LegacyDevice, LegacyKind, ManagerError,
+};
 use devices::DeviceType;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::fdt::DeviceInfoForFDT;
 use devices::legacy::IrqChip;
 use kernel::cmdline as kernel_cmdline;
 use kvm_ioctls::{IoEventAddress, VmFd};
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use polly::event_manager::{BarrierKey, BarrierRequest};
 use utils::eventfd::EventFd;
 
 /// Errors for MMIO device manager.
@@ -37,6 +43,9 @@ pub enum Error {
     RegisterIoEvent(kvm_ioctls::Error),
     /// Registering an IRQ FD failed.
     RegisterIrqFd(kvm_ioctls::Error),
+    Provider(devices::virtio::lifecycle::ProviderFault),
+    BarrierActive,
+    DeviceLock,
     /// Failed to create vhost-user device.
     #[cfg(all(feature = "vhost-user", target_os = "linux"))]
     VhostUserDevice(io::Error),
@@ -44,20 +53,23 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Error::CreateMmioTransport(ref e) => {
+        match self {
+            Error::CreateMmioTransport(e) => {
                 write!(f, "failed to create mmio transport for the device {e}")
             }
-            Error::BusError(ref e) => write!(f, "failed to perform bus operation: {e}"),
-            Error::Cmdline(ref e) => {
+            Error::BusError(e) => write!(f, "failed to perform bus operation: {e}"),
+            Error::Cmdline(e) => {
                 write!(f, "unable to add device to kernel command line: {e}")
             }
-            Error::EventFd(ref e) => write!(f, "failed to create or clone event descriptor: {e}"),
+            Error::EventFd(e) => write!(f, "failed to create or clone event descriptor: {e}"),
             Error::IrqsExhausted => write!(f, "no more IRQs are available"),
-            Error::RegisterIoEvent(ref e) => write!(f, "failed to register IO event: {e}"),
-            Error::RegisterIrqFd(ref e) => write!(f, "failed to register irqfd: {e}"),
+            Error::RegisterIoEvent(e) => write!(f, "failed to register IO event: {e}"),
+            Error::RegisterIrqFd(e) => write!(f, "failed to register irqfd: {e}"),
+            Error::Provider(e) => write!(f, "failed to bind transport attachment: {e:?}"),
+            Error::BarrierActive => write!(f, "device topology is fenced"),
+            Error::DeviceLock => write!(f, "device lock unavailable"),
             #[cfg(all(feature = "vhost-user", target_os = "linux"))]
-            Error::VhostUserDevice(ref e) => write!(f, "failed to create vhost-user device: {e}"),
+            Error::VhostUserDevice(e) => write!(f, "failed to create vhost-user device: {e}"),
         }
     }
 }
@@ -76,12 +88,122 @@ type Result<T> = ::std::result::Result<T, Error>;
 /// Currently hardcoded to 4K.
 const MMIO_LEN: u64 = 0x1000;
 
-#[cfg(target_arch = "x86_64")]
-// One eventfd is registered once with KVM for all transports on this line.
-// Manager ownership keeps it alive independently of any individual device.
-struct SharedInterruptLine {
+/// One actual event object/GSI registration. Independent event objects sharing a
+/// GSI are deliberately separate routes.
+pub struct IrqRoute {
+    pub gsi: u32,
+    pub members: Vec<u64>,
     event: Arc<EventFd>,
     registered: bool,
+}
+
+impl IrqRoute {
+    pub fn notifier(&self) -> &Arc<EventFd> {
+        &self.event
+    }
+
+    pub fn is_registered(&self) -> bool {
+        self.registered
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteTransition {
+    Fence,
+    Rearm,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteFault {
+    ForeignBarrier,
+    InvalidTransition,
+    ProducersNotQuiesced,
+    Deadline,
+    Native {
+        gsi: u32,
+        error: kvm_ioctls::Error,
+    },
+    Host {
+        kind: io::ErrorKind,
+        raw_os_error: Option<i32>,
+    },
+    WorkerPanicked,
+    WorkerPoisoned,
+}
+
+impl From<io::Error> for RouteFault {
+    fn from(error: io::Error) -> Self {
+        Self::Host {
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RouteError {
+    pub key: BarrierKey,
+    pub request: Option<BarrierRequest>,
+    pub transition: RouteTransition,
+    pub fault: RouteFault,
+}
+
+impl fmt::Display for RouteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "IRQ route {:?} for {:?}: {:?}",
+            self.transition, self.key, self.fault
+        )
+    }
+}
+
+impl std::error::Error for RouteError {}
+
+struct RouteWork {
+    routes: Vec<IrqRoute>,
+    request: BarrierRequest,
+    transition: RouteTransition,
+    failure: Option<RouteFault>,
+}
+
+struct RouteWorker {
+    work: Arc<Mutex<RouteWork>>,
+    handle: JoinHandle<()>,
+}
+
+fn run_route_work(vm: Arc<VmFd>, work: &Mutex<RouteWork>, completion: &EventFd) {
+    let mut work = match work.lock() {
+        Ok(work) => work,
+        Err(_) => return,
+    };
+    let request = work.request;
+    let transition = work.transition;
+    for index in 0..work.routes.len() {
+        if Instant::now() >= request.deadline {
+            work.failure = Some(RouteFault::Deadline);
+            break;
+        }
+        let route = &mut work.routes[index];
+        let result = match (transition, route.registered) {
+            (RouteTransition::Fence, true) => vm.unregister_irqfd(&route.event, route.gsi),
+            (RouteTransition::Rearm, false) => vm.register_irqfd(&route.event, route.gsi),
+            _ => continue,
+        };
+        if let Err(error) = result {
+            let gsi = route.gsi;
+            work.failure = Some(RouteFault::Native { gsi, error });
+            break;
+        }
+        route.registered = transition == RouteTransition::Rearm;
+        if Instant::now() >= request.deadline {
+            work.failure = Some(RouteFault::Deadline);
+            break;
+        }
+    }
+    if let Err(error) = completion.write(1) {
+        work.failure.get_or_insert(RouteFault::from(error));
+    }
 }
 
 /// Manages the complexities of registering a MMIO device.
@@ -91,8 +213,16 @@ pub struct MMIODeviceManager {
     irq: u32,
     last_irq: u32,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    pub quiescence: DeviceQuiescence,
+    routes: Vec<IrqRoute>,
     #[cfg(target_arch = "x86_64")]
-    shared_irq: Option<SharedInterruptLine>,
+    shared_irq: Option<usize>,
+    route_request: Option<(BarrierRequest, RouteTransition)>,
+    route_failure: Option<RouteError>,
+    route_worker: Option<RouteWorker>,
+    route_completion: Option<Arc<EventFd>>,
+    #[cfg(target_arch = "x86_64")]
+    legacy_route_range: Option<std::ops::Range<usize>>,
 }
 
 impl MMIODeviceManager {
@@ -107,9 +237,306 @@ impl MMIODeviceManager {
             last_irq: irq_interval.1,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
+            quiescence: DeviceQuiescence::default(),
+            routes: Vec::new(),
             #[cfg(target_arch = "x86_64")]
             shared_irq: None,
+            route_request: None,
+            route_failure: None,
+            route_worker: None,
+            route_completion: None,
+            #[cfg(target_arch = "x86_64")]
+            legacy_route_range: None,
         }
+    }
+
+    fn virtio_route(&mut self) -> Result<usize> {
+        #[cfg(target_arch = "x86_64")]
+        if self.irq == self.last_irq
+            && let Some(index) = self.shared_irq
+        {
+            return Ok(index);
+        }
+        let index = self.routes.len();
+        self.routes.push(IrqRoute {
+            gsi: self.irq,
+            members: Vec::new(),
+            event: Arc::new(EventFd::new(0).map_err(Error::EventFd)?),
+            registered: false,
+        });
+        #[cfg(target_arch = "x86_64")]
+        if self.irq == self.last_irq {
+            self.shared_irq = Some(index);
+        }
+        Ok(index)
+    }
+
+    pub fn irq_routes(&self) -> Option<&[IrqRoute]> {
+        if self.route_worker.is_some() {
+            None
+        } else {
+            Some(&self.routes)
+        }
+    }
+
+    pub fn irq_completion_event(&self) -> Option<&EventFd> {
+        self.route_completion.as_deref()
+    }
+
+    pub fn preflight_quiesce(&self) -> std::result::Result<(), ManagerError> {
+        self.quiescence.preflight_quiesce()
+    }
+
+    /// Native deassignment runs on an owned worker, after every producer is quiet.
+    /// The control owner must poll this completion while servicing control/exit.
+    pub fn begin_irq_fence(
+        &mut self,
+        vm: Arc<VmFd>,
+        request: BarrierRequest,
+    ) -> std::result::Result<(), RouteError> {
+        if self.route_request.is_some() {
+            return Err(Self::route_error(
+                request,
+                RouteTransition::Fence,
+                RouteFault::InvalidTransition,
+            ));
+        }
+        if !self.quiescence.fully_quiesced(request.key).map_err(|_| {
+            Self::route_error(
+                request,
+                RouteTransition::Fence,
+                RouteFault::ProducersNotQuiesced,
+            )
+        })? {
+            return Err(Self::route_error(
+                request,
+                RouteTransition::Fence,
+                RouteFault::ProducersNotQuiesced,
+            ));
+        }
+        self.start_route_work(vm, request, RouteTransition::Fence)
+    }
+
+    /// Routes are restored before workers, callback ingress and CPU release.
+    /// Cancellation names the original fence but has its own absolute deadline.
+    pub fn begin_irq_rearm(
+        &mut self,
+        vm: Arc<VmFd>,
+        fenced: BarrierKey,
+        request: BarrierRequest,
+    ) -> std::result::Result<(), RouteError> {
+        match self.route_request {
+            Some((original, RouteTransition::Fence))
+                if original.key == fenced && self.route_worker.is_none() => {}
+            _ => {
+                return Err(Self::route_error(
+                    request,
+                    RouteTransition::Rearm,
+                    RouteFault::ForeignBarrier,
+                ));
+            }
+        }
+        if request.key.generation != fenced.generation || request.key.operation == fenced.operation
+        {
+            return Err(Self::route_error(
+                request,
+                RouteTransition::Rearm,
+                RouteFault::ForeignBarrier,
+            ));
+        }
+        if self.route_failure.as_ref().is_some_and(|error| {
+            matches!(
+                error.fault,
+                RouteFault::WorkerPanicked | RouteFault::WorkerPoisoned,
+            )
+        }) {
+            return Err(Self::route_error(
+                request,
+                RouteTransition::Rearm,
+                RouteFault::InvalidTransition,
+            ));
+        }
+        self.start_route_work(vm, request, RouteTransition::Rearm)
+    }
+
+    pub fn poll_irq_routes(
+        &mut self,
+        key: BarrierKey,
+    ) -> std::result::Result<Poll<()>, RouteError> {
+        let (request, transition) = self.route_request.ok_or(RouteError {
+            key,
+            request: None,
+            transition: RouteTransition::Fence,
+            fault: RouteFault::ForeignBarrier,
+        })?;
+        if request.key != key {
+            return Err(Self::route_error(
+                request,
+                transition,
+                RouteFault::ForeignBarrier,
+            ));
+        }
+        if self
+            .route_worker
+            .as_ref()
+            .is_some_and(|worker| !worker.handle.is_finished())
+        {
+            if Instant::now() >= request.deadline {
+                let error = Self::route_error(request, transition, RouteFault::Deadline);
+                return Err(*self.route_failure.get_or_insert(error));
+            }
+            return self.route_failure.map_or(Ok(Poll::Pending), Err);
+        }
+        if let Some(worker) = self.route_worker.take() {
+            let panicked = worker.handle.join().is_err();
+            let mut work = match worker.work.lock() {
+                Ok(work) => work,
+                Err(poisoned) => {
+                    let mut work = poisoned.into_inner();
+                    self.routes = std::mem::take(&mut work.routes);
+                    let error = Self::route_error(request, transition, RouteFault::WorkerPoisoned);
+                    return Err(*self.route_failure.get_or_insert(error));
+                }
+            };
+            self.routes = std::mem::take(&mut work.routes);
+            if panicked {
+                let error = Self::route_error(request, transition, RouteFault::WorkerPanicked);
+                return Err(*self.route_failure.get_or_insert(error));
+            }
+            if let Some(fault) = work.failure.take() {
+                let error = Self::route_error(request, transition, fault);
+                return Err(*self.route_failure.get_or_insert(error));
+            }
+        }
+        if Instant::now() >= request.deadline {
+            let error = Self::route_error(request, transition, RouteFault::Deadline);
+            return Err(*self.route_failure.get_or_insert(error));
+        }
+        if let Some(error) = &self.route_failure {
+            return Err(*error);
+        }
+        if transition == RouteTransition::Rearm {
+            self.route_request = None;
+        }
+        Ok(Poll::Ready(()))
+    }
+
+    fn start_route_work(
+        &mut self,
+        vm: Arc<VmFd>,
+        request: BarrierRequest,
+        transition: RouteTransition,
+    ) -> std::result::Result<(), RouteError> {
+        if Instant::now() >= request.deadline {
+            return Err(Self::route_error(request, transition, RouteFault::Deadline));
+        }
+        if self.route_worker.is_some() {
+            return Err(Self::route_error(
+                request,
+                transition,
+                RouteFault::InvalidTransition,
+            ));
+        }
+        if self.route_completion.is_none() {
+            self.route_completion = Some(Arc::new(
+                EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(|error| {
+                    Self::route_error(request, transition, RouteFault::from(error))
+                })?,
+            ));
+        }
+        let completion = self
+            .route_completion
+            .clone()
+            .ok_or_else(|| Self::route_error(request, transition, RouteFault::InvalidTransition))?;
+        let work = Arc::new(Mutex::new(RouteWork {
+            routes: std::mem::take(&mut self.routes),
+            request,
+            transition,
+            failure: None,
+        }));
+        let worker_work = work.clone();
+        self.route_request = Some((request, transition));
+        self.route_failure = None;
+        match thread::Builder::new()
+            .name("irq-route-barrier".into())
+            .spawn(move || {
+                run_route_work(vm, &worker_work, &completion);
+            }) {
+            Ok(handle) => {
+                self.route_worker = Some(RouteWorker { work, handle });
+                Ok(())
+            }
+            Err(error) => {
+                let mut work = match work.lock() {
+                    Ok(work) => work,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                self.routes = std::mem::take(&mut work.routes);
+                let error = Self::route_error(request, transition, RouteFault::from(error));
+                self.route_failure = Some(error);
+                Err(error)
+            }
+        }
+    }
+
+    fn route_error(
+        request: BarrierRequest,
+        transition: RouteTransition,
+        fault: RouteFault,
+    ) -> RouteError {
+        RouteError {
+            key: request.key,
+            request: Some(request),
+            transition,
+            fault,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn retain_legacy_routes(
+        &mut self,
+        legacy: &crate::vmm::device_manager::legacy::PortIODeviceManager,
+    ) -> Result<()> {
+        if self.legacy_route_range.is_some() || self.route_request.is_some() {
+            return Err(Error::BarrierActive);
+        }
+        let start = self.routes.len();
+        self.legacy_route_range = Some(start..start);
+        legacy.retain_live_inventory(&mut self.quiescence);
+        for ((gsi, event), address) in legacy
+            .irq_events()
+            .into_iter()
+            .zip([0x3f8, 0x2f8, 0x3e8, 0x2e8, 0x60])
+        {
+            self.routes.push(IrqRoute {
+                gsi,
+                members: vec![address],
+                event: Arc::new(event.try_clone().map_err(Error::EventFd)?),
+                registered: false,
+            });
+            if let Some(range) = &mut self.legacy_route_range {
+                range.end = self.routes.len();
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn register_legacy_irq_routes(
+        &mut self,
+        vm: &VmFd,
+        legacy: &crate::vmm::device_manager::legacy::PortIODeviceManager,
+    ) -> Result<()> {
+        self.retain_legacy_routes(legacy)?;
+        if let Some(range) = &self.legacy_route_range {
+            for index in range.clone() {
+                let route = &mut self.routes[index];
+                vm.register_irqfd(&route.event, route.gsi)
+                    .map_err(Error::RegisterIrqFd)?;
+                route.registered = true;
+            }
+        }
+        Ok(())
     }
 
     /// Register a MMIO IOAPIC device.
@@ -120,10 +547,20 @@ impl MMIODeviceManager {
     ) -> Result<()> {
         if let Some(intc) = intc {
             let (addr, size) = {
-                let intc = intc.lock().unwrap();
+                let intc = intc.lock().map_err(|_| Error::DeviceLock)?;
                 (intc.get_mmio_addr(), intc.get_mmio_size())
             };
-            self.bus.insert(intc, addr, size).map_err(Error::BusError)?;
+            self.bus
+                .insert(intc.clone(), addr, size)
+                .map_err(Error::BusError)?;
+            self.quiescence.retain_legacy(
+                LegacyAttachment {
+                    kind: LegacyKind::InterruptController,
+                    address: addr,
+                    irq: None,
+                },
+                LegacyDevice::InterruptController(intc),
+            );
         }
 
         Ok(())
@@ -138,28 +575,25 @@ impl MMIODeviceManager {
         device: Arc<Mutex<dyn devices::virtio::VirtioDevice>>,
         device_id: String,
     ) -> Result<(u64, u32)> {
+        if self.route_request.is_some() {
+            return Err(Error::BarrierActive);
+        }
         if self.irq > self.last_irq {
             return Err(Error::IrqsExhausted);
         }
 
-        #[cfg(target_arch = "x86_64")]
-        let shared_event = if self.irq == self.last_irq {
-            if self.shared_irq.is_none() {
-                self.shared_irq = Some(SharedInterruptLine {
-                    event: Arc::new(EventFd::new(0).map_err(Error::EventFd)?),
-                    registered: false,
-                });
-            }
-            self.shared_irq.as_ref().map(|line| line.event.clone())
-        } else {
-            None
-        };
-        #[cfg(not(target_arch = "x86_64"))]
-        let shared_event = None;
+        let route_index = self.virtio_route()?;
+        let shared_event = Some(self.routes[route_index].event.clone());
+        let type_id = device
+            .try_lock()
+            .map_err(|_| Error::DeviceLock)?
+            .device_type();
         let mut mmio_device =
             devices::virtio::MmioTransport::new(memory, intc, device, shared_event)
                 .map_err(Error::CreateMmioTransport)?;
-        let type_id = mmio_device.locked_device().device_type();
+        mmio_device
+            .set_attachment_address(self.mmio_base)
+            .map_err(Error::Provider)?;
 
         for (i, queue_evt) in mmio_device.queue_evts().iter().enumerate() {
             let io_addr = IoEventAddress::Mmio(
@@ -170,27 +604,28 @@ impl MMIODeviceManager {
                 .map_err(Error::RegisterIoEvent)?;
         }
 
-        #[cfg(target_arch = "x86_64")]
-        let register_irq = self.irq != self.last_irq
-            || self.shared_irq.as_ref().is_none_or(|line| !line.registered);
-        #[cfg(not(target_arch = "x86_64"))]
-        let register_irq = true;
-        if register_irq {
-            vm.register_irqfd(mmio_device.interrupt_evt(), self.irq)
+        if !self.routes[route_index].registered {
+            vm.register_irqfd(&self.routes[route_index].event, self.irq)
                 .map_err(Error::RegisterIrqFd)?;
-            #[cfg(target_arch = "x86_64")]
-            if self.irq == self.last_irq
-                && let Some(line) = &mut self.shared_irq
-            {
-                line.registered = true;
-            }
+            self.routes[route_index].registered = true;
         }
 
         mmio_device.set_irq_line(self.irq);
 
+        let transport = Arc::new(Mutex::new(mmio_device));
         self.bus
-            .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)
+            .insert(transport.clone(), self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
+        self.routes[route_index].members.push(self.mmio_base);
+        self.quiescence.retain_transport(
+            AttachmentIdentity {
+                device_type: DeviceType::Virtio(type_id),
+                configured_id: device_id.clone(),
+                address: self.mmio_base,
+                irq: self.irq,
+            },
+            transport,
+        );
         let ret = (self.mmio_base, self.irq);
         self.id_to_dev_info.insert(
             (DeviceType::Virtio(type_id), device_id),
@@ -247,18 +682,40 @@ impl MMIODeviceManager {
             return Err(Error::IrqsExhausted);
         }
 
-        vm.register_irqfd(serial.lock().unwrap().interrupt_evt(), self.irq)
+        let event = Arc::new(
+            serial
+                .lock()
+                .map_err(|_| Error::DeviceLock)?
+                .interrupt_evt()
+                .try_clone()
+                .map_err(Error::EventFd)?,
+        );
+        vm.register_irqfd(&event, self.irq)
             .map_err(Error::RegisterIrqFd)?;
+        self.routes.push(IrqRoute {
+            gsi: self.irq,
+            members: vec![self.mmio_base],
+            event,
+            registered: true,
+        });
 
         {
-            let mut serial = serial.lock().unwrap();
+            let mut serial = serial.lock().map_err(|_| Error::DeviceLock)?;
             serial.set_intc(intc);
             serial.set_irq_line(self.irq);
         }
 
         self.bus
-            .insert(serial, self.mmio_base, MMIO_LEN)
+            .insert(serial.clone(), self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
+        self.quiescence.retain_legacy(
+            LegacyAttachment {
+                kind: LegacyKind::Serial,
+                address: self.mmio_base,
+                irq: Some(self.irq),
+            },
+            LegacyDevice::Serial(serial),
+        );
 
         cmdline
             .insert(
@@ -294,14 +751,30 @@ impl MMIODeviceManager {
         }
 
         // Attaching the RTC device.
-        let rtc_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
-        let device = devices::legacy::RTC::new(rtc_evt.try_clone().map_err(Error::EventFd)?);
+        let rtc_evt = Arc::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?);
+        let device = Arc::new(Mutex::new(devices::legacy::RTC::new(
+            rtc_evt.try_clone().map_err(Error::EventFd)?,
+        )));
         vm.register_irqfd(&rtc_evt, self.irq)
             .map_err(Error::RegisterIrqFd)?;
+        self.routes.push(IrqRoute {
+            gsi: self.irq,
+            members: vec![self.mmio_base],
+            event: rtc_evt,
+            registered: true,
+        });
 
         self.bus
-            .insert(Arc::new(Mutex::new(device)), self.mmio_base, MMIO_LEN)
+            .insert(device.clone(), self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
+        self.quiescence.retain_legacy(
+            LegacyAttachment {
+                kind: LegacyKind::Rtc,
+                address: self.mmio_base,
+                irq: Some(self.irq),
+            },
+            LegacyDevice::Rtc(device),
+        );
 
         let ret = self.mmio_base;
         self.id_to_dev_info.insert(
@@ -350,8 +823,8 @@ impl DeviceInfoForFDT for MMIODeviceInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::super::builder;
-    use super::*;
+    use crate::vmm::builder;
+    use crate::vmm::device_manager::kvm::mmio::*;
     use arch;
     use devices::legacy::DummyIrqChip;
     #[cfg(target_arch = "aarch64")]
@@ -596,5 +1069,100 @@ mod tests {
                 device_manager.id_to_dev_info[&(DeviceType::Virtio(type_id), id.clone())]._irq
             );
         }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn quiescence_route_plan_owns_ten_dedicated_notifiers_and_one_shared_line() {
+        let mut manager = MMIODeviceManager::new(&mut 0xd000_0000, (5, 15));
+        for irq in 5..15 {
+            manager.irq = irq;
+            let index = manager.virtio_route().unwrap();
+            assert_eq!(manager.routes[index].gsi, irq);
+            assert!(!manager.routes[index].is_registered());
+        }
+        manager.irq = 15;
+        let first = manager.virtio_route().unwrap();
+        let peer = manager.virtio_route().unwrap();
+        assert_eq!(first, peer);
+        assert_eq!(manager.routes.len(), 11);
+        for dedicated in &manager.routes[..10] {
+            assert!(!Arc::ptr_eq(
+                dedicated.notifier(),
+                manager.routes[first].notifier()
+            ));
+        }
+        let survivor = manager.routes[first].notifier().clone();
+        let dropped_peer = survivor.clone();
+        dropped_peer.write(3).unwrap();
+        drop(dropped_peer);
+        survivor.write(4).unwrap();
+        assert_eq!(manager.routes[first].notifier().read().unwrap(), 7);
+        assert!(manager.routes.iter().all(|route| !route.is_registered()));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn quiescence_route_inventory_preserves_independent_legacy_producers() {
+        use crate::vmm::device_manager::legacy::PortIODeviceManager;
+        let mut legacy = PortIODeviceManager::new(
+            Arc::new(Mutex::new(devices::legacy::Cmos::new(0, 0))),
+            Vec::new(),
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+        )
+        .unwrap();
+        legacy.register_devices().unwrap();
+        let mut manager = MMIODeviceManager::new(&mut 0xd000_0000, (5, 15));
+        manager.retain_legacy_routes(&legacy).unwrap();
+        assert_eq!(
+            manager
+                .routes
+                .iter()
+                .map(|route| route.gsi)
+                .collect::<Vec<_>>(),
+            [4, 3, 4, 3, 1]
+        );
+        assert!(manager.routes.iter().all(|route| !route.is_registered()));
+        assert!(!Arc::ptr_eq(
+            manager.routes[0].notifier(),
+            manager.routes[2].notifier()
+        ));
+        legacy.com_evt_1.write(2).unwrap();
+        legacy.com_evt_3.write(6).unwrap();
+        assert_eq!(manager.routes[0].notifier().read().unwrap(), 2);
+        assert_eq!(manager.routes[2].notifier().read().unwrap(), 6);
+        assert!(manager.preflight_quiesce().is_err());
+        assert!(manager.retain_legacy_routes(&legacy).is_err());
+        assert_eq!(manager.routes.len(), 5);
+    }
+
+    #[test]
+    fn quiescence_route_deadline_retains_failure_and_notifier_ownership() {
+        use polly::event_manager::{BarrierGeneration, OperationId};
+        let mut manager = MMIODeviceManager::new(&mut 0xd000_0000, (5, 15));
+        let route = manager.virtio_route().unwrap();
+        let request = BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(8),
+                generation: BarrierGeneration(2),
+            },
+            deadline: Instant::now(),
+        };
+        manager.route_request = Some((request, RouteTransition::Fence));
+        assert!(matches!(
+            manager.poll_irq_routes(request.key).unwrap_err().fault,
+            RouteFault::Deadline
+        ));
+        assert!(matches!(
+            manager.poll_irq_routes(request.key).unwrap_err().fault,
+            RouteFault::Deadline
+        ));
+        assert!(!manager.routes[route].is_registered());
+        manager.routes[route].notifier().write(11).unwrap();
+        assert_eq!(manager.routes[route].notifier().read().unwrap(), 11);
+        assert_eq!(
+            manager.route_request,
+            Some((request, RouteTransition::Fence))
+        );
     }
 }

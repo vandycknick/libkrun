@@ -119,7 +119,9 @@ impl Vsock {
                     } else {
                         // We are using a consuming iterator over the virtio buffers, so, if we can't
                         // fill in this buffer, we'll need to undo the last iterator step.
-                        queue_rx.undo_pop();
+                        if let Err(error) = queue_rx.undo_pop(head.index) {
+                            log::error!("failed to return unconsumed vsock RX head: {error}");
+                        }
                         break;
                     }
                 }
@@ -175,13 +177,17 @@ impl Vsock {
             if pkt.type_() == uapi::VSOCK_TYPE_DGRAM {
                 debug!("process_stream_tx() is DGRAM");
                 if self.muxer.send_dgram_pkt(&pkt).is_err() {
-                    queue_tx.undo_pop();
+                    if let Err(error) = queue_tx.undo_pop(head.index) {
+                        log::error!("failed to return unconsumed vsock TX head: {error}");
+                    }
                     break;
                 }
             } else {
                 debug!("process_stream_tx() is STREAM");
                 if self.muxer.send_stream_pkt(&pkt).is_err() {
-                    queue_tx.undo_pop();
+                    if let Err(error) = queue_tx.undo_pop(head.index) {
+                        log::error!("failed to return unconsumed vsock TX head: {error}");
+                    }
                     break;
                 }
             }

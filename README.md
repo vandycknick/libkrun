@@ -244,6 +244,79 @@ reducers and immutable compiled inventories, never the runtime host query.
 Do not replace this filter with wholesale fork tests: existing unrelated
 tests construct real VMs.
 
+### Internal device/callback quiescence contracts
+
+The transport/provider contracts are internal Rust APIs, not delivered live
+operations. Real devices still refuse quiescence unless they explicitly supply
+`VirtioStateProvider`; an inactive device or an empty queue is not a provider.
+No native or public live-operation bit is enabled by these contracts.
+
+All participants use `polly::event_manager::BarrierRequest { key, deadline }`,
+where `BarrierKey { operation: OperationId, generation: BarrierGeneration }`
+distinguishes the operation from its pause generation. One absolute `Instant`
+deadline covers each transition. Cancellation/resume names the original cut
+and supplies a different operation in the same generation with its own deadline.
+Caller timeout/drop does not cancel accepted work or reopen admission.
+
+`EventManager` checks `DispatchRole` before **each** callback, including a
+previously fetched ready batch. Existing registrations default to `Ingress`.
+The owner classifies `Control`, `Exit` and provider-gated `Completion` fds
+before starting a barrier. `begin_ingress_fence` admits drain completions;
+`park_callbacks` subsequently admits only control/exit. Mixed ingress/completion
+callbacks require provider-side ingress closure before using `Completion`.
+Suppressed interests are removed from polling to avoid a paused busy loop,
+without reading their endpoints. Cached readiness is retained and replayed
+after `reopen_ingress`; registration identities prevent stale ready events
+from being delivered to a replacement registration of the same fd.
+
+Both native MMIO managers retain typed transports in attachment order, including
+configured IDs, addresses and IRQs, in `DeviceQuiescence`. Its begin/poll journal
+keeps accepted transitions and errors. `quiescence_settled` observes whether
+accepted old work has actually returned ownership, including late returns after
+a deadline. It is for explicit cancellation reconciliation, not permission to
+issue a token despite a failed operation. `fully_quiesced` additionally requires
+every attachment and refuses uncovered legacy participants. Source resume
+touches only accepted participants and never resets untouched devices.
+These device-only observations are not a CPU/callback/maintenance/IRQ barrier.
+
+KVM registration and live route work share the existing manager-owned route
+inventory. Dedicated virtio lines have one notifier each; x86 virtio IRQ15
+members share one notifier/registration while retaining independent transport
+status and ACK state. The five existing legacy event/GSI registrations remain
+five distinct routes, including COM1/3 on GSI4 and COM2/4 on GSI3. Sink UARTs,
+CMOS, i8042 and attached arm64 legacy devices retain typed ownership and refuse
+live admission until real legacy providers exist.
+
+After producers settle, `begin_irq_fence(Arc<VmFd>, request)` runs actual KVM
+IRQFD deassignment on an owned worker. `poll_irq_routes` never joins before
+the worker is finished; late polling recovers every route's actual registration
+state even after timeout. The route vector and VM stay owned during native
+calls and errors. `irq_completion_event` supplies the existing owner loop's
+completion wakeup. Deassignment is not exercised by pure tests. Before source
+release, `begin_irq_rearm` restores each detached registration once, then the
+owner resumes devices/queue scans, reopens callback ingress, and releases CPUs
+last. Ambiguous worker/controller faults cannot be treated as successful rearm.
+HVF retains synchronous interrupt-source/controller ownership instead of
+inventing a KVM IRQFD boundary; its real native/controller lane remains
+unqualified until platform execution evidence exists.
+
+Hypervisor-free selections for these new seams (not native IRQ/VM proof):
+
+```sh
+cargo test --locked -p krun-polly --lib event_manager::tests::callback_
+cargo test --locked -p libkrun --features blk,net --lib vmm::device_manager::quiescence::tests::
+cargo test --locked -p libkrun --features blk,net --lib vmm::device_manager::kvm::mmio::tests::quiescence_route_
+cargo test --locked -p libkrun --features blk,net --lib vmm::device_manager::legacy::tests::legacy_inventory_
+# On the macOS lane, not a Linux qualification:
+cargo test --locked -p libkrun --features blk,net --lib vmm::device_manager::hvf::mmio::tests::hvf_route_inventory_
+```
+
+These selections use real eventfds, cached ready events, route ownership and
+default-provider refusals. None constructs a VM or calls a hypervisor. Native
+route drain/rearm, CPU parking, actual device providers and complete host-writer
+coverage require their separate execution gates; passing a pure reducer or
+empty participant set does not establish a whole-machine cut.
+
 
 ## Networking
 

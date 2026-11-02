@@ -11,6 +11,9 @@ pub mod legacy;
 /// Device Shared Memory Region Manager.
 pub mod shm;
 
+/// Owned attachment inventory and nonblocking device-provider journal.
+pub mod quiescence;
+
 /// Memory Mapped I/O Manager.
 #[cfg(target_os = "linux")]
 pub mod kvm;

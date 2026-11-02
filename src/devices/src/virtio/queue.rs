@@ -6,9 +6,11 @@
 // found in the THIRD-PARTY file.
 
 use crate::virtio::RuntimeGuestMemory;
+use polly::event_manager::BarrierKey;
 use std::cmp::min;
 use std::fmt::{self, Debug, Display};
 use std::num::Wrapping;
+use std::sync::Arc;
 use std::sync::atomic::{Ordering, fence};
 use virtio_bindings::virtio_ring::VRING_USED_F_NO_NOTIFY;
 use vm_memory::{Address, ByteValued, GuestAddress, GuestMemoryError, VolatileMemoryError};
@@ -68,6 +70,7 @@ pub enum Error {
     GuestMemoryError(GuestMemoryError),
     /// DescriptorChain split is out of bounds.
     SplitOutOfBounds(usize),
+    Ownership(QueueOwnershipFault),
 }
 
 impl Display for Error {
@@ -107,6 +110,7 @@ impl Display for Error {
             FindMemoryRegion => write!(f, "no memory region for this address range"),
             GuestMemoryError(e) => write!(f, "descriptor guest memory error: {e}"),
             SplitOutOfBounds(off) => write!(f, "`DescriptorChain` split is out of bounds: {off}"),
+            Ownership(fault) => write!(f, "queue ownership fault: {fault:?}"),
         }
     }
 }
@@ -313,6 +317,32 @@ impl<'a> DescriptorChain<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueOwnershipFault {
+    MalformedAvailable,
+    DuplicateHead,
+    UnownedCompletion,
+    InvalidUndo,
+    Publication,
+    Processing,
+    OutstandingHeads,
+    ForeignBarrier,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueState {
+    pub max_size: u16,
+    pub size: u16,
+    pub ready: bool,
+    pub desc_table: u64,
+    pub avail_ring: u64,
+    pub used_ring: u64,
+    pub next_avail: u16,
+    pub next_used: u16,
+    pub event_idx_enabled: bool,
+    pub num_added: u16,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 /// A virtio queue's parameters.
 pub struct Queue {
@@ -343,6 +373,11 @@ pub struct Queue {
     /// The number of descriptor chains placed in the used ring via `add_used`
     /// since the last time `needs_notification` was called on the associated queue.
     num_added: Wrapping<u16>,
+    identity: Arc<()>,
+    owned: Vec<Option<u16>>,
+    last_pop: Option<(u16, u16)>,
+    fault: Option<QueueOwnershipFault>,
+    admission: Option<BarrierKey>,
 }
 
 impl Queue {
@@ -359,7 +394,104 @@ impl Queue {
             next_used: Wrapping(0),
             event_idx_enabled: false,
             num_added: Wrapping(0),
+            identity: Arc::new(()),
+            owned: vec![None; usize::from(max_size)],
+            last_pop: None,
+            fault: None,
+            admission: None,
         }
+    }
+
+    pub(crate) fn identity(&self) -> Arc<()> {
+        Arc::clone(&self.identity)
+    }
+
+    pub fn record_processing_failure(&mut self) {
+        self.record_fault(QueueOwnershipFault::Processing);
+    }
+
+    fn record_fault(&mut self, fault: QueueOwnershipFault) {
+        self.fault.get_or_insert(fault);
+    }
+
+    /// Serialize this call with descriptor acquisition using the queue owner's lock.
+    /// The lock must not be held across backend I/O or a worker join.
+    pub fn close_admission(&mut self, key: BarrierKey) -> Result<(), Error> {
+        if self.admission.is_some_and(|current| current != key) {
+            return Err(Error::Ownership(QueueOwnershipFault::ForeignBarrier));
+        }
+        self.admission = Some(key);
+        Ok(())
+    }
+
+    pub fn reopen_admission(&mut self, key: BarrierKey) -> Result<(), Error> {
+        if self.admission != Some(key) {
+            return Err(Error::Ownership(QueueOwnershipFault::ForeignBarrier));
+        }
+        self.admission = None;
+        Ok(())
+    }
+
+    pub fn capture_state(&self) -> Result<QueueState, Error> {
+        if let Some(fault) = self.fault {
+            return Err(Error::Ownership(fault));
+        }
+        if self.owned.iter().any(Option::is_some) {
+            return Err(Error::Ownership(QueueOwnershipFault::OutstandingHeads));
+        }
+        Ok(QueueState {
+            max_size: self.max_size,
+            size: self.size,
+            ready: self.ready,
+            desc_table: self.desc_table.raw_value(),
+            avail_ring: self.avail_ring.raw_value(),
+            used_ring: self.used_ring.raw_value(),
+            next_avail: self.next_avail.0,
+            next_used: self.next_used.0,
+            event_idx_enabled: self.event_idx_enabled,
+            num_added: self.num_added.0,
+        })
+    }
+
+    pub fn validate_state(
+        &self,
+        mem: &RuntimeGuestMemory,
+        state: &QueueState,
+    ) -> Result<(), Error> {
+        if state.max_size != self.max_size {
+            return Err(Error::InvalidMaxSize);
+        }
+        // Unready queues may contain partially negotiated sizes and addresses.
+        if !state.ready {
+            return Ok(());
+        }
+        if state.size == 0 || state.size > state.max_size || !state.size.is_power_of_two() {
+            return Err(Error::InvalidSize);
+        }
+        for (address, length, alignment) in [
+            (state.desc_table, 16 * usize::from(state.size), 16),
+            (state.avail_ring, 6 + 2 * usize::from(state.size), 2),
+            (state.used_ring, 6 + 8 * usize::from(state.size), 4),
+        ] {
+            if address % alignment != 0 {
+                return Err(Error::InvalidChain);
+            }
+            mem.get_slice(GuestAddress(address), length)
+                .map_err(Error::GuestMemory)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_state(&mut self, state: &QueueState) {
+        self.size = state.size;
+        self.ready = state.ready;
+        self.desc_table = GuestAddress(state.desc_table);
+        self.avail_ring = GuestAddress(state.avail_ring);
+        self.used_ring = GuestAddress(state.used_ring);
+        self.next_avail = Wrapping(state.next_avail);
+        self.next_used = Wrapping(state.next_used);
+        self.event_idx_enabled = state.event_idx_enabled;
+        self.num_added = Wrapping(state.num_added);
     }
 
     pub fn get_max_size(&self) -> u16 {
@@ -434,7 +566,8 @@ impl Queue {
     /// Returns the number of yet-to-be-popped descriptor chains in the avail ring.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self, mem: &RuntimeGuestMemory) -> u16 {
-        (self.avail_idx(mem, Ordering::Acquire).unwrap() - self.next_avail).0
+        self.avail_idx(mem, Ordering::Acquire)
+            .map_or(0, |index| (index - self.next_avail).0)
     }
 
     /// Checks if the driver has made any descriptor chains available in the avail ring.
@@ -444,7 +577,21 @@ impl Queue {
 
     /// Pop the first available descriptor chain from the avail ring.
     pub fn pop<'b>(&mut self, mem: &'b RuntimeGuestMemory) -> Option<DescriptorChain<'b>> {
-        if self.len(mem) == 0 || self.actual_size() == 0 {
+        if self.admission.is_some() || self.actual_size() == 0 {
+            return None;
+        }
+        let available = match self.avail_idx(mem, Ordering::Acquire) {
+            Ok(index) => (index - self.next_avail).0,
+            Err(_) => {
+                self.record_fault(QueueOwnershipFault::MalformedAvailable);
+                return None;
+            }
+        };
+        if available == 0 {
+            return None;
+        }
+        if available > self.actual_size() {
+            self.record_fault(QueueOwnershipFault::MalformedAvailable);
             return None;
         }
 
@@ -476,21 +623,50 @@ impl Queue {
         // Make sure we catch all updates on the queue
         fence(Ordering::Acquire);
 
-        // `self.is_valid()` already performed all the bound checks on the descriptor table
-        // and virtq rings, so it's safe to unwrap guest memory reads and to use unchecked
-        // offsets.
-        let desc_index: u16 = mem
-            .read_obj(self.avail_ring.unchecked_add(u64::from(index_offset)))
-            .unwrap();
-
-        DescriptorChain::checked_new(mem, self.desc_table, self.actual_size(), desc_index)
-            .inspect(|_| self.next_avail += Wrapping(1))
+        let desc_index: u16 =
+            match mem.read_obj(self.avail_ring.unchecked_add(u64::from(index_offset))) {
+                Ok(index) => index,
+                Err(_) => {
+                    self.record_fault(QueueOwnershipFault::MalformedAvailable);
+                    return None;
+                }
+            };
+        let Some(chain) =
+            DescriptorChain::checked_new(mem, self.desc_table, self.actual_size(), desc_index)
+        else {
+            self.record_fault(QueueOwnershipFault::MalformedAvailable);
+            return None;
+        };
+        let Some(slot) = self.owned.get_mut(usize::from(desc_index)) else {
+            self.record_fault(QueueOwnershipFault::MalformedAvailable);
+            return None;
+        };
+        if slot.is_some() {
+            self.record_fault(QueueOwnershipFault::DuplicateHead);
+            return None;
+        }
+        *slot = Some(self.next_avail.0);
+        self.last_pop = Some((desc_index, self.next_avail.0));
+        self.next_avail += Wrapping(1);
+        Some(chain)
     }
 
-    /// Undo the effects of the last `self.pop()` call.
-    /// The caller can use this, if it was unable to consume the last popped descriptor chain.
-    pub fn undo_pop(&mut self) {
+    /// Return only the most recently acquired, completely unconsumed head.
+    /// This is not rollback for DMA or externally visible backend effects.
+    pub fn undo_pop(&mut self, head: u16) -> Result<(), Error> {
+        let valid = self.last_pop.is_some_and(|(index, position)| {
+            index == head
+                && Wrapping(position) + Wrapping(1) == self.next_avail
+                && self.owned.get(usize::from(head)) == Some(&Some(position))
+        });
+        if !valid {
+            self.record_fault(QueueOwnershipFault::InvalidUndo);
+            return Err(Error::Ownership(QueueOwnershipFault::InvalidUndo));
+        }
+        self.owned[usize::from(head)] = None;
+        self.last_pop = None;
         self.next_avail -= Wrapping(1);
+        Ok(())
     }
 
     pub fn add_used(
@@ -499,6 +675,33 @@ impl Queue {
         head_index: u16,
         len: u32,
     ) -> Result<(), Error> {
+        let result = self.publish_used(mem, head_index, len);
+        if result.is_ok() {
+            if let Some(slot) = self.owned.get_mut(usize::from(head_index)) {
+                *slot = None;
+            }
+            if self.last_pop.is_some_and(|(head, _)| head == head_index) {
+                self.last_pop = None;
+            }
+        } else {
+            self.record_fault(QueueOwnershipFault::Publication);
+        }
+        result
+    }
+
+    fn publish_used(
+        &mut self,
+        mem: &RuntimeGuestMemory,
+        head_index: u16,
+        len: u32,
+    ) -> Result<(), Error> {
+        if self
+            .owned
+            .get(usize::from(head_index))
+            .is_none_or(Option::is_none)
+        {
+            return Err(Error::Ownership(QueueOwnershipFault::UnownedCompletion));
+        }
         if head_index >= self.size {
             error!("attempted to add out of bounds descriptor to used ring: {head_index}");
             return Err(Error::InvalidDescriptorIndex);
@@ -678,20 +881,19 @@ impl Queue {
         // uses wrapped arithmetic to see whether `used_event` can be found between `old` and
         // `next_used` in the circular sequence space of the used ring.
         if self.event_idx_enabled {
-            let used_event = self.used_event(mem, Ordering::Relaxed)?;
+            let used_event = match self.used_event(mem, Ordering::Relaxed) {
+                Ok(event) => event,
+                Err(error) => {
+                    self.record_fault(QueueOwnershipFault::Publication);
+                    return Err(error);
+                }
+            };
             let old = used_idx - self.num_added;
             self.num_added = Wrapping(0);
             return Ok(used_idx - used_event - Wrapping(1) < used_idx - old);
         }
 
         Ok(true)
-    }
-
-    /// Goes back one position in the available descriptor chain offered by the driver.
-    /// Rust does not support bidirectional iterators. This is the only way to revert the effect
-    /// of an iterator increment on the queue.
-    pub fn go_to_previous_position(&mut self) {
-        self.next_avail -= Wrapping(1);
     }
 
     /// Fetch the available ring index (`virtq_avail->idx`) from guest memory.
@@ -1110,7 +1312,7 @@ pub(crate) mod tests {
         assert!(q.pop(m).is_none());
 
         // Undoing the last pop should let us walk the last chain again.
-        q.undo_pop();
+        q.undo_pop(2).unwrap();
         assert_eq!(q.len(m), 1);
 
         // Walk the last chain again (three descriptors).
@@ -1140,10 +1342,141 @@ pub(crate) mod tests {
         assert_eq!(vq.used.idx.get(), 0);
 
         //should be ok
+        vq.dtable[1].set(0x1000, 0x1000, 0, 0);
+        vq.avail.ring[0].set(1);
+        vq.avail.idx.set(1);
+        assert_eq!(q.pop(m).unwrap().index, 1);
         let _ = q.add_used(m, 1, 0x1000);
         assert_eq!(vq.used.idx.get(), 1);
         let x = vq.used.ring[0].get();
         assert_eq!(x.id, 1);
         assert_eq!(x.len, 0x1000);
+    }
+
+    fn barrier_key() -> BarrierKey {
+        use polly::event_manager::{BarrierGeneration, OperationId};
+        BarrierKey {
+            operation: OperationId(7),
+            generation: BarrierGeneration(2),
+        }
+    }
+
+    #[test]
+    fn lifecycle_queue_close_preserves_unpopped_work_and_wraparound() {
+        let mem = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0), &mem, 8);
+        ring.dtable[0].set(0x1000, 16, 0, 0);
+        ring.dtable[1].set(0x1100, 16, 0, 0);
+        let mut queue = ring.create_queue();
+        queue.next_avail = Wrapping(u16::MAX);
+        queue.next_used = Wrapping(u16::MAX);
+        queue.set_event_idx(true);
+        ring.avail.ring[7].set(0);
+        ring.avail.ring[0].set(1);
+        ring.avail.idx.set(1);
+        ring.avail.event.set(u16::MAX);
+        let head = queue.pop(&mem).unwrap();
+        queue.close_admission(barrier_key()).unwrap();
+        assert!(queue.pop(&mem).is_none());
+        assert!(queue.capture_state().is_err());
+        queue.add_used(&mem, head.index, 16).unwrap();
+        let state = queue.capture_state().unwrap();
+        assert_eq!(state.next_avail, 0);
+        assert_eq!(state.next_used, 0);
+        assert_eq!(state.num_added, 1);
+        assert_eq!(queue.len(&mem), 1);
+        let mut restored = Queue::new(8);
+        restored.validate_state(&mem, &state).unwrap();
+        restored.apply_state(&state);
+        assert_eq!(restored.capture_state().unwrap(), state);
+        queue.reopen_admission(barrier_key()).unwrap();
+        assert_eq!(queue.pop(&mem).unwrap().index, 1);
+        assert!(queue.needs_notification(&mem).unwrap());
+    }
+
+    #[test]
+    fn lifecycle_queue_undo_is_correlated_and_exactly_once() {
+        let mem = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0), &mem, 8);
+        ring.dtable[0].set(0x1000, 16, 0, 0);
+        ring.avail.ring[0].set(0);
+        ring.avail.idx.set(1);
+        let mut queue = ring.create_queue();
+        let head = queue.pop(&mem).unwrap();
+        assert!(queue.undo_pop(1).is_err());
+        assert_eq!(queue.next_avail.0, 1);
+        queue.undo_pop(head.index).unwrap();
+        assert_eq!(queue.next_avail.0, 0);
+        assert!(queue.undo_pop(head.index).is_err());
+        assert_eq!(queue.next_avail.0, 0);
+        assert!(queue.capture_state().is_err());
+    }
+
+    #[test]
+    fn lifecycle_queue_duplicate_and_publication_failure_remain_faulted() {
+        let mem = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0), &mem, 8);
+        ring.dtable[0].set(0x1000, 16, 0, 0);
+        ring.avail.ring[0].set(0);
+        ring.avail.ring[1].set(0);
+        ring.avail.idx.set(2);
+        let mut queue = ring.create_queue();
+        queue.pop(&mem).unwrap();
+        assert!(queue.pop(&mem).is_none());
+        queue.add_used(&mem, 0, 16).unwrap();
+        assert!(queue.capture_state().is_err());
+
+        let mut queue = ring.create_queue();
+        queue.pop(&mem).unwrap();
+        queue.used_ring = GuestAddress(0x8000);
+        assert!(queue.add_used(&mem, 0, 16).is_err());
+        queue.used_ring = ring.used.flags.location;
+        queue.add_used(&mem, 0, 16).unwrap();
+        assert!(queue.capture_state().is_err());
+        assert!(queue.add_used(&mem, 0, 16).is_err());
+    }
+
+    #[test]
+    fn lifecycle_queue_validation_checks_full_extent_without_mutation() {
+        let mem = RuntimeGuestMemory::from_ranges(&[
+            (GuestAddress(0), 0x1000),
+            (GuestAddress(0x2000), 0x1000),
+        ])
+        .unwrap();
+        let queue = Queue::new(8);
+        let original = queue.capture_state().unwrap();
+        let mut state = original.clone();
+        state.size = 8;
+        state.ready = true;
+        state.desc_table = 0xff0;
+        state.avail_ring = 0x2000;
+        state.used_ring = 0x2100;
+        assert!(queue.validate_state(&mem, &state).is_err());
+        state.ready = false;
+        state.size = 3;
+        state.desc_table = u64::MAX;
+        queue.validate_state(&mem, &state).unwrap();
+        assert_eq!(queue.capture_state().unwrap(), original);
+    }
+
+    #[test]
+    fn lifecycle_queue_failed_index_store_retains_owned_head() {
+        let mem = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0), &mem, 8);
+        ring.dtable[0].set(0x1000, 16, 0, 0);
+        ring.avail.ring[0].set(0);
+        ring.avail.idx.set(1);
+        let mut queue = ring.create_queue();
+        queue.pop(&mem).unwrap();
+        let publication_memory =
+            RuntimeGuestMemory::from_ranges(&[(GuestAddress(0x1000), 0x1000)]).unwrap();
+        queue.used_ring = GuestAddress(0xffc);
+        assert!(queue.add_used(&publication_memory, 0, 16).is_err());
+        let element: crate::virtio::queue::VirtqUsedElem =
+            publication_memory.read_obj(GuestAddress(0x1000)).unwrap();
+        assert_eq!(element.id, 0);
+        assert_eq!(queue.next_used.0, 1);
+        assert!(queue.owned[0].is_some());
+        assert!(queue.capture_state().is_err());
     }
 }

@@ -186,7 +186,9 @@ impl TsiStreamProxy {
             };
 
             if len == 0 {
-                queue.undo_pop();
+                if let Err(error) = queue.undo_pop(head.index) {
+                    log::error!("failed to return unconsumed stream head: {error}");
+                }
                 break;
             } else {
                 have_used = true;

@@ -1,12 +1,12 @@
 use rand::{TryRng, rngs::SysRng};
 use utils::eventfd::EventFd;
 
-use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RngError,
-    RuntimeGuestMemory, VirtioDevice,
-};
-use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
+use crate::virtio::rng::{Result, RngError, defs, defs::uapi};
+use crate::virtio::{
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RuntimeGuestMemory,
+    VirtioDevice,
+};
 
 // Request queue.
 pub(crate) const REQ_INDEX: usize = 0;
@@ -27,7 +27,7 @@ impl Rng {
         &self.queues.as_ref().expect("queues should exist")[idx].event
     }
 
-    pub fn new() -> super::Result<Rng> {
+    pub fn new() -> Result<Rng> {
         Ok(Rng {
             queues: None,
             avail_features: AVAIL_FEATURES,
@@ -62,12 +62,12 @@ impl Rng {
                 let mut rand_bytes = vec![0u8; desc.len as usize];
                 if let Err(e) = SysRng.try_fill_bytes(&mut rand_bytes) {
                     error!("Failed to fill buffer with random data: {e:?}");
-                    queues[REQ_INDEX].queue.go_to_previous_position();
+                    queues[REQ_INDEX].queue.record_processing_failure();
                     break;
                 }
                 if let Err(e) = mem.write_slice(&rand_bytes[..], desc.addr) {
                     error!("Failed to write slice: {e:?}");
-                    queues[REQ_INDEX].queue.go_to_previous_position();
+                    queues[REQ_INDEX].queue.record_processing_failure();
                     break;
                 }
                 written += desc.len;
@@ -154,5 +154,43 @@ impl VirtioDevice for Rng {
         self.queues = None;
         self.device_state = DeviceState::Inactive;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::queue::tests::VirtQueue;
+    use crate::virtio::rng::device::Rng;
+    use crate::virtio::{DeviceQueue, InterruptTransport, RuntimeGuestMemory, VirtioDevice};
+    use std::sync::Arc;
+    use utils::eventfd::EventFd;
+    use vm_memory::GuestAddress;
+
+    #[test]
+    fn lifecycle_rng_partial_dma_never_rewinds_published_head() {
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0), &memory, 8);
+        ring.dtable[0].set(0x1000, 16, 3, 1);
+        ring.dtable[1].set(0x8000, 16, 2, 0);
+        ring.avail.ring[0].set(0);
+        ring.avail.idx.set(1);
+        let queue = DeviceQueue::new(ring.create_queue(), Arc::new(EventFd::new(0).unwrap()));
+        let mut rng = Rng::new().unwrap();
+        rng.activate(
+            memory.clone(),
+            InterruptTransport::new(DummyIrqChip::new().into(), "rng-test".into(), None).unwrap(),
+            vec![queue],
+        )
+        .unwrap();
+        assert!(rng.process_req());
+        let queue = &rng.queues.as_ref().unwrap()[0].queue;
+        assert_eq!(queue.next_avail.0, 1);
+        assert_eq!(queue.next_used.0, 1);
+        assert!(queue.capture_state().is_err());
+        assert_eq!(ring.used.ring[0].get().len, 16);
+        assert!(!rng.process_req());
+        assert_eq!(ring.used.idx.get(), 1);
+        assert!(rng.state_provider().is_none());
     }
 }

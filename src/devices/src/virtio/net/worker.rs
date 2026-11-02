@@ -363,7 +363,7 @@ impl NetWorker {
                     raise_irq = true;
                 }
                 Err(WriteError::NothingWritten) => {
-                    tx_queue.undo_pop();
+                    tx_queue.undo_pop(head_index).map_err(TxError::QueueError)?;
                     result = Err(TxError::Backend(WriteError::NothingWritten));
                     break;
                 }

@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex};
 use devices;
 use utils::eventfd::EventFd;
 
+use crate::vmm::device_manager::quiescence::{
+    DeviceQuiescence, LegacyAttachment, LegacyDevice, LegacyKind,
+};
+
 /// Errors corresponding to the `PortIODeviceManager`.
 #[derive(Debug)]
 pub enum Error {
@@ -19,15 +23,17 @@ pub enum Error {
     BusError(devices::BusError),
     /// Cannot create EventFd.
     EventFd(std::io::Error),
+    DeviceLock,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::Error::*;
 
-        match *self {
-            BusError(ref err) => write!(f, "Failed to add legacy device to Bus: {err}"),
-            EventFd(ref err) => write!(f, "Failed to create EventFd: {err}"),
+        match self {
+            BusError(err) => write!(f, "Failed to add legacy device to Bus: {err}"),
+            EventFd(err) => write!(f, "Failed to create EventFd: {err}"),
+            DeviceLock => write!(f, "Legacy device lock is poisoned"),
         }
     }
 }
@@ -48,6 +54,9 @@ pub struct PortIODeviceManager {
     pub com_evt_3: EventFd,
     pub com_evt_4: EventFd,
     pub kbd_evt: EventFd,
+    attached_serial: Vec<(u64, Arc<Mutex<devices::legacy::Serial>>)>,
+    cmos_attached: bool,
+    i8042_attached: bool,
 }
 
 impl PortIODeviceManager {
@@ -63,7 +72,7 @@ impl PortIODeviceManager {
             let com_evt = match stdio_serial.get(i) {
                 Some(s) => s
                     .lock()
-                    .unwrap()
+                    .map_err(|_| Error::DeviceLock)?
                     .interrupt_evt()
                     .try_clone()
                     .map_err(Error::EventFd)?,
@@ -89,6 +98,9 @@ impl PortIODeviceManager {
             com_evt_3: evts[2].try_clone().map_err(Error::EventFd)?,
             com_evt_4: evts[3].try_clone().map_err(Error::EventFd)?,
             kbd_evt,
+            attached_serial: Vec::new(),
+            cmos_attached: false,
+            i8042_attached: false,
         })
     }
 
@@ -97,58 +109,89 @@ impl PortIODeviceManager {
         self.io_bus
             .insert(self.cmos.clone(), 0x70, 0x8)
             .map_err(Error::BusError)?;
+        self.cmos_attached = true;
 
         if let Some(serial) = self.stdio_serial.first() {
             self.io_bus
                 .insert(serial.clone(), 0x3f8, 0x8)
                 .map_err(Error::BusError)?;
+            self.attached_serial.push((0x3f8, serial.clone()));
         }
-        self.io_bus
-            .insert(
-                self.stdio_serial
-                    .get(1)
-                    .unwrap_or(&Arc::new(Mutex::new(devices::legacy::Serial::new_sink(
-                        self.com_evt_2.try_clone().map_err(Error::EventFd)?,
-                    ))))
-                    .clone(),
-                0x2f8,
-                0x8,
-            )
-            .map_err(Error::BusError)?;
-        self.io_bus
-            .insert(
-                self.stdio_serial
-                    .get(2)
-                    .unwrap_or(&Arc::new(Mutex::new(devices::legacy::Serial::new_sink(
-                        self.com_evt_3.try_clone().map_err(Error::EventFd)?,
-                    ))))
-                    .clone(),
-                0x3e8,
-                0x8,
-            )
-            .map_err(Error::BusError)?;
-        self.io_bus
-            .insert(
-                self.stdio_serial
-                    .get(3)
-                    .unwrap_or(&Arc::new(Mutex::new(devices::legacy::Serial::new_sink(
-                        self.com_evt_4.try_clone().map_err(Error::EventFd)?,
-                    ))))
-                    .clone(),
-                0x2e8,
-                0x8,
-            )
-            .map_err(Error::BusError)?;
+        for (index, address, event) in [
+            (1, 0x2f8, &self.com_evt_2),
+            (2, 0x3e8, &self.com_evt_3),
+            (3, 0x2e8, &self.com_evt_4),
+        ] {
+            let serial = match self.stdio_serial.get(index) {
+                Some(serial) => serial.clone(),
+                None => Arc::new(Mutex::new(devices::legacy::Serial::new_sink(
+                    event.try_clone().map_err(Error::EventFd)?,
+                ))),
+            };
+            self.io_bus
+                .insert(serial.clone(), address, 0x8)
+                .map_err(Error::BusError)?;
+            self.attached_serial.push((address, serial));
+        }
         self.io_bus
             .insert(self.i8042.clone(), 0x060, 0x5)
             .map_err(Error::BusError)?;
+        self.i8042_attached = true;
         Ok(())
+    }
+
+    /// These are five independent registrations, not three deduplicated GSIs.
+    pub fn irq_events(&self) -> [(u32, &EventFd); 5] {
+        [
+            (4, &self.com_evt_1),
+            (3, &self.com_evt_2),
+            (4, &self.com_evt_3),
+            (3, &self.com_evt_4),
+            (1, &self.kbd_evt),
+        ]
+    }
+
+    pub fn retain_live_inventory(&self, inventory: &mut DeviceQuiescence) {
+        if self.cmos_attached {
+            inventory.retain_legacy(
+                LegacyAttachment {
+                    kind: LegacyKind::Cmos,
+                    address: 0x70,
+                    irq: None,
+                },
+                LegacyDevice::Cmos(self.cmos.clone()),
+            );
+        }
+        for (address, serial) in &self.attached_serial {
+            let irq = match address {
+                0x3f8 | 0x3e8 => 4,
+                _ => 3,
+            };
+            inventory.retain_legacy(
+                LegacyAttachment {
+                    kind: LegacyKind::Serial,
+                    address: *address,
+                    irq: Some(irq),
+                },
+                LegacyDevice::Serial(serial.clone()),
+            );
+        }
+        if self.i8042_attached {
+            inventory.retain_legacy(
+                LegacyAttachment {
+                    kind: LegacyKind::I8042,
+                    address: 0x60,
+                    irq: Some(1),
+                },
+                LegacyDevice::I8042(self.i8042.clone()),
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::vmm::device_manager::legacy::*;
 
     #[test]
     fn test_register_legacy_devices() {
@@ -180,5 +223,36 @@ mod tests {
                 std::io::Error::from_raw_os_error(1)
             )
         );
+    }
+
+    #[test]
+    fn legacy_inventory_retains_bus_only_uart_sinks_and_independent_routes() {
+        let cmos = Arc::new(Mutex::new(devices::legacy::Cmos::new(0, 0)));
+        let mut manager = PortIODeviceManager::new(
+            cmos,
+            Vec::new(),
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+        )
+        .unwrap();
+        manager.register_devices().unwrap();
+        assert_eq!(manager.attached_serial.len(), 3);
+        let mut inventory = DeviceQuiescence::default();
+        manager.retain_live_inventory(&mut inventory);
+        let addresses: Vec<_> = inventory
+            .legacy_attachments()
+            .iter()
+            .map(|owner| owner.attachment.address)
+            .collect();
+        assert_eq!(addresses, [0x70, 0x2f8, 0x3e8, 0x2e8, 0x60]);
+        assert!(inventory.preflight_quiesce().is_err());
+        let routes = manager.irq_events();
+        assert_eq!(
+            routes.iter().map(|(gsi, _)| *gsi).collect::<Vec<_>>(),
+            [4, 3, 4, 3, 1]
+        );
+        routes[0].1.write(2).unwrap();
+        routes[2].1.write(5).unwrap();
+        assert_eq!(routes[0].1.read().unwrap(), 2);
+        assert_eq!(routes[2].1.read().unwrap(), 5);
     }
 }

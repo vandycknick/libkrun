@@ -223,7 +223,9 @@ impl InputWorker {
             }
 
             if bytes_written == 0 {
-                self.event_q.queue.undo_pop();
+                if let Err(error) = self.event_q.queue.undo_pop(desc_chain.index) {
+                    log::error!("failed to return unconsumed input head: {error}");
+                }
                 break;
             }
 

@@ -26,6 +26,7 @@ pub mod fs;
 pub mod gpu;
 #[cfg(feature = "input")]
 pub mod input;
+pub mod lifecycle;
 pub mod linux_errno;
 mod memory;
 mod mmio;
@@ -52,7 +53,7 @@ pub use self::memory::*;
 pub use self::mmio::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;
-pub use self::queue::{Descriptor, DescriptorChain, Queue};
+pub use self::queue::{Descriptor, DescriptorChain, Queue, QueueOwnershipFault, QueueState};
 #[cfg(not(feature = "tee"))]
 pub use self::rng::*;
 #[cfg(feature = "vhost-user")]

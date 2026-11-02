@@ -47,7 +47,9 @@ pub(crate) fn process_tx(
 
         if bytes_written == 0 {
             log::trace!("Tx Add used {bytes_written}");
-            queue.undo_pop();
+            if let Err(error) = queue.undo_pop(head_index) {
+                log::error!("failed to return unconsumed TX head: {error}");
+            }
         } else {
             log::trace!("Tx add used {bytes_written}");
             if let Err(e) = queue.add_used(&mem, head_index, bytes_written as u32) {

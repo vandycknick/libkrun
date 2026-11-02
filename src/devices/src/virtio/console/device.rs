@@ -153,7 +153,9 @@ impl Console {
                     }
                 }
             } else {
-                control_rx.queue.undo_pop();
+                if let Err(error) = control_rx.queue.undo_pop(head.index) {
+                    log::error!("failed to return unconsumed control head: {error}");
+                }
                 break;
             }
         }

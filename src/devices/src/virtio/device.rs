@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use super::{ActivateResult, InterruptTransport, Queue, RuntimeGuestMemory};
-use crate::virtio::AsAny;
+use crate::virtio::lifecycle::VirtioStateProvider;
+use crate::virtio::{ActivateResult, AsAny, InterruptTransport, Queue, RuntimeGuestMemory};
 use utils::eventfd::EventFd;
 
 /// Configuration for a single virtqueue.
@@ -152,6 +152,15 @@ pub trait VirtioDevice: AsAny + Send {
 
     /// Checks if the resources of this device are activated.
     fn is_activated(&self) -> bool;
+
+    /// Missing providers refuse live admission even for inactive devices.
+    fn state_provider(&self) -> Option<&dyn VirtioStateProvider> {
+        None
+    }
+
+    fn state_provider_mut(&mut self) -> Option<&mut dyn VirtioStateProvider> {
+        None
+    }
 
     /// Optionally deactivates this device. The device should drop its queues.
     /// After reset, the transport will recreate queues from queue_config().
