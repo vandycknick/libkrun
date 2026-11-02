@@ -100,6 +100,12 @@ macro_rules! arm64_sys_reg {
 // https://elixir.bootlin.com/linux/v4.20.17/source/arch/arm64/include/asm/sysreg.h#L135
 arm64_sys_reg!(MPIDR_EL1, 3, 0, 0, 0, 5);
 
+// kvm-bindings cannot bind the UAPI's function-like timer macros. CNT and CVAL
+// deliberately retain Linux's historical swapped encodings, not architectural aliases.
+pub const KVM_REG_ARM_TIMER_CNT: u64 = 0x6030_0000_0013_df1a;
+pub const KVM_REG_ARM_TIMER_CVAL: u64 = 0x6030_0000_0013_df02;
+pub const KVM_REG_ARM_TIMER_CTL: u64 = 0x6030_0000_0013_df19;
+
 /// Configure core registers for a given CPU.
 ///
 /// # Arguments

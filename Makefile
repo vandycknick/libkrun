@@ -122,6 +122,10 @@ debug: $(LIBRARY_DEBUG_$(OS)) libkrun.pc libkrun_init.pc
 live-capabilities:
 	cargo run --locked -p libkrun $(FEATURE_FLAGS) --example live_capabilities
 
+.PHONY: native-execution-probe
+native-execution-probe:
+	cargo build --locked -p libkrun $(FEATURE_FLAGS) --features native-execution-probe --example native-execution-probe
+
 # Regenerate ffier bindings for libkrun.
 # The Rust client is generated at compile time from the committed JSON
 # (see src/libkrun-via-cdylib-weak/build.rs). Run this after changing the

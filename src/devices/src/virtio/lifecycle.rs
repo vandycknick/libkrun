@@ -82,6 +82,12 @@ pub enum ResumeAcceptance {
     },
 }
 
+pub struct DormantDeviceContext {
+    pub memory: RuntimeGuestMemory,
+    pub interrupt: crate::virtio::mmio::InterruptTransport,
+    pub activated: bool,
+}
+
 /// A provider retains backend, worker handles and faults until terminal cleanup.
 /// Begin/poll must not wait for workers or join an unfinished thread. An accepted
 /// send is recorded before a fallible wake. Ready transfers queues exactly once;
@@ -107,8 +113,21 @@ pub trait VirtioStateProvider: Send {
     fn state_limit(&self) -> u32;
     fn capture_payload(&self, key: BarrierKey) -> Result<Vec<u8>, ProviderFault>;
     fn validate_payload(&self, payload: &[u8]) -> Result<(), ProviderFault>;
+    fn validate_restore(&self, _payload: &[u8]) -> Result<(), ProviderFault> {
+        Err(ProviderFault::Unsupported)
+    }
     /// Called only after complete transport and device validation, while dormant.
     fn apply_payload(&mut self, payload: &[u8]) -> Result<(), ProviderFault>;
+    /// A fresh destination retains no source resources and cannot dispatch work.
+    /// Providers must explicitly implement dormant construction before admission.
+    fn prepare_restore(
+        &mut self,
+        _request: BarrierRequest,
+        _payload: &[u8],
+        _context: DormantDeviceContext,
+    ) -> Result<(), ProviderFault> {
+        Err(ProviderFault::Unsupported)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

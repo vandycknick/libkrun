@@ -12,8 +12,6 @@ type SetState = unsafe extern "C" fn(*const c_void, usize) -> hv_return_t;
 type GetIcc = unsafe extern "C" fn(hv_vcpu_t, hv_gic_icc_reg_t, *mut u64) -> hv_return_t;
 type SetIcc = unsafe extern "C" fn(hv_vcpu_t, hv_gic_icc_reg_t, u64) -> hv_return_t;
 
-// These complete tables are retained for Phase 9, never invoked by admission discovery.
-#[allow(dead_code)]
 struct GicBlobApi {
     create: StateCreate,
     get_size: StateGetSize,
@@ -21,7 +19,6 @@ struct GicBlobApi {
     set_state: SetState,
 }
 
-#[allow(dead_code)]
 struct GicCpuApi {
     get_icc: GetIcc,
     set_icc: SetIcc,
@@ -85,6 +82,76 @@ impl HvfFramework {
         self.gic_symbols
     }
 
+    pub fn capture_gic(self: &Arc<Self>) -> Result<Vec<u8>, Error> {
+        let api = self
+            ._gic_blob
+            .as_ref()
+            .ok_or(Error::MissingStateApi("GIC blob"))?;
+        let object =
+            unsafe { OwnedConfig::new((api.create)(), self.clone(), "hv_gic_state_create")? };
+        let mut size = 0;
+        native_status("hv_gic_state_get_size", unsafe {
+            (api.get_size)(object.as_ptr(), &mut size)
+        })?;
+        if size == 0 || size > crate::state::MAX_GIC_BYTES {
+            return Err(Error::ExecutionState(crate::state::StateError(
+                "GIC blob size",
+            )));
+        }
+        let mut bytes = vec![0; size];
+        native_status("hv_gic_state_get_data", unsafe {
+            (api.get_data)(object.as_ptr(), bytes.as_mut_ptr().cast())
+        })?;
+        Ok(bytes)
+    }
+
+    pub fn install_gic(&self, bytes: &[u8]) -> Result<(), Error> {
+        if bytes.is_empty() || bytes.len() > crate::state::MAX_GIC_BYTES {
+            return Err(Error::ExecutionState(crate::state::StateError(
+                "GIC blob size",
+            )));
+        }
+        let api = self
+            ._gic_blob
+            .as_ref()
+            .ok_or(Error::MissingStateApi("GIC blob"))?;
+        native_status("hv_gic_set_state", unsafe {
+            (api.set_state)(bytes.as_ptr().cast(), bytes.len())
+        })
+    }
+
+    pub fn get_icc(&self, cpu: hv_vcpu_t, register: u16) -> Result<u64, Error> {
+        let api = self
+            ._gic_cpu
+            .as_ref()
+            .ok_or(Error::MissingStateApi("GIC ICC"))?;
+        let mut value = 0;
+        let status = unsafe { (api.get_icc)(cpu, register, &mut value) };
+        if status != crate::bindings::HV_SUCCESS {
+            return Err(Error::ExecutionRegister {
+                symbol: "hv_gic_get_icc_reg",
+                register: u32::from(register),
+                status,
+            });
+        }
+        Ok(value)
+    }
+
+    pub fn set_icc(&self, cpu: hv_vcpu_t, register: u16, value: u64) -> Result<(), Error> {
+        let api = self
+            ._gic_cpu
+            .as_ref()
+            .ok_or(Error::MissingStateApi("GIC ICC"))?;
+        let status = unsafe { (api.set_icc)(cpu, register, value) };
+        if status != crate::bindings::HV_SUCCESS {
+            return Err(Error::ExecutionRegister {
+                symbol: "hv_gic_set_icc_reg",
+                register: u32::from(register),
+                status,
+            });
+        }
+        Ok(())
+    }
     /// # Safety
     /// `T` must match the named framework symbol's native ABI. Copied pointers must
     /// retain an owning `Arc<HvfFramework>` for their entire usable lifetime.
@@ -100,6 +167,14 @@ unsafe fn optional_symbol<T: Copy>(library: &libloading::Library, name: &[u8]) -
             log::debug!("optional HVF symbol {:?} unavailable: {error}", name);
             None
         }
+    }
+}
+
+fn native_status(symbol: &'static str, status: hv_return_t) -> Result<(), Error> {
+    if status == crate::bindings::HV_SUCCESS {
+        Ok(())
+    } else {
+        Err(Error::NativeCall { symbol, status })
     }
 }
 

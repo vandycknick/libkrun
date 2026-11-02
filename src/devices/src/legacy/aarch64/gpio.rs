@@ -79,6 +79,49 @@ pub struct Gpio {
 }
 
 impl Gpio {
+    pub fn capture_state(&self) -> crate::legacy::state::GpioState {
+        crate::legacy::state::GpioState {
+            data: self.data,
+            direction: self.dir,
+            interrupt_sense: self.isense,
+            interrupt_both_edges: self.ibe,
+            interrupt_event: self.iev,
+            interrupt_mask: self.im,
+            interrupt_status: self.istate,
+            alternate_function: self.afsel,
+        }
+    }
+
+    pub fn install_state(
+        &mut self,
+        state: &crate::legacy::state::GpioState,
+    ) -> std::result::Result<(), utils::state::Error> {
+        if [
+            state.data,
+            state.direction,
+            state.interrupt_sense,
+            state.interrupt_both_edges,
+            state.interrupt_event,
+            state.interrupt_mask,
+            state.interrupt_status,
+            state.alternate_function,
+        ]
+        .iter()
+        .any(|value| *value > 255)
+        {
+            return Err(utils::state::Error::Invalid("GPIO register"));
+        }
+        self.data = state.data;
+        self.dir = state.direction;
+        self.isense = state.interrupt_sense;
+        self.ibe = state.interrupt_both_edges;
+        self.iev = state.interrupt_event;
+        self.im = state.interrupt_mask;
+        self.istate = state.interrupt_status;
+        self.afsel = state.alternate_function;
+        Ok(())
+    }
+
     /// Constructs an PL061 GPIO device.
     pub fn new(shutdown_efd: EventFd, interrupt_evt: EventFd) -> Self {
         Self {

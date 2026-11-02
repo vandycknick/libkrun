@@ -29,6 +29,9 @@ impl KvmIoapic {
 }
 
 impl IrqChipT for KvmIoapic {
+    fn execution_state_supported(&self) -> bool {
+        true
+    }
     fn get_mmio_addr(&self) -> u64 {
         0
     }

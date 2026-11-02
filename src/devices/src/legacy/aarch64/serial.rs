@@ -92,9 +92,73 @@ pub struct Serial {
     input: Option<Box<dyn ReadableFd + Send>>,
     intc: Option<IrqChip>,
     irq_line: Option<u32>,
+    input_closed: bool,
+    state_fault: bool,
 }
 
 impl Serial {
+    pub fn capture_state(
+        &self,
+    ) -> std::result::Result<crate::legacy::state::Pl011State, utils::state::Error> {
+        use crate::legacy::state::{MAX_SERIAL_INPUT, Pl011State};
+        if self.state_fault {
+            return Err(utils::state::Error::Invalid("PL011 terminality fault"));
+        }
+        if self.read_fifo.len() > MAX_SERIAL_INPUT {
+            return Err(utils::state::Error::Limit);
+        }
+        Ok(Pl011State {
+            flags: self.flags,
+            lcr: self.lcr,
+            rsr: self.rsr,
+            cr: self.cr,
+            dmacr: self.dmacr,
+            debug: self.debug,
+            interrupt_enabled: self.int_enabled,
+            interrupt_level: self.int_level,
+            ilpr: self.ilpr,
+            ibrd: self.ibrd,
+            fbrd: self.fbrd,
+            ifl: self.ifl,
+            read_count: self.read_count,
+            read_trigger: self.read_trigger,
+            input: self.read_fifo.iter().copied().collect(),
+            has_input: self.input.is_some(),
+            has_output: self.out.is_some(),
+            input_closed: self.input_closed,
+        })
+    }
+
+    pub fn install_state(
+        &mut self,
+        state: &crate::legacy::state::Pl011State,
+    ) -> std::result::Result<(), utils::state::Error> {
+        if state.input.len() > crate::legacy::state::MAX_SERIAL_INPUT
+            || state.read_trigger != 1
+            || state.has_input != self.input.is_some()
+            || state.has_output != self.out.is_some()
+        {
+            return Err(utils::state::Error::Invalid("PL011 endpoint or FIFO"));
+        }
+        self.flags = state.flags;
+        self.lcr = state.lcr;
+        self.rsr = state.rsr;
+        self.cr = state.cr;
+        self.dmacr = state.dmacr;
+        self.debug = state.debug;
+        self.int_enabled = state.interrupt_enabled;
+        self.int_level = state.interrupt_level;
+        self.ilpr = state.ilpr;
+        self.ibrd = state.ibrd;
+        self.fbrd = state.fbrd;
+        self.ifl = state.ifl;
+        self.read_count = state.read_count;
+        self.read_trigger = state.read_trigger;
+        self.read_fifo = state.input.iter().copied().collect();
+        self.input_closed = state.input_closed;
+        Ok(())
+    }
+
     /// Constructs an AMBA PL011 UART device.
     pub fn new(
         interrupt_evt: EventFd,
@@ -156,6 +220,8 @@ impl Serial {
             input,
             intc: None,
             irq_line: None,
+            input_closed: false,
+            state_fault: false,
         }
     }
 
@@ -307,12 +373,19 @@ impl Serial {
     }
 
     fn trigger_interrupt(&mut self) -> result::Result<(), DeviceError> {
-        if let Some(intc) = &self.intc {
+        let result = if let Some(intc) = &self.intc {
             intc.lock()
-                .unwrap()
-                .set_irq(self.irq_line, Some(&self.interrupt_evt))?;
+                .map_err(|_| {
+                    DeviceError::IoError(io::Error::other("poisoned PL011 interrupt controller"))
+                })
+                .and_then(|intc| intc.set_irq(self.irq_line, Some(&self.interrupt_evt)))
+        } else {
+            Ok(())
+        };
+        if result.is_err() {
+            self.state_fault = true;
         }
-        Ok(())
+        result
     }
 }
 
@@ -376,6 +449,7 @@ impl BusDevice for Serial {
         if data.len() <= 4 {
             let v = read_le_u32(data);
             if let Err(e) = self.handle_write(offset, v) {
+                self.state_fault = true;
                 warn!("Failed to write to PL011 device: {e}");
             }
         } else {
@@ -391,6 +465,9 @@ impl BusDevice for Serial {
 impl Subscriber for Serial {
     /// Handle a read event (EPOLLIN) on the serial input fd.
     fn process(&mut self, event: &EpollEvent, _: &mut EventManager) {
+        if self.input_closed {
+            return;
+        }
         let source = event.fd();
         let event_set = event.event_set();
 
@@ -407,11 +484,18 @@ impl Subscriber for Serial {
         {
             let mut out = [0u8; 32];
             match input.read(&mut out[..]) {
+                Ok(0) => self.input_closed = true,
                 Ok(count) => {
                     self.queue_input_bytes(&out[..count])
                         .unwrap_or_else(|e| warn!("Serial error on input: {e:?}"));
                 }
                 Err(e) => {
+                    if !matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) {
+                        self.state_fault = true;
+                    }
                     warn!("error while reading stdin: {e:?}");
                 }
             }
@@ -421,6 +505,9 @@ impl Subscriber for Serial {
     /// Initial registration of pollable objects.
     /// If serial input is present, register the serial input FD as readable.
     fn interest_list(&self) -> Vec<EpollEvent> {
+        if self.input_closed {
+            return Vec::new();
+        }
         match &self.input {
             Some(input) => vec![EpollEvent::new(EventSet::IN, input.as_raw_fd() as u64)],
             None => vec![],

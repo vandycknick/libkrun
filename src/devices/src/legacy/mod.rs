@@ -20,6 +20,7 @@ mod ioapic_kvm;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod ioapic_whp;
 mod irqchip;
+pub mod kvm_state;
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
 mod kvmaia;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -30,6 +31,7 @@ mod kvmgicv3;
 mod kvmioapic;
 #[cfg(target_arch = "aarch64")]
 mod rtc_pl031;
+pub mod state;
 #[cfg(target_os = "macos")]
 mod vcpu;
 #[cfg(target_arch = "x86_64")]

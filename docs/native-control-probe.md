@@ -124,3 +124,63 @@ and polling until reap, then reports failure rather than a backdated success.
 For a genuinely stuck native syscall the outer runner may terminate and reap the
 entire standalone process; never reinterpret runner timeout as successful native
 cleanup or qualification.
+
+## HVF execution-state source contract
+
+The execution schema is `arch::hvf_state`, shared with HVF without a Linux
+framework dependency. Its CPU register groups are distinct: general registers
+have no FP/LR aliases, SIMD values are fixed 128-bit little-endian values,
+architectural/model/debug inventories are exact, and ICC excludes observational
+RPR and nested aliases. Debug banks come from the saved debug identity.
+Unknown inventories, SVE/SME, exposed PMU state without framework access, and
+expanded debug models are refused rather than omitted.
+
+The existing owned optional framework API captures a bounded GIC object and
+releases that object on every path before releasing its framework owner. The
+opaque blob is separate from owner-thread CPU registers and the software
+pending IRQ, wake, offline and accepted CPU_ON state. Framework vCPU IDs and
+channels are recreated; only logical identity and MPIDR cross the cut.
+
+HVF capture retains the CPU cut before disabling native timer controls. Capture
+retry does not consume the pause or resample a retained cut. Destination CPU
+construction skips cold initial registers and remains fenced. Installation
+keeps timers disabled during prepared dwell. Final preparation applies one
+absolute counter offset before compare/control state and restores the framework
+notification mask and matching software cache. Controller installation must
+finish before any route/device producer reopens; CPUs release last.
+A fresh same-generation capture request refences the retained timer cut before
+an unreleased time plan is replaced; an exact duplicate returns its retained
+payload without replaying native setters. Refencing invalidates release
+preparation before native mutation.
+For a retained execution cut, the subsequent generic `PrepareResume(0)` only
+validates the exact completed typed time-plan key and acknowledges readiness.
+It never recomputes or reinstalls an offset from the ordinary-pause baseline.
+An absent/wrong-key plan or a nonzero generic time advance is refused. Ordinary
+pause/resume without an execution cut retains its separate elapsed-time path.
+
+The source implementation samples the architectural host counter and Mach
+timebase separately. It does not infer physical-counter/timer epoch equivalence
+from the virtual offset API. Actual Apple-silicon capture/install, physical and
+virtual timer continuation, native GIC/ICC compatibility, multi-CPU clock
+brackets, offline/waiting wake, prepared dwell, repeated fresh-process restore
+and failed-attempt cleanup remain **pending-lane:hvf**. The Linux standalone
+command above does not run those cases and grants no HVF qualification.
+XNU's [userspace timebase implementation](https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/mach_absolute_time.s)
+adds a separately maintained offset to the architectural counter. Consequently
+neither a Mach timestamp nor the virtual-offset setter proves a physical epoch.
+An enabled physical timer receives a named unqualified-epoch refusal; its
+register inventory is not silently discarded or treated as a virtual timer.
+
+Audited hypervisor-free data tests, runnable on Linux without HVF symbols:
+
+```sh
+cargo test --locked -p krun-arch --lib hvf_state::tests::hvf_execution_
+```
+
+The following macOS filter exercises real software-state ownership only: no VM
+or vCPU is created and no native wake method is called.
+
+```sh
+cargo test --locked -p krun-devices --lib legacy::vcpu::tests::hvf_execution_
+```
+

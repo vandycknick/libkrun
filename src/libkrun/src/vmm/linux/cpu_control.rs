@@ -47,7 +47,13 @@ impl CpuMailbox {
     }
 
     pub(crate) fn halt(&mut self) {
+        self.prepared = None;
         self.disposition = CpuDisposition::Stopped;
+    }
+
+    pub(crate) fn preparation_failed(&mut self) {
+        self.disposition = CpuDisposition::Parked;
+        self.prepared = None;
     }
 
     pub(crate) fn apply(&mut self, cpu_id: u8, command: CpuCommand) -> CpuAck {
@@ -57,6 +63,9 @@ impl CpuMailbox {
             CpuCommandKind::PrepareResume { .. } => CpuAckKind::Prepared,
             CpuCommandKind::Release => CpuAckKind::Released,
             CpuCommandKind::Stop => CpuAckKind::Stopped,
+            CpuCommandKind::CaptureExecution => CpuAckKind::Captured,
+            CpuCommandKind::InstallExecution => CpuAckKind::Installed,
+            CpuCommandKind::PrepareExecutionTime => CpuAckKind::TimePrepared,
         };
         let result = match command.kind {
             CpuCommandKind::Stop => {
@@ -78,6 +87,24 @@ impl CpuMailbox {
                     Ok(())
                 } else {
                     Err("stale or foreign vCPU park".to_owned())
+                }
+            }
+            CpuCommandKind::CaptureExecution
+            | CpuCommandKind::InstallExecution
+            | CpuCommandKind::PrepareExecutionTime => {
+                if (self.disposition == CpuDisposition::Parked
+                    || (self.disposition == CpuDisposition::Prepared
+                        && command.kind == CpuCommandKind::CaptureExecution))
+                    && (key.generation == self.key.generation
+                        || (self.key.generation.0 == 0
+                            && command.kind == CpuCommandKind::InstallExecution))
+                {
+                    self.key = key;
+                    self.disposition = CpuDisposition::Parked;
+                    self.prepared = None;
+                    Ok(())
+                } else {
+                    Err("execution operation requires the exact parked CPU".to_owned())
                 }
             }
             CpuCommandKind::PrepareResume { .. } => {
@@ -113,6 +140,7 @@ impl CpuMailbox {
             cpu_id,
             kind,
             result,
+            execution: None,
         }
     }
 }
@@ -137,6 +165,7 @@ mod tests {
                 deadline: Instant::now(),
             },
             kind,
+            execution: None,
         }
     }
 
@@ -273,14 +302,14 @@ mod tests {
         let mut mailbox = CpuMailbox::new();
         let mut prepare = command(1, 0, CpuCommandKind::PrepareResume { paused_ticks: 0 });
         prepare.barrier.key.operation = OperationId(12);
-        assert!(mailbox.apply(0, prepare).result.is_ok());
+        assert!(mailbox.apply(0, prepare.clone()).result.is_ok());
         assert!(
             mailbox
                 .apply(0, command(1, 0, CpuCommandKind::Release))
                 .result
                 .is_err()
         );
-        let mut release = prepare;
+        let mut release = prepare.clone();
         release.kind = CpuCommandKind::Release;
         assert!(mailbox.apply(0, release).result.is_ok());
         assert!(mailbox.apply(0, prepare).result.is_err());
@@ -344,6 +373,61 @@ mod tests {
                 .apply(0, command(4, 0, CpuCommandKind::Stop))
                 .result
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn kvm_execution_mailbox_refence_invalidates_prepared_release() {
+        let mut mailbox = CpuMailbox::new();
+        assert!(
+            mailbox
+                .apply(
+                    0,
+                    command(1, 0, CpuCommandKind::PrepareResume { paused_ticks: 0 })
+                )
+                .result
+                .is_ok()
+        );
+        assert!(
+            mailbox
+                .apply(0, command(2, 0, CpuCommandKind::InstallExecution))
+                .result
+                .is_err()
+        );
+        assert!(
+            mailbox
+                .apply(0, command(3, 0, CpuCommandKind::CaptureExecution))
+                .result
+                .is_ok()
+        );
+        assert_eq!(mailbox.disposition(), CpuDisposition::Parked);
+        assert!(
+            mailbox
+                .apply(0, command(4, 0, CpuCommandKind::Release))
+                .result
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn kvm_execution_mailbox_native_failure_cannot_certify_prepared() {
+        let mut mailbox = CpuMailbox::new();
+        assert!(
+            mailbox
+                .apply(
+                    0,
+                    command(1, 0, CpuCommandKind::PrepareResume { paused_ticks: 0 })
+                )
+                .result
+                .is_ok()
+        );
+        mailbox.preparation_failed();
+        assert_eq!(mailbox.disposition(), CpuDisposition::Parked);
+        assert!(
+            mailbox
+                .apply(0, command(2, 0, CpuCommandKind::Release))
+                .result
+                .is_err()
         );
     }
 }

@@ -35,6 +35,7 @@ pub mod rand;
 pub mod signal;
 pub mod sized_vec;
 pub mod sm;
+pub mod state;
 pub mod syscall;
 pub mod time;
 pub mod worker_message;

@@ -580,6 +580,14 @@ impl MmioTransport {
     }
 
     pub fn validate_transport(&self, state: &MmioTransportState) -> Result<(), ProviderFault> {
+        self.validate_transport_install(state, false)
+    }
+
+    fn validate_transport_install(
+        &self,
+        state: &MmioTransportState,
+        restoring: bool,
+    ) -> Result<(), ProviderFault> {
         let device = self
             .device
             .try_lock()
@@ -600,7 +608,7 @@ impl MmioTransport {
                     | device_status::FAILED)
                 != 0
             || state.activated != (state.device_status & device_status::DRIVER_OK != 0)
-            || state.activated != self.quiesced_active
+            || (!restoring && state.activated != self.quiesced_active)
         {
             return Err(ProviderFault::DeviceState);
         }
@@ -738,6 +746,73 @@ impl MmioTransport {
         provider
             .apply_payload(payload)
             .map_err(|fault| self.lifecycle.fail(key, fault))
+    }
+
+    pub fn prepare_restore(
+        &mut self,
+        request: BarrierRequest,
+        state: &MmioTransportState,
+        payload: &[u8],
+    ) -> Result<(), LifecycleError> {
+        if self.lifecycle.snapshot.request.is_some() || self.locked_device().is_activated() {
+            return Err(self
+                .lifecycle
+                .error(request.key, ProviderFault::InvalidTransition));
+        }
+        self.validate_transport_install(state, true)
+            .map_err(|fault| self.lifecycle.error(request.key, fault))?;
+        self.validate_device_state(payload)
+            .map_err(|fault| self.lifecycle.error(request.key, fault))?;
+        let device = self.device.clone();
+        let mut device = device
+            .try_lock()
+            .map_err(|_| self.lifecycle.error(request.key, ProviderFault::DeviceLock))?;
+        device.set_acked_features(state.acked_features);
+        let provider = device.state_provider_mut().ok_or_else(|| {
+            self.lifecycle
+                .error(request.key, ProviderFault::Unsupported)
+        })?;
+        provider
+            .validate_restore(payload)
+            .map_err(|fault| self.lifecycle.error(request.key, fault))?;
+        self.lifecycle.begin(request, ProviderStage::Quiescing);
+        provider
+            .prepare_restore(
+                request,
+                payload,
+                crate::virtio::lifecycle::DormantDeviceContext {
+                    memory: self.mem.clone(),
+                    interrupt: self.interrupt.clone(),
+                    activated: state.activated,
+                },
+            )
+            .map_err(|fault| self.lifecycle.fail(request.key, fault))?;
+        drop(device);
+        self.quiesced_active = state.activated;
+        if state.activated {
+            let queues = self
+                .queues
+                .take()
+                .ok_or_else(|| self.lifecycle.fail(request.key, ProviderFault::QueueCount))?;
+            let queues = queues
+                .into_iter()
+                .zip(&self.queue_evts)
+                .zip(&state.queues)
+                .map(|((mut queue, event), saved)| {
+                    queue.apply_state(saved);
+                    crate::virtio::device::DeviceQueue {
+                        queue,
+                        event: event.clone(),
+                    }
+                })
+                .collect();
+            self.escrow
+                .receive(queues, &self.mem)
+                .map_err(|fault| self.lifecycle.fail(request.key, fault))?;
+        }
+        self.lifecycle.snapshot.stage = ProviderStage::Quiesced;
+        self.apply_transport(state)
+            .map_err(|fault| self.lifecycle.fail(request.key, fault))
     }
 
     fn check_device_status(&self, set: u32, clr: u32) -> bool {

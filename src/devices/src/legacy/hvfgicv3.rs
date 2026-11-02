@@ -125,9 +125,48 @@ impl HvfGicV3 {
             vcpu_count,
         })
     }
+
+    pub fn capture_execution_state(&self) -> Result<hvf::state::GicState, Error> {
+        let state = hvf::state::GicState {
+            vcpu_count: u8::try_from(self.vcpu_count)
+                .map_err(|_| Error::ExecutionState(hvf::state::StateError("GIC CPU count")))?,
+            properties: self.properties,
+            bytes: self.bindings.framework.capture_gic()?,
+        };
+        state.validate().map_err(Error::ExecutionState)?;
+        Ok(state)
+    }
+
+    pub fn install_execution_state(&self, state: &hvf::state::GicState) -> Result<(), Error> {
+        state.validate().map_err(Error::ExecutionState)?;
+        if u64::from(state.vcpu_count) != self.vcpu_count || state.properties != self.properties {
+            return Err(Error::ExecutionState(hvf::state::StateError(
+                "GIC topology mismatch",
+            )));
+        }
+        self.bindings.framework.install_gic(&state.bytes)
+    }
 }
 
 impl IrqChipT for HvfGicV3 {
+    fn execution_state_supported(&self) -> bool {
+        self.bindings
+            .framework
+            .gic_symbols()
+            .into_iter()
+            .all(|available| available)
+    }
+
+    fn capture_hvf_state(&self) -> Result<hvf::state::GicState, String> {
+        self.capture_execution_state()
+            .map_err(|error| error.to_string())
+    }
+
+    fn install_hvf_state(&self, state: &hvf::state::GicState) -> Result<(), String> {
+        self.install_execution_state(state)
+            .map_err(|error| error.to_string())
+    }
+
     fn get_mmio_addr(&self) -> u64 {
         0
     }

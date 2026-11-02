@@ -68,6 +68,44 @@ pub struct RTC {
 }
 
 impl RTC {
+    pub fn capture_state(
+        &self,
+    ) -> std::result::Result<crate::legacy::state::RtcState, utils::state::Error> {
+        let elapsed = self.previous_now.elapsed().as_nanos();
+        let nanos = i128::from(self.tick_offset)
+            .checked_add(i128::try_from(elapsed).map_err(|_| utils::state::Error::Overflow)?)
+            .ok_or(utils::state::Error::Overflow)?;
+        if !(0..=i128::from(i64::MAX)).contains(&nanos) {
+            return Err(utils::state::Error::Invalid("RTC guest-time anchor"));
+        }
+        Ok(crate::legacy::state::RtcState {
+            guest_nanoseconds: nanos as u64,
+            match_value: self.match_value,
+            load: self.load,
+            interrupt_mask: self.imsc,
+            interrupt_status: self.ris,
+        })
+    }
+
+    pub fn install_state(
+        &mut self,
+        state: &crate::legacy::state::RtcState,
+    ) -> std::result::Result<(), utils::state::Error> {
+        if state.guest_nanoseconds > i64::MAX as u64
+            || state.interrupt_mask > 1
+            || state.interrupt_status > 1
+        {
+            return Err(utils::state::Error::Invalid("RTC state"));
+        }
+        self.tick_offset = state.guest_nanoseconds as i64;
+        self.previous_now = Instant::now();
+        self.match_value = state.match_value;
+        self.load = state.load;
+        self.imsc = state.interrupt_mask;
+        self.ris = state.interrupt_status;
+        Ok(())
+    }
+
     /// Constructs an AMBA PL031 RTC device.
     pub fn new(interrupt_evt: EventFd) -> RTC {
         RTC {

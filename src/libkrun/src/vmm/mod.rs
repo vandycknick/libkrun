@@ -14,6 +14,8 @@
 pub mod builder;
 pub mod control;
 pub(crate) mod device_manager;
+#[allow(dead_code)]
+pub mod execution;
 /// Resource store for configured microVM resources.
 pub mod resources;
 /// Signal handling utilities.
@@ -145,11 +147,18 @@ pub struct Vmm {
     pub(crate) mmio_device_manager: MMIODeviceManager,
 
     pub(crate) control: control::ControlOwner,
+    pub(crate) execution: execution::runtime::ExecutionOwner,
+    pub(crate) execution_controller: IrqChip,
 }
 
 impl Vmm {
     /// Starts the microVM vcpus.
-    pub fn start_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
+    pub fn start_vcpus(&mut self, vcpus: Vec<Vcpu>) -> Result<()> {
+        self.start_vcpus_parked(vcpus)?;
+        self.resume_vcpus()
+    }
+
+    pub(crate) fn start_vcpus_parked(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
         let vcpu_count = vcpus.len();
 
         #[cfg(target_os = "linux")]
@@ -163,10 +172,8 @@ impl Vmm {
 
             self.vcpus_handles
                 .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
+            self.control.cpus.constructed_cpu();
         }
-
-        self.control.cpus = control::CpuController::new(self.vcpus_handles.len());
-        self.resume_vcpus()?;
 
         Ok(())
     }

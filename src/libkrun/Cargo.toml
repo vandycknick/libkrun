@@ -22,6 +22,7 @@ vhost-user = ["devices/vhost-user", "krun_display"]
 timesync = ["devices/timesync"]
 ffi = ["serde_json", "dep:ffier", "dep:ffier-builtins", "devices/ffi"]
 native-control-probe = []
+native-execution-probe = []
 
 [dependencies]
 bitfield = { version = "0.19.4", optional = true }
@@ -59,7 +60,7 @@ cpuid = { package = "krun-cpuid", version = "=0.1.0-2.0.0-dev", path = "../cpuid
 zstd = "0.13"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30.1", features = ["fs", "term"] }
+nix = { version = "0.30.1", features = ["fs", "term", "feature"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
@@ -88,5 +89,12 @@ crate-type = ["cdylib", "lib"]
 name = "native-control-probe"
 path = "examples/native_control_probe.rs"
 required-features = ["native-control-probe"]
+test = false
+bench = false
+
+[[example]]
+name = "native-execution-probe"
+path = "examples/native_execution_probe.rs"
+required-features = ["native-execution-probe"]
 test = false
 bench = false

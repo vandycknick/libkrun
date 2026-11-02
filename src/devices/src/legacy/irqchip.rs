@@ -16,6 +16,10 @@ pub struct IrqChipDevice {
 }
 
 impl IrqChipDevice {
+    pub fn execution_state_supported(&self) -> bool {
+        self.inner.execution_state_supported()
+    }
+
     pub fn new(irqchip: Box<dyn IrqChipT>) -> Self {
         Self { inner: irqchip }
     }
@@ -34,6 +38,32 @@ impl IrqChipDevice {
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError> {
         self.inner.set_irq(irq_line, interrupt_evt)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn capture_kvm_state(
+        &self,
+        mpidrs: &[u64],
+    ) -> Result<crate::legacy::kvm_state::GicState, String> {
+        self.inner.capture_kvm_state(mpidrs)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn install_kvm_state(
+        &self,
+        state: &crate::legacy::kvm_state::GicState,
+    ) -> Result<(), String> {
+        self.inner.install_kvm_state(state)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn capture_hvf_state(&self) -> Result<hvf::state::GicState, String> {
+        self.inner.capture_hvf_state()
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn install_hvf_state(&self, state: &hvf::state::GicState) -> Result<(), String> {
+        self.inner.install_hvf_state(state)
     }
 }
 
@@ -114,6 +144,9 @@ impl AIADevice for IrqChipDevice {
 
 #[cfg(target_arch = "x86_64")]
 pub trait IrqChipT: BusDevice {
+    fn execution_state_supported(&self) -> bool {
+        false
+    }
     fn get_mmio_addr(&self) -> u64;
     fn get_mmio_size(&self) -> u64;
     fn set_irq(
@@ -125,6 +158,28 @@ pub trait IrqChipT: BusDevice {
 
 #[cfg(target_arch = "aarch64")]
 pub trait IrqChipT: BusDevice + GICDevice {
+    fn execution_state_supported(&self) -> bool {
+        false
+    }
+    #[cfg(target_os = "linux")]
+    fn capture_kvm_state(
+        &self,
+        _mpidrs: &[u64],
+    ) -> Result<crate::legacy::kvm_state::GicState, String> {
+        Err("KVM GICv3 state provider unavailable".into())
+    }
+    #[cfg(target_os = "linux")]
+    fn install_kvm_state(&self, _state: &crate::legacy::kvm_state::GicState) -> Result<(), String> {
+        Err("KVM GICv3 state provider unavailable".into())
+    }
+    #[cfg(target_os = "macos")]
+    fn capture_hvf_state(&self) -> Result<hvf::state::GicState, String> {
+        Err("HVF native GIC state provider unavailable".into())
+    }
+    #[cfg(target_os = "macos")]
+    fn install_hvf_state(&self, _state: &hvf::state::GicState) -> Result<(), String> {
+        Err("HVF native GIC state provider unavailable".into())
+    }
     fn get_mmio_addr(&self) -> u64;
     fn get_mmio_size(&self) -> u64;
     fn set_irq(
@@ -136,6 +191,9 @@ pub trait IrqChipT: BusDevice + GICDevice {
 
 #[cfg(target_arch = "riscv64")]
 pub trait IrqChipT: BusDevice + AIADevice {
+    fn execution_state_supported(&self) -> bool {
+        false
+    }
     fn get_mmio_addr(&self) -> u64;
     fn get_mmio_size(&self) -> u64;
     fn set_irq(

@@ -9,6 +9,13 @@ pub mod logging;
     not(feature = "tee")
 ))]
 pub mod native_control_probe;
+#[cfg(all(
+    feature = "native-execution-probe",
+    target_os = "linux",
+    target_arch = "x86_64",
+    not(feature = "tee")
+))]
+pub mod native_execution_probe;
 pub mod payload;
 pub mod vmm_builder;
 pub use crate::vmm::control;

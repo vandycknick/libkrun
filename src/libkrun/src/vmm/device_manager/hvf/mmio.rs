@@ -21,7 +21,7 @@ use polly::event_manager::{BarrierKey, BarrierRequest, EventManager};
 use utils::eventfd::EventFd;
 
 use crate::vmm::device_manager::quiescence::{
-    AttachmentIdentity, DeviceQuiescence, LegacyAttachment, LegacyKind, ManagerError,
+    AttachmentIdentity, DeviceQuiescence, LegacyAttachment, LegacyHandle, LegacyKind, ManagerError,
 };
 use crate::vmm::vstate::Vm;
 
@@ -136,6 +136,21 @@ pub struct MMIODeviceManager {
 }
 
 impl MMIODeviceManager {
+    pub fn set_restore_position(&mut self, address: u64, irq: u32) -> Result<()> {
+        if self.route_request.is_some()
+            || irq < arch::IRQ_BASE
+            || irq > self.last_irq
+            || address < arch::MMIO_MEM_START
+            || address.checked_add(MMIO_LEN).is_none()
+            || address % MMIO_LEN != 0
+        {
+            return Err(Error::BarrierActive);
+        }
+        self.mmio_base = address;
+        self.irq = irq;
+        Ok(())
+    }
+
     /// Create a new DeviceManager handling mmio devices (virtio net, block).
     pub fn new(mmio_base: &mut u64, irq_interval: (u32, u32)) -> MMIODeviceManager {
         if cfg!(target_arch = "aarch64") {
@@ -387,13 +402,16 @@ impl MMIODeviceManager {
         }
 
         self.bus
-            .insert(serial, self.mmio_base, MMIO_LEN)
+            .insert(serial.clone(), self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
-        self.quiescence.retain_legacy(LegacyAttachment {
-            kind: LegacyKind::Serial,
-            address: self.mmio_base,
-            irq: Some(self.irq),
-        });
+        self.quiescence.retain_legacy_device(
+            LegacyAttachment {
+                kind: LegacyKind::Serial,
+                address: self.mmio_base,
+                irq: Some(self.irq),
+            },
+            LegacyHandle::Serial(serial),
+        );
 
         cmdline
             .insert(
@@ -432,13 +450,16 @@ impl MMIODeviceManager {
         )));
 
         self.bus
-            .insert(device, self.mmio_base, MMIO_LEN)
+            .insert(device.clone(), self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
-        self.quiescence.retain_legacy(LegacyAttachment {
-            kind: LegacyKind::Rtc,
-            address: self.mmio_base,
-            irq: Some(self.irq),
-        });
+        self.quiescence.retain_legacy_device(
+            LegacyAttachment {
+                kind: LegacyKind::Rtc,
+                address: self.mmio_base,
+                irq: Some(self.irq),
+            },
+            LegacyHandle::Rtc(device),
+        );
 
         let ret = self.mmio_base;
         self.id_to_dev_info.insert(
@@ -487,13 +508,16 @@ impl MMIODeviceManager {
         }
 
         self.bus
-            .insert(gpio, self.mmio_base, MMIO_LEN)
+            .insert(gpio.clone(), self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
-        self.quiescence.retain_legacy(LegacyAttachment {
-            kind: LegacyKind::Gpio,
-            address: self.mmio_base,
-            irq: Some(self.irq),
-        });
+        self.quiescence.retain_legacy_device(
+            LegacyAttachment {
+                kind: LegacyKind::Gpio,
+                address: self.mmio_base,
+                irq: Some(self.irq),
+            },
+            LegacyHandle::Gpio(gpio),
+        );
 
         let ret = self.mmio_base;
         self.id_to_dev_info.insert(
@@ -523,14 +547,17 @@ impl MMIODeviceManager {
         // anything in the guest.
         if mmio_size != 0 {
             self.bus
-                .insert(intc, mmio_addr, mmio_size)
+                .insert(intc.clone(), mmio_addr, mmio_size)
                 .map_err(Error::BusError)?;
         }
-        self.quiescence.retain_legacy(LegacyAttachment {
-            kind: LegacyKind::InterruptController,
-            address: mmio_addr,
-            irq: None,
-        });
+        self.quiescence.retain_legacy_device(
+            LegacyAttachment {
+                kind: LegacyKind::InterruptController,
+                address: mmio_addr,
+                irq: None,
+            },
+            LegacyHandle::InterruptController(intc),
+        );
 
         Ok(())
     }

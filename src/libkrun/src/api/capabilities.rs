@@ -200,6 +200,28 @@ pub struct NativeBuildFacts {
 }
 
 impl NativeBuildFacts {
+    pub fn execution_producer(&self) -> Result<String, &'static str> {
+        if !self.binding_complete() || self.control_abi != Some(1) {
+            return Err("native producer binding incomplete");
+        }
+        let mut value = String::new();
+        write!(
+            &mut value,
+            "execution-producer-v1;{};{:?};{:?};{:?};",
+            self.query_abi, self.control_abi, self.backend, self.architecture
+        )
+        .map_err(|_| "native producer formatting")?;
+        for package in self.packages {
+            package
+                .write_canonical(&mut value)
+                .map_err(|_| "native producer formatting")?;
+        }
+        if value.len() > crate::vmm::execution::MAX_NATIVE_BINDING {
+            return Err("native producer binding too large");
+        }
+        Ok(value)
+    }
+
     /// Optional native packages not yet instrumented cannot yield a complete binding.
     pub fn binding_complete(&self) -> bool {
         let required = [
@@ -261,6 +283,7 @@ impl NativeBuildFacts {
                                 | "CARGO_FEATURE_TDX"
                                 | "CARGO_FEATURE_AWS_NITRO"
                                 | "CARGO_FEATURE_NATIVE_CONTROL_PROBE"
+                                | "CARGO_FEATURE_NATIVE_EXECUTION_PROBE"
                         )
                     })
                 })
@@ -1217,6 +1240,7 @@ mod tests {
             profile_packages!(Some(&["CARGO_FEATURE_TDX"])),
             profile_packages!(Some(&["CARGO_FEATURE_AWS_NITRO"])),
             profile_packages!(Some(&["CARGO_FEATURE_NATIVE_CONTROL_PROBE"])),
+            profile_packages!(Some(&["CARGO_FEATURE_NATIVE_EXECUTION_PROBE"])),
             profile_packages!(None),
         ];
         for packages in PROFILES {

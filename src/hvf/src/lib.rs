@@ -15,11 +15,16 @@ pub mod build_facts {
 pub mod bindings;
 mod discard;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+mod execution;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub mod framework;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub use execution::capture_clock_cut;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 mod probe;
 pub mod reclaim;
 pub mod remap;
+pub use arch::hvf_state as state;
 
 use bindings::*;
 
@@ -136,6 +141,13 @@ pub enum Error {
     InvalidMemoryFault,
     ReclaimState(ReclaimStateError),
     ReclaimProbeCleanup(String),
+    ExecutionState(state::StateError),
+    MissingStateApi(&'static str),
+    ExecutionRegister {
+        symbol: &'static str,
+        register: u32,
+        status: hv_return_t,
+    },
     UnsupportedPsci(u64),
     UnsupportedSystemRegister {
         register: u32,
@@ -165,6 +177,15 @@ impl Display for Error {
             InvalidMemoryFault => write!(f, "Invalid fault in mapped guest RAM"),
             ReclaimState(err) => write!(f, "Error tracking guest RAM in HVF: {err}"),
             ReclaimProbeCleanup(err) => write!(f, "Error cleaning up HVF reclaim probe: {err}"),
+            ExecutionState(error) => write!(f, "Invalid HVF execution state: {error}"),
+            MissingStateApi(symbol) => write!(f, "Missing HVF state API: {symbol}"),
+            ExecutionRegister {
+                symbol,
+                register,
+                status,
+            } => {
+                write!(f, "{symbol} register {register:#x} failed: {status}")
+            }
             UnsupportedPsci(function) => write!(f, "Unsupported PSCI function {function:#x}"),
             UnsupportedSystemRegister { register, write } => {
                 write!(
@@ -284,6 +305,13 @@ pub struct HvfCpuResources {
     _lifetime: Arc<HvfVmLifetime>,
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     _framework: Arc<HvfFramework>,
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+impl HvfCpuResources {
+    pub fn framework(&self) -> Arc<HvfFramework> {
+        self._framework.clone()
+    }
 }
 
 pub(crate) struct HvfVmLifetime {
@@ -759,8 +787,9 @@ impl HvfVcpu<'_> {
         let mut val: u64 = 0;
         let ret = unsafe { hv_vcpu_get_reg(self.vcpuid, reg, &mut val as *mut _) };
         if ret != HV_SUCCESS {
-            Err(Error::NativeCall {
+            Err(Error::ExecutionRegister {
                 symbol: "hv_vcpu_get_reg",
+                register: reg,
                 status: ret,
             })
         } else {
@@ -771,8 +800,9 @@ impl HvfVcpu<'_> {
     pub fn write_reg(&self, rt: u32, val: u64) -> Result<(), Error> {
         let ret = unsafe { hv_vcpu_set_reg(self.vcpuid, rt, val) };
         if ret != HV_SUCCESS {
-            Err(Error::NativeCall {
+            Err(Error::ExecutionRegister {
                 symbol: "hv_vcpu_set_reg",
+                register: rt,
                 status: ret,
             })
         } else {
@@ -784,8 +814,9 @@ impl HvfVcpu<'_> {
         let mut val: u64 = 0;
         let ret = unsafe { hv_vcpu_get_sys_reg(self.vcpuid, reg, &mut val as *mut _) };
         if ret != HV_SUCCESS {
-            Err(Error::NativeCall {
+            Err(Error::ExecutionRegister {
                 symbol: "hv_vcpu_get_sys_reg",
+                register: u32::from(reg),
                 status: ret,
             })
         } else {
@@ -1059,15 +1090,14 @@ impl HvfVcpu<'_> {
 
                 // Also CNTV_CVAL & CNTV_CVAL_EL0
                 let cval = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)?;
-                // This preserves the existing same-VM clock model. Mach/guest
-                // counter epoch and rate equivalence still require native qualification.
-                let now = unsafe { mach_absolute_time() }.saturating_sub(self.vtimer_offset.get());
-                if now > cval {
+                let now = host_counter().wrapping_sub(self.vtimer_offset.get());
+                let remaining = state::timer_remaining(cval, now);
+                if remaining == 0 {
                     return Ok(VcpuExit::WaitForEventExpired);
                 }
 
                 let timeout =
-                    ticks_to_duration(cval - now, self.cntfrq).ok_or(Error::InvalidMemoryFault)?;
+                    ticks_to_duration(remaining, self.cntfrq).ok_or(Error::InvalidMemoryFault)?;
                 Ok(VcpuExit::WaitForEventTimeout(timeout))
             }
             EC_AA64_HVC => self.handle_psci_request(),
@@ -1105,6 +1135,18 @@ fn mmio_value(bytes: &[u8; 8], len: usize) -> Result<u64, Error> {
         }
         _ => Err(Error::InvalidMemoryFault),
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn host_counter() -> u64 {
+    let counter: u64;
+    unsafe { asm!("isb", "mrs {}, cntvct_el0", out(reg) counter) };
+    counter
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn host_counter() -> u64 {
+    unsafe { mach_absolute_time() }
 }
 
 fn ticks_to_duration(ticks: u64, frequency: u64) -> Option<Duration> {

@@ -13,6 +13,125 @@ use devices::virtio::MmioTransport;
 use devices::virtio::lifecycle::{LifecycleError, LifecycleSnapshot, ProviderFault, ProviderStage};
 use polly::event_manager::{BarrierKey, BarrierRequest};
 
+use devices::legacy::state::{LegacyPayload, LegacyState};
+
+#[derive(Clone)]
+pub enum LegacyHandle {
+    Serial(Arc<Mutex<devices::legacy::Serial>>),
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    InterruptController(devices::legacy::IrqChip),
+    #[cfg(target_arch = "x86_64")]
+    Cmos(Arc<Mutex<devices::legacy::Cmos>>),
+    #[cfg(target_arch = "x86_64")]
+    I8042(Arc<Mutex<devices::legacy::I8042Device>>),
+    #[cfg(target_arch = "aarch64")]
+    Rtc(Arc<Mutex<devices::legacy::RTC>>),
+    #[cfg(target_arch = "aarch64")]
+    Gpio(Arc<Mutex<devices::legacy::Gpio>>),
+}
+
+pub struct LegacyParticipant {
+    pub identity: LegacyAttachment,
+    pub handle: Option<LegacyHandle>,
+}
+
+impl LegacyHandle {
+    pub fn capture(&self) -> Result<LegacyPayload, String> {
+        match self {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::InterruptController(_) => {
+                Err("controller state belongs to the native execution cut".into())
+            }
+            Self::Serial(device) => {
+                let device = device.try_lock().map_err(|_| "serial lock")?;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    device
+                        .capture_state()
+                        .map(LegacyPayload::Uart)
+                        .map_err(|error| error.to_string())
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    device
+                        .capture_state()
+                        .map(LegacyPayload::Pl011)
+                        .map_err(|error| error.to_string())
+                }
+                #[cfg(target_arch = "riscv64")]
+                {
+                    let _ = device;
+                    Err("riscv execution state unsupported".into())
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            Self::Cmos(device) => Ok(LegacyPayload::Cmos(
+                device.try_lock().map_err(|_| "CMOS lock")?.capture_state(),
+            )),
+            #[cfg(target_arch = "x86_64")]
+            Self::I8042(device) => device
+                .try_lock()
+                .map_err(|_| "i8042 lock")?
+                .capture_state()
+                .map(LegacyPayload::I8042)
+                .map_err(|error| error.to_string()),
+            #[cfg(target_arch = "aarch64")]
+            Self::Rtc(device) => device
+                .try_lock()
+                .map_err(|_| "RTC lock")?
+                .capture_state()
+                .map(LegacyPayload::Rtc)
+                .map_err(|error| error.to_string()),
+            #[cfg(target_arch = "aarch64")]
+            Self::Gpio(device) => Ok(LegacyPayload::Gpio(
+                device.try_lock().map_err(|_| "GPIO lock")?.capture_state(),
+            )),
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub fn install(&self, _payload: &LegacyPayload) -> Result<(), String> {
+        Err("execution state excluded for this architecture".into())
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub fn install(&self, payload: &LegacyPayload) -> Result<(), String> {
+        let result = match (self, payload) {
+            #[cfg(target_arch = "x86_64")]
+            (Self::Serial(device), LegacyPayload::Uart(state)) => device
+                .try_lock()
+                .map_err(|_| "serial lock")?
+                .install_state(state),
+            #[cfg(target_arch = "aarch64")]
+            (Self::Serial(device), LegacyPayload::Pl011(state)) => device
+                .try_lock()
+                .map_err(|_| "serial lock")?
+                .install_state(state),
+            #[cfg(target_arch = "x86_64")]
+            (Self::Cmos(device), LegacyPayload::Cmos(state)) => device
+                .try_lock()
+                .map_err(|_| "CMOS lock")?
+                .install_state(state),
+            #[cfg(target_arch = "x86_64")]
+            (Self::I8042(device), LegacyPayload::I8042(state)) => device
+                .try_lock()
+                .map_err(|_| "i8042 lock")?
+                .install_state(state),
+            #[cfg(target_arch = "aarch64")]
+            (Self::Rtc(device), LegacyPayload::Rtc(state)) => device
+                .try_lock()
+                .map_err(|_| "RTC lock")?
+                .install_state(state),
+            #[cfg(target_arch = "aarch64")]
+            (Self::Gpio(device), LegacyPayload::Gpio(state)) => device
+                .try_lock()
+                .map_err(|_| "GPIO lock")?
+                .install_state(state),
+            _ => return Err("legacy payload kind mismatch".into()),
+        };
+        result.map_err(|error| error.to_string())
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttachmentIdentity {
     pub device_type: DeviceType,
@@ -124,7 +243,7 @@ enum Transition {
 
 pub struct DeviceQuiescence {
     attachments: Vec<TransportAttachment>,
-    legacy: Vec<LegacyAttachment>,
+    legacy: Vec<LegacyParticipant>,
     request: Option<BarrierRequest>,
     transition: Transition,
 }
@@ -145,9 +264,119 @@ impl DeviceQuiescence {
         self.request
     }
 
-    #[cfg(all(test, target_arch = "x86_64"))]
-    pub fn legacy_attachments(&self) -> &[LegacyAttachment] {
-        &self.legacy
+    pub fn legacy_attachments(&self) -> Vec<LegacyAttachment> {
+        self.legacy
+            .iter()
+            .map(|participant| participant.identity)
+            .collect()
+    }
+
+    pub fn has_transports(&self) -> bool {
+        !self.attachments.is_empty()
+    }
+
+    pub fn attachment_identities(&self) -> Vec<AttachmentIdentity> {
+        self.attachments
+            .iter()
+            .map(|attachment| attachment.identity.clone())
+            .collect()
+    }
+
+    pub fn prepare_restore(
+        &mut self,
+        request: BarrierRequest,
+        states: &[crate::vmm::execution::device_restore::RestoreDeviceBinding],
+    ) -> Result<(), String> {
+        if self.request.is_some()
+            || self.attachments.len() != states.len()
+            || self
+                .attachments
+                .iter()
+                .zip(states)
+                .any(|(actual, saved)| actual.identity != saved.identity)
+        {
+            return Err("restore attachment inventory mismatch".into());
+        }
+        self.request = Some(request);
+        self.transition = Transition::Quiesce;
+        for (attachment, saved) in self.attachments.iter_mut().zip(states) {
+            attachment.attempted = true;
+            attachment.accepted = true;
+            attachment
+                .transport
+                .try_lock()
+                .map_err(|_| "restore transport lock")?
+                .prepare_restore(request, &saved.state, &saved.payload)
+                .map_err(|error| format!("restore {:?}: {error}", saved.identity))?;
+        }
+        Ok(())
+    }
+
+    pub fn retain_legacy_device(&mut self, identity: LegacyAttachment, handle: LegacyHandle) {
+        self.legacy.push(LegacyParticipant {
+            identity,
+            handle: Some(handle),
+        });
+    }
+
+    pub fn capture_legacy(&self) -> Result<Vec<LegacyState>, String> {
+        let mut states = Vec::with_capacity(self.legacy.len());
+        for participant in &self.legacy {
+            if participant.identity.kind == LegacyKind::InterruptController {
+                continue;
+            }
+            let payload = participant
+                .handle
+                .as_ref()
+                .ok_or_else(|| {
+                    format!(
+                        "missing {:?} provider at {:#x}",
+                        participant.identity.kind, participant.identity.address
+                    )
+                })?
+                .capture()
+                .map_err(|error| {
+                    format!(
+                        "{:?} at {:#x}: {error}",
+                        participant.identity.kind, participant.identity.address
+                    )
+                })?;
+            states.push(LegacyState {
+                address: participant.identity.address,
+                irq: participant.identity.irq,
+                payload,
+            });
+        }
+        states.sort_by_key(|state| (state.payload.tag(), state.address));
+        Ok(states)
+    }
+
+    pub fn install_legacy(&self, states: &[LegacyState]) -> Result<(), String> {
+        let expected = self.capture_legacy()?;
+        if expected.len() != states.len()
+            || expected.iter().zip(states).any(|(current, saved)| {
+                (current.payload.tag(), current.address, current.irq)
+                    != (saved.payload.tag(), saved.address, saved.irq)
+            })
+        {
+            return Err("legacy installation inventory mismatch".into());
+        }
+        for state in states {
+            let participant = self
+                .legacy
+                .iter()
+                .find(|participant| {
+                    participant.identity.address == state.address
+                        && participant.identity.irq == state.irq
+                })
+                .ok_or("missing legacy participant")?;
+            participant
+                .handle
+                .as_ref()
+                .ok_or("missing legacy provider")?
+                .install(&state.payload)?;
+        }
+        Ok(())
     }
 
     pub fn retain_transport(
@@ -167,12 +396,32 @@ impl DeviceQuiescence {
     }
 
     pub fn retain_legacy(&mut self, attachment: LegacyAttachment) {
-        self.legacy.push(attachment);
+        self.legacy.push(LegacyParticipant {
+            identity: attachment,
+            handle: None,
+        });
     }
 
     pub fn preflight_quiesce(&self) -> Result<(), ManagerError> {
-        if let Some(legacy) = self.legacy.first() {
-            return Err(self.error(None, ManagerFault::MissingLegacyProvider(*legacy)));
+        if let Some(legacy) = self
+            .legacy
+            .iter()
+            .find(|participant| participant.handle.is_none())
+        {
+            return Err(self.error(None, ManagerFault::MissingLegacyProvider(legacy.identity)));
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        for legacy in &self.legacy {
+            if let Some(LegacyHandle::InterruptController(controller)) = &legacy.handle {
+                let controller = controller
+                    .try_lock()
+                    .map_err(|_| self.error(None, ManagerFault::LockBusy))?;
+                if !controller.execution_state_supported() {
+                    return Err(
+                        self.error(None, ManagerFault::MissingLegacyProvider(legacy.identity))
+                    );
+                }
+            }
         }
         for (index, attachment) in self.attachments.iter().enumerate() {
             let transport = attachment
@@ -237,7 +486,10 @@ impl DeviceQuiescence {
 
     pub fn fully_quiesced(&self, key: BarrierKey) -> Result<bool, ManagerError> {
         self.check_key(key, Transition::Quiesce)?;
-        if !self.legacy.is_empty()
+        if self
+            .legacy
+            .iter()
+            .any(|participant| participant.handle.is_none())
             || self
                 .attachments
                 .iter()

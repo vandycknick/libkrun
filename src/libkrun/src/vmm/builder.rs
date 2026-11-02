@@ -3,6 +3,19 @@
 
 //! Enables pre-boot setup, instantiation and booting of a Firecracker VMM.
 
+#[cfg(all(
+    not(feature = "tee"),
+    any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
+#[allow(dead_code)]
+pub(crate) mod restore;
+
 use crossbeam_channel::Sender;
 #[cfg(target_os = "macos")]
 use crossbeam_channel::unbounded;
@@ -25,7 +38,7 @@ use utils::windows::SendHandle;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 
-use super::{Error, Vmm};
+use crate::vmm::{Error, Vmm};
 
 #[cfg(target_arch = "x86_64")]
 use crate::vmm::device_manager::legacy::PortIODeviceManager;
@@ -1196,7 +1209,7 @@ pub fn build_microvm(
     // We use this atomic to record the exit code set by init/init.c in the VM.
     let exit_code = Arc::new(AtomicI32::new(i32::MAX));
 
-    let control = crate::vmm::control::ControlOwner::new()
+    let control = crate::vmm::control::ControlOwner::new(crate::vmm::control::BarrierGeneration(0))
         .map_err(Error::EventFd)
         .map_err(StartMicrovmError::Internal)?;
 
@@ -1211,6 +1224,8 @@ pub fn build_microvm(
         vm,
         mmio_device_manager,
         control,
+        execution: crate::vmm::execution::runtime::ExecutionOwner::default(),
+        execution_controller: intc.clone(),
     };
     // Set raw mode for FDs that are connected to legacy serial devices.
     for serial_tty in serial_ttys {
@@ -2214,7 +2229,7 @@ fn create_vcpus_aarch64(
     nested_enabled: bool,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
-    let mut boot_senders: HashMap<u64, Sender<u64>> = HashMap::new();
+    let mut boot_senders: HashMap<u64, Sender<hvf::state::CpuOn>> = HashMap::new();
 
     for cpu_index in 0..vcpu_config.vcpu_count {
         let (boot_sender, boot_receiver) = if cpu_index != 0 {

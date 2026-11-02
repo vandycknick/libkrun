@@ -12,6 +12,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use std::{fmt, io};
 
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+use crate::vmm::device_manager::quiescence::LegacyHandle;
 use crate::vmm::device_manager::quiescence::{
     AttachmentIdentity, DeviceQuiescence, LegacyAttachment, LegacyKind, ManagerError,
 };
@@ -212,6 +214,66 @@ pub struct MMIODeviceManager {
 }
 
 impl MMIODeviceManager {
+    pub fn execution_irq_routes(
+        &self,
+    ) -> std::result::Result<Vec<crate::vmm::execution::IrqRouteIdentity>, String> {
+        if self.route_worker.is_some() {
+            return Err("IRQ route ownership still in flight".into());
+        }
+        let mut routes = self
+            .routes
+            .iter()
+            .map(|route| crate::vmm::execution::IrqRouteIdentity {
+                gsi: route.gsi,
+                members: route.members.clone(),
+            })
+            .collect::<Vec<_>>();
+        for route in &mut routes {
+            route.members.sort_unstable();
+        }
+        routes.sort();
+        Ok(routes)
+    }
+
+    pub fn set_restore_position(&mut self, address: u64, irq: u32) -> Result<()> {
+        if self.route_request.is_some()
+            || irq < arch::IRQ_BASE
+            || irq > self.last_irq
+            || address < arch::MMIO_MEM_START
+            || address.checked_add(MMIO_LEN).is_none()
+            || !address.is_multiple_of(MMIO_LEN)
+        {
+            return Err(Error::BarrierActive);
+        }
+        self.mmio_base = address;
+        self.irq = irq;
+        Ok(())
+    }
+
+    pub fn register_restored_irq(
+        &mut self,
+        vm: &VmFd,
+        gsi: u32,
+        event: EventFd,
+        address: u64,
+    ) -> Result<()> {
+        if self.route_request.is_some() {
+            return Err(Error::BarrierActive);
+        }
+        self.routes.push(IrqRoute {
+            gsi,
+            members: vec![address],
+            event: Arc::new(event),
+            registered: false,
+        });
+        if let Some(route) = self.routes.last_mut() {
+            vm.register_irqfd(&route.event, gsi)
+                .map_err(Error::RegisterIrqFd)?;
+            route.registered = true;
+        }
+        Ok(())
+    }
+
     /// Create a new DeviceManager handling mmio devices (virtio net, block).
     pub fn new(mmio_base: &mut u64, irq_interval: (u32, u32)) -> MMIODeviceManager {
         if cfg!(any(target_arch = "aarch64", target_arch = "riscv64")) {
@@ -684,13 +746,16 @@ impl MMIODeviceManager {
         }
 
         self.bus
-            .insert(serial, self.mmio_base, MMIO_LEN)
+            .insert(serial.clone(), self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
-        self.quiescence.retain_legacy(LegacyAttachment {
-            kind: LegacyKind::Serial,
-            address: self.mmio_base,
-            irq: Some(self.irq),
-        });
+        self.quiescence.retain_legacy_device(
+            LegacyAttachment {
+                kind: LegacyKind::Serial,
+                address: self.mmio_base,
+                irq: Some(self.irq),
+            },
+            LegacyHandle::Serial(serial),
+        );
 
         cmdline
             .insert(
@@ -740,13 +805,16 @@ impl MMIODeviceManager {
         });
 
         self.bus
-            .insert(device, self.mmio_base, MMIO_LEN)
+            .insert(device.clone(), self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
-        self.quiescence.retain_legacy(LegacyAttachment {
-            kind: LegacyKind::Rtc,
-            address: self.mmio_base,
-            irq: Some(self.irq),
-        });
+        self.quiescence.retain_legacy_device(
+            LegacyAttachment {
+                kind: LegacyKind::Rtc,
+                address: self.mmio_base,
+                irq: Some(self.irq),
+            },
+            LegacyHandle::Rtc(device),
+        );
 
         let ret = self.mmio_base;
         self.id_to_dev_info.insert(
@@ -1100,7 +1168,7 @@ mod tests {
         legacy.com_evt_3.write(6).unwrap();
         assert_eq!(manager.routes[0].event.read().unwrap(), 2);
         assert_eq!(manager.routes[2].event.read().unwrap(), 6);
-        assert!(manager.preflight_quiesce().is_err());
+        assert!(manager.preflight_quiesce().is_ok());
         assert!(manager.retain_legacy_routes(&legacy).is_err());
         assert_eq!(manager.routes.len(), 5);
     }

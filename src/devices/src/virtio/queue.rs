@@ -458,7 +458,15 @@ impl Queue {
         mem: &RuntimeGuestMemory,
         state: &QueueState,
     ) -> Result<(), Error> {
-        if state.max_size != self.max_size {
+        Self::validate_restored_state(self.max_size, mem, state)
+    }
+
+    pub fn validate_restored_state(
+        max_size: u16,
+        mem: &RuntimeGuestMemory,
+        state: &QueueState,
+    ) -> Result<(), Error> {
+        if state.max_size != max_size {
             return Err(Error::InvalidMaxSize);
         }
         // Unready queues may contain partially negotiated sizes and addresses.

@@ -1,4 +1,5 @@
 use crossbeam_channel::Sender;
+use hvf::state::{CpuDisposition, SoftwareState, StateError};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
@@ -23,6 +24,7 @@ struct PerCPUInterruptControllerState {
     status: VcpuStatus,
     pending_irqs: VecDeque<u32>,
     wfe_sender: Option<Sender<u32>>,
+    wake_pending: bool,
 }
 
 impl PerCPUInterruptControllerState {
@@ -35,20 +37,26 @@ impl PerCPUInterruptControllerState {
 
         match self.status {
             VcpuStatus::Waiting => {
-                self.wfe_sender
-                    .as_mut()
-                    .unwrap()
-                    .send(self.vcpuid as u32)
-                    .unwrap();
+                self.wake_pending = true;
+                if let Some(sender) = &self.wfe_sender {
+                    let _ = sender.send(self.vcpuid as u32);
+                }
                 self.status = VcpuStatus::Running;
             }
             VcpuStatus::Running => {
-                vcpu_request_exit(self.vcpuid).unwrap();
+                if let Err(error) = vcpu_request_exit(self.vcpuid) {
+                    log::error!("HVF software IRQ wake failed: {error}");
+                }
             }
         }
     }
 
     fn should_wait(&mut self) -> bool {
+        if self.wake_pending {
+            self.wake_pending = false;
+            self.status = VcpuStatus::Running;
+            return false;
+        }
         if self.pending_irqs.is_empty() {
             self.status = VcpuStatus::Waiting;
             return true;
@@ -79,6 +87,7 @@ impl VcpuList {
                 status: VcpuStatus::Running,
                 pending_irqs: VecDeque::new(),
                 wfe_sender: None,
+                wake_pending: false,
             }));
         }
 
@@ -106,52 +115,113 @@ impl VcpuList {
             .set_irq_common(irq);
     }
 
-    pub fn register(&self, vcpuid: u64, wfe_sender: Sender<u32>) {
-        assert!(vcpuid < self.cpu_count);
-        self.vcpus[vcpuid as usize].lock().unwrap().wfe_sender = Some(wfe_sender);
+    pub fn register_owner(
+        &self,
+        logical_id: u8,
+        native_id: u64,
+        wfe_sender: Sender<u32>,
+    ) -> Result<(), StateError> {
+        let cpu = self
+            .vcpus
+            .get(usize::from(logical_id))
+            .ok_or(StateError("software CPU identity"))?;
+        let mut cpu = cpu
+            .lock()
+            .map_err(|_| StateError("software CPU lock poisoned"))?;
+        cpu.vcpuid = native_id;
+        cpu.wfe_sender = Some(wfe_sender);
+        Ok(())
+    }
+
+    fn owner_index(&self, native_id: u64) -> Option<usize> {
+        self.vcpus.iter().position(|cpu| {
+            cpu.lock()
+                .is_ok_and(|cpu| cpu.wfe_sender.is_some() && cpu.vcpuid == native_id)
+        })
+    }
+
+    pub fn capture_execution_state(
+        &self,
+        logical_id: u8,
+        disposition: CpuDisposition,
+    ) -> Result<SoftwareState, StateError> {
+        let cpu = self
+            .vcpus
+            .get(usize::from(logical_id))
+            .ok_or(StateError("software CPU identity"))?
+            .lock()
+            .map_err(|_| StateError("software CPU lock poisoned"))?;
+        if cpu.pending_irqs.len() > hvf::state::MAX_PENDING_IRQS {
+            return Err(StateError("software pending IRQ inventory"));
+        }
+        let state = SoftwareState {
+            disposition,
+            pending_irqs: cpu.pending_irqs.iter().copied().collect(),
+            wake_pending: cpu.wake_pending,
+            cpu_on: None,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn install_execution_state(
+        &self,
+        logical_id: u8,
+        state: &SoftwareState,
+    ) -> Result<(), StateError> {
+        state.validate()?;
+        let mut cpu = self
+            .vcpus
+            .get(usize::from(logical_id))
+            .ok_or(StateError("software CPU identity"))?
+            .lock()
+            .map_err(|_| StateError("software CPU lock poisoned"))?;
+        cpu.pending_irqs = state.pending_irqs.iter().copied().collect();
+        cpu.status = if state.disposition == CpuDisposition::Waiting {
+            VcpuStatus::Waiting
+        } else {
+            VcpuStatus::Running
+        };
+        cpu.wake_pending = state.wake_pending;
+        Ok(())
     }
 }
 
 impl Vcpus for VcpuList {
     fn set_vtimer_irq(&self, vcpuid: u64) {
-        assert!(vcpuid < self.cpu_count);
-        self.vcpus[vcpuid as usize]
-            .lock()
-            .unwrap()
-            .set_irq_common(VTIMER_IRQ);
+        if let Some(index) = self.owner_index(vcpuid)
+            && let Ok(mut cpu) = self.vcpus[index].lock()
+        {
+            cpu.set_irq_common(VTIMER_IRQ);
+        }
     }
 
     fn should_wait(&self, vcpuid: u64) -> bool {
-        assert!(vcpuid < self.cpu_count);
-        self.vcpus[vcpuid as usize].lock().unwrap().should_wait()
+        self.owner_index(vcpuid)
+            .and_then(|index| self.vcpus[index].lock().ok())
+            .is_some_and(|mut cpu| cpu.should_wait())
     }
 
     fn has_pending_irq(&self, vcpuid: u64) -> bool {
-        assert!(vcpuid < self.cpu_count);
-        self.vcpus[vcpuid as usize]
-            .lock()
-            .unwrap()
-            .has_pending_irq()
+        self.owner_index(vcpuid)
+            .and_then(|index| self.vcpus[index].lock().ok())
+            .is_some_and(|cpu| cpu.has_pending_irq())
     }
 
     fn get_pending_irq(&self, vcpuid: u64) -> u32 {
-        assert!(vcpuid < self.cpu_count);
-        self.vcpus[vcpuid as usize]
-            .lock()
-            .unwrap()
-            .get_pending_irq()
+        self.owner_index(vcpuid)
+            .and_then(|index| self.vcpus[index].lock().ok())
+            .map_or(GIC_INTID_SPURIOUS, |mut cpu| cpu.get_pending_irq())
     }
 
     fn handle_sysreg_read(&self, vcpuid: u64, reg: u32) -> Option<u64> {
-        assert!(vcpuid < self.cpu_count);
-
         if is_id_sysreg(reg) {
             return Some(0);
         }
 
         match reg {
             SYSREG_ICC_IAR1_EL1 => Some(
-                self.vcpus[vcpuid as usize]
+                self.vcpus[self.owner_index(vcpuid)?]
                     .lock()
                     .unwrap()
                     .get_pending_irq() as u64,
@@ -190,8 +260,6 @@ impl Vcpus for VcpuList {
     }
 
     fn handle_sysreg_write(&self, vcpuid: u64, reg: u32, val: u64) -> bool {
-        assert!(vcpuid < self.cpu_count);
-
         if is_id_sysreg(reg) {
             return true;
         }
@@ -252,5 +320,54 @@ impl Vcpus for VcpuList {
             | SYSREG_OSDLR_EL1 => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::legacy::vcpu::VcpuList;
+    use hvf::state::{CpuDisposition, SoftwareState};
+
+    #[test]
+    fn hvf_execution_software_capture_keeps_logical_native_identity_separate() {
+        let cpus = VcpuList::new(2);
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        cpus.register_owner(1, 77, sender).expect("register owner");
+        assert_eq!(cpus.owner_index(77), Some(1));
+        assert_eq!(cpus.owner_index(1), None);
+        let state = SoftwareState {
+            disposition: CpuDisposition::Waiting,
+            pending_irqs: vec![27, 4, 27],
+            wake_pending: true,
+            cpu_on: None,
+        };
+        cpus.install_execution_state(1, &state)
+            .expect("install software state");
+        assert_eq!(
+            cpus.capture_execution_state(1, CpuDisposition::Waiting)
+                .expect("capture software state"),
+            state
+        );
+        assert_eq!(
+            cpus.capture_execution_state(1, CpuDisposition::Waiting)
+                .expect("repeat capture"),
+            state
+        );
+    }
+
+    #[test]
+    fn hvf_execution_software_rejects_invalid_before_mutation() {
+        let cpus = VcpuList::new(1);
+        let original = cpus
+            .capture_execution_state(0, CpuDisposition::Offline)
+            .expect("offline state");
+        let mut invalid = original.clone();
+        invalid.pending_irqs.push(1023);
+        assert!(cpus.install_execution_state(0, &invalid).is_err());
+        assert_eq!(
+            cpus.capture_execution_state(0, CpuDisposition::Offline)
+                .expect("unchanged state"),
+            original
+        );
     }
 }

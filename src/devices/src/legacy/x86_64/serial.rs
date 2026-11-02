@@ -70,9 +70,60 @@ pub struct Serial {
     in_buffer: VecDeque<u8>,
     out: Option<Box<dyn io::Write + Send>>,
     input: Option<Box<dyn ReadableFd + Send>>,
+    input_closed: bool,
+    state_fault: bool,
 }
 
 impl Serial {
+    pub fn capture_state(&self) -> Result<crate::legacy::state::UartState, utils::state::Error> {
+        use crate::legacy::state::{MAX_SERIAL_INPUT, UartState};
+        if self.state_fault {
+            return Err(utils::state::Error::Invalid("UART terminality fault"));
+        }
+        if self.in_buffer.len() > MAX_SERIAL_INPUT {
+            return Err(utils::state::Error::Limit);
+        }
+        Ok(UartState {
+            interrupt_enable: self.interrupt_enable,
+            interrupt_identification: self.interrupt_identification,
+            line_control: self.line_control,
+            line_status: self.line_status,
+            modem_control: self.modem_control,
+            modem_status: self.modem_status,
+            scratch: self.scratch,
+            baud_divisor: self.baud_divisor,
+            input: self.in_buffer.iter().copied().collect(),
+            has_input: self.input.is_some(),
+            has_output: self.out.is_some(),
+            input_closed: self.input_closed,
+        })
+    }
+
+    pub fn install_state(
+        &mut self,
+        state: &crate::legacy::state::UartState,
+    ) -> Result<(), utils::state::Error> {
+        if state.input.len() > crate::legacy::state::MAX_SERIAL_INPUT
+            || state.interrupt_enable & !15 != 0
+        {
+            return Err(utils::state::Error::Invalid("UART state"));
+        }
+        if state.has_input != self.input.is_some() || state.has_output != self.out.is_some() {
+            return Err(utils::state::Error::Invalid("UART endpoint shape"));
+        }
+        self.interrupt_enable = state.interrupt_enable;
+        self.interrupt_identification = state.interrupt_identification;
+        self.line_control = state.line_control;
+        self.line_status = state.line_status;
+        self.modem_control = state.modem_control;
+        self.modem_status = state.modem_status;
+        self.scratch = state.scratch;
+        self.baud_divisor = state.baud_divisor;
+        self.in_buffer = state.input.iter().copied().collect();
+        self.input_closed = state.input_closed;
+        Ok(())
+    }
+
     pub fn new(
         interrupt_evt: EventFd,
         out: Option<Box<dyn io::Write + Send>>,
@@ -91,6 +142,8 @@ impl Serial {
             in_buffer: VecDeque::new(),
             out,
             input,
+            input_closed: false,
+            state_fault: false,
         }
     }
 
@@ -164,7 +217,11 @@ impl Serial {
     }
 
     fn trigger_interrupt(&mut self) -> io::Result<()> {
-        self.interrupt_evt.write(1)
+        let result = self.interrupt_evt.write(1);
+        if result.is_err() {
+            self.state_fault = true;
+        }
+        result
     }
 
     fn iir_reset(&mut self) {
@@ -253,6 +310,7 @@ impl BusDevice for Serial {
             return;
         }
         if let Err(e) = self.handle_write(offset as u8, data[0]) {
+            self.state_fault = true;
             error!("Failed the write to serial: {e}");
         }
     }
@@ -261,6 +319,9 @@ impl BusDevice for Serial {
 impl Subscriber for Serial {
     /// Handle a read event (EPOLLIN) on the serial input fd.
     fn process(&mut self, event: &EpollEvent, _: &mut EventManager) {
+        if self.input_closed {
+            return;
+        }
         let source = event.fd();
         let event_set = event.event_set();
 
@@ -277,11 +338,18 @@ impl Subscriber for Serial {
         {
             let mut out = [0u8; 32];
             match input.read(&mut out[..]) {
+                Ok(0) => self.input_closed = true,
                 Ok(count) => {
                     self.raw_input(&out[..count])
                         .unwrap_or_else(|e| warn!("Serial error on input: {e}"));
                 }
                 Err(e) => {
+                    if !matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) {
+                        self.state_fault = true;
+                    }
                     warn!("error while reading stdin: {e:?}");
                 }
             }
@@ -291,6 +359,9 @@ impl Subscriber for Serial {
     /// Initial registration of pollable objects.
     /// If serial input is present, register the serial input FD as readable.
     fn interest_list(&self) -> Vec<EpollEvent> {
+        if self.input_closed {
+            return Vec::new();
+        }
         match &self.input {
             Some(input) => vec![EpollEvent::new(EventSet::IN, input.as_raw_fd() as u64)],
             None => vec![],
@@ -559,5 +630,26 @@ mod tests {
         let mut data = [0u8];
         serial.read(0, u64::from(SCR), &mut data[..]);
         assert_eq!(data[0], 0x12_u8);
+    }
+    #[test]
+    fn legacy_uart_state_preserves_rx_without_irq_or_output_replay() {
+        let mut source = Serial::new_sink(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+        source.interrupt_enable = 1;
+        source.baud_divisor = 37;
+        source.scratch = 91;
+        source.raw_input(&[11, 13, 17]).unwrap();
+        let state = source.capture_state().unwrap();
+        let mut destination = Serial::new_sink(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+        destination.install_state(&state).unwrap();
+        assert!(destination.interrupt_evt.read().is_err());
+        assert_eq!(destination.capture_state().unwrap(), state);
+        assert_eq!(destination.handle_read(DATA), 11);
+        assert_eq!(destination.handle_read(DATA), 13);
+        assert_eq!(destination.handle_read(DATA), 17);
+        let before = source.capture_state().unwrap();
+        let mut bad = before.clone();
+        bad.has_output = true;
+        assert!(source.install_state(&bad).is_err());
+        assert_eq!(source.capture_state().unwrap(), before);
     }
 }

@@ -93,9 +93,48 @@ pub struct I8042Device {
     buf: [u8; BUF_SIZE],
     bhead: Wrapping<usize>,
     btail: Wrapping<usize>,
+    reset_pending: bool,
 }
 
 impl I8042Device {
+    pub fn capture_state(
+        &self,
+    ) -> std::result::Result<crate::legacy::state::I8042State, utils::state::Error> {
+        if self.reset_pending {
+            return Err(utils::state::Error::Invalid("i8042 reset pending"));
+        }
+        let length = self.buf_len();
+        if length > BUF_SIZE {
+            return Err(utils::state::Error::Invalid("i8042 buffer"));
+        }
+        Ok(crate::legacy::state::I8042State {
+            status: self.status,
+            control: self.control,
+            output: self.outp,
+            command: self.cmd,
+            buffer: self.buf,
+            head: (self.bhead.0 % BUF_SIZE) as u8,
+            length: length as u8,
+        })
+    }
+
+    pub fn install_state(
+        &mut self,
+        state: &crate::legacy::state::I8042State,
+    ) -> std::result::Result<(), utils::state::Error> {
+        if state.head >= BUF_SIZE as u8 || state.length > BUF_SIZE as u8 || self.reset_pending {
+            return Err(utils::state::Error::Invalid("i8042 state"));
+        }
+        self.status = state.status;
+        self.control = state.control;
+        self.outp = state.output;
+        self.cmd = state.command;
+        self.buf = state.buffer;
+        self.bhead = Wrapping(usize::from(state.head));
+        self.btail = self.bhead + Wrapping(usize::from(state.length));
+        Ok(())
+    }
+
     /// Constructs an i8042 device that will signal the given event when the guest requests it.
     pub fn new(reset_evt: EventFd, kbd_interrupt_evt: EventFd) -> I8042Device {
         I8042Device {
@@ -108,6 +147,7 @@ impl I8042Device {
             buf: [0; BUF_SIZE],
             bhead: Wrapping(0),
             btail: Wrapping(0),
+            reset_pending: false,
         }
     }
 
@@ -227,6 +267,7 @@ impl BusDevice for I8042Device {
 
         match offset {
             OFS_STATUS if data[0] == CMD_RESET_CPU => {
+                self.reset_pending = true;
                 // The guest wants to assert the CPU reset line. We handle that by triggering
                 // our exit event fd. Meaning Firecracker will be exiting as soon as the VMM
                 // thread wakes up to handle this event.
@@ -484,5 +525,32 @@ mod tests {
             i8042.trigger_kbd_interrupt().unwrap_err(),
             Error::KbdInterruptDisabled
         )
+    }
+    #[test]
+    fn legacy_i8042_state_preserves_wrapping_buffer_and_refuses_reset() {
+        let mut source = I8042Device::new(
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+        );
+        source.bhead = Wrapping(usize::MAX - 2);
+        source.btail = source.bhead;
+        for byte in 1..=8 {
+            source.push_byte(byte).unwrap();
+        }
+        let state = source.capture_state().unwrap();
+        let mut destination = I8042Device::new(
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+        );
+        destination.install_state(&state).unwrap();
+        assert!(destination.kbd_interrupt_evt.read().is_err());
+        for byte in 1..=8 {
+            assert_eq!(destination.pop_byte(), Some(byte));
+        }
+        source.reset_pending = true;
+        assert!(source.capture_state().is_err());
+        let mut bad = state;
+        bad.length = 17;
+        assert!(destination.install_state(&bad).is_err());
     }
 }

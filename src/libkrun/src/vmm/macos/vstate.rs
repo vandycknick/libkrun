@@ -16,8 +16,10 @@ use std::time::{Duration, Instant};
 use crate::api::capabilities::{HvfGicModel, HvfVmFacts, Observation};
 use crate::vmm::control::RequestId;
 use crate::vmm::control::{CpuAck, CpuAckKind, CpuCommand, CpuCommandKind, CpuSubmission};
+use crate::vmm::execution::{CpuExecutionInput, CpuExecutionState, CpuTimePlan};
 use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
 use crate::vmm::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
+use hvf::state::{CpuDisposition, CpuOn};
 
 use arch::ArchMemoryInfo;
 use arch::guest_memory::{RamLayout, RamPermissions, RamRegion, ReclaimError};
@@ -331,8 +333,8 @@ pub struct VcpuConfig {
 pub struct Vcpu {
     id: u8,
     boot_entry_addr: u64,
-    boot_receiver: Option<Receiver<u64>>,
-    boot_senders: Option<HashMap<u64, Sender<u64>>>,
+    boot_receiver: Option<Receiver<CpuOn>>,
+    boot_senders: Option<HashMap<u64, Sender<CpuOn>>>,
     fdt_addr: u64,
     mmio_bus: Option<devices::Bus>,
     exit_evt: EventFd,
@@ -352,6 +354,7 @@ pub struct Vcpu {
     vcpu_list: Arc<VcpuList>,
     reclaim_state: Arc<ReclaimState>,
     nested_enabled: bool,
+    restore_prepared: bool,
 }
 
 impl Vcpu {
@@ -369,7 +372,7 @@ impl Vcpu {
     pub fn new_aarch64(
         id: u8,
         boot_entry_addr: GuestAddress,
-        boot_receiver: Option<Receiver<u64>>,
+        boot_receiver: Option<Receiver<CpuOn>>,
         exit_evt: EventFd,
         vcpu_list: Arc<VcpuList>,
         reclaim_state: Arc<ReclaimState>,
@@ -398,6 +401,7 @@ impl Vcpu {
             vcpu_list,
             reclaim_state,
             nested_enabled,
+            restore_prepared: false,
         })
     }
 
@@ -420,7 +424,7 @@ impl Vcpu {
         self.mmio_bus = Some(mmio_bus);
     }
 
-    pub fn set_boot_senders(&mut self, boot_senders: HashMap<u64, Sender<u64>>) {
+    pub fn set_boot_senders(&mut self, boot_senders: HashMap<u64, Sender<CpuOn>>) {
         self.boot_senders = Some(boot_senders);
     }
 
@@ -432,6 +436,20 @@ impl Vcpu {
     pub fn configure_aarch64(&mut self, mem_info: &ArchMemoryInfo) -> Result<()> {
         self.fdt_addr = mem_info.fdt_addr;
 
+        Ok(())
+    }
+
+    pub fn prepare_restore(&mut self, state: &hvf::state::CpuState) -> Result<()> {
+        state
+            .validate()
+            .map_err(|error| Error::VmSetup(hvf::Error::ExecutionState(error)))?;
+        if state.logical_id != self.id || self.nested_enabled {
+            return Err(Error::VmSetup(hvf::Error::ExecutionState(
+                hvf::state::StateError("restore CPU identity or nested profile"),
+            )));
+        }
+        self.mpidr = state.mpidr;
+        self.restore_prepared = true;
         Ok(())
     }
 
@@ -491,7 +509,12 @@ impl Vcpu {
                     debug!("CpuOn: mpidr=0x{mpidr:x} entry=0x{entry:x} context_id={context_id}");
                     if let Some(boot_senders) = &self.boot_senders {
                         if let Some(sender) = boot_senders.get(&mpidr) {
-                            sender.send(entry).map_err(|_| Error::VcpuChannelClosed)?;
+                            sender
+                                .send(CpuOn {
+                                    entry,
+                                    context: context_id,
+                                })
+                                .map_err(|_| Error::VcpuChannelClosed)?;
                         }
                     } else {
                         error!("CpuOn request coming from an unexpected vCPU={}", self.id);
@@ -568,12 +591,15 @@ impl Vcpu {
         };
         let hvf_id = hvf_vcpu.id();
         let (wfe_sender, wfe_receiver) = unbounded();
-        self.vcpu_list.register(hvf_id, wfe_sender);
+        if let Err(error) = self.vcpu_list.register_owner(self.id, hvf_id, wfe_sender) {
+            let _ = ready_sender.send((Some(hvf_id), Some(error.to_string())));
+            return;
+        }
         let mut initialized = self.boot_receiver.is_none();
         let startup_error = hvf_vcpu
             .initialize(self.mpidr)
             .and_then(|()| {
-                if initialized {
+                if initialized && !self.restore_prepared {
                     hvf_vcpu.set_initial_state(self.boot_entry_addr, self.fdt_addr)
                 } else {
                     Ok(())
@@ -592,6 +618,15 @@ impl Vcpu {
         let mut prepared = None;
         let mut completion_failed = false;
         let mut waiting: Option<Option<Duration>> = None;
+        let framework = match &self._resources {
+            Some((_, resources)) => resources.framework(),
+            None => return,
+        };
+        let mut captured: Option<Arc<CpuExecutionState>> = None;
+        let mut installed: Option<Arc<CpuExecutionInput>> = None;
+        let mut installed_time: Option<(BarrierKey, Arc<CpuExecutionInput>)> = None;
+        let mut pending_cpu_on: Option<CpuOn> = None;
+        let mut capture_request: Option<RequestId> = None;
 
         loop {
             let command = match self.event_receiver.try_recv() {
@@ -605,13 +640,29 @@ impl Vcpu {
                     return;
                 }
                 Err(TryRecvError::Empty) if parked => self.event_receiver.recv().ok(),
+                Err(TryRecvError::Empty) if !initialized && pending_cpu_on.is_some() => {
+                    if let Some(start) = pending_cpu_on.take() {
+                        match hvf_vcpu
+                            .set_initial_state(start.entry, self.fdt_addr)
+                            .and_then(|()| hvf_vcpu.write_reg(0, start.context))
+                        {
+                            Ok(()) => initialized = true,
+                            Err(error) => {
+                                parked = true;
+                                terminal_fault = Some(error.to_string());
+                            }
+                        }
+                    }
+                    None
+                }
                 Err(TryRecvError::Empty) if !initialized => {
                     let boot = self.boot_receiver.as_ref().cloned().unwrap_or_else(never);
                     select! {
                         recv(self.event_receiver) -> command => command.ok(),
                         recv(boot) -> entry => {
                             match entry {
-                                Ok(entry) => match hvf_vcpu.set_initial_state(entry, self.fdt_addr) {
+                                Ok(start) => match hvf_vcpu.set_initial_state(start.entry, self.fdt_addr)
+                                    .and_then(|()| hvf_vcpu.write_reg(0, start.context)) {
                                     Ok(()) => initialized = true,
                                     Err(error) => {
                                         log::error!("CPU {} CPU_ON: {error}", self.id);
@@ -669,8 +720,13 @@ impl Vcpu {
                     CpuCommandKind::PrepareResume { .. } => CpuAckKind::Prepared,
                     CpuCommandKind::Release => CpuAckKind::Released,
                     CpuCommandKind::Stop => CpuAckKind::Stopped,
+                    CpuCommandKind::CaptureExecution => CpuAckKind::Captured,
+                    CpuCommandKind::InstallExecution => CpuAckKind::Installed,
+                    CpuCommandKind::PrepareExecutionTime => CpuAckKind::TimePrepared,
                 };
                 let mut stopped = false;
+                let mut execution = None;
+                let mut execution_mutated = false;
                 let outcome = match command.kind {
                     CpuCommandKind::Stop => {
                         parked = true;
@@ -695,6 +751,9 @@ impl Vcpu {
                                         timer_plan =
                                             hvf::VtimerResume::new(hvf_vcpu.vtimer_offset());
                                         prepared = None;
+                                        captured = None;
+                                        installed_time = None;
+                                        capture_request = None;
                                     }
                                     if let Some(error) = &terminal_fault {
                                         Err(error.clone())
@@ -714,25 +773,39 @@ impl Vcpu {
                             || key.generation != command.barrier.key.generation
                             || completion_failed
                             || terminal_fault.is_some()
+                            || self.restore_prepared && installed.is_none()
                         {
                             Err("HVF CPU is not parked at the requested key".to_owned())
                         } else {
-                            timer_plan.prepare(paused_ticks).and_then(|target| {
-                                if prepared.is_some_and(|previous| previous != command.barrier.key)
-                                {
-                                    return Err("HVF timer preparation key changed".to_owned());
+                            match hvf::state::resume_time_action(
+                                captured.is_some(),
+                                &command.barrier.key,
+                                installed_time.as_ref().map(|(key, _)| key),
+                                prepared.as_ref(),
+                                paused_ticks,
+                            )
+                            .map_err(|error| error.to_string())
+                            {
+                                Ok(hvf::state::ResumeTimeAction::RetainInstalledExecution) => {
+                                    Ok(())
                                 }
-                                hvf_vcpu
-                                    .set_vtimer_offset(target)
-                                    .map(|()| prepared = Some(command.barrier.key))
-                                    .map_err(|error| error.to_string())
-                            })
+                                Ok(hvf::state::ResumeTimeAction::PrepareOrdinaryOffset) => {
+                                    timer_plan.prepare(paused_ticks).and_then(|target| {
+                                        hvf_vcpu
+                                            .set_vtimer_offset(target)
+                                            .map(|()| prepared = Some(command.barrier.key))
+                                            .map_err(|error| error.to_string())
+                                    })
+                                }
+                                Err(error) => Err(error),
+                            }
                         }
                     }
                     CpuCommandKind::Release => {
                         if !parked
                             || completion_failed
                             || terminal_fault.is_some()
+                            || self.restore_prepared && installed.is_none()
                             || prepared != Some(command.barrier.key)
                         {
                             Err("HVF release lacks exact completed preparation".to_owned())
@@ -741,13 +814,171 @@ impl Vcpu {
                             Ok(())
                         }
                     }
+                    CpuCommandKind::CaptureExecution => {
+                        if !parked
+                            || key.generation != command.barrier.key.generation
+                            || captured.is_none() && key != command.barrier.key
+                            || completion_failed
+                            || terminal_fault.is_some()
+                        {
+                            Err("HVF capture requires the exact completed pause".to_owned())
+                        } else if let Some(state) = &captured {
+                            if capture_request == Some(command.request) {
+                                execution = Some(state.clone());
+                                Ok(())
+                            } else {
+                                prepared = None;
+                                installed_time = None;
+                                hvf_vcpu
+                                    .fence_execution_time()
+                                    .map_err(|error| error.to_string())
+                                    .map(|()| {
+                                        capture_request = Some(command.request);
+                                        execution = Some(state.clone());
+                                    })
+                            }
+                        } else {
+                            let disposition = if !initialized {
+                                CpuDisposition::Offline
+                            } else if waiting.is_some() {
+                                CpuDisposition::Waiting
+                            } else {
+                                CpuDisposition::Runnable
+                            };
+                            self.vcpu_list
+                                .capture_execution_state(self.id, disposition)
+                                .map_err(|error| error.to_string())
+                                .and_then(|mut software| {
+                                    if !initialized
+                                        && pending_cpu_on.is_none()
+                                        && let Some(boot) = &self.boot_receiver
+                                    {
+                                        match boot.try_recv() {
+                                            Ok(start) => pending_cpu_on = Some(start),
+                                            Err(TryRecvError::Empty) => {}
+                                            Err(TryRecvError::Disconnected) => {
+                                                return Err("HVF CPU_ON channel closed".to_owned());
+                                            }
+                                        }
+                                    }
+                                    software.cpu_on = pending_cpu_on;
+                                    hvf_vcpu
+                                        .capture_execution_state(self.id, software, &framework)
+                                        .map_err(|error| error.to_string())
+                                })
+                                .and_then(|state| {
+                                    let state = Arc::new(CpuExecutionState::Hvf(state));
+                                    captured = Some(state.clone());
+                                    hvf_vcpu
+                                        .fence_execution_time()
+                                        .map_err(|error| error.to_string())
+                                        .map(|()| {
+                                            capture_request = Some(command.request);
+                                            execution = Some(state);
+                                        })
+                                })
+                        }
+                    }
+                    CpuCommandKind::InstallExecution => {
+                        if !parked || !self.restore_prepared || terminal_fault.is_some() {
+                            Err("HVF install requires a fresh fenced restore".to_owned())
+                        } else if installed.is_some() {
+                            if installed == command.execution && command.barrier.key == key {
+                                Ok(())
+                            } else {
+                                Err("HVF install key/payload changed".to_owned())
+                            }
+                        } else {
+                            match command.execution.as_deref() {
+                                Some(CpuExecutionInput::Install(CpuExecutionState::Hvf(state)))
+                                    if state.logical_id == self.id && state.mpidr == self.mpidr =>
+                                {
+                                    execution_mutated = true;
+                                    hvf_vcpu
+                                        .install_execution_state(
+                                            state,
+                                            state.timer.offset,
+                                            &framework,
+                                        )
+                                        .map_err(|error| error.to_string())
+                                        .and_then(|()| {
+                                            self.vcpu_list
+                                                .install_execution_state(self.id, &state.software)
+                                                .map_err(|error| error.to_string())
+                                        })
+                                        .map(|()| {
+                                            initialized = state.software.disposition
+                                                != CpuDisposition::Offline;
+                                            waiting = (state.software.disposition
+                                                == CpuDisposition::Waiting)
+                                                .then_some(None);
+                                            pending_cpu_on = state.software.cpu_on;
+                                            captured = Some(Arc::new(CpuExecutionState::Hvf(
+                                                state.clone(),
+                                            )));
+                                            installed = command.execution.clone();
+                                            key = command.barrier.key;
+                                        })
+                                }
+                                _ => Err("HVF install payload/backend mismatch".to_owned()),
+                            }
+                        }
+                    }
+                    CpuCommandKind::PrepareExecutionTime => {
+                        if !parked
+                            || completion_failed
+                            || terminal_fault.is_some()
+                            || command.barrier.key.generation != key.generation
+                        {
+                            Err("HVF time preparation requires a fenced CPU".to_owned())
+                        } else if let Some((previous_key, previous)) = &installed_time {
+                            if *previous_key == command.barrier.key
+                                && Some(previous) == command.execution.as_ref()
+                            {
+                                Ok(())
+                            } else {
+                                Err("HVF time preparation key/payload changed".to_owned())
+                            }
+                        } else {
+                            match command.execution.as_deref() {
+                                Some(CpuExecutionInput::PrepareTime(CpuTimePlan::Hvf(plan)))
+                                    if plan.logical_id == self.id
+                                        && matches!(captured.as_deref(),
+                                            Some(CpuExecutionState::Hvf(state))
+                                                if state.timer == plan.timer) =>
+                                {
+                                    execution_mutated = true;
+                                    hvf_vcpu
+                                        .prepare_execution_time(&plan.timer, plan.absolute_offset)
+                                        .map_err(|error| error.to_string())
+                                        .map(|()| {
+                                            prepared = Some(command.barrier.key);
+                                            if waiting.is_some() {
+                                                waiting = Some(
+                                                    hvf_vcpu.execution_timer_wait(&plan.timer),
+                                                );
+                                            }
+                                            if let Some(input) = &command.execution {
+                                                installed_time =
+                                                    Some((command.barrier.key, input.clone()));
+                                            }
+                                        })
+                                }
+                                _ => Err("HVF time payload/backend mismatch".to_owned()),
+                            }
+                        }
+                    }
                 };
+                if outcome.is_err() && execution_mutated {
+                    terminal_fault = outcome.as_ref().err().cloned();
+                }
                 let _ = self.control_sender.send(CpuAck {
                     request: command.request,
                     key: command.barrier.key,
                     cpu_id: self.id,
                     kind: ack_kind,
                     result: outcome,
+                    execution,
                 });
                 let _ = self.exit_evt.write(1);
                 if stopped {
@@ -882,6 +1113,7 @@ impl Drop for VcpuHandle {
                     deadline: Instant::now(),
                 },
                 kind: CpuCommandKind::Stop,
+                execution: None,
             });
             if let Some(id) = self.hvf_id
                 && let Err(error) = hvf::vcpu_request_exit(id)

@@ -1,4 +1,6 @@
 pub(crate) mod cpu_control;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) mod execution;
 
 #[cfg(feature = "tee")]
 pub mod tee;

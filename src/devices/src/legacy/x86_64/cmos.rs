@@ -16,6 +16,25 @@ pub struct Cmos {
 }
 
 impl Cmos {
+    pub fn capture_state(&self) -> crate::legacy::state::CmosState {
+        crate::legacy::state::CmosState {
+            index: self.index,
+            data: self.data,
+        }
+    }
+
+    pub fn install_state(
+        &mut self,
+        state: &crate::legacy::state::CmosState,
+    ) -> Result<(), utils::state::Error> {
+        if state.index > INDEX_MASK {
+            return Err(utils::state::Error::Invalid("CMOS index"));
+        }
+        self.index = state.index;
+        self.data = state.data;
+        Ok(())
+    }
+
     pub fn new(mem_below_4g: u64, mem_above_4g: u64) -> Cmos {
         debug!("cmos: mem_below_4g={mem_below_4g} mem_above_4g={mem_above_4g}");
 

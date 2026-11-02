@@ -15,6 +15,8 @@ pub mod build_facts {
 use std::result;
 
 pub mod guest_memory;
+pub mod hvf_state;
+pub mod x86_state;
 
 #[derive(Default)]
 pub struct ArchMemoryInfo {

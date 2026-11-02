@@ -9,6 +9,7 @@ use crossbeam_channel::{Sender, bounded};
 pub use polly::event_manager::{BarrierGeneration, BarrierKey, BarrierRequest, OperationId};
 use utils::pollable_channel::{PollableChannelReciever, PollableChannelSender, pollable_channel};
 
+use crate::vmm::execution::{CpuExecutionInput, CpuExecutionState};
 use crate::vmm::vstate::VcpuHandle;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,21 +19,28 @@ pub struct RequestId(pub u64);
 pub enum CpuCommandKind {
     Park,
     PrepareResume { paused_ticks: u64 },
+    CaptureExecution,
+    InstallExecution,
+    PrepareExecutionTime,
     Release,
     Stop,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct CpuCommand {
     pub request: RequestId,
     pub barrier: BarrierRequest,
     pub kind: CpuCommandKind,
+    pub execution: Option<Arc<CpuExecutionInput>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CpuAckKind {
     Parked,
     Prepared,
+    Captured,
+    Installed,
+    TimePrepared,
     Released,
     Stopped,
 }
@@ -42,6 +50,9 @@ impl CpuCommandKind {
         match self {
             Self::Park => CpuAckKind::Parked,
             Self::PrepareResume { .. } => CpuAckKind::Prepared,
+            Self::CaptureExecution => CpuAckKind::Captured,
+            Self::InstallExecution => CpuAckKind::Installed,
+            Self::PrepareExecutionTime => CpuAckKind::TimePrepared,
             Self::Release => CpuAckKind::Released,
             Self::Stop => CpuAckKind::Stopped,
         }
@@ -55,6 +66,7 @@ pub struct CpuAck {
     pub cpu_id: u8,
     pub kind: CpuAckKind,
     pub result: Result<(), String>,
+    pub execution: Option<Arc<CpuExecutionState>>,
 }
 
 #[derive(Debug)]
@@ -113,6 +125,7 @@ pub enum ControlState {
     Running,
     Pausing { key: BarrierKey, failed: bool },
     Paused(PauseToken),
+    RestorePrepared { key: BarrierKey },
     Resuming { key: BarrierKey },
     RollingBack { key: BarrierKey },
     FailedFenced,
@@ -204,6 +217,7 @@ impl ControlClient {
 struct CpuSlot {
     accepted: bool,
     acknowledgement: Option<Result<(), String>>,
+    execution: Option<Arc<CpuExecutionState>>,
 }
 
 struct CpuBatch {
@@ -216,13 +230,45 @@ struct CpuBatch {
 pub(crate) struct CpuController {
     count: usize,
     batches: Vec<CpuBatch>,
+    released_any: bool,
 }
 
 impl CpuController {
+    #[cfg(any(
+        test,
+        all(
+            feature = "native-execution-probe",
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(feature = "tee")
+        )
+    ))]
+    pub fn release_may_have_run(&self) -> bool {
+        self.released_any
+    }
+
+    pub fn capture_complete(&self, request: RequestId, key: BarrierKey) -> bool {
+        self.batches.last().is_some_and(|batch| {
+            batch.command.request == request
+                && batch.command.barrier.key == key
+                && batch.command.kind == CpuCommandKind::CaptureExecution
+                && batch.slots.iter().all(|slot| {
+                    slot.accepted
+                        && matches!(slot.acknowledgement, Some(Ok(())))
+                        && slot.execution.is_some()
+                })
+        })
+    }
+
+    pub fn constructed_cpu(&mut self) {
+        self.count += 1;
+    }
+
     pub fn new(cpu_count: usize) -> Self {
         Self {
             count: cpu_count,
             batches: Vec::with_capacity(3),
+            released_any: false,
         }
     }
 
@@ -252,6 +298,39 @@ impl CpuController {
         kind: CpuCommandKind,
         handles: &[VcpuHandle],
     ) -> Result<(), ControlFailure> {
+        self.begin_execution(request, barrier, kind, &[], handles)
+    }
+
+    pub fn begin_execution(
+        &mut self,
+        request: RequestId,
+        barrier: BarrierRequest,
+        kind: CpuCommandKind,
+        inputs: &[Option<Arc<CpuExecutionInput>>],
+        handles: &[VcpuHandle],
+    ) -> Result<(), ControlFailure> {
+        let typed = matches!(
+            kind,
+            CpuCommandKind::InstallExecution | CpuCommandKind::PrepareExecutionTime
+        );
+        if (typed && inputs.len() != self.count)
+            || (!typed && !inputs.is_empty())
+            || inputs
+                .iter()
+                .enumerate()
+                .any(|(index, input)| match (kind, input.as_deref()) {
+                    (CpuCommandKind::InstallExecution, Some(CpuExecutionInput::Install(state))) => {
+                        usize::from(state.id()) != index
+                    }
+                    (
+                        CpuCommandKind::PrepareExecutionTime,
+                        Some(CpuExecutionInput::PrepareTime(_)),
+                    ) => false,
+                    _ => true,
+                })
+        {
+            return Err(ControlFailure::InvalidOperation);
+        }
         if handles.len() != self.count || self.count == 0 {
             return Err(ControlFailure::Unsupported(
                 "empty or changed CPU topology".into(),
@@ -272,16 +351,22 @@ impl CpuController {
             request,
             barrier,
             kind,
+            execution: None,
         };
         let mut batch = CpuBatch {
-            command,
+            command: command.clone(),
             slots: (0..self.count).map(|_| CpuSlot::default()).collect(),
         };
         let mut failure = None;
         for (index, handle) in handles.iter().enumerate() {
+            let mut command = command.clone();
+            command.execution = inputs.get(index).cloned().flatten();
             match handle.send_control(command) {
                 CpuSubmission::Accepted { kick_error } => {
                     batch.slots[index].accepted = true;
+                    if kind == CpuCommandKind::Release {
+                        self.released_any = true;
+                    }
                     if let Some(error) = kick_error {
                         failure.get_or_insert(ControlFailure::Participant(error));
                     }
@@ -308,7 +393,19 @@ impl CpuController {
                     && slot.accepted
                     && slot.acknowledgement.is_none()
                 {
-                    slot.acknowledgement = Some(ack.result);
+                    let payload_valid = if ack.kind == CpuAckKind::Captured && ack.result.is_ok() {
+                        ack.execution.as_ref().is_some_and(|state| {
+                            state.id() == ack.cpu_id && state.validate().is_ok()
+                        })
+                    } else {
+                        ack.execution.is_none()
+                    };
+                    if payload_valid {
+                        slot.execution = ack.execution;
+                        slot.acknowledgement = Some(ack.result);
+                    } else {
+                        slot.acknowledgement = Some(Err("CPU reply payload/phase mismatch".into()));
+                    }
                 }
                 return;
             }
@@ -369,6 +466,39 @@ impl CpuController {
             Poll::Pending
         }
     }
+
+    pub fn captured(&self) -> Result<Vec<Arc<CpuExecutionState>>, ControlFailure> {
+        let batch = self
+            .batches
+            .last()
+            .ok_or(ControlFailure::InvalidOperation)?;
+        if batch.command.kind != CpuCommandKind::CaptureExecution {
+            return Err(ControlFailure::InvalidOperation);
+        }
+        batch
+            .slots
+            .iter()
+            .map(|slot| {
+                if !slot.accepted || !matches!(slot.acknowledgement, Some(Ok(()))) {
+                    return Err(ControlFailure::Busy);
+                }
+                slot.execution.clone().ok_or_else(|| {
+                    ControlFailure::Participant("missing captured CPU payload".into())
+                })
+            })
+            .collect()
+    }
+
+    pub fn parked(&self, key: BarrierKey) -> bool {
+        self.batches.last().is_some_and(|batch| {
+            batch.command.kind == CpuCommandKind::Park
+                && batch.command.barrier.key == key
+                && batch
+                    .slots
+                    .iter()
+                    .all(|slot| slot.accepted && matches!(slot.acknowledgement, Some(Ok(()))))
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -377,6 +507,12 @@ pub(crate) enum Phase {
     Devices,
     Maintenance,
     Routes,
+    Cut,
+    RecoverCut,
+    PrepareTime,
+    CpuRefence,
+    CpuPrepare,
+    Prepared,
     CancelPark,
     CancelDevices,
     Rearm,
@@ -411,7 +547,7 @@ pub(crate) struct ControlOwner {
 }
 
 impl ControlOwner {
-    pub fn new() -> std::io::Result<Self> {
+    pub fn new(generation: BarrierGeneration) -> std::io::Result<Self> {
         let (client, receiver) = ControlClient::channel()?;
         Ok(Self {
             client,
@@ -420,7 +556,7 @@ impl ControlOwner {
             active: None,
             cpus: CpuController::new(0),
             run: Arc::new(()),
-            generation: 0,
+            generation: generation.0,
             last_operation: 0,
         })
     }
@@ -549,6 +685,25 @@ impl crate::vmm::Vmm {
                 self.mmio_device_manager
                     .preflight_quiesce()
                     .map_err(|error| ControlFailure::Unsupported(error.to_string()))?;
+                if cfg!(feature = "tee")
+                    || !self
+                        .execution_controller
+                        .try_lock()
+                        .map_err(|_| {
+                            ControlFailure::Unsupported("interrupt controller lock".into())
+                        })?
+                        .execution_state_supported()
+                {
+                    return Err(ControlFailure::Unsupported(
+                        "execution controller profile".into(),
+                    ));
+                }
+                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                if self.execution.profile.is_none() {
+                    return Err(ControlFailure::Unsupported(
+                        "execution clock/PIT profile not admitted".into(),
+                    ));
+                }
                 self.control.reserve(request.operation)?;
                 let barrier = BarrierRequest {
                     key: self.control.next_key(request.operation)?,
@@ -612,13 +767,12 @@ impl crate::vmm::Vmm {
                     deadline: request.deadline,
                 };
                 active.request = request;
-                active.phase = Phase::Rearm;
+                active.phase = Phase::PrepareTime;
                 active.failed = false;
                 self.control.state = ControlState::Resuming {
                     key: active.barrier.key,
                 };
                 self.control.active = Some(active);
-                self.begin_rearm();
                 Ok(())
             }
             RequestKind::CancelPause(original) => {
@@ -675,7 +829,7 @@ impl crate::vmm::Vmm {
         if let Some(active) = &mut self.control.active {
             active.failed = true;
             self.control.state = match active.phase {
-                Phase::Park | Phase::Devices | Phase::Maintenance | Phase::Routes => {
+                Phase::Park | Phase::Devices | Phase::Maintenance | Phase::Routes | Phase::Cut => {
                     ControlState::Pausing {
                         key: active.original,
                         failed: true,
@@ -684,30 +838,10 @@ impl crate::vmm::Vmm {
                 Phase::Stop => ControlState::Stopping,
                 _ => ControlState::FailedFenced,
             };
+            if self.control.state == ControlState::FailedFenced {
+                self.execution.failed_install = true;
+            }
             let _ = active.request.reply.try_send(Err(error));
-        }
-    }
-
-    fn begin_rearm(&mut self) {
-        let Some(active) = &mut self.control.active else {
-            return;
-        };
-        if !active.routes_begun {
-            active.phase = Phase::ResumeDevices;
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        let result = self.mmio_device_manager.begin_irq_rearm(
-            self.vm.fd_owner(),
-            active.original,
-            active.barrier,
-        );
-        #[cfg(target_os = "macos")]
-        let result = self
-            .mmio_device_manager
-            .begin_irq_rearm(active.original, active.barrier);
-        if let Err(error) = result {
-            self.fail_control(ControlFailure::Participant(error.to_string()));
         }
     }
 
@@ -846,6 +980,15 @@ impl crate::vmm::Vmm {
                 if Instant::now() >= active.barrier.deadline {
                     return Err(ControlFailure::Deadline);
                 }
+                self.begin_execution_cut(active.request.id, active.barrier)
+                    .map_err(ControlFailure::Participant)?;
+                active.phase = Phase::Cut;
+            }
+            Phase::Cut => {
+                match self.poll_execution_cut() {
+                    Poll::Pending => return Ok(false),
+                    Poll::Ready(result) => result.map_err(ControlFailure::Participant)?,
+                }
                 let token = self.control.token(active.original, active.owner);
                 self.control.state = ControlState::Paused(token.clone());
                 let _ = active
@@ -876,7 +1019,72 @@ impl crate::vmm::Vmm {
                         return Ok(false);
                     }
                 }
-                active.phase = Phase::Rearm;
+                active.phase = Phase::PrepareTime;
+            }
+            Phase::RecoverCut => {
+                match self.poll_execution_cut() {
+                    Poll::Pending => return Ok(false),
+                    Poll::Ready(result) => result.map_err(ControlFailure::Participant)?,
+                }
+                active.phase = Phase::PrepareTime;
+            }
+            Phase::PrepareTime => {
+                if self.execution.has_cut_work() {
+                    if self.execution.retained.is_none() {
+                        self.begin_execution_cut(
+                            active.request.id,
+                            BarrierRequest {
+                                key: active.original,
+                                deadline: active.barrier.deadline,
+                            },
+                        )
+                        .map_err(ControlFailure::Participant)?;
+                        active.phase = Phase::RecoverCut;
+                    } else {
+                        self.begin_execution_refence(active.request.id, active.barrier)
+                            .map_err(ControlFailure::Participant)?;
+                        active.phase = Phase::CpuRefence;
+                    }
+                } else {
+                    let paused_ticks = cpu_clock()
+                        .checked_sub(active.cpu_parked_at.unwrap_or_else(cpu_clock))
+                        .ok_or(ControlFailure::Exhausted)?;
+                    self.control.cpus.begin(
+                        active.request.id,
+                        active.barrier,
+                        CpuCommandKind::PrepareResume { paused_ticks },
+                        &self.vcpus_handles,
+                    )?;
+                    active.phase = Phase::Prepared;
+                }
+            }
+            Phase::CpuRefence => {
+                match self.control.cpus.poll(&mut self.vcpus_handles) {
+                    Poll::Pending => return Ok(false),
+                    Poll::Ready(result) => result?,
+                }
+                self.begin_execution_time(active.request.id, active.barrier)
+                    .map_err(ControlFailure::Participant)?;
+                active.phase = Phase::CpuPrepare;
+            }
+            Phase::CpuPrepare => {
+                match self.control.cpus.poll(&mut self.vcpus_handles) {
+                    Poll::Pending => return Ok(false),
+                    Poll::Ready(result) => result?,
+                }
+                self.control.cpus.begin(
+                    active.request.id,
+                    active.barrier,
+                    CpuCommandKind::PrepareResume { paused_ticks: 0 },
+                    &self.vcpus_handles,
+                )?;
+                active.phase = Phase::Prepared;
+            }
+            Phase::Prepared => {
+                match self.control.cpus.poll(&mut self.vcpus_handles) {
+                    Poll::Pending => return Ok(false),
+                    Poll::Ready(result) => result?,
+                }
                 if active.routes_begun {
                     #[cfg(target_os = "linux")]
                     let result = self.mmio_device_manager.begin_irq_rearm(
@@ -889,6 +1097,7 @@ impl crate::vmm::Vmm {
                         .mmio_device_manager
                         .begin_irq_rearm(active.original, active.barrier);
                     result.map_err(|error| ControlFailure::Participant(error.to_string()))?;
+                    active.phase = Phase::Rearm;
                 } else {
                     active.phase = Phase::ResumeDevices;
                 }
@@ -933,13 +1142,10 @@ impl crate::vmm::Vmm {
                 events
                     .reopen_ingress(active.original, active.barrier)
                     .map_err(|error| ControlFailure::Participant(format!("{error:?}")))?;
-                let paused_ticks = cpu_clock()
-                    .checked_sub(active.cpu_parked_at.unwrap_or_else(cpu_clock))
-                    .ok_or(ControlFailure::Exhausted)?;
                 self.control.cpus.begin(
                     active.request.id,
                     active.barrier,
-                    CpuCommandKind::PrepareResume { paused_ticks },
+                    CpuCommandKind::Release,
                     &self.vcpus_handles,
                 )?;
                 active.phase = Phase::Release;
@@ -949,28 +1155,10 @@ impl crate::vmm::Vmm {
                     Poll::Pending => return Ok(false),
                     Poll::Ready(result) => result?,
                 }
-                if self
-                    .control
-                    .cpus
-                    .active_request()
-                    .is_some_and(|(_, _, kind)| {
-                        matches!(kind, CpuCommandKind::PrepareResume { .. })
-                    })
-                {
-                    self.control.cpus.begin(
-                        active.request.id,
-                        active.barrier,
-                        CpuCommandKind::Release,
-                        &self.vcpus_handles,
-                    )?;
-                } else {
-                    if Instant::now() >= active.barrier.deadline {
-                        return Err(ControlFailure::Deadline);
-                    }
-                    self.control.state = ControlState::Running;
-                    let _ = active.request.reply.try_send(Ok(ControlReply::Complete));
-                    return Ok(true);
-                }
+                self.finish_execution_release();
+                self.control.state = ControlState::Running;
+                let _ = active.request.reply.try_send(Ok(ControlReply::Complete));
+                return Ok(true);
             }
             Phase::Stop => {
                 match self.control.cpus.poll(&mut self.vcpus_handles) {
@@ -1032,14 +1220,17 @@ mod tests {
                         deadline: Instant::now() + Duration::from_secs(1),
                     },
                     kind: CpuCommandKind::Park,
+                    execution: None,
                 },
                 slots: (0..2)
                     .map(|_| CpuSlot {
                         accepted: true,
                         acknowledgement: None,
+                        execution: None,
                     })
                     .collect(),
             }],
+            released_any: false,
         }
     }
 
@@ -1050,6 +1241,7 @@ mod tests {
             cpu_id,
             kind: CpuAckKind::Parked,
             result: Ok(()),
+            execution: None,
         }
     }
 
@@ -1099,8 +1291,8 @@ mod tests {
 
     #[test]
     fn control_tokens_are_run_bound_and_consumed() {
-        let mut owner = ControlOwner::new().unwrap();
-        let foreign = ControlOwner::new().unwrap();
+        let mut owner = ControlOwner::new(BarrierGeneration(0)).unwrap();
+        let foreign = ControlOwner::new(BarrierGeneration(0)).unwrap();
         let token = owner.token(key(), PauseOwner::User);
         owner.state = ControlState::Paused(token.clone());
         assert!(owner.validate_token(&token));
@@ -1123,7 +1315,7 @@ mod tests {
     fn cpu_journal_reconciliation_keeps_late_original_ownership() {
         let mut journal = journal();
         let deadline = journal.batches[0].command.barrier.deadline;
-        let original = journal.batches[0].command;
+        let original = journal.batches[0].command.clone();
         journal.batches.push(CpuBatch {
             command: CpuCommand {
                 request: RequestId(8),
@@ -1133,6 +1325,7 @@ mod tests {
                 .map(|_| CpuSlot {
                     accepted: true,
                     acknowledgement: None,
+                    execution: None,
                 })
                 .collect(),
         });
@@ -1155,10 +1348,48 @@ mod tests {
 
     #[test]
     fn control_operation_ids_never_reuse_authority() {
-        let mut owner = ControlOwner::new().unwrap();
+        let mut owner = ControlOwner::new(BarrierGeneration(0)).unwrap();
         assert!(owner.reserve(OperationId(1)).is_ok());
         assert!(owner.reserve(OperationId(1)).is_err());
         assert!(owner.reserve(OperationId(0)).is_err());
         assert!(owner.reserve(OperationId(2)).is_ok());
+    }
+    #[test]
+    fn cpu_journal_capture_requires_typed_payload_not_generic_success() {
+        let mut controller = journal();
+        controller.batches[0].command.kind = CpuCommandKind::CaptureExecution;
+        let mut reply = ack(0);
+        reply.kind = CpuAckKind::Captured;
+        controller.acknowledge(0, reply);
+        assert!(matches!(
+            controller.batches[0].slots[0].acknowledgement,
+            Some(Err(_))
+        ));
+        assert!(controller.captured().is_err());
+        assert!(!controller.release_may_have_run());
+    }
+
+    #[test]
+    fn control_restored_generation_advances_and_refuses_overflow() {
+        let installed = BarrierGeneration(41);
+        let mut owner = ControlOwner::new(installed).unwrap();
+        owner.state = ControlState::RestorePrepared {
+            key: BarrierKey {
+                operation: OperationId(0),
+                generation: installed,
+            },
+        };
+        let next = owner.next_key(OperationId(1)).unwrap();
+        assert_eq!(next.generation, BarrierGeneration(42));
+        assert!(next.generation.0 > installed.0);
+        assert_eq!(
+            owner.next_key(OperationId(2)).unwrap().generation,
+            BarrierGeneration(43)
+        );
+        let mut exhausted = ControlOwner::new(BarrierGeneration(u64::MAX)).unwrap();
+        assert!(matches!(
+            exhausted.next_key(OperationId(1)),
+            Err(crate::vmm::control::ControlFailure::Exhausted)
+        ));
     }
 }

@@ -40,6 +40,10 @@ use crate::vmm::linux::tee::inteltdx::{Error as TdxError, IntelTdx};
 #[cfg(feature = "amd-sev")]
 use kbs_types::Tee;
 
+use crate::vmm::execution::kvm::{KvmCpuState, KvmCpuTimePlan, KvmVmState};
+use crate::vmm::execution::{CpuExecutionInput, CpuExecutionState};
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use crate::vmm::linux::execution::{self, CpuCaptureConfig};
 #[cfg(feature = "tee")]
 use crate::vmm::resources::TeeConfig;
 use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
@@ -48,12 +52,7 @@ use cpuid::{VmSpec, c3, filter_cpuid, t2};
 #[cfg(not(feature = "tee"))]
 use kvm_bindings::kvm_userspace_memory_region;
 #[cfg(target_arch = "x86_64")]
-use kvm_bindings::{
-    CpuId, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
-    KVM_MAX_CPUID_ENTRIES, MsrList, Msrs, kvm_clock_data, kvm_debugregs, kvm_irqchip,
-    kvm_lapic_state, kvm_mp_state, kvm_pit_state2, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs,
-    kvm_xsave,
-};
+use kvm_bindings::{CpuId, KVM_MAX_CPUID_ENTRIES, MsrList};
 use kvm_bindings::{KVM_API_VERSION, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 #[cfg(feature = "tee")]
 use kvm_bindings::{KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_PRIVATE, kvm_enable_cap};
@@ -116,6 +115,9 @@ pub enum Error {
     #[cfg(target_arch = "aarch64")]
     /// Error configuring the general purpose aarch64 registers.
     REGSConfiguration(arch::aarch64::regs::Error),
+    #[cfg(target_arch = "aarch64")]
+    /// Failed to establish the shared physical/virtual guest counter epoch.
+    VmCounterOffset(String),
     #[cfg(target_arch = "riscv64")]
     /// Error configuring the general purpose riscv64 registers.
     REGSConfiguration(arch::riscv64::regs::Error),
@@ -158,62 +160,23 @@ pub enum Error {
     /// Cannot open the VCPU file descriptor.
     VcpuFd(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
-    /// Failed to get KVM vcpu debug regs.
-    VcpuGetDebugRegs(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to get KVM vcpu lapic.
-    VcpuGetLapic(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to get KVM vcpu mp state.
-    VcpuGetMpState(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to get KVM vcpu msrs.
-    VcpuGetMsrs(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
     /// Failed to get KVM vcpu regs.
     VcpuGetRegs(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
     /// Failed to get KVM vcpu sregs.
     VcpuGetSregs(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
-    /// Failed to get KVM vcpu event.
-    VcpuGetVcpuEvents(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to get KVM vcpu xcrs.
-    VcpuGetXcrs(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to get KVM vcpu xsave.
-    VcpuGetXsave(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu cpuid.
     VcpuSetCpuid(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
-    /// Failed to set KVM vcpu debug regs.
-    VcpuSetDebugRegs(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to set KVM vcpu lapic.
-    VcpuSetLapic(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu mp state.
     VcpuSetMpState(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to set KVM vcpu msrs.
-    VcpuSetMsrs(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu regs.
     VcpuSetRegs(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu sregs.
     VcpuSetSregs(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to set KVM vcpu event.
-    VcpuSetVcpuEvents(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to set KVM vcpu xcrs.
-    VcpuSetXcrs(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to set KVM vcpu xsave.
-    VcpuSetXsave(kvm_ioctls::Error),
     /// Cannot spawn a new vCPU thread.
     VcpuSpawn(io::Error),
     /// Cannot cleanly initialize vcpu TLS.
@@ -227,24 +190,6 @@ pub enum Error {
     VcpuUnsupportedHypercall,
     /// Cannot open the VM file descriptor.
     VmFd(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to get KVM vm pit state.
-    VmGetPit2(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to get KVM vm clock.
-    VmGetClock(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to get KVM vm irqchip.
-    VmGetIrqChip(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to set KVM vm pit state.
-    VmSetPit2(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to set KVM vm clock.
-    VmSetClock(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
-    /// Failed to set KVM vm irqchip.
-    VmSetIrqChip(kvm_ioctls::Error),
     /// Cannot configure the microvm.
     VmSetup(kvm_ioctls::Error),
     /// Failed to enable split IRQCHIP in vm
@@ -320,6 +265,8 @@ impl Display for Error {
                 f,
                 "Error configuring the general purpose aarch64 registers: {e:?}"
             ),
+            #[cfg(target_arch = "aarch64")]
+            VmCounterOffset(e) => write!(f, "Cannot establish the ARM common counter epoch: {e}"),
             #[cfg(target_arch = "riscv64")]
             REGSConfiguration(e) => write!(
                 f,
@@ -337,61 +284,23 @@ impl Display for Error {
                 "Error configuring the floating point related registers: {e:?}"
             ),
             #[cfg(target_arch = "x86_64")]
-            VcpuGetDebugRegs(e) => write!(f, "Failed to get KVM vcpu debug regs: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VcpuGetLapic(e) => write!(f, "Failed to get KVM vcpu lapic: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VcpuGetMpState(e) => write!(f, "Failed to get KVM vcpu mp state: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VcpuGetMsrs(e) => write!(f, "Failed to get KVM vcpu msrs: {e}"),
-            #[cfg(target_arch = "x86_64")]
             VcpuGetRegs(e) => write!(f, "Failed to get KVM vcpu regs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuGetSregs(e) => write!(f, "Failed to get KVM vcpu sregs: {e}"),
             #[cfg(target_arch = "x86_64")]
-            VcpuGetVcpuEvents(e) => write!(f, "Failed to get KVM vcpu event: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VcpuGetXcrs(e) => write!(f, "Failed to get KVM vcpu xcrs: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VcpuGetXsave(e) => write!(f, "Failed to get KVM vcpu xsave: {e}"),
-            #[cfg(target_arch = "x86_64")]
             VcpuSetCpuid(e) => write!(f, "Failed to set KVM vcpu cpuid: {e}"),
             #[cfg(target_arch = "x86_64")]
-            VcpuSetDebugRegs(e) => write!(f, "Failed to set KVM vcpu debug regs: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VcpuSetLapic(e) => write!(f, "Failed to set KVM vcpu lapic: {e}"),
-            #[cfg(target_arch = "x86_64")]
             VcpuSetMpState(e) => write!(f, "Failed to set KVM vcpu mp state: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VcpuSetMsrs(e) => write!(f, "Failed to set KVM vcpu msrs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetRegs(e) => write!(f, "Failed to set KVM vcpu regs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetSregs(e) => write!(f, "Failed to set KVM vcpu sregs: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VcpuSetVcpuEvents(e) => write!(f, "Failed to set KVM vcpu event: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VcpuSetXcrs(e) => write!(f, "Failed to set KVM vcpu xcrs: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VcpuSetXsave(e) => write!(f, "Failed to set KVM vcpu xsave: {e}"),
             VcpuSpawn(e) => write!(f, "Cannot spawn a new vCPU thread: {e}"),
             VcpuTlsInit => write!(f, "Cannot clean init vcpu TLS"),
             VcpuTlsNotPresent => write!(f, "Vcpu not present in TLS"),
             VcpuUnhandledKvmExit => write!(f, "Unexpected KVM_RUN exit reason"),
             #[cfg(feature = "tee")]
             VcpuUnsupportedHypercall => write!(f, "Unsupported KVM_EXIT_HYPERCALL"),
-            #[cfg(target_arch = "x86_64")]
-            VmGetPit2(e) => write!(f, "Failed to get KVM vm pit state: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VmGetClock(e) => write!(f, "Failed to get KVM vm clock: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VmGetIrqChip(e) => write!(f, "Failed to get KVM vm irqchip: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VmSetPit2(e) => write!(f, "Failed to set KVM vm pit state: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VmSetClock(e) => write!(f, "Failed to set KVM vm clock: {e}"),
-            #[cfg(target_arch = "x86_64")]
-            VmSetIrqChip(e) => write!(f, "Failed to set KVM vm irqchip: {e}"),
             #[cfg(target_arch = "aarch64")]
             VcpuArmPreferredTarget(e) => {
                 write!(f, "Error getting the Vcpu preferred target on Arm: {e}")
@@ -482,6 +391,16 @@ pub struct Vm {
     supported_cpuid: CpuId,
     #[cfg(target_arch = "x86_64")]
     supported_msrs: MsrList,
+    #[cfg(target_arch = "x86_64")]
+    retained_pit: Option<kvm_bindings::kvm_pit_state2>,
+    #[cfg(target_arch = "x86_64")]
+    execution_clock_observation: std::sync::Mutex<Option<execution::KvmClockObservation>>,
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    retained_execution: Option<KvmVmState>,
+    #[cfg(target_arch = "aarch64")]
+    execution_controller: Option<devices::legacy::IrqChip>,
+    #[cfg(target_arch = "aarch64")]
+    arm_counter_model: crate::vmm::execution::kvm::ArmCounterModel,
 
     #[cfg(feature = "amd-sev")]
     tee: Option<AmdSnp>,
@@ -499,6 +418,10 @@ impl Vm {
     pub fn new(kvm: &Kvm) -> Result<Self> {
         //create fd for interacting with kvm-vm specific functions
         let vm_fd = kvm.create_vm().map_err(Error::VmFd)?;
+        // Establish both counter views before any vCPU can execute, including cold sources.
+        #[cfg(target_arch = "aarch64")]
+        let arm_counter_model =
+            execution::initialize_counter_model(&vm_fd).map_err(Error::VmCounterOffset)?;
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         let supported_cpuid = kvm
@@ -515,6 +438,16 @@ impl Vm {
             supported_cpuid,
             #[cfg(target_arch = "x86_64")]
             supported_msrs,
+            #[cfg(target_arch = "x86_64")]
+            retained_pit: None,
+            #[cfg(target_arch = "x86_64")]
+            execution_clock_observation: std::sync::Mutex::new(None),
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            retained_execution: None,
+            #[cfg(target_arch = "aarch64")]
+            execution_controller: None,
+            #[cfg(target_arch = "aarch64")]
+            arm_counter_model,
         })
     }
 
@@ -551,6 +484,9 @@ impl Vm {
             next_mem_slot: 0,
             supported_cpuid,
             supported_msrs,
+            retained_pit: None,
+            execution_clock_observation: std::sync::Mutex::new(None),
+            retained_execution: None,
             tee,
             guest_memfds: Vec::new(),
         })
@@ -595,6 +531,9 @@ impl Vm {
             next_mem_slot: 0,
             supported_cpuid,
             supported_msrs,
+            retained_pit: None,
+            execution_clock_observation: std::sync::Mutex::new(None),
+            retained_execution: None,
             tdx: Some(IntelTdx::new()),
             guest_memfds: Vec::new(),
         })
@@ -850,79 +789,96 @@ impl Vm {
         Arc::clone(&self.fd)
     }
 
-    #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
-    /// Saves and returns the Kvm Vm state.
-    pub fn save_state(&self) -> Result<VmState> {
-        let pitstate = self.fd.get_pit2().map_err(Error::VmGetPit2)?;
-
-        let mut clock = self.fd.get_clock().map_err(Error::VmGetClock)?;
-        // This bit is not accepted in SET_CLOCK, clear it.
-        clock.flags &= !KVM_CLOCK_TSC_STABLE;
-
-        let mut pic_master = kvm_irqchip {
-            chip_id: KVM_IRQCHIP_PIC_MASTER,
-            ..Default::default()
-        };
-        self.fd
-            .get_irqchip(&mut pic_master)
-            .map_err(Error::VmGetIrqChip)?;
-
-        let mut pic_slave = kvm_irqchip {
-            chip_id: KVM_IRQCHIP_PIC_SLAVE,
-            ..Default::default()
-        };
-        self.fd
-            .get_irqchip(&mut pic_slave)
-            .map_err(Error::VmGetIrqChip)?;
-
-        let mut ioapic = kvm_irqchip {
-            chip_id: KVM_IRQCHIP_IOAPIC,
-            ..Default::default()
-        };
-        self.fd
-            .get_irqchip(&mut ioapic)
-            .map_err(Error::VmGetIrqChip)?;
-
-        Ok(VmState {
-            pitstate,
-            clock,
-            pic_master,
-            pic_slave,
-            ioapic,
-        })
+    pub(crate) fn capture_execution(
+        &mut self,
+        profile: &execution::KvmCaptureProfile,
+    ) -> std::result::Result<KvmVmState, String> {
+        if let Some(state) = &self.retained_execution {
+            return Ok(state.clone());
+        }
+        let state = execution::capture_vm(&self.fd, profile, &mut self.retained_pit)?;
+        self.retained_execution = Some(state.clone());
+        Ok(state)
     }
 
-    #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
-    /// Restores the Kvm Vm state.
-    pub fn restore_state(&self, state: &VmState) -> Result<()> {
-        self.fd
-            .set_pit2(&state.pitstate)
-            .map_err(Error::VmSetPit2)?;
-        self.fd.set_clock(&state.clock).map_err(Error::VmSetClock)?;
-        self.fd
-            .set_irqchip(&state.pic_master)
-            .map_err(Error::VmSetIrqChip)?;
-        self.fd
-            .set_irqchip(&state.pic_slave)
-            .map_err(Error::VmSetIrqChip)?;
-        self.fd
-            .set_irqchip(&state.ioapic)
-            .map_err(Error::VmSetIrqChip)?;
-        Ok(())
+    pub(crate) fn install_execution(&self, state: &KvmVmState) -> std::result::Result<(), String> {
+        execution::install_vm(&self.fd, state)
     }
-}
 
-#[allow(unused)]
-#[cfg(target_arch = "x86_64")]
-/// Structure holding VM kvm state.
-pub struct VmState {
-    pitstate: kvm_pit_state2,
-    clock: kvm_clock_data,
-    pic_master: kvm_irqchip,
-    pic_slave: kvm_irqchip,
-    ioapic: kvm_irqchip,
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn prepare_execution_time(
+        &self,
+        state: &KvmVmState,
+        cpus: &[KvmCpuState],
+    ) -> std::result::Result<Vec<KvmCpuTimePlan>, String> {
+        let mut observation = self
+            .execution_clock_observation
+            .lock()
+            .map_err(|_| "kvm/clock/observation-lock")?;
+        *observation = None;
+        execution::prepare_vm_time(&self.fd, state, cpus, &mut observation)
+    }
+
+    #[cfg(all(feature = "native-execution-probe", target_arch = "x86_64"))]
+    pub(crate) fn execution_time_observation(
+        &self,
+    ) -> std::result::Result<Option<execution::KvmClockObservation>, String> {
+        Ok(*self
+            .execution_clock_observation
+            .lock()
+            .map_err(|_| "kvm/clock/observation-lock")?)
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub(crate) fn finish_execution_release(&mut self) {
+        self.retained_execution = None;
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.retained_pit = None;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn set_execution_controller(&mut self, controller: devices::legacy::IrqChip) {
+        self.execution_controller = Some(controller);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn capture_execution(
+        &mut self,
+        profile: &execution::KvmCaptureProfile,
+    ) -> std::result::Result<KvmVmState, String> {
+        if let Some(state) = &self.retained_execution {
+            return Ok(state.clone());
+        }
+        self.set_execution_controller(Arc::clone(&profile.controller));
+        let state = execution::capture_arm_vm(profile, self.arm_counter_model)?;
+        self.retained_execution = Some(state.clone());
+        Ok(state)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn install_execution(&self, state: &KvmVmState) -> std::result::Result<(), String> {
+        state.validate()?;
+        self.execution_controller
+            .as_ref()
+            .ok_or("kvm/gic/controller-not-retained")?
+            .lock()
+            .map_err(|_| "kvm/gic/controller-lock")?
+            .install_kvm_state(&execution::arm_gic_state(state)?)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn prepare_execution_time(
+        &self,
+        state: &KvmVmState,
+        cpus: &[KvmCpuState],
+    ) -> std::result::Result<Vec<KvmCpuTimePlan>, String> {
+        self.install_execution(state)?;
+        execution::prepare_arm_time(&self.fd, state, cpus)
+    }
 }
 
 /// Encapsulates configuration parameters for the guest vCPUS.
@@ -954,8 +910,8 @@ pub struct Vcpu {
     io_bus: devices::Bus,
     #[cfg(target_arch = "x86_64")]
     cpuid: CpuId,
-    #[cfg(target_arch = "x86_64")]
-    msr_list: MsrList,
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    capture_config: CpuCaptureConfig,
     #[cfg(target_arch = "x86_64")]
     kernel_enomem_workaround: bool,
 
@@ -973,6 +929,10 @@ pub struct Vcpu {
     control_sender: Sender<CpuAck>,
     control_receiver: Option<Receiver<CpuAck>>,
     mailbox: CpuMailbox,
+    execution_cut: Option<Arc<CpuExecutionState>>,
+    execution_journal: Vec<(CpuCommand, CpuAck)>,
+    execution_stop_only: bool,
+    execution_time_ready: bool,
     retained_resources: Option<(GuestMemoryMmap, Arc<VmFd>)>,
     #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
     probe_park_state: ProbeParkJournal,
@@ -1105,8 +1065,15 @@ impl Vcpu {
             mmio_bus: None,
             exit_evt,
             io_bus,
-            cpuid,
-            msr_list,
+            cpuid: cpuid.clone(),
+            capture_config: CpuCaptureConfig {
+                logical_id: id,
+                host_cpuid: cpuid,
+                raw_msrs: msr_list.as_slice().to_vec(),
+                xsave_size: usize::try_from(vm_fd.check_extension_int(kvm_ioctls::Cap::Xsave2))
+                    .unwrap_or(0),
+                deadline_supported: vm_fd.check_extension(kvm_ioctls::Cap::TscDeadlineTimer),
+            },
             kernel_enomem_workaround,
             event_receiver,
             event_sender: Some(event_sender),
@@ -1115,6 +1082,10 @@ impl Vcpu {
             control_sender,
             control_receiver: Some(control_receiver),
             mailbox: CpuMailbox::new(),
+            execution_cut: None,
+            execution_journal: Vec::new(),
+            execution_stop_only: false,
+            execution_time_ready: false,
             retained_resources: None,
             #[cfg(feature = "native-control-probe")]
             probe_park_state: Arc::new(std::sync::Mutex::new(None)),
@@ -1144,6 +1115,9 @@ impl Vcpu {
             mmio_bus: None,
             exit_evt,
             mpidr: 0,
+            capture_config: CpuCaptureConfig {
+                init: kvm_bindings::kvm_vcpu_init::default(),
+            },
             event_receiver,
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
@@ -1151,6 +1125,10 @@ impl Vcpu {
             control_sender,
             control_receiver: Some(control_receiver),
             mailbox: CpuMailbox::new(),
+            execution_cut: None,
+            execution_journal: Vec::new(),
+            execution_stop_only: false,
+            execution_time_ready: false,
             retained_resources: None,
         })
     }
@@ -1182,6 +1160,10 @@ impl Vcpu {
             control_sender,
             control_receiver: Some(control_receiver),
             mailbox: CpuMailbox::new(),
+            execution_cut: None,
+            execution_journal: Vec::new(),
+            execution_stop_only: false,
+            execution_time_ready: false,
             retained_resources: None,
         })
     }
@@ -1300,6 +1282,7 @@ impl Vcpu {
         }
 
         self.fd.vcpu_init(&kvi).map_err(Error::VcpuArmInit)?;
+        self.capture_config.init = kvi;
 
         // Must precede any register access; KVM returns -EPERM until finalized.
         if sve {
@@ -1373,6 +1356,46 @@ impl Vcpu {
             .map_err(Error::VcpuSetMpState)
     }
 
+    #[cfg(all(feature = "native-execution-probe", target_arch = "x86_64"))]
+    pub(crate) fn configure_execution_fixture(
+        &mut self,
+        entry: u64,
+        offline: bool,
+        vcpu_count: u8,
+    ) -> std::result::Result<(), String> {
+        let spec = VmSpec::new(self.id, vcpu_count, false, false)
+            .map_err(|e| format!("fixture/CPU-model: {e:?}"))?;
+        filter_cpuid(&mut self.cpuid, &spec).map_err(|e| format!("fixture/CPUID: {e:?}"))?;
+        self.fd
+            .set_cpuid2(&self.cpuid)
+            .map_err(|e| format!("fixture/SET_CPUID2: {e}"))?;
+        let mut sregs = self
+            .fd
+            .get_sregs()
+            .map_err(|e| format!("fixture/GET_SREGS: {e}"))?;
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        self.fd
+            .set_sregs(&sregs)
+            .map_err(|e| format!("fixture/SET_SREGS: {e}"))?;
+        self.fd
+            .set_regs(&kvm_bindings::kvm_regs {
+                rip: entry,
+                rflags: 2,
+                ..Default::default()
+            })
+            .map_err(|e| format!("fixture/SET_REGS: {e}"))?;
+        self.fd
+            .set_mp_state(kvm_bindings::kvm_mp_state {
+                mp_state: if offline {
+                    kvm_bindings::KVM_MP_STATE_UNINITIALIZED
+                } else {
+                    kvm_bindings::KVM_MP_STATE_RUNNABLE
+                },
+            })
+            .map_err(|e| format!("fixture/SET_MP_STATE: {e}"))
+    }
+
     pub fn retain_resources(&mut self, memory: GuestMemoryMmap, vm: &Vm) {
         self.retained_resources = Some((memory, vm.fd_owner()));
     }
@@ -1420,121 +1443,23 @@ impl Vcpu {
         ))
     }
 
-    #[allow(unused)]
-    #[cfg(target_arch = "x86_64")]
-    fn save_state(&self) -> Result<VcpuState> {
-        /*
-         * Ordering requirements:
-         *
-         * KVM_GET_MP_STATE calls kvm_apic_accept_events(), which might modify
-         * vCPU/LAPIC state. As such, it must be done before most everything
-         * else, otherwise we cannot restore everything and expect it to work.
-         *
-         * KVM_GET_VCPU_EVENTS/KVM_SET_VCPU_EVENTS is unsafe if other vCPUs are
-         * still running.
-         *
-         * KVM_GET_LAPIC may change state of LAPIC before returning it.
-         *
-         * GET_VCPU_EVENTS should probably be last to save. The code looks as
-         * it might as well be affected by internal state modifications of the
-         * GET ioctls.
-         *
-         * SREGS saves/restores a pending interrupt, similar to what
-         * VCPU_EVENTS also does.
-         *
-         * GET_MSRS requires a pre-populated data structure to do something
-         * meaningful. For SET_MSRS it will then contain good data.
-         */
-
-        // Build the list of MSRs we want to save.
-        let num_msrs = self.msr_list.as_fam_struct_ref().nmsrs as usize;
-        let mut msrs = Msrs::new(num_msrs).unwrap();
-        {
-            let indices = self.msr_list.as_slice();
-            let msr_entries = msrs.as_mut_slice();
-            assert_eq!(indices.len(), msr_entries.len());
-            for (pos, index) in indices.iter().enumerate() {
-                msr_entries[pos].index = *index;
-            }
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn initialize_aarch64_saved(
+        &mut self,
+        state: &crate::vmm::execution::kvm::ArmCpuState,
+    ) -> std::result::Result<(), String> {
+        let init = kvm_bindings::kvm_vcpu_init {
+            target: state.target,
+            features: state.features,
+        };
+        if init.features[0] & (1 << kvm_bindings::KVM_ARM_VCPU_SVE) != 0 {
+            return Err("kvm/arm64/sve-unqualified".into());
         }
-        let mp_state = self.fd.get_mp_state().map_err(Error::VcpuGetMpState)?;
-        let regs = self.fd.get_regs().map_err(Error::VcpuGetRegs)?;
-        let sregs = self.fd.get_sregs().map_err(Error::VcpuGetSregs)?;
-        let xsave = self.fd.get_xsave().map_err(Error::VcpuGetXsave)?;
-        let xcrs = self.fd.get_xcrs().map_err(Error::VcpuGetXcrs)?;
-        let debug_regs = self.fd.get_debug_regs().map_err(Error::VcpuGetDebugRegs)?;
-        let lapic = self.fd.get_lapic().map_err(Error::VcpuGetLapic)?;
-        let nmsrs = self.fd.get_msrs(&mut msrs).map_err(Error::VcpuGetMsrs)?;
-        assert_eq!(nmsrs, num_msrs);
-        let vcpu_events = self
-            .fd
-            .get_vcpu_events()
-            .map_err(Error::VcpuGetVcpuEvents)?;
-        Ok(VcpuState {
-            cpuid: self.cpuid.clone(),
-            msrs,
-            debug_regs,
-            lapic,
-            mp_state,
-            regs,
-            sregs,
-            vcpu_events,
-            xcrs,
-            xsave,
-        })
-    }
-
-    #[allow(unused)]
-    #[cfg(target_arch = "x86_64")]
-    fn restore_state(&self, state: VcpuState) -> Result<()> {
-        /*
-         * Ordering requirements:
-         *
-         * KVM_GET_VCPU_EVENTS/KVM_SET_VCPU_EVENTS is unsafe if other vCPUs are
-         * still running.
-         *
-         * Some SET ioctls (like set_mp_state) depend on kvm_vcpu_is_bsp(), so
-         * if we ever change the BSP, we have to do that before restoring anything.
-         * The same seems to be true for CPUID stuff.
-         *
-         * SREGS saves/restores a pending interrupt, similar to what
-         * VCPU_EVENTS also does.
-         *
-         * SET_REGS clears pending exceptions unconditionally, thus, it must be
-         * done before SET_VCPU_EVENTS, which restores it.
-         *
-         * SET_LAPIC must come after SET_SREGS, because the latter restores
-         * the apic base msr.
-         *
-         * SET_LAPIC must come before SET_MSRS, because the TSC deadline MSR
-         * only restores successfully, when the LAPIC is correctly configured.
-         */
         self.fd
-            .set_cpuid2(&state.cpuid)
-            .map_err(Error::VcpuSetCpuid)?;
-        self.fd
-            .set_mp_state(state.mp_state)
-            .map_err(Error::VcpuSetMpState)?;
-        self.fd.set_regs(&state.regs).map_err(Error::VcpuSetRegs)?;
-        self.fd
-            .set_sregs(&state.sregs)
-            .map_err(Error::VcpuSetSregs)?;
-        unsafe {
-            self.fd
-                .set_xsave(&state.xsave)
-                .map_err(Error::VcpuSetXsave)?;
-        }
-        self.fd.set_xcrs(&state.xcrs).map_err(Error::VcpuSetXcrs)?;
-        self.fd
-            .set_debug_regs(&state.debug_regs)
-            .map_err(Error::VcpuSetDebugRegs)?;
-        self.fd
-            .set_lapic(&state.lapic)
-            .map_err(Error::VcpuSetLapic)?;
-        self.fd.set_msrs(&state.msrs).map_err(Error::VcpuSetMsrs)?;
-        self.fd
-            .set_vcpu_events(&state.vcpu_events)
-            .map_err(Error::VcpuSetVcpuEvents)?;
+            .vcpu_init(&init)
+            .map_err(|e| format!("kvm/arm64/VCPU_INIT: {e}"))?;
+        self.capture_config.init = init;
+        self.mpidr = state.mpidr;
         Ok(())
     }
 
@@ -1712,8 +1637,150 @@ impl Vcpu {
         }
     }
 
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn execution_command(
+        &mut self,
+        command: &CpuCommand,
+    ) -> std::result::Result<Option<Arc<CpuExecutionState>>, String> {
+        use crate::vmm::control::CpuCommandKind;
+        match command.kind {
+            CpuCommandKind::CaptureExecution => {
+                self.execution_time_ready = false;
+                if command.execution.is_some() {
+                    return Err("capture has unexpected input".into());
+                }
+                if self.execution_cut.is_none() {
+                    let state = execution::capture_cpu(&self.fd, self.id, &self.capture_config)?;
+                    // Native timer cancellation can partially fail. The original cut must already have an owner.
+                    self.execution_cut = Some(Arc::new(CpuExecutionState::Kvm(state)));
+                }
+                let state = self
+                    .execution_cut
+                    .as_ref()
+                    .ok_or("missing retained CPU cut")?;
+                let CpuExecutionState::Kvm(native) = state.as_ref() else {
+                    return Err("wrong CPU backend".into());
+                };
+                execution::fence_cpu_timer(&self.fd, native)?;
+                Ok(Some(Arc::clone(state)))
+            }
+            CpuCommandKind::InstallExecution => {
+                let Some(input) = command.execution.as_deref() else {
+                    return Err("install input missing".into());
+                };
+                let CpuExecutionInput::Install(CpuExecutionState::Kvm(state)) = input else {
+                    return Err("install CPU backend mismatch".into());
+                };
+                if state.id() != self.id {
+                    return Err("install logical CPU mismatch".into());
+                }
+                self.execution_time_ready = false;
+                self.execution_cut = Some(Arc::new(CpuExecutionState::Kvm(state.clone())));
+                let installed = execution::install_cpu(&self.fd, state, &self.capture_config);
+                if installed.is_err() {
+                    self.execution_stop_only = true;
+                }
+                installed?;
+                Ok(None)
+            }
+            CpuCommandKind::PrepareExecutionTime => {
+                self.execution_time_ready = false;
+                let Some(input) = command.execution.as_deref() else {
+                    return Err("time input missing".into());
+                };
+                let CpuExecutionInput::PrepareTime(crate::vmm::execution::CpuTimePlan::Kvm(plan)) =
+                    input
+                else {
+                    return Err("time CPU backend mismatch".into());
+                };
+                let Some(state) = self.execution_cut.as_deref() else {
+                    return Err("time preparation requires retained cut".into());
+                };
+                let CpuExecutionState::Kvm(state) = state else {
+                    return Err("time retained backend mismatch".into());
+                };
+                execution::prepare_cpu_time(&self.fd, state, plan)?;
+                self.execution_time_ready = true;
+                Ok(None)
+            }
+            _ => Err("not an execution command".into()),
+        }
+    }
+
+    fn acknowledge_command(&mut self, command: &CpuCommand) -> CpuAck {
+        use crate::vmm::control::CpuCommandKind;
+        let execution_kind = matches!(
+            command.kind,
+            CpuCommandKind::CaptureExecution
+                | CpuCommandKind::InstallExecution
+                | CpuCommandKind::PrepareExecutionTime
+        );
+        if let Some((original, result)) = self.execution_journal.iter().find(|(original, _)| {
+            original.request == command.request
+                && original.barrier.key == command.barrier.key
+                && original.kind == command.kind
+        }) {
+            let mut result = result.clone();
+            if original.execution != command.execution {
+                result.result = Err("conflicting duplicate CPU execution command".into());
+                result.execution = None;
+            }
+            return result;
+        }
+        let was_running = self.mailbox.disposition() == CpuDisposition::Running;
+        let capture_without_retained = command.kind == CpuCommandKind::CaptureExecution
+            && self.mailbox.disposition() == CpuDisposition::Prepared
+            && self.execution_cut.is_none();
+        let mut ack = self.mailbox.apply(self.id, command.clone());
+        if ack.result.is_err() {
+            return ack;
+        }
+        if capture_without_retained {
+            self.mailbox.preparation_failed();
+            ack.result =
+                Err("prepared CPU refence requires an original retained execution cut".into());
+            return ack;
+        }
+        if command.kind == CpuCommandKind::Park && was_running {
+            self.execution_cut = None;
+            self.execution_journal.clear();
+            self.execution_time_ready = false;
+        }
+        if self.execution_stop_only && command.kind != CpuCommandKind::Stop {
+            self.mailbox.preparation_failed();
+            ack.result = Err("partial execution installation is stop-only".into());
+        } else if matches!(command.kind, CpuCommandKind::PrepareResume { .. }) {
+            // The ordinary cold-boot path has no retained execution cut.
+            if self.execution_cut.is_some() && !self.execution_time_ready {
+                self.mailbox.preparation_failed();
+                ack.result = Err("common execution clock not prepared".into());
+            }
+        }
+        if execution_kind && ack.result.is_ok() {
+            if self.execution_journal.len() >= 32 {
+                ack.result = Err("CPU execution journal limit".into());
+                return ack;
+            } else {
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                match self.execution_command(command) {
+                    Ok(payload) => ack.execution = payload,
+                    Err(error) => {
+                        self.mailbox.preparation_failed();
+                        ack.result = Err(error);
+                    }
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                {
+                    ack.result = Err("execution backend unsupported".into());
+                }
+            }
+            self.execution_journal.push((command.clone(), ack.clone()));
+        }
+        ack
+    }
+
     fn control(&mut self, command: CpuCommand) -> StateMachine<Self> {
-        let ack = self.mailbox.apply(self.id, command);
+        let ack = self.acknowledge_command(&command);
         #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
         let ack = {
             let mut ack = ack;
@@ -1795,21 +1862,6 @@ impl Drop for Vcpu {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-/// Structure holding VCPU kvm state.
-pub struct VcpuState {
-    cpuid: CpuId,
-    msrs: Msrs,
-    debug_regs: kvm_debugregs,
-    lapic: kvm_lapic_state,
-    mp_state: kvm_mp_state,
-    regs: kvm_regs,
-    sregs: kvm_sregs,
-    vcpu_events: kvm_vcpu_events,
-    xcrs: kvm_xcrs,
-    xsave: kvm_xsave,
-}
-
 // Lifecycle exits are separate from correlated control acknowledgements.
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1829,7 +1881,10 @@ pub struct VcpuHandle {
     // Rust JoinHandles have to be wrapped in Option if you ever plan on 'join()'ing them.
     // We want to be able to join these threads in tests.
     vcpu_thread: Option<thread::JoinHandle<()>>,
-    #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(feature = "native-control-probe", feature = "native-execution-probe"),
+        target_arch = "x86_64"
+    ))]
     probe_ack_hold: std::sync::Mutex<ProbeAckHold>,
     #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
     probe_park_state: ProbeParkJournal,
@@ -1849,7 +1904,10 @@ impl VcpuHandle {
             response_receiver,
             control_receiver,
             vcpu_thread: Some(vcpu_thread),
-            #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+            #[cfg(all(
+                any(feature = "native-control-probe", feature = "native-execution-probe"),
+                target_arch = "x86_64"
+            ))]
             probe_ack_hold: std::sync::Mutex::new(ProbeAckHold::default()),
             #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
             probe_park_state,
@@ -1857,7 +1915,10 @@ impl VcpuHandle {
     }
 
     pub fn send_control(&self, command: CpuCommand) -> CpuSubmission {
-        #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+        #[cfg(all(
+            any(feature = "native-control-probe", feature = "native-execution-probe"),
+            target_arch = "x86_64"
+        ))]
         if command.kind == crate::vmm::control::CpuCommandKind::Stop {
             match self.probe_ack_hold.lock() {
                 Ok(mut hold) => hold.kind = None,
@@ -1875,7 +1936,10 @@ impl VcpuHandle {
     }
 
     pub fn try_control_ack(&self) -> std::result::Result<Option<CpuAck>, String> {
-        #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+        #[cfg(all(
+            any(feature = "native-control-probe", feature = "native-execution-probe"),
+            target_arch = "x86_64"
+        ))]
         {
             let mut hold = self
                 .probe_ack_hold
@@ -1896,7 +1960,10 @@ impl VcpuHandle {
             }
             Ok(None)
         }
-        #[cfg(not(all(feature = "native-control-probe", target_arch = "x86_64")))]
+        #[cfg(not(all(
+            any(feature = "native-control-probe", feature = "native-execution-probe"),
+            target_arch = "x86_64"
+        )))]
         self.receive_control_ack()
     }
 
@@ -1926,7 +1993,10 @@ impl VcpuHandle {
         Ok(true)
     }
 
-    #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(feature = "native-control-probe", feature = "native-execution-probe"),
+        target_arch = "x86_64"
+    ))]
     pub(crate) fn set_probe_ack_hold(
         &self,
         kind: Option<crate::vmm::control::CpuCommandKind>,
@@ -1941,11 +2011,17 @@ impl VcpuHandle {
             CpuCommandKind::PrepareResume { .. } => CpuAckKind::Prepared,
             CpuCommandKind::Release => CpuAckKind::Released,
             CpuCommandKind::Stop => CpuAckKind::Stopped,
+            CpuCommandKind::CaptureExecution => CpuAckKind::Captured,
+            CpuCommandKind::InstallExecution => CpuAckKind::Installed,
+            CpuCommandKind::PrepareExecutionTime => CpuAckKind::TimePrepared,
         });
         Ok(())
     }
 
-    #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(feature = "native-control-probe", feature = "native-execution-probe"),
+        target_arch = "x86_64"
+    ))]
     pub(crate) fn probe_held_ack(&self) -> std::result::Result<Option<CpuAck>, String> {
         let hold = self
             .probe_ack_hold
@@ -1981,7 +2057,10 @@ pub(crate) struct ProbeParkState {
     pub rax: u64,
 }
 
-#[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
+#[cfg(all(
+    any(feature = "native-control-probe", feature = "native-execution-probe"),
+    target_arch = "x86_64"
+))]
 #[derive(Default)]
 struct ProbeAckHold {
     kind: Option<crate::vmm::control::CpuAckKind>,
@@ -2006,6 +2085,7 @@ impl Drop for VcpuHandle {
                         deadline: std::time::Instant::now(),
                     },
                     kind: CpuCommandKind::Stop,
+                    execution: None,
                 });
                 let _ = thread.kill(sigrtmin() + VCPU_RTSIG_OFFSET);
             }
