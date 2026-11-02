@@ -1,6 +1,11 @@
 // Copyright 2021 Red Hat, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+/// Package-local compiled feature and build-input observations.
+pub mod build_facts {
+    include!(concat!(env!("OUT_DIR"), "/live_build.rs"));
+}
+
 #[allow(non_camel_case_types)]
 #[allow(improper_ctypes)]
 #[allow(dead_code)]

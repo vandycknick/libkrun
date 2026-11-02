@@ -69,6 +69,154 @@ Imago's zero-preserving operation, including its explicit-zero fallback when
 hole punching is unavailable. Hypervisor-free real Raw-device regressions run
 with `cargo test --locked -p krun-devices --features blk zero_range`.
 
+## Native live-state observations (Rust)
+
+The Silo fork exposes a Rust-only, machine-less query in
+`krun::api::capabilities`, outside generated FFI:
+
+```rust
+pub fn compiled_live_build() -> &'static NativeBuildFacts;
+pub fn query_live_host() -> NativeHostReport;
+```
+
+Query ABI `LIVE_QUERY_ABI = 1` is distinct from the package/C ABI and the
+scratch checkpoint format. The compiled `control_abi` is currently `None`.
+The adapter-facing types are:
+
+```rust
+NativeBuildFacts {
+    query_abi: u32,
+    control_abi: Option<u32>,
+    backend: NativeBackend,
+    architecture: NativeArchitecture,
+    packages: &'static [PackageBuildFacts],
+}
+PackageBuildFacts {
+    name: &'static str,
+    version: &'static str,
+    target: Option<&'static str>,
+    features: Option<&'static [&'static str]>,
+    settings: &'static [(&'static str, Option<&'static str>)],
+    settings_observed: bool,
+    rustc_version: Option<&'static str>,
+    source: SourceProvenance,
+}
+SourceProvenance {
+    root: Option<&'static str>,
+    revision: Option<&'static str>,
+    worktree: WorktreeState, // Clean | Dirty | Unknown
+}
+NativeHostReport {
+    build: &'static NativeBuildFacts,
+    lane: NativeLane,
+    kvm: KvmHostFacts,
+    kvm_prerequisites: KvmPrerequisites,
+    hvf: HvfHostFacts,
+    operations: NativeLiveOperations,
+}
+```
+
+All fields above are public. Backends are `Kvm`, `Hvf`, or `Unsupported`;
+architectures are `X86_64`, `Aarch64`, `Riscv64`, or `Unsupported`.
+`NativeLane` distinguishes `KvmX86_64`, `KvmArm64GicV3`, `HvfArm64GicV3`,
+and `Unsupported`. A lane is a **candidate**, not admission of a VM or GIC.
+Lane selection consumes the observed package feature inventories as well as
+backend/architecture. TEE, AMD SEV, TDX and AWS Nitro builds are excluded,
+including when a dependency independently enables their features. Their
+actual compiled backend remains recorded, but they receive `Unsupported`,
+incomplete live binding and no KVM/HVF host probing. Unknown feature
+inventories also cannot select a live lane. Nested virtualization is a
+per-VM runtime setting, not a Cargo feature; this host query does not admit
+nested VMs or probe nested virtualization.
+
+Each instrumented package records its own Cargo-normalized
+`CARGO_FEATURE_*` identifiers in sorted order, including implicit features
+and independently unified dependency features. It records `TARGET`, `HOST`,
+`OPT_LEVEL`, `DEBUG`, `PROFILE`, target architecture/OS/environment/ABI,
+endianness, pointer width, CPU features, `CARGO_ENCODED_RUSTFLAGS`, compiler
+path/version, wrapper paths and Apple SDK/deployment inputs. Missing values
+remain `None`, distinct from an observed empty string. `settings_observed`
+is false if an environment value was not representable as UTF-8, so malformed
+optional inputs cannot look like known absence. These are observed
+inputs, not a claim to reconstruct every effective rustc option or native
+third-party build. The allocation-free borrowed inventory covers libkrun,
+arch, arch-gen, devices, kernel, polly, utils, SMBIOS, x86 CPUID and macOS HVF
+when linked. Optional display/input/Nitro packages are not instrumented;
+activation of their associated features in **any** recorded package keeps
+`NativeBuildFacts::binding_complete()` false. This is partial evidence, not
+permission to bind an unobserved package to its parent's settings.
+
+Source observations are dependency-local at build time: Git root, full HEAD
+and clean/dirty/unknown worktree, including nonignored untracked files and
+submodule changes. Source files/directories and Git HEAD/index/ref metadata
+are Cargo rebuild inputs. A dirty or unknown checkout, missing required
+package/settings/features/compiler, inconsistent target or malformed revision
+cannot yield a complete recorded binding. `clean_revision()` returns a full
+revision only for a Git-clean observation. Ignored/generated assets,
+external build inputs, wrapper contents and changes concurrent with
+compilation still need consumer-side content/evidence binding. Neither
+`clean_revision()` nor `binding_complete()` is qualification. No declared
+parent dependency revision is substituted for an unknown native revision.
+
+`PackageBuildFacts::write_canonical(&mut impl std::fmt::Write)` emits
+`native-package-v1;`, then length-delimited name, version, target, counted
+feature/settings inventories, an `observed;`/`partial;` settings-observation
+marker, compiler version, source root/revision and worktree state.
+A field is `<UTF-8-byte-length>:<bytes>;`; unknown is `?;`.
+Feature/settings counts are `<count>;`, or `?;` for an unknown feature set.
+Settings retain their recorded order. Worktree terminates with `clean;`,
+`dirty;` or `unknown;`. Consumers may hash this without native allocations
+or a native hashing dependency, and must also bind the query/control ABI,
+backend, architecture and complete package inventory.
+
+Host values use `Observation<T>`:
+`Observed(T)`, `Unavailable(NativeQueryError)`, `NotEvaluated`, or
+`NotApplicable`. Errors retain `QueryOperation`, optional raw OS errno and
+`std::io::ErrorKind`. Linux opens one close-on-exec `/dev/kvm` system fd,
+reads API version and integer `KVM_CHECK_EXTENSION` values for `Irqchip`,
+`Ioeventfd`, `Irqfd`, `UserMemory`, target-specific `SetTssAddr`/`ArmPsci02`,
+and `ImmediateExit`. Positive payloads are not reduced to booleans; errors
+are not reduced to absent capabilities. `KvmHostFacts` contains `access`,
+`api_version`, a fixed seven-entry `capabilities` array of
+`KvmCapabilityFact { capability, value }`, and `gic_model`. The latter stays
+not evaluated on arm64. `reduce_kvm_prerequisites(NativeLane, &KvmHostFacts)`
+returns `SystemQueriesAvailable`, `NotApplicable`, `Incomplete`,
+`Unavailable(error)`, `ApiMismatch { observed, required }`, or
+`MissingCapability(capability)`. Successful system queries do not establish
+that VM construction will succeed.
+
+`HvfHostFacts` has `framework`, `vm_admission` and `gic_model`, each
+`Observation<()>`. They remain `NotEvaluated` on HVF, and `NotApplicable`
+elsewhere. Optional GIC symbol resolution is not part of this surface yet.
+No query creates a VM/vCPU/GIC, installs signals, allocates guest RAM,
+executes guest code, or performs capture/restore/reclaim probes.
+
+`NativeLiveOperations` has `pause`, `capture`, `restore`, `fork` and
+`incremental`, each `NativeOperationSupport`. Every returned value is
+`Unsupported(reason)`, with `BuildExcluded`,
+`DeviceProvidersNotImplemented`, or `NotImplemented` as appropriate.
+API presence, a clean source revision and accessible host APIs grant no
+native operation and no public Silo operation.
+
+Run the standalone query explicitly (not as a Cargo test):
+
+```sh
+make live-capabilities BLK=1 NET=1
+# For an already built example, audit only its query syscalls:
+strace -f -e trace=openat,ioctl,close target/debug/examples/live_capabilities
+```
+
+The audited hypervisor-free unit selection is:
+
+```sh
+cargo test --locked -p libkrun --features blk,net --lib api::capabilities::tests::native_live_
+```
+
+Those tests exercise real pure provenance/binding/serialization/capability
+reducers and immutable compiled inventories, never the runtime host query.
+Do not replace this filter with wholesale fork tests: existing unrelated
+tests construct real VMs.
+
 
 ## Networking
 

@@ -4,6 +4,14 @@
 //! Implements platform specific functionality.
 //! Supported platforms: x86_64 and aarch64.
 
+/// Package-local compiled feature and build-input observations.
+pub mod build_facts {
+    pub use arch_gen::build_facts as arch_gen;
+    #[cfg(not(target_os = "windows"))]
+    pub use smbios::build_facts as smbios;
+    include!(concat!(env!("OUT_DIR"), "/live_build.rs"));
+}
+
 use std::result;
 
 pub mod guest_memory;
