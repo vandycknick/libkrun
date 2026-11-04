@@ -262,6 +262,8 @@ pub(crate) struct RestoreDeviceBinding {
 pub(crate) struct PreparedDeviceInstall {
     pub binding: StateBinding,
     pub devices: Vec<RestoreDeviceBinding>,
+    #[cfg(not(feature = "tee"))]
+    pub balloon_bindings: Vec<crate::api::device_builders::BalloonBinding>,
     pub serial: Vec<(u64, Arc<Mutex<Serial>>)>,
     pub shutdown: Option<EventFd>,
     #[cfg(feature = "native-execution-probe")]
@@ -275,8 +277,10 @@ pub(crate) struct PreparedDeviceInstall {
 }
 
 impl PreparedDeviceInstall {
-    pub fn validate_memory(&self, memory: &vm_memory::GuestMemoryMmap) -> Result<(), String> {
-        let memory = devices::virtio::RuntimeGuestMemory::passthrough(memory.clone());
+    pub fn validate_memory(
+        &self,
+        memory: &arch::guest_memory::ReadGuestMemory<'_>,
+    ) -> Result<(), String> {
         for entry in &self.devices {
             if entry.identity.device_type != devices::DeviceType::Virtio(entry.state.device_type) {
                 return Err(format!("restore attachment identity {:?}", entry.identity));
@@ -327,7 +331,7 @@ impl PreparedDeviceInstall {
                 return Err(format!("restore transport profile {:?}", entry.identity));
             }
             for (queue, saved) in queues.iter().zip(&entry.state.queues) {
-                devices::virtio::Queue::validate_restored_state(queue.size, &memory, saved)
+                devices::virtio::Queue::validate_restored_state(queue.size, memory, saved)
                     .map_err(|error| format!("restore queue {:?}: {error:?}", entry.identity))?;
                 let event_idx =
                     entry.state.activated && entry.state.acked_features & (1 << 29) != 0;
@@ -412,6 +416,8 @@ impl PreparedDeviceInstall {
         Ok(Self {
             binding,
             devices,
+            #[cfg(not(feature = "tee"))]
+            balloon_bindings: Vec::new(),
             serial,
             shutdown,
             #[cfg(feature = "native-execution-probe")]
@@ -428,6 +434,8 @@ impl PreparedDeviceInstall {
     pub fn empty(binding: &StateBinding) -> Self {
         Self {
             binding: binding.clone(),
+            #[cfg(not(feature = "tee"))]
+            balloon_bindings: Vec::new(),
             devices: Vec::new(),
             serial: Vec::new(),
             shutdown: None,
@@ -573,7 +581,9 @@ mod tests {
         let memory =
             vm_memory::GuestMemoryMmap::from_ranges(&[(vm_memory::GuestAddress(0), 0x1000)])
                 .unwrap();
-        let error = plan.validate_memory(&memory).unwrap_err();
+        let error = plan
+            .validate_memory(&arch::guest_memory::ReadGuestMemory::new(&memory))
+            .unwrap_err();
         assert!(error.starts_with("restore attachment identity"));
         let result = PreparedDeviceInstall::validate(binding, plan.devices, Vec::new(), None);
         let error = match result {

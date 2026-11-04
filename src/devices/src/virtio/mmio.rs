@@ -332,8 +332,8 @@ impl InterruptTransport {
 
 impl MmioTransport {
     /// Constructs a new MMIO transport for the given virtio device.
-    pub fn new<M: Into<RuntimeGuestMemory>>(
-        mem: M,
+    pub fn new(
+        mem: RuntimeGuestMemory,
         intc: IrqChip,
         device: Arc<Mutex<dyn VirtioDevice>>,
         shared_interrupt_event: Option<Arc<EventFd>>,
@@ -362,7 +362,7 @@ impl MmioTransport {
             queue_select: 0,
             device_status: device_status::INIT,
             config_generation: 0,
-            mem: mem.into(),
+            mem,
             queues: Some(queues),
             queue_evts,
             queue_config,
@@ -1723,7 +1723,6 @@ pub(crate) mod tests {
 
     use crate::legacy::DummyIrqChip;
     use crate::virtio::mmio::*;
-    use vm_memory::GuestMemoryMmap;
 
     static QUEUE_CONFIG: [QueueConfig; 2] = [QueueConfig::new(16), QueueConfig::new(32)];
 
@@ -1807,7 +1806,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_new() {
-        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
         let dummy = DummyDevice::new();
         let mut d = MmioTransport::new(
             m,
@@ -1840,7 +1839,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_bus_device_read() {
-        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
         let mut d = MmioTransport::new(
             m,
             DummyIrqChip::new().into(),
@@ -1924,7 +1923,7 @@ pub(crate) mod tests {
     #[test]
     #[allow(clippy::cognitive_complexity)]
     fn test_bus_device_write() {
-        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
         let dummy_dev = Arc::new(Mutex::new(DummyDevice::new()));
         let mut d =
             MmioTransport::new(m, DummyIrqChip::new().into(), dummy_dev.clone(), None).unwrap();
@@ -2083,7 +2082,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_bus_device_activate() {
-        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
         let mut d = MmioTransport::new(
             m,
             DummyIrqChip::new().into(),
@@ -2196,7 +2195,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_bus_device_reset() {
-        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
 
         let mut d = MmioTransport::new(
             m,
@@ -2831,7 +2830,7 @@ pub(crate) mod tests {
     fn irq_probe_release_preserves_newer_cause_without_replaying_irq() {
         let line = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
         let mut transport = irq_probe_rng_transport(line.clone());
-        let mut peer = irq_probe_rng_transport(line.clone());
+        let peer = irq_probe_rng_transport(line.clone());
         transport.diagnostic_hold_irq_acks(true).unwrap();
         transport.interrupt(VIRTIO_MMIO_INT_VRING).unwrap();
         transport.interrupt(VIRTIO_MMIO_INT_CONFIG).unwrap();

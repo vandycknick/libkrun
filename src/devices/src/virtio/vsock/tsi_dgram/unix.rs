@@ -8,7 +8,7 @@ use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::socket::UnixAddr;
 use nix::sys::socket::{
     AddressFamily, MsgFlags, SockFlag, SockType, SockaddrIn, SockaddrLike, SockaddrStorage, bind,
-    connect, getpeername, recv, send, sendto, socket,
+    connect, getpeername, socket,
 };
 
 #[cfg(target_os = "macos")]
@@ -16,9 +16,11 @@ use super::super::super::linux_errno::linux_errno_raw;
 use super::super::defs;
 use super::super::defs::uapi;
 use super::super::muxer::{MuxerRx, push_packet};
-use super::super::packet::{TsiConnectReq, TsiGetnameRsp, TsiSendtoAddr, VsockPacket};
 use super::super::proxy::{ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
 use crate::virtio::RuntimeGuestMemory;
+use crate::virtio::vsock::packet::{
+    RxPacket, TsiConnectReq, TsiGetnameRsp, TsiSendtoAddr, TxPacket,
+};
 use utils::epoll::EventSet;
 
 pub type SendtoAddr = SockaddrStorage;
@@ -92,7 +94,7 @@ pub(crate) fn create(
     })
 }
 
-pub(crate) fn init_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) {
+pub(crate) fn init_pkt(proxy: &super::TsiDgramProxy, pkt: &mut RxPacket) {
     debug!(
         "init_pkt: id={}, src_port={}, dst_port={}",
         proxy.id, proxy.local_port, proxy.peer_port
@@ -107,7 +109,7 @@ pub(crate) fn init_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) {
         .set_fwd_cnt(proxy.tx_cnt.0);
 }
 
-pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -> RecvPkt {
+pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut RxPacket) -> RecvPkt {
     if let Some(buf) = pkt.buf_mut() {
         // Disable UDP credit accounting until is fixed in the kernel
         //let peer_credit = self.peer_avail_credit();
@@ -127,7 +129,12 @@ pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -
         }
         */
 
-        match recv(proxy.fd.as_raw_fd(), &mut buf[..max_len], MsgFlags::empty()) {
+        match crate::virtio::vsock::packet::recv_into(
+            proxy.fd.as_raw_fd(),
+            buf,
+            max_len,
+            MsgFlags::empty(),
+        ) {
             Ok(cnt) => {
                 debug!("recv cnt={cnt}");
                 if cnt > 0 {
@@ -149,7 +156,7 @@ pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -
 
 pub(crate) fn do_connect(
     proxy: &mut super::TsiDgramProxy,
-    pkt: &VsockPacket,
+    pkt: &TxPacket,
     req: TsiConnectReq,
 ) -> ProxyUpdate {
     debug!("connect: addr={}", req.addr);
@@ -187,7 +194,7 @@ pub(crate) fn do_connect(
     update
 }
 
-pub(crate) fn do_getpeername(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) {
+pub(crate) fn do_getpeername(proxy: &mut super::TsiDgramProxy, pkt: &TxPacket) {
     debug!("process_getpeername");
 
     let (result, addr): (i32, SockaddrStorage) = match getpeername(proxy.fd.as_raw_fd()) {
@@ -219,7 +226,7 @@ pub(crate) fn do_getpeername(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 }
 
-pub(crate) fn sendmsg(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) -> ProxyUpdate {
+pub(crate) fn sendmsg(proxy: &mut super::TsiDgramProxy, pkt: &TxPacket) -> ProxyUpdate {
     debug!("sendmsg");
 
     let ret = if let Some(buf) = pkt.buf() {
@@ -228,7 +235,7 @@ pub(crate) fn sendmsg(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) -> Pr
         #[cfg(target_os = "linux")]
         let flags = MsgFlags::MSG_NOSIGNAL;
 
-        match send(proxy.fd.as_raw_fd(), buf, flags) {
+        match crate::virtio::vsock::packet::send_from(proxy.fd.as_raw_fd(), buf, flags) {
             Ok(sent) => {
                 proxy.tx_cnt += Wrapping(sent as u32);
                 sent as i32
@@ -284,7 +291,7 @@ pub(crate) fn do_sendto_addr(proxy: &mut super::TsiDgramProxy, req: TsiSendtoAdd
     update
 }
 
-pub(crate) fn sendto_data(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) {
+pub(crate) fn sendto_data(proxy: &mut super::TsiDgramProxy, pkt: &TxPacket) {
     debug!("sendto_data");
 
     proxy.peer_buf_alloc = pkt.buf_alloc();
@@ -297,7 +304,7 @@ pub(crate) fn sendto_data(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) {
             #[cfg(target_os = "linux")]
             let flags = MsgFlags::MSG_NOSIGNAL;
 
-            match sendto(proxy.fd.as_raw_fd(), buf, &addr, flags) {
+            match crate::virtio::vsock::packet::send_to(proxy.fd.as_raw_fd(), buf, &addr, flags) {
                 Ok(sent) => {
                     proxy.tx_cnt += Wrapping(sent as u32);
                 }
@@ -311,14 +318,11 @@ pub(crate) fn sendto_data(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) {
     }
 }
 
-pub(crate) fn do_listen(_proxy: &mut super::TsiDgramProxy, _pkt: &VsockPacket) -> ProxyUpdate {
+pub(crate) fn do_listen(_proxy: &mut super::TsiDgramProxy, _pkt: &TxPacket) -> ProxyUpdate {
     ProxyUpdate::default()
 }
 
-pub(crate) fn update_peer_credit(
-    proxy: &mut super::TsiDgramProxy,
-    pkt: &VsockPacket,
-) -> ProxyUpdate {
+pub(crate) fn update_peer_credit(proxy: &mut super::TsiDgramProxy, pkt: &TxPacket) -> ProxyUpdate {
     debug!(
         "update_credit: buf_alloc={} rx_cnt={} fwd_cnt={}",
         pkt.buf_alloc(),

@@ -59,6 +59,7 @@ pub use self::rng::*;
 #[cfg(feature = "vhost-user")]
 pub use self::vhost_user::VhostUserDevice;
 pub use self::vsock::*;
+pub use arch::guest_memory::{HostReadGuard, HostWriteGuard, ReadView, WriteView};
 
 /// When the driver initializes the device, it lets the device know about the
 /// completed stages using the Device Status Field.

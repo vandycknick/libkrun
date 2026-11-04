@@ -8,7 +8,8 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use devices::bus::BusAccessObserver;
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use devices::virtio::RuntimeGuestMemory;
+use vm_memory::GuestAddress;
 
 use crate::api::vmm_builder::native_device_probe::{Driver, bounded, write_new};
 use crate::vmm::control::CpuCommandKind;
@@ -24,7 +25,7 @@ const LOW: u64 = 0x70000;
 
 /// Preserve both epoch reads; an interrupted publication is evidence, not a
 /// completed IRQ record. No guest work or request is retried by this reader.
-fn irq_words(memory: &GuestMemoryMmap) -> Result<([u64; 23], [u64; 2]), String> {
+fn irq_words(memory: &RuntimeGuestMemory) -> Result<([u64; 23], [u64; 2]), String> {
     let before = memory
         .load(GuestAddress(SLOT + 184), Ordering::SeqCst)
         .map_err(|e| e.to_string())?;
@@ -220,7 +221,7 @@ impl Witness {
             .lock()
             .map_err(|_| "witness completion lock poisoned")? = Some(ips);
         let (request, barrier, inputs) = {
-            let vmm = driver.vmm.try_lock().map_err(|_| "witness VMM lock")?;
+            let mut vmm = driver.vmm.try_lock().map_err(|_| "witness VMM lock")?;
             let active = vmm
                 .control
                 .active
@@ -268,6 +269,9 @@ impl Witness {
                 .address
                 .lock()
                 .map_err(|_| "witness address poisoned")? = Some(address);
+            if !vmm.reopen_memory_for_resume(barrier.key)? {
+                return Err("source witness native writers remain outstanding".into());
+            }
             let memory = &vmm.guest_memory;
             memory
                 .write_slice(&code, GuestAddress(CODE))
@@ -382,6 +386,7 @@ impl Witness {
                     CpuCommandKind::InitializeDeviceWitness,
                     &inputs,
                     &vmm.vcpus_handles,
+                    Some(vmm.memory.native()?),
                 )
                 .map_err(|e| e.to_string())?;
         }
@@ -651,7 +656,7 @@ impl Drop for Witness {
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
 
     use crate::api::vmm_builder::native_device_probe::witness::{
         CODE, SLOT, fixture_symbol, irq_words,
@@ -680,7 +685,9 @@ mod tests {
 
     #[test]
     fn device_witness_irq_publication_retains_incomplete_epoch() {
-        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(SLOT), 0x1000)]).unwrap();
+        let memory = crate::vmm::memory::runtime_memory_for_test(
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(SLOT), 0x1000)]).unwrap(),
+        );
         memory
             .store(1u64, GuestAddress(SLOT + 184), Ordering::SeqCst)
             .unwrap();

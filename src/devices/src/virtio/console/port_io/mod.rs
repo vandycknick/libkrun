@@ -1,7 +1,7 @@
+use crate::virtio::{ReadView, WriteView};
 use log::Level;
 use std::io;
 use utils::eventfd::EventFd;
-use vm_memory::{VolatileSlice, WriteVolatile};
 
 #[cfg(unix)]
 mod unix;
@@ -14,13 +14,13 @@ mod windows;
 pub use windows::*;
 
 pub trait PortInput {
-    fn read_volatile(&mut self, buf: &mut VolatileSlice) -> Result<usize, io::Error>;
+    fn read_volatile(&mut self, buf: WriteView<'_>) -> Result<usize, io::Error>;
 
     fn wait_until_readable(&self, stopfd: Option<&EventFd>) -> io::Result<()>;
 }
 
 pub trait PortOutput {
-    fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error>;
+    fn write_volatile(&mut self, buf: ReadView<'_>) -> Result<usize, io::Error>;
 
     /// Wake for output readiness or destructive shutdown, never reversible quiesce.
     /// The caller must inspect terminal intent before retrying a write.
@@ -68,8 +68,11 @@ impl PortOutputLog {
 }
 
 impl PortOutput for PortOutputLog {
-    fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error> {
-        self.buf.write_volatile(buf).map_err(io::Error::other)?;
+    fn write_volatile(&mut self, buf: ReadView<'_>) -> Result<usize, io::Error> {
+        let start = self.buf.len();
+        self.buf.resize(start + buf.len(), 0);
+        buf.read_slice(&mut self.buf[start..], 0)
+            .map_err(io::Error::other)?;
 
         let mut start = 0;
         for (i, ch) in self.buf.iter().cloned().enumerate() {

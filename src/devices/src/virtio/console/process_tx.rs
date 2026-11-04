@@ -75,12 +75,12 @@ pub(crate) fn process_tx(
                 failed = true;
                 break;
             };
-            let result = mem.try_access(
+            let result = mem.try_read_access(
                 desc.len as usize,
                 GuestAddress(desc.addr),
                 |_, len, _, src| {
                     loop {
-                        match output.write_volatile(&src) {
+                        match output.write_volatile(src) {
                             Ok(n) if n > 0 && n <= len => {
                                 bytes_written = bytes_written
                                     .checked_add(n as u32)

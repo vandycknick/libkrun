@@ -3,7 +3,9 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::Wrapping;
 use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket, RawSocket};
 
-use utils::windows::RawFd;
+use std::os::windows::io::OwnedSocket as OwnedFd;
+use utils::windows::{AsRawFd, RawFd};
+use windows_sys::Win32::Networking::WinSock::ADDRESS_FAMILY as AddressFamily;
 use windows_sys::Win32::Networking::WinSock::{
     FIONBIO, INVALID_SOCKET, SD_BOTH, SD_RECEIVE, SD_SEND, SOCK_STREAM, SOCKADDR, SOCKET,
     SOCKET_ERROR, WSAEWOULDBLOCK, WSAGetLastError, accept, bind, closesocket, connect, getpeername,
@@ -18,10 +20,12 @@ use super::super::super::linux_errno::wsa_errno_to_linux;
 use super::super::defs;
 use super::super::defs::uapi;
 use super::super::muxer::{MuxerRx, push_packet};
-use super::super::packet::{TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, VsockPacket};
 use super::super::proxy::{
-    AddressFamily, AsRawFd, NewProxyType, OwnedFd, Proxy, ProxyError, ProxyRemoval, ProxyStatus,
-    ProxyUpdate, RecvPkt, address_family_from_linux,
+    NewProxyType, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
+    address_family_from_linux,
+};
+use crate::virtio::vsock::packet::{
+    RxPacket, TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TxPacket,
 };
 use utils::epoll::EventSet;
 
@@ -60,7 +64,7 @@ fn sock(proxy: &super::TsiStreamProxy) -> SOCKET {
     proxy.fd.as_raw_socket() as SOCKET
 }
 
-pub(crate) fn recv_to_pkt(proxy: &super::TsiStreamProxy, pkt: &mut VsockPacket) -> RecvPkt {
+pub(crate) fn recv_to_pkt(proxy: &super::TsiStreamProxy, pkt: &mut RxPacket) -> RecvPkt {
     if let Some(buf) = pkt.buf_mut() {
         let peer_credit = proxy.peer_avail_credit();
         let max_len = std::cmp::min(buf.len(), peer_credit);
@@ -154,7 +158,7 @@ fn try_listen(
 
 pub(crate) fn do_connect(
     proxy: &mut super::TsiStreamProxy,
-    _pkt: &VsockPacket,
+    _pkt: &TxPacket,
     req: TsiConnectReq,
 ) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
@@ -199,7 +203,7 @@ pub(crate) fn do_connect(
     update
 }
 
-pub(crate) fn do_getpeername(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) {
+pub(crate) fn do_getpeername(proxy: &mut super::TsiStreamProxy, pkt: &TxPacket) {
     let mut sa_buf = [0u8; 128];
     let mut sa_len: i32 = 128;
 
@@ -245,7 +249,7 @@ pub(crate) fn do_getpeername(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacke
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 }
 
-pub(crate) fn sendmsg(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) -> ProxyUpdate {
+pub(crate) fn sendmsg(proxy: &mut super::TsiStreamProxy, pkt: &TxPacket) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
 
     let ret = if let Some(buf) = pkt.buf() {
@@ -277,10 +281,7 @@ pub(crate) fn sendmsg(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) -> P
     update
 }
 
-pub(crate) fn update_peer_credit(
-    proxy: &mut super::TsiStreamProxy,
-    pkt: &VsockPacket,
-) -> ProxyUpdate {
+pub(crate) fn update_peer_credit(proxy: &mut super::TsiStreamProxy, pkt: &TxPacket) -> ProxyUpdate {
     proxy.peer_buf_alloc = pkt.buf_alloc();
     proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
     let mut update = ProxyUpdate::default();
@@ -322,7 +323,7 @@ pub(crate) fn update_peer_credit(
 
 pub(crate) fn do_listen(
     proxy: &mut super::TsiStreamProxy,
-    pkt: &VsockPacket,
+    pkt: &TxPacket,
     req: TsiListenReq,
     host_port_map: &Option<HashMap<u16, u16>>,
 ) -> ProxyUpdate {
@@ -366,7 +367,7 @@ pub(crate) fn do_accept(proxy: &mut super::TsiStreamProxy, req: TsiAcceptReq) ->
 
 pub(crate) fn process_op_response(
     proxy: &mut super::TsiStreamProxy,
-    pkt: &VsockPacket,
+    pkt: &TxPacket,
 ) -> ProxyUpdate {
     proxy.peer_buf_alloc = pkt.buf_alloc();
     proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
@@ -379,7 +380,7 @@ pub(crate) fn process_op_response(
     }
 }
 
-pub(crate) fn do_shutdown(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) {
+pub(crate) fn do_shutdown(proxy: &mut super::TsiStreamProxy, pkt: &TxPacket) {
     let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
     let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 

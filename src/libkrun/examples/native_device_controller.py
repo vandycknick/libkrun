@@ -947,11 +947,15 @@ def main():
     parser.add_argument("--evidence", required=True, type=Path)
     parser.add_argument("--execution-completeness", action="store_true")
     parser.add_argument("--busy-devices", action="store_true")
+    parser.add_argument("--memory-dirty", action="store_true",
+                        help="standalone commit-7 cumulative CPU/host dirty coverage proof")
     parser.add_argument("--witness-dir", type=Path)
     parser.add_argument("--device-pressure", type=Path)
     args = parser.parse_args()
     if args.execution_completeness != args.busy_devices:
         parser.error("closed production extension requires both --execution-completeness and --busy-devices")
+    if args.memory_dirty and args.execution_completeness:
+        parser.error("--memory-dirty is a focused source proof, not the execution-completeness cohort")
     if args.netd is None:
         parser.error("supply actual netd with NETD_BIN or --netd")
     args.guest_init = args.guest_init or args.register_fixture.parent / "native-device-linux"
@@ -1018,7 +1022,11 @@ def main():
     report = {"schema": 1, "scope": "whole-machine-production", "native_pause": False, "pid": os.getpid(),
               "qualification_granted": False, "qualification_eligible": False}
     try:
-        if args.execution_completeness:
+        if args.memory_dirty:
+            from native_memory_controller import run
+            report["scope"] = "commit7-cumulative-memory-dirty-observations"
+            report["memory"] = run(args, echo)
+        elif args.execution_completeness:
             from native_device_execution import run
             observations = run(args, Session, seal_cut, save, digest, echo)
             report["absolute_no_early_requirement"] = "not-gating"

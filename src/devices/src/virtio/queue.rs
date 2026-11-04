@@ -6,6 +6,7 @@
 // found in the THIRD-PARTY file.
 
 use crate::virtio::RuntimeGuestMemory;
+use arch::guest_memory::ReadGuestMemory;
 use polly::event_manager::BarrierKey;
 use std::cmp::min;
 use std::fmt::{self, Debug, Display};
@@ -458,12 +459,12 @@ impl Queue {
         mem: &RuntimeGuestMemory,
         state: &QueueState,
     ) -> Result<(), Error> {
-        Self::validate_restored_state(self.max_size, mem, state)
+        Self::validate_restored_state(self.max_size, &mem.read_only(), state)
     }
 
     pub fn validate_restored_state(
         max_size: u16,
-        mem: &RuntimeGuestMemory,
+        mem: &ReadGuestMemory<'_>,
         state: &QueueState,
     ) -> Result<(), Error> {
         if state.max_size != max_size {
@@ -484,7 +485,7 @@ impl Queue {
             if address % alignment != 0 {
                 return Err(Error::InvalidChain);
             }
-            mem.get_slice(GuestAddress(address), length)
+            mem.validate_range(GuestAddress(address), length)
                 .map_err(Error::GuestMemory)?;
         }
         Ok(())
@@ -952,8 +953,8 @@ pub(crate) mod tests {
     use std::marker::PhantomData;
     use std::mem;
 
-    pub use super::*;
-    use vm_memory::{GuestAddress, GuestMemoryMmap};
+    pub use crate::virtio::queue::*;
+    use vm_memory::GuestAddress;
 
     // Represents a location in GuestMemoryMmap which holds a given type.
     pub struct SomeplaceInMemory<'a, T> {
@@ -1189,13 +1190,11 @@ pub(crate) mod tests {
 
     #[test]
     fn test_checked_new_descriptor_chain() {
-        let m = &RuntimeGuestMemory::passthrough(
-            GuestMemoryMmap::from_ranges(&[
-                (GuestAddress(0), 0x10000),
-                (GuestAddress(0x20000), 0x2000),
-            ])
-            .unwrap(),
-        );
+        let m = &RuntimeGuestMemory::from_ranges(&[
+            (GuestAddress(0), 0x10000),
+            (GuestAddress(0x20000), 0x2000),
+        ])
+        .unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
         assert!(vq.end().0 < 0x1000);
@@ -1242,9 +1241,7 @@ pub(crate) mod tests {
     #[test]
     #[allow(unused)]
     fn test_queue_validation() {
-        let m = &RuntimeGuestMemory::passthrough(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
-        );
+        let m = &RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
         let mut q = vq.create_queue();
@@ -1295,9 +1292,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_queue_processing() {
-        let m = &RuntimeGuestMemory::passthrough(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
-        );
+        let m = &RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
         let mut q = vq.create_queue();
 
@@ -1365,9 +1360,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_add_used() {
-        let m = &RuntimeGuestMemory::passthrough(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
-        );
+        let m = &RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
         let mut q = vq.create_queue();

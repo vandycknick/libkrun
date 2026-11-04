@@ -112,9 +112,18 @@ impl super::Vmm {
             return;
         }
 
-        let region = self
-            .guest_memory()
-            .find_region(GuestAddress(properties.gpa));
+        let memory = match self
+            .memory_domain
+            .with_external_mapping(|memory| memory.clone())
+        {
+            Ok(memory) => memory,
+            Err(error) => {
+                log::error!("confidential memory export refused: {error}");
+                let _ = sender.send(false);
+                return;
+            }
+        };
+        let region = memory.find_region(GuestAddress(properties.gpa));
         if region.is_none() {
             error!(
                 "guest memory region corresponding to GPA 0x{:x} not found",

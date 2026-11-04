@@ -6,7 +6,7 @@ use std::time::Instant;
 use devices::virtio::block::Block;
 use devices::virtio::lifecycle::ProviderFault;
 use devices::virtio::{Balloon, Console, Vsock};
-use vm_memory::{Bytes, GuestAddress};
+use vm_memory::GuestAddress;
 
 use crate::api::vmm_builder::native_device_probe::{Driver, Resource, WAIT, write_new};
 use crate::vmm::control::ControlState;
@@ -515,7 +515,7 @@ mod tests {
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let transport = Arc::new(Mutex::new(
             MmioTransport::new(
-                memory,
+                crate::vmm::memory::runtime_memory_for_test(memory),
                 DummyIrqChip::new().into(),
                 Arc::new(Mutex::new(Rng::new().unwrap())),
                 None,

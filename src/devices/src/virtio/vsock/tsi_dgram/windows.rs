@@ -14,16 +14,19 @@ use super::super::defs;
 use super::super::defs::uapi;
 use super::super::muxer::{MuxerRx, push_packet};
 use super::super::muxer_rxq::MuxerRxQ;
-use super::super::packet::{TsiConnectReq, TsiGetnameRsp, TsiSendtoAddr, VsockPacket};
 use super::super::proxy::{
-    AsRawFd, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt, address_family_from_linux,
+    ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt, address_family_from_linux,
 };
 use super::super::windows::sockaddr_storage::{
     SockaddrStorage, storage_to_winsock, winsock_to_storage,
 };
 use crate::virtio::RuntimeGuestMemory;
 use crate::virtio::vsock::packet::PacketQueue as VirtQueue;
+use crate::virtio::vsock::packet::{
+    RxPacket, TsiConnectReq, TsiGetnameRsp, TsiSendtoAddr, TxPacket,
+};
 use utils::epoll::EventSet;
+use utils::windows::AsRawFd;
 
 pub type SendtoAddr = SockaddrStorage;
 
@@ -82,7 +85,7 @@ pub(crate) fn create(
     })
 }
 
-pub(crate) fn init_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) {
+pub(crate) fn init_pkt(proxy: &super::TsiDgramProxy, pkt: &mut RxPacket) {
     pkt.set_op(uapi::VSOCK_OP_RW)
         .set_src_cid(uapi::VSOCK_HOST_CID)
         .set_dst_cid(proxy.cid)
@@ -93,13 +96,9 @@ pub(crate) fn init_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) {
         .set_fwd_cnt(proxy.tx_cnt.0);
 }
 
-pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -> RecvPkt {
+pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut RxPacket) -> RecvPkt {
     if let Some(buf) = pkt.buf_mut() {
-        let peer_credit = proxy.peer_avail_credit();
-        let max_len = std::cmp::min(buf.len(), peer_credit);
-        if max_len == 0 {
-            return RecvPkt::WaitForCredit;
-        }
+        let max_len = buf.len();
 
         let res = unsafe { recv(sock(proxy), buf.as_mut_ptr() as _, max_len as i32, 0) };
 
@@ -122,7 +121,7 @@ pub(crate) fn recv_to_pkt(proxy: &super::TsiDgramProxy, pkt: &mut VsockPacket) -
 
 pub(crate) fn do_connect(
     proxy: &mut super::TsiDgramProxy,
-    pkt: &VsockPacket,
+    pkt: &TxPacket,
     req: TsiConnectReq,
 ) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
@@ -163,7 +162,7 @@ pub(crate) fn do_connect(
     update
 }
 
-pub(crate) fn do_getpeername(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) {
+pub(crate) fn do_getpeername(proxy: &mut super::TsiDgramProxy, pkt: &TxPacket) {
     let mut sa_buf = [0u8; 128]; // Size matching SOCKADDR_STORAGE
     let mut sa_len = sa_buf.len() as i32;
 
@@ -202,7 +201,7 @@ pub(crate) fn do_getpeername(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 }
 
-pub(crate) fn sendmsg(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) -> ProxyUpdate {
+pub(crate) fn sendmsg(proxy: &mut super::TsiDgramProxy, pkt: &TxPacket) -> ProxyUpdate {
     if let Some(buf) = pkt.buf() {
         let res = unsafe { send(sock(proxy), buf.as_ptr() as _, buf.len() as i32, 0) };
         if res >= 0 {
@@ -249,7 +248,7 @@ pub(crate) fn do_sendto_addr(proxy: &mut super::TsiDgramProxy, req: TsiSendtoAdd
     update
 }
 
-pub(crate) fn sendto_data(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) {
+pub(crate) fn sendto_data(proxy: &mut super::TsiDgramProxy, pkt: &TxPacket) {
     proxy.peer_buf_alloc = pkt.buf_alloc();
     proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
@@ -278,7 +277,7 @@ pub(crate) fn sendto_data(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) {
     // sendto_addr is retained to preserve multi-packet stream integration mirrored from unix.rs
 }
 
-pub(crate) fn do_listen(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) -> ProxyUpdate {
+pub(crate) fn do_listen(proxy: &mut super::TsiDgramProxy, pkt: &TxPacket) -> ProxyUpdate {
     let result = -1i32; // DGRAM doesn't listen
     let rx = MuxerRx::ListenResponse {
         local_port: pkt.dst_port(),
@@ -289,10 +288,7 @@ pub(crate) fn do_listen(proxy: &mut super::TsiDgramProxy, pkt: &VsockPacket) -> 
     ProxyUpdate::default()
 }
 
-pub(crate) fn update_peer_credit(
-    proxy: &mut super::TsiDgramProxy,
-    pkt: &VsockPacket,
-) -> ProxyUpdate {
+pub(crate) fn update_peer_credit(proxy: &mut super::TsiDgramProxy, pkt: &TxPacket) -> ProxyUpdate {
     proxy.peer_buf_alloc = pkt.buf_alloc();
     proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
     proxy.status = ProxyStatus::Connected;

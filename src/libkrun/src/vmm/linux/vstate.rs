@@ -7,28 +7,38 @@
 
 #[cfg(target_arch = "aarch64")]
 use arch::ArchMemoryInfo;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use arch::guest_memory::TrackingMode;
+use arch::guest_memory::{
+    ConstructionAuthority, CpuHarvest, CpuTrackingEpoch, DirtyFailure, DirtyPageMap, MemoryCut,
+    MemoryDomain, NativeEffectsPermit,
+};
+use arch::guest_memory::{DirtyEffect, DirtyLocation, DirtyOperation};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use libc::{c_int, c_void, siginfo_t};
 use std::cell::Cell;
 use std::fmt::{Display, Formatter};
 use std::io;
+use std::ops::Deref;
 #[cfg(all(feature = "tee", target_arch = "x86_64"))]
 use std::ops::Range;
-
-#[cfg(all(feature = "tee", target_arch = "x86_64"))]
-use std::os::unix::io::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 
 #[cfg(target_arch = "x86_64")]
 use std::env;
 use std::result;
-use std::sync::Arc;
 use std::sync::atomic::{Ordering, fence};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 #[cfg(target_arch = "x86_64")]
 use std::time::Duration;
 
 use crate::vmm::control::{CpuAck, CpuCommand, CpuSubmission};
-use crate::vmm::linux::cpu_control::{CpuDisposition, CpuMailbox, submit_command};
+use crate::vmm::linux::cpu_control::{
+    CpuDisposition, CpuMailbox, finish_native_command, submit_command,
+};
+#[cfg(not(feature = "tee"))]
+use crate::vmm::linux::dirty::KvmMemory;
 use crate::vmm::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 
 #[cfg(feature = "amd-sev")]
@@ -82,6 +92,9 @@ pub(crate) const VCPU_RTSIG_OFFSET: i32 = 0;
 #[derive(Debug)]
 pub enum Error {
     ControlChannel,
+    DirtyMemory(DirtyFailure),
+    GuestMemory(vm_memory::GuestMemoryError),
+    GuestMemoryNotInitialized,
     SignalHandler(utils::errno::Error),
     #[cfg(target_arch = "x86_64")]
     /// A call to cpuid instruction failed.
@@ -204,6 +217,9 @@ impl Display for Error {
 
         match self {
             ControlChannel => write!(f, "vCPU control channel unavailable"),
+            DirtyMemory(e) => write!(f, "KVM memory tracking: {e:?}"),
+            GuestMemory(e) => write!(f, "KVM guest memory: {e}"),
+            GuestMemoryNotInitialized => write!(f, "KVM guest memory is not fully initialized"),
             SignalHandler(e) => write!(f, "Failed to register vCPU kick handler: {e}"),
             #[cfg(target_arch = "x86_64")]
             CpuId(e) => write!(f, "Cpuid error: {e:?}"),
@@ -381,10 +397,92 @@ impl KvmContext {
     }
 }
 
+pub struct VmFdOwner {
+    // The last native VM descriptor must close before registered backing can disappear.
+    fd: VmFd,
+    backing: OnceLock<Arc<GuestMemoryMmap>>,
+    domain: OnceLock<Arc<MemoryDomain>>,
+}
+
+impl VmFdOwner {
+    fn new(fd: VmFd) -> Self {
+        Self {
+            fd,
+            backing: OnceLock::new(),
+            domain: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn retain_backing(
+        &self,
+        backing: &Arc<GuestMemoryMmap>,
+    ) -> std::result::Result<(), DirtyFailure> {
+        if let Some(retained) = self.backing.get() {
+            if Arc::ptr_eq(retained, backing) {
+                return Ok(());
+            }
+            return Err(DirtyFailure {
+                operation: DirtyOperation::Bind,
+                location: DirtyLocation::Vm,
+                native_code: 0,
+                effect: DirtyEffect::PreEffectRefusal,
+            });
+        }
+        self.backing
+            .set(Arc::clone(backing))
+            .map_err(|_| DirtyFailure {
+                operation: DirtyOperation::Bind,
+                location: DirtyLocation::Vm,
+                native_code: 0,
+                effect: DirtyEffect::PreEffectRefusal,
+            })
+    }
+
+    pub(crate) fn bind_domain(
+        &self,
+        domain: Arc<MemoryDomain>,
+    ) -> std::result::Result<(), DirtyFailure> {
+        let refusal = DirtyFailure {
+            operation: DirtyOperation::Bind,
+            location: DirtyLocation::Vm,
+            native_code: 0,
+            effect: DirtyEffect::PreEffectRefusal,
+        };
+        let backing = self.backing.get().ok_or(refusal)?;
+        if !domain.matches_mapping(backing) {
+            return Err(refusal);
+        }
+        if let Some(retained) = self.domain.get() {
+            return if Arc::ptr_eq(retained, &domain) {
+                Ok(())
+            } else {
+                Err(refusal)
+            };
+        }
+        self.domain.set(domain).map_err(|_| refusal)
+    }
+}
+
+impl Deref for VmFdOwner {
+    type Target = VmFd;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fd
+    }
+}
+
+impl AsRawFd for VmFdOwner {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
 /// A wrapper around creating and using a VM.
 pub struct Vm {
-    fd: Arc<VmFd>,
+    fd: Arc<VmFdOwner>,
     next_mem_slot: u32,
+    #[cfg(not(feature = "tee"))]
+    memory: KvmMemory,
 
     // X86 specific fields.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -434,8 +532,9 @@ impl Vm {
             arch::x86_64::msr::supported_guest_msrs(kvm).map_err(Error::GuestMSRs)?;
 
         Ok(Vm {
-            fd: Arc::new(vm_fd),
+            fd: Arc::new(VmFdOwner::new(vm_fd)),
             next_mem_slot: 0,
+            memory: KvmMemory::new(),
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             supported_cpuid,
             #[cfg(target_arch = "x86_64")]
@@ -484,7 +583,7 @@ impl Vm {
         };
 
         Ok(Vm {
-            fd: Arc::new(vm_fd),
+            fd: Arc::new(VmFdOwner::new(vm_fd)),
             next_mem_slot: 0,
             supported_cpuid,
             supported_msrs,
@@ -533,7 +632,7 @@ impl Vm {
         vm_fd.enable_cap(&cap).map_err(Error::VmApicBusClockRate)?;
 
         Ok(Vm {
-            fd: Arc::new(vm_fd),
+            fd: Arc::new(VmFdOwner::new(vm_fd)),
             next_mem_slot: 0,
             supported_cpuid,
             supported_msrs,
@@ -568,6 +667,33 @@ impl Vm {
         if guest_mem.num_regions() > kvm_max_memslots {
             return Err(Error::NotEnoughMemorySlots);
         }
+        #[cfg(not(feature = "tee"))]
+        self.memory
+            .prepare_registration(guest_mem)
+            .map_err(Error::DirtyMemory)?;
+        #[cfg(not(feature = "tee"))]
+        self.fd
+            .retain_backing(
+                self.memory
+                    .backing()
+                    .ok_or(Error::GuestMemoryNotInitialized)?,
+            )
+            .map_err(Error::DirtyMemory)?;
+        #[cfg(feature = "tee")]
+        {
+            if self.fd.backing.get().is_some() {
+                return Err(Error::DirtyMemory(DirtyFailure {
+                    operation: DirtyOperation::Bind,
+                    location: DirtyLocation::Vm,
+                    native_code: 0,
+                    effect: DirtyEffect::PreEffectRefusal,
+                }));
+            }
+            let backing = Arc::new(guest_mem.clone());
+            self.fd
+                .retain_backing(&backing)
+                .map_err(Error::DirtyMemory)?;
+        }
 
         for region in guest_mem.iter() {
             self.memory_region_set(guest_mem, region)?;
@@ -579,6 +705,54 @@ impl Vm {
             .map_err(Error::VmSetup)?;
 
         Ok(())
+    }
+
+    pub(crate) fn memory_init_tracked(
+        &mut self,
+        domain: Arc<MemoryDomain>,
+        authority: &ConstructionAuthority,
+        kvm_max_memslots: usize,
+    ) -> std::result::Result<CpuTrackingEpoch, DirtyFailure> {
+        #[cfg(not(feature = "tee"))]
+        {
+            let count = domain.layout().regions().len();
+            let next = u32::try_from(count).map_err(|_| DirtyFailure {
+                operation: DirtyOperation::Arm,
+                location: DirtyLocation::Vm,
+                native_code: 0,
+                effect: DirtyEffect::PreEffectRefusal,
+            })?;
+            if self.next_mem_slot != 0 || count > kvm_max_memslots {
+                return Err(DirtyFailure {
+                    operation: DirtyOperation::Arm,
+                    location: DirtyLocation::Vm,
+                    native_code: 0,
+                    effect: DirtyEffect::PreEffectRefusal,
+                });
+            }
+            let epoch = self
+                .memory
+                .initialize_tracked(&self.fd, Arc::clone(&domain), authority)?;
+            self.next_mem_slot = next;
+            #[cfg(target_arch = "x86_64")]
+            self.fd
+                .set_tss_address(arch::x86_64::layout::KVM_TSS_ADDRESS as usize)
+                .map_err(|error| {
+                    domain.invalidate_coverage();
+                    DirtyFailure {
+                        operation: DirtyOperation::Arm,
+                        location: DirtyLocation::Vm,
+                        native_code: i64::from(error.errno()),
+                        effect: DirtyEffect::CoverageLost,
+                    }
+                })?;
+            Ok(epoch)
+        }
+        #[cfg(feature = "tee")]
+        {
+            let _ = (domain, authority, kvm_max_memslots);
+            Err(unsupported_dirty(DirtyOperation::Arm))
+        }
     }
 
     #[cfg(all(feature = "tee", target_arch = "x86_64"))]
@@ -616,12 +790,9 @@ impl Vm {
             flags: 0,
         };
 
-        // Safe because we mapped the memory region and ensured regions do not overlap.
-        unsafe {
-            self.fd
-                .set_user_memory_region(memory_region)
-                .map_err(Error::SetUserMemoryRegion)?;
-        };
+        self.memory
+            .register(&self.fd, memory_region)
+            .map_err(Error::SetUserMemoryRegion)?;
 
         Ok(())
     }
@@ -702,14 +873,83 @@ impl Vm {
         guest_mem: &GuestMemoryMmap,
         region: &GuestRegionMmap,
     ) -> Result<()> {
-        let host_addr = guest_mem.get_host_address(region.start_addr()).unwrap() as u64;
+        let host_addr = guest_mem
+            .get_host_address(region.start_addr())
+            .map_err(Error::GuestMemory)? as u64;
         let start = region.start_addr().raw_value();
 
+        let next_mem_slot = self
+            .next_mem_slot
+            .checked_add(1)
+            .ok_or(Error::NotEnoughMemorySlots)?;
         self.create_guest_physical_memory_slot(host_addr, start, region)?;
 
-        self.next_mem_slot += 1;
+        self.next_mem_slot = next_mem_slot;
 
         Ok(())
+    }
+
+    pub(crate) fn bind_memory_domain(
+        &mut self,
+        domain: Arc<MemoryDomain>,
+    ) -> std::result::Result<(), DirtyFailure> {
+        #[cfg(not(feature = "tee"))]
+        {
+            self.memory.bind(Arc::clone(&domain))?;
+            self.fd.bind_domain(domain)
+        }
+        #[cfg(feature = "tee")]
+        {
+            let _ = domain;
+            Err(unsupported_dirty(DirtyOperation::Bind))
+        }
+    }
+
+    pub(crate) fn arm_initial(
+        &mut self,
+        authority: &ConstructionAuthority,
+    ) -> std::result::Result<CpuTrackingEpoch, DirtyFailure> {
+        #[cfg(not(feature = "tee"))]
+        {
+            self.memory.arm(&self.fd, authority)
+        }
+        #[cfg(feature = "tee")]
+        {
+            let _ = authority;
+            Err(unsupported_dirty(DirtyOperation::Arm))
+        }
+    }
+
+    pub(crate) fn collect_cpu_dirty(
+        &mut self,
+        cut: &MemoryCut,
+        retained: &mut DirtyPageMap,
+    ) -> std::result::Result<CpuHarvest, DirtyFailure> {
+        #[cfg(not(feature = "tee"))]
+        {
+            self.memory.collect(&self.fd, cut, retained)
+        }
+        #[cfg(feature = "tee")]
+        {
+            let _ = (cut, retained);
+            Err(unsupported_dirty(DirtyOperation::Collect))
+        }
+    }
+
+    pub(crate) fn rearm_cpu_dirty(
+        &mut self,
+        cut: &MemoryCut,
+        harvested: CpuHarvest,
+    ) -> std::result::Result<CpuTrackingEpoch, DirtyFailure> {
+        #[cfg(not(feature = "tee"))]
+        {
+            self.memory.rearm(cut, harvested)
+        }
+        #[cfg(feature = "tee")]
+        {
+            let _ = (cut, harvested);
+            Err(unsupported_dirty(DirtyOperation::Rearm))
+        }
     }
 
     #[cfg(feature = "tdx")]
@@ -793,36 +1033,66 @@ impl Vm {
         &self.fd
     }
 
-    pub fn fd_owner(&self) -> Arc<VmFd> {
+    pub fn fd_owner(&self) -> Arc<VmFdOwner> {
         Arc::clone(&self.fd)
+    }
+
+    fn validate_native_effects(
+        &self,
+        permit: &NativeEffectsPermit,
+    ) -> std::result::Result<(), String> {
+        #[cfg(not(feature = "tee"))]
+        {
+            self.memory.validate_native(permit)
+        }
+        #[cfg(feature = "tee")]
+        {
+            let _ = permit;
+            Err("kvm/native/tee-excluded".into())
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn capture_execution(
         &mut self,
         profile: &execution::KvmCaptureProfile,
+        permit: &NativeEffectsPermit,
     ) -> std::result::Result<KvmVmState, String> {
+        self.validate_native_effects(permit)?;
         if let Some(state) = &self.retained_execution {
             return Ok(state.clone());
         }
-        let state = execution::capture_vm(
-            &self.fd,
-            profile,
-            &mut self.retained_pit,
-            #[cfg(feature = "native-device-probe")]
-            &self.execution_controller_writes,
+        let state = execution::native_result(
+            permit,
+            execution::capture_vm(
+                &self.fd,
+                profile,
+                &mut self.retained_pit,
+                #[cfg(feature = "native-device-probe")]
+                &self.execution_controller_writes,
+                permit,
+            ),
         )?;
         self.retained_execution = Some(state.clone());
         Ok(state)
     }
 
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn install_execution(&self, state: &KvmVmState) -> std::result::Result<(), String> {
-        execution::install_vm(
-            &self.fd,
-            state,
-            #[cfg(feature = "native-device-probe")]
-            &self.execution_controller_writes,
+    pub(crate) fn install_execution(
+        &self,
+        state: &KvmVmState,
+        permit: &NativeEffectsPermit,
+    ) -> std::result::Result<(), String> {
+        self.validate_native_effects(permit)?;
+        execution::native_result(
+            permit,
+            execution::install_vm(
+                &self.fd,
+                state,
+                #[cfg(feature = "native-device-probe")]
+                &self.execution_controller_writes,
+                permit,
+            ),
         )
     }
 
@@ -831,19 +1101,25 @@ impl Vm {
         &self,
         state: &KvmVmState,
         cpus: &[KvmCpuState],
+        permit: &NativeEffectsPermit,
     ) -> std::result::Result<Vec<KvmCpuTimePlan>, String> {
+        self.validate_native_effects(permit)?;
         let mut observation = self
             .execution_clock_observation
             .lock()
             .map_err(|_| "kvm/clock/observation-lock")?;
         *observation = None;
-        execution::prepare_vm_time(
-            &self.fd,
-            state,
-            cpus,
-            &mut observation,
-            #[cfg(feature = "native-device-probe")]
-            &self.execution_controller_writes,
+        execution::native_result(
+            permit,
+            execution::prepare_vm_time(
+                &self.fd,
+                state,
+                cpus,
+                &mut observation,
+                #[cfg(feature = "native-device-probe")]
+                &self.execution_controller_writes,
+                permit,
+            ),
         )
     }
 
@@ -892,25 +1168,38 @@ impl Vm {
     pub(crate) fn capture_execution(
         &mut self,
         profile: &execution::KvmCaptureProfile,
+        permit: &NativeEffectsPermit,
     ) -> std::result::Result<KvmVmState, String> {
+        self.validate_native_effects(permit)?;
         if let Some(state) = &self.retained_execution {
             return Ok(state.clone());
         }
         self.set_execution_controller(Arc::clone(&profile.controller));
-        let state = execution::capture_arm_vm(profile, self.arm_counter_model)?;
+        let state = execution::native_result(
+            permit,
+            execution::capture_arm_vm(profile, self.arm_counter_model, permit),
+        )?;
         self.retained_execution = Some(state.clone());
         Ok(state)
     }
 
     #[cfg(target_arch = "aarch64")]
-    pub(crate) fn install_execution(&self, state: &KvmVmState) -> std::result::Result<(), String> {
+    pub(crate) fn install_execution(
+        &self,
+        state: &KvmVmState,
+        permit: &NativeEffectsPermit,
+    ) -> std::result::Result<(), String> {
+        self.validate_native_effects(permit)?;
         state.validate()?;
-        self.execution_controller
-            .as_ref()
-            .ok_or("kvm/gic/controller-not-retained")?
-            .lock()
-            .map_err(|_| "kvm/gic/controller-lock")?
-            .install_kvm_state(&execution::arm_gic_state(state)?)
+        execution::native_result(
+            permit,
+            self.execution_controller
+                .as_ref()
+                .ok_or("kvm/gic/controller-not-retained")?
+                .lock()
+                .map_err(|_| "kvm/gic/controller-lock")?
+                .install_kvm_state(&execution::arm_gic_state(state)?),
+        )
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -918,9 +1207,20 @@ impl Vm {
         &self,
         state: &KvmVmState,
         cpus: &[KvmCpuState],
+        permit: &NativeEffectsPermit,
     ) -> std::result::Result<Vec<KvmCpuTimePlan>, String> {
-        self.install_execution(state)?;
-        execution::prepare_arm_time(&self.fd, state, cpus)
+        self.install_execution(state, permit)?;
+        execution::native_result(permit, execution::prepare_arm_time(&self.fd, state, cpus))
+    }
+}
+
+#[cfg(feature = "tee")]
+fn unsupported_dirty(operation: DirtyOperation) -> DirtyFailure {
+    DirtyFailure {
+        operation,
+        location: DirtyLocation::Vm,
+        native_code: 0,
+        effect: DirtyEffect::PreEffectRefusal,
     }
 }
 
@@ -978,7 +1278,8 @@ pub struct Vcpu {
     execution_time_ready: bool,
     #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
     device_witness_source: bool,
-    retained_resources: Option<(GuestMemoryMmap, Arc<VmFd>)>,
+    retained_resources: Arc<VmFdOwner>,
+    memory_domain: Option<Arc<MemoryDomain>>,
     #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
     probe_park_state: ProbeParkJournal,
     #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
@@ -1078,7 +1379,7 @@ impl Vcpu {
     /// # Arguments
     ///
     /// * `id` - Represents the CPU number between [0, max vcpus).
-    /// * `vm_fd` - The kvm `VmFd` for the virtual machine this vcpu will get attached to.
+    /// * `vm_owner` - Owns the native VM descriptor and registered RAM backing.
     /// * `cpuid` - The `CpuId` listing the supported capabilities of this vcpu.
     /// * `msr_list` - The `MsrList` listing the supported MSRs for this vcpu.
     /// * `io_bus` - The io-bus used to access port-io devices.
@@ -1086,13 +1387,18 @@ impl Vcpu {
     #[cfg(target_arch = "x86_64")]
     pub fn new_x86_64(
         id: u8,
-        vm_fd: &VmFd,
+        vm_owner: Arc<VmFdOwner>,
         cpuid: CpuId,
         msr_list: MsrList,
         io_bus: devices::Bus,
         exit_evt: EventFd,
         #[cfg(feature = "tee")] pm_sender: Sender<WorkerMessage>,
     ) -> Result<Self> {
+        if vm_owner.backing.get().is_none() {
+            return Err(Error::GuestMemoryNotInitialized);
+        }
+        let memory_domain = vm_owner.domain.get().cloned();
+        let vm_fd: &VmFd = &vm_owner;
         let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
         let (event_sender, event_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
@@ -1135,7 +1441,8 @@ impl Vcpu {
             execution_time_ready: false,
             #[cfg(feature = "native-device-probe")]
             device_witness_source: true,
-            retained_resources: None,
+            retained_resources: vm_owner,
+            memory_domain,
             #[cfg(feature = "native-control-probe")]
             probe_park_state: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "native-device-probe")]
@@ -1150,11 +1457,16 @@ impl Vcpu {
     /// # Arguments
     ///
     /// * `id` - Represents the CPU number between [0, max vcpus).
-    /// * `vm_fd` - The kvm `VmFd` for the virtual machine this vcpu will get attached to.
+    /// * `vm_owner` - Owns the native VM descriptor and registered RAM backing.
     /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
     /// * `create_ts` - A timestamp used by the vcpu to calculate its lifetime.
     #[cfg(target_arch = "aarch64")]
-    pub fn new_aarch64(id: u8, vm_fd: &VmFd, exit_evt: EventFd) -> Result<Self> {
+    pub fn new_aarch64(id: u8, vm_owner: Arc<VmFdOwner>, exit_evt: EventFd) -> Result<Self> {
+        if vm_owner.backing.get().is_none() {
+            return Err(Error::GuestMemoryNotInitialized);
+        }
+        let memory_domain = vm_owner.domain.get().cloned();
+        let vm_fd: &VmFd = &vm_owner;
         let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
         let (event_sender, event_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
@@ -1180,7 +1492,8 @@ impl Vcpu {
             execution_journal: Vec::new(),
             execution_stop_only: false,
             execution_time_ready: false,
-            retained_resources: None,
+            retained_resources: vm_owner,
+            memory_domain,
         })
     }
 
@@ -1189,11 +1502,16 @@ impl Vcpu {
     /// # Arguments
     ///
     /// * `id` - Represents the CPU number between [0, max vcpus).
-    /// * `vm_fd` - The kvm `VmFd` for the virtual machine this vcpu will get attached to.
+    /// * `vm_owner` - Owns the native VM descriptor and registered RAM backing.
     /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
     /// * `create_ts` - A timestamp used by the vcpu to calculate its lifetime.
     #[cfg(target_arch = "riscv64")]
-    pub fn new_riscv64(id: u8, vm_fd: &VmFd, exit_evt: EventFd) -> Result<Self> {
+    pub fn new_riscv64(id: u8, vm_owner: Arc<VmFdOwner>, exit_evt: EventFd) -> Result<Self> {
+        if vm_owner.backing.get().is_none() {
+            return Err(Error::GuestMemoryNotInitialized);
+        }
+        let memory_domain = vm_owner.domain.get().cloned();
+        let vm_fd: &VmFd = &vm_owner;
         let kvm_vcpu = vm_fd.create_vcpu(id as u64).map_err(Error::VcpuFd)?;
         let (event_sender, event_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
@@ -1215,7 +1533,8 @@ impl Vcpu {
             execution_journal: Vec::new(),
             execution_stop_only: false,
             execution_time_ready: false,
-            retained_resources: None,
+            retained_resources: vm_owner,
+            memory_domain,
         })
     }
 
@@ -1372,13 +1691,10 @@ impl Vcpu {
     #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
     pub(crate) fn configure_control_probe(
         &mut self,
-        memory: GuestMemoryMmap,
-        vm: Arc<VmFd>,
         entry: u64,
         data_segment: u16,
         mmio_bus: devices::Bus,
     ) -> Result<()> {
-        self.retained_resources = Some((memory, vm));
         self.mmio_bus = Some(mmio_bus);
         self.fd
             .set_cpuid2(&self.cpuid)
@@ -1447,8 +1763,17 @@ impl Vcpu {
             .map_err(|e| format!("fixture/SET_MP_STATE: {e}"))
     }
 
-    pub fn retain_resources(&mut self, memory: GuestMemoryMmap, vm: &Vm) {
-        self.retained_resources = Some((memory, vm.fd_owner()));
+    pub fn retain_resources(&mut self, vm: &Vm) -> Result<()> {
+        if !Arc::ptr_eq(&self.retained_resources, &vm.fd) {
+            return Err(Error::GuestMemoryNotInitialized);
+        }
+        #[cfg(not(feature = "tee"))]
+        let domain = vm.memory.domain().ok_or(Error::GuestMemoryNotInitialized)?;
+        #[cfg(not(feature = "tee"))]
+        {
+            self.memory_domain = Some(Arc::clone(domain));
+        }
+        Ok(())
     }
 
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.
@@ -1702,6 +2027,20 @@ impl Vcpu {
         command: &CpuCommand,
     ) -> std::result::Result<Option<Arc<CpuExecutionState>>, String> {
         use crate::vmm::control::CpuCommandKind;
+        let permit = command
+            .native_effects
+            .as_deref()
+            .ok_or("kvm/native/effects-authority-missing")?;
+        let domain = self
+            .memory_domain
+            .as_ref()
+            .ok_or("kvm/native/memory-domain-unbound")?;
+        permit
+            .validate_domain(domain)
+            .map_err(|e| format!("kvm/native/authority: {e}"))?;
+        if domain.tracking_mode() != Some(TrackingMode::Capture) {
+            return Err("kvm/native/memory-tracking-not-finalized".into());
+        }
         match command.kind {
             #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
             CpuCommandKind::InitializeDeviceWitness => {
@@ -1739,7 +2078,7 @@ impl Vcpu {
                 cpu.regs = bootstrap.regs;
                 cpu.special = bootstrap.special.clone();
                 cpu.mp_state = 0;
-                let result = execution::initialize_device_witness(&self.fd, cpu);
+                let result = execution::initialize_device_witness(&self.fd, cpu, permit);
                 if result.is_err() {
                     self.execution_stop_only = true;
                 }
@@ -1752,7 +2091,8 @@ impl Vcpu {
                     return Err("capture has unexpected input".into());
                 }
                 if self.execution_cut.is_none() {
-                    let state = execution::capture_cpu(&self.fd, self.id, &self.capture_config)?;
+                    let state =
+                        execution::capture_cpu(&self.fd, self.id, &self.capture_config, permit)?;
                     // Native timer cancellation can partially fail. The original cut must already have an owner.
                     self.execution_cut = Some(Arc::new(CpuExecutionState::Kvm(state)));
                 }
@@ -1763,7 +2103,7 @@ impl Vcpu {
                 let CpuExecutionState::Kvm(native) = state.as_ref() else {
                     return Err("wrong CPU backend".into());
                 };
-                execution::fence_cpu_timer(&self.fd, native)?;
+                execution::fence_cpu_timer(&self.fd, native, permit)?;
                 Ok(Some(Arc::clone(state)))
             }
             CpuCommandKind::InstallExecution => {
@@ -1782,7 +2122,8 @@ impl Vcpu {
                 }
                 self.execution_time_ready = false;
                 self.execution_cut = Some(Arc::new(CpuExecutionState::Kvm(state.clone())));
-                let installed = execution::install_cpu(&self.fd, state, &self.capture_config);
+                let installed =
+                    execution::install_cpu(&self.fd, state, &self.capture_config, permit);
                 if installed.is_err() {
                     self.execution_stop_only = true;
                 }
@@ -1805,7 +2146,7 @@ impl Vcpu {
                 let CpuExecutionState::Kvm(state) = state else {
                     return Err("time retained backend mismatch".into());
                 };
-                execution::prepare_cpu_time(&self.fd, state, plan)?;
+                execution::prepare_cpu_time(&self.fd, state, plan, permit)?;
                 self.execution_time_ready = true;
                 Ok(None)
             }
@@ -1883,13 +2224,17 @@ impl Vcpu {
                     ack.result = Err("execution backend unsupported".into());
                 }
             }
-            self.execution_journal.push((command.clone(), ack.clone()));
+            let mut terminal = command.clone();
+            // The journal remembers the operation, not a completed native-effects obligation.
+            terminal.native_effects = None;
+            self.execution_journal.push((terminal, ack.clone()));
         }
         ack
     }
 
-    fn control(&mut self, command: CpuCommand) -> StateMachine<Self> {
+    fn control(&mut self, mut command: CpuCommand) -> StateMachine<Self> {
         let ack = self.acknowledge_command(&command);
+        let ack = finish_native_command(&mut command, ack);
         #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
         let ack = {
             let mut ack = ack;
@@ -1960,7 +2305,6 @@ impl Vcpu {
 
     #[cfg(feature = "tdx")]
     pub fn tdx_secure_virt_prepare(&self, launcher: &mut tdx::launch::Launcher) {
-        use std::os::fd::AsRawFd;
         launcher.add_vcpu_fd(self.fd.as_raw_fd());
     }
 }
@@ -2249,6 +2593,7 @@ impl Drop for VcpuHandle {
                     },
                     kind: CpuCommandKind::Stop,
                     execution: None,
+                    native_effects: None,
                 });
                 let _ = thread.kill(sigrtmin() + VCPU_RTSIG_OFFSET);
             }
@@ -2298,7 +2643,7 @@ mod tests {
         {
             vcpu = Vcpu::new_x86_64(
                 1,
-                vm.fd(),
+                vm.fd_owner(),
                 vm.supported_cpuid().clone(),
                 vm.supported_msrs().clone(),
                 devices::Bus::new(),
@@ -2308,7 +2653,7 @@ mod tests {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            vcpu = Vcpu::new_aarch64(1, vm.fd(), exit_evt).unwrap();
+            vcpu = Vcpu::new_aarch64(1, vm.fd_owner(), exit_evt).unwrap();
         }
 
         (vm, vcpu, gm)
@@ -2413,7 +2758,7 @@ mod tests {
         // Try it for when vcpu id is 0.
         let mut vcpu = Vcpu::new_aarch64(
             0,
-            vm.fd(),
+            vm.fd_owner(),
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
         )
         .unwrap();
@@ -2426,7 +2771,7 @@ mod tests {
         // Try it for when vcpu id is NOT 0.
         let mut vcpu = Vcpu::new_aarch64(
             1,
-            vm.fd(),
+            vm.fd_owner(),
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
         )
         .unwrap();

@@ -1,11 +1,10 @@
+use crate::virtio::{ReadView, WriteView};
 use std::fs::File;
 use std::io::{self, ErrorKind, IsTerminal};
 use std::mem::MaybeUninit;
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, OwnedHandle, RawHandle};
 use utils::eventfd::EventFd;
 use utils::windows::AsRawFd;
-use vm_memory::VolatileSlice;
-use vm_memory::bitmap::Bitmap;
 use windows_sys::Win32::{
     Foundation::FALSE,
     Storage::FileSystem::{ReadFile, WriteFile},
@@ -62,7 +61,7 @@ impl AsRawHandle for PortInputHandle {
 }
 
 impl PortInput for PortInputHandle {
-    fn read_volatile(&mut self, buf: &mut VolatileSlice) -> io::Result<usize> {
+    fn read_volatile(&mut self, buf: WriteView<'_>) -> io::Result<usize> {
         let len = u32::try_from(buf.len()).map_err(|_| {
             io::Error::new(ErrorKind::InvalidInput, "buffer length exceeds u32::MAX")
         })?;
@@ -70,7 +69,7 @@ impl PortInput for PortInputHandle {
         let ret = unsafe {
             ReadFile(
                 self.as_raw_handle(),
-                buf.ptr_guard_mut().as_ptr(),
+                buf.as_mut_ptr(),
                 len,
                 &mut bytes_read,
                 std::ptr::null_mut(),
@@ -81,14 +80,9 @@ impl PortInput for PortInputHandle {
             if err.kind() == ErrorKind::BrokenPipe {
                 return Ok(0);
             }
-            if err.kind() != ErrorKind::WouldBlock {
-                // We don't know if a partial read might have happened, so mark everything as dirty
-                buf.bitmap().mark_dirty(0, buf.len());
-            }
             Err(err)
         } else {
             let n = bytes_read as usize;
-            buf.bitmap().mark_dirty(0, n);
             Ok(n)
         }
     }
@@ -103,7 +97,7 @@ impl PortInput for PortInputHandle {
 }
 
 impl PortInput for PortInputEmpty {
-    fn read_volatile(&mut self, _buf: &mut VolatileSlice) -> Result<usize, io::Error> {
+    fn read_volatile(&mut self, _buf: WriteView<'_>) -> Result<usize, io::Error> {
         Ok(0)
     }
 
@@ -127,7 +121,7 @@ impl AsRawHandle for PortOutputHandle {
 }
 
 impl PortOutput for PortOutputHandle {
-    fn write_volatile(&mut self, buf: &VolatileSlice) -> io::Result<usize> {
+    fn write_volatile(&mut self, buf: ReadView<'_>) -> io::Result<usize> {
         let len = u32::try_from(buf.len()).map_err(|_| {
             io::Error::new(ErrorKind::InvalidInput, "buffer length exceeds u32::MAX")
         })?;
@@ -135,7 +129,7 @@ impl PortOutput for PortOutputHandle {
         let ret = unsafe {
             WriteFile(
                 self.as_raw_handle(),
-                buf.ptr_guard().as_ptr(),
+                buf.as_ptr(),
                 len,
                 &mut bytes_written,
                 std::ptr::null_mut(),

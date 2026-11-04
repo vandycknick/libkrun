@@ -16,16 +16,18 @@ use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::socket::{
     AddressFamily, Backlog, MsgFlags, Shutdown, SockFlag, SockType, SockaddrLike, SockaddrStorage,
-    accept, bind, connect, getpeername, listen, recv, send, setsockopt, shutdown, socket, sockopt,
+    accept, bind, connect, getpeername, listen, setsockopt, shutdown, socket, sockopt,
 };
 
 #[cfg(target_os = "macos")]
 use super::super::super::linux_errno::linux_errno_raw;
 use super::super::defs;
 use super::super::muxer::{MuxerRx, push_packet};
-use super::super::packet::{TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, VsockPacket};
 use super::super::proxy::{
     NewProxyType, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
+};
+use crate::virtio::vsock::packet::{
+    RxPacket, TsiAcceptReq, TsiConnectReq, TsiGetnameRsp, TsiListenReq, TxPacket,
 };
 use utils::epoll::EventSet;
 
@@ -174,7 +176,7 @@ fn try_listen(
     }
 }
 
-pub(crate) fn recv_to_pkt(proxy: &super::TsiStreamProxy, pkt: &mut VsockPacket) -> RecvPkt {
+pub(crate) fn recv_to_pkt(proxy: &super::TsiStreamProxy, pkt: &mut RxPacket) -> RecvPkt {
     if let Some(buf) = pkt.buf_mut() {
         let peer_credit = proxy.peer_avail_credit();
         let max_len = std::cmp::min(buf.len(), peer_credit);
@@ -190,9 +192,10 @@ pub(crate) fn recv_to_pkt(proxy: &super::TsiStreamProxy, pkt: &mut VsockPacket) 
             return RecvPkt::WaitForCredit;
         }
 
-        match recv(
+        match crate::virtio::vsock::packet::recv_into(
             proxy.fd.as_raw_fd(),
-            &mut buf[..max_len],
+            buf,
+            max_len,
             MsgFlags::MSG_DONTWAIT,
         ) {
             Ok(cnt) => {
@@ -269,7 +272,7 @@ fn get_unixsock_path(_proxy: &super::TsiStreamProxy, addr: &SockaddrStorage) -> 
 
 pub(crate) fn do_connect(
     proxy: &mut super::TsiStreamProxy,
-    _pkt: &VsockPacket,
+    _pkt: &TxPacket,
     req: TsiConnectReq,
 ) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
@@ -311,7 +314,7 @@ pub(crate) fn do_connect(
     update
 }
 
-pub(crate) fn do_getpeername(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) {
+pub(crate) fn do_getpeername(proxy: &mut super::TsiStreamProxy, pkt: &TxPacket) {
     debug!("getpeername: id={}", proxy.id);
 
     let (result, addr_len, addr): (i32, u32, SockaddrStorage) =
@@ -357,7 +360,7 @@ pub(crate) fn do_getpeername(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacke
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 }
 
-pub(crate) fn sendmsg(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) -> ProxyUpdate {
+pub(crate) fn sendmsg(proxy: &mut super::TsiStreamProxy, pkt: &TxPacket) -> ProxyUpdate {
     debug!("sendmsg");
 
     let mut update = ProxyUpdate::default();
@@ -368,7 +371,7 @@ pub(crate) fn sendmsg(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) -> P
         #[cfg(target_os = "linux")]
         let flags = MsgFlags::MSG_NOSIGNAL;
 
-        match send(proxy.fd.as_raw_fd(), buf, flags) {
+        match crate::virtio::vsock::packet::send_from(proxy.fd.as_raw_fd(), buf, flags) {
             Ok(sent) => {
                 if sent != buf.len() {
                     error!("couldn't set everything: buf={}, sent={}", buf.len(), sent);
@@ -408,7 +411,7 @@ pub(crate) fn sendmsg(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) -> P
 
 pub(crate) fn do_listen(
     proxy: &mut super::TsiStreamProxy,
-    pkt: &VsockPacket,
+    pkt: &TxPacket,
     req: TsiListenReq,
     host_port_map: &Option<HashMap<u16, u16>>,
 ) -> ProxyUpdate {
@@ -456,10 +459,7 @@ pub(crate) fn do_accept(proxy: &mut super::TsiStreamProxy, req: TsiAcceptReq) ->
     update
 }
 
-pub(crate) fn update_peer_credit(
-    proxy: &mut super::TsiStreamProxy,
-    pkt: &VsockPacket,
-) -> ProxyUpdate {
+pub(crate) fn update_peer_credit(proxy: &mut super::TsiStreamProxy, pkt: &TxPacket) -> ProxyUpdate {
     debug!(
         "update_credit: buf_alloc={} rx_cnt={} fwd_cnt={}",
         pkt.buf_alloc(),
@@ -479,7 +479,7 @@ pub(crate) fn update_peer_credit(
 
 pub(crate) fn process_op_response(
     proxy: &mut super::TsiStreamProxy,
-    pkt: &VsockPacket,
+    pkt: &TxPacket,
 ) -> ProxyUpdate {
     debug!(
         "process_op_response: id={} src_port={} dst_port={}",
@@ -500,7 +500,7 @@ pub(crate) fn process_op_response(
     }
 }
 
-pub(crate) fn do_shutdown(proxy: &mut super::TsiStreamProxy, pkt: &VsockPacket) {
+pub(crate) fn do_shutdown(proxy: &mut super::TsiStreamProxy, pkt: &TxPacket) {
     let recv_off = pkt.flags() & super::uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
     let send_off = pkt.flags() & super::uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 

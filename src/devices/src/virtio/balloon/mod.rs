@@ -4,8 +4,16 @@ mod event_handler;
 pub use self::defs::uapi::VIRTIO_ID_BALLOON as TYPE_BALLOON;
 pub use self::device::Balloon;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BalloonMemoryPolicy {
+    Untracked,
+    TrackedCapture,
+    RestoredInput,
+    RestoredPrivate,
+}
+
 mod defs {
-    use super::super::QueueConfig;
+    use crate::virtio::QueueConfig;
 
     pub const BALLOON_DEV_ID: &str = "virtio_balloon";
     pub const NUM_QUEUES: usize = 5;
@@ -26,6 +34,7 @@ pub enum BalloonError {
     /// Failed to create event fd.
     EventFd(std::io::Error),
     UnsupportedRestoreFeatures(u64),
+    InvalidMemoryPolicy,
 }
 
 type Result<T> = std::result::Result<T, BalloonError>;

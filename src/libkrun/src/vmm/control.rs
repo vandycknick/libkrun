@@ -40,6 +40,7 @@ pub struct CpuCommand {
     pub barrier: BarrierRequest,
     pub kind: CpuCommandKind,
     pub execution: Option<Arc<CpuExecutionInput>>,
+    pub native_effects: Option<Arc<arch::guest_memory::NativeEffectsPermit>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -310,7 +311,18 @@ impl CpuController {
         kind: CpuCommandKind,
         handles: &[VcpuHandle],
     ) -> Result<(), ControlFailure> {
-        self.begin_execution(request, barrier, kind, &[], handles)
+        self.begin_execution(request, barrier, kind, &[], handles, None)
+    }
+
+    pub fn begin_native(
+        &mut self,
+        request: RequestId,
+        barrier: BarrierRequest,
+        kind: CpuCommandKind,
+        handles: &[VcpuHandle],
+        permit: Arc<arch::guest_memory::NativeEffectsPermit>,
+    ) -> Result<(), ControlFailure> {
+        self.begin_execution(request, barrier, kind, &[], handles, Some(permit))
     }
 
     pub fn begin_execution(
@@ -320,7 +332,17 @@ impl CpuController {
         kind: CpuCommandKind,
         inputs: &[Option<Arc<CpuExecutionInput>>],
         handles: &[VcpuHandle],
+        native_effects: Option<Arc<arch::guest_memory::NativeEffectsPermit>>,
     ) -> Result<(), ControlFailure> {
+        if matches!(
+            kind,
+            CpuCommandKind::CaptureExecution
+                | CpuCommandKind::InstallExecution
+                | CpuCommandKind::PrepareExecutionTime
+        ) && native_effects.is_none()
+        {
+            return Err(ControlFailure::InvalidOperation);
+        }
         let typed = matches!(
             kind,
             CpuCommandKind::InstallExecution | CpuCommandKind::PrepareExecutionTime
@@ -387,6 +409,7 @@ impl CpuController {
             barrier,
             kind,
             execution: None,
+            native_effects,
         };
         let mut batch = CpuBatch {
             command: command.clone(),
@@ -419,6 +442,9 @@ impl CpuController {
                 }
             }
         }
+        if batch.slots.iter().all(|slot| !slot.accepted) {
+            batch.command.native_effects = None;
+        }
         self.batches.push(batch);
         failure.map_or(Ok(()), Err)
     }
@@ -449,6 +475,13 @@ impl CpuController {
                     } else {
                         slot.acknowledgement = Some(Err("CPU reply payload/phase mismatch".into()));
                     }
+                }
+                if batch
+                    .slots
+                    .iter()
+                    .all(|slot| !slot.accepted || slot.acknowledgement.is_some())
+                {
+                    batch.command.native_effects = None;
                 }
                 return;
             }
@@ -597,6 +630,7 @@ pub(crate) enum Phase {
     Devices,
     Maintenance,
     Routes,
+    MemoryDrain,
     Cut,
     RecoverCut,
     PrepareTime,
@@ -765,6 +799,11 @@ impl crate::vmm::Vmm {
             Ok(()) => {}
             Err(error) if matches!(error.fault, ManagerFault::LockBusy) => pending = true,
             Err(error) => return Err(ControlFailure::Unsupported(error.to_string())),
+        }
+        if self.memory_domain.tracking_mode() != Some(arch::guest_memory::TrackingMode::Capture) {
+            return Err(ControlFailure::Unsupported(
+                "runtime memory was excluded at construction".into(),
+            ));
         }
         match self.execution_controller.try_lock() {
             Ok(controller) => {
@@ -1037,12 +1076,15 @@ impl crate::vmm::Vmm {
         if let Some(active) = &mut self.control.active {
             active.failed = true;
             self.control.state = match active.phase {
-                Phase::Park | Phase::Devices | Phase::Maintenance | Phase::Routes | Phase::Cut => {
-                    ControlState::Pausing {
-                        key: active.original,
-                        failed: true,
-                    }
-                }
+                Phase::Park
+                | Phase::Devices
+                | Phase::Maintenance
+                | Phase::Routes
+                | Phase::MemoryDrain
+                | Phase::Cut => ControlState::Pausing {
+                    key: active.original,
+                    failed: true,
+                },
                 Phase::Stop => ControlState::Stopping,
                 _ => ControlState::FailedFenced,
             };
@@ -1199,6 +1241,18 @@ impl crate::vmm::Vmm {
                 if Instant::now() >= active.barrier.deadline {
                     return Err(ControlFailure::Deadline);
                 }
+                self.memory
+                    .begin_close(active.original)
+                    .map_err(|error| ControlFailure::Participant(error.to_string()))?;
+                active.phase = Phase::MemoryDrain;
+            }
+            Phase::MemoryDrain => {
+                match self.memory.poll_drained() {
+                    Poll::Pending => return Ok(false),
+                    Poll::Ready(result) => {
+                        result.map_err(|error| ControlFailure::Participant(error.to_string()))?
+                    }
+                }
                 self.begin_execution_cut(active.request.id, active.barrier)
                     .map_err(ControlFailure::Participant)?;
                 active.phase = Phase::Cut;
@@ -1209,6 +1263,15 @@ impl crate::vmm::Vmm {
                     Poll::Ready(result) => result.map_err(ControlFailure::Participant)?,
                 }
                 let token = self.control.token(active.original, active.owner);
+                if !self
+                    .finish_memory_cut(active.original)
+                    .map_err(ControlFailure::Participant)?
+                {
+                    return Ok(false);
+                }
+                self.memory
+                    .bind_pause(active.original, &token)
+                    .map_err(|error| ControlFailure::Participant(error.to_string()))?;
                 self.control.state = ControlState::Paused(token.clone());
                 let _ = active
                     .request
@@ -1257,6 +1320,25 @@ impl crate::vmm::Vmm {
                 active.phase = Phase::PrepareTime;
             }
             Phase::PrepareTime => {
+                if self.memory_domain.tracking_mode()
+                    == Some(arch::guest_memory::TrackingMode::Capture)
+                    && self.memory.has_closing()
+                {
+                    match self.memory.poll_drained() {
+                        Poll::Pending => return Ok(false),
+                        Poll::Ready(result) => result
+                            .map_err(|error| ControlFailure::Participant(error.to_string()))?,
+                    }
+                }
+                if self.memory_domain.tracking_mode()
+                    == Some(arch::guest_memory::TrackingMode::Capture)
+                    && (!self.execution.has_cut_work() || self.execution.retained.is_some())
+                    && !self
+                        .reopen_memory_for_resume(active.original)
+                        .map_err(ControlFailure::Participant)?
+                {
+                    return Ok(false);
+                }
                 if self.execution.has_cut_work() {
                     if self.execution.retained.is_none() {
                         self.begin_execution_cut(
@@ -1353,6 +1435,7 @@ impl crate::vmm::Vmm {
                 }
             }
             Phase::ResumeDevices => {
+                self.memory.retire_native();
                 if active.devices_begun {
                     match self
                         .mmio_device_manager
@@ -1616,6 +1699,7 @@ mod tests {
                     },
                     kind: CpuCommandKind::Park,
                     execution: None,
+                    native_effects: None,
                 },
                 slots: (0..2)
                     .map(|_| CpuSlot {

@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/sysmacros.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
@@ -616,6 +617,88 @@ static void emit_devices(uint64_t sequence, const char *token) {
     emit_record(output, "{\"fixture\":\"production-linux-devices\",\"request_token\":\"%s\",\"sequence\":%" PRIu64 ",\"monotonic_ns\":%" PRIu64 ",\"disk0\":%" PRIuFAST64 ",\"disk1\":%" PRIuFAST64 ",\"rng\":%" PRIuFAST64 ",\"report\":%" PRIuFAST64 ",\"console_tx\":%" PRIuFAST64 ",\"console_rx\":%" PRIuFAST64 ",\"net_tx\":%" PRIuFAST64 ",\"net_rx\":%" PRIuFAST64 ",\"net_replies\":%" PRIuFAST64 ",\"net_mismatches\":%" PRIuFAST64 ",\"net_timeouts\":%" PRIuFAST64 ",\"net_refused\":%" PRIuFAST64 ",\"net_interrupted\":%" PRIuFAST64 ",\"net_full_replies\":%" PRIu64 ",\"net_last_full_reply_sequence\":%s,\"vsock\":%" PRIuFAST64 ",\"vsock_listeners\":%u,\"failed\":%d}\n", token, sequence, (uint64_t)now.tv_sec * UINT64_C(1000000000) + now.tv_nsec, atomic_load(&disks[0]), atomic_load(&disks[1]), atomic_load(&entropy), atomic_load(&reclaim), atomic_load(&console_tx), atomic_load(&console_rx), atomic_load(&net_tx), atomic_load(&net_rx), atomic_load(&net_replies), atomic_load(&net_mismatches), atomic_load(&net_timeouts), atomic_load(&net_refused), atomic_load(&net_interrupted), full_replies, reply_sequence, atomic_load(&vsock_io), atomic_load(&vsock_listeners), atomic_load(&failure));
 }
 
+/* The undrained vmsplice pipe retains real page references, not just virtual
+ * mlock residency. No fork follows allocation, and no pipe reader consumes them.
+ * Only D writes the CPU page; the host page is never reused by Linux or workers. */
+static unsigned char *memory_pages;
+static int memory_pin_pipe[2] = {-1, -1};
+static uint64_t memory_gpa[2];
+static unsigned memory_cpu_byte = 0x43, memory_cpu_generation;
+static int memory_buffers(const char *token, int cpu_write) {
+    const size_t page = 4096;
+    if (!memory_pages) {
+        if (sysconf(_SC_PAGESIZE) != (long)page) { errno = ENOTSUP; return -1; }
+        void *mapping = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapping == MAP_FAILED) return -1;
+        if (madvise(mapping, 2 * page, MADV_NOHUGEPAGE) || mlock(mapping, 2 * page)) {
+            int error = errno; munmap(mapping, 2 * page); errno = error; return -1;
+        }
+        memset(mapping, 0x48, page);
+        memset((unsigned char *)mapping + page, memory_cpu_byte, page);
+        int pin_pipe[2];
+        if (pipe2(pin_pipe, O_CLOEXEC | O_NONBLOCK)) {
+            int error = errno; munmap(mapping, 2 * page); errno = error; return -1;
+        }
+        struct iovec pinned = {.iov_base = mapping, .iov_len = 2 * page};
+        ssize_t held = vmsplice(pin_pipe[1], &pinned, 1, SPLICE_F_NONBLOCK);
+        if (held != (ssize_t)(2 * page)) {
+            int error = held < 0 ? errno : EIO;
+            close(pin_pipe[0]); close(pin_pipe[1]); munmap(mapping, 2 * page);
+            errno = error; return -1;
+        }
+        int fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            int error = errno; close(pin_pipe[0]); close(pin_pipe[1]);
+            munmap(mapping, 2 * page); errno = error; return -1;
+        }
+        int error = 0;
+        for (unsigned index = 0; index < 2; ++index) {
+            uint64_t entry;
+            uintptr_t address = (uintptr_t)mapping + index * page;
+            if (pread(fd, &entry, sizeof(entry), (off_t)((address / page) * sizeof(entry))) != sizeof(entry)) {
+                error = EIO; break;
+            }
+            uint64_t pfn = entry & ((UINT64_C(1) << 55) - 1);
+            if (!(entry & (UINT64_C(1) << 63)) || (entry & (UINT64_C(1) << 62)) ||
+                !pfn || pfn > UINT64_MAX / page) {
+                error = ENOTSUP; break;
+            }
+            memory_gpa[index] = pfn * page;
+        }
+        close(fd);
+        if (error) {
+            close(pin_pipe[0]); close(pin_pipe[1]); munmap(mapping, 2 * page);
+            errno = error; return -1;
+        }
+        memory_pin_pipe[0] = pin_pipe[0]; memory_pin_pipe[1] = pin_pipe[1];
+        memory_pages = mapping;
+    }
+    int held_bytes = 0;
+    if (ioctl(memory_pin_pipe[0], FIONREAD, &held_bytes)) return -1;
+    if (held_bytes != (int)(2 * page)) { errno = EIO; return -1; }
+    if (cpu_write) {
+        if (memory_cpu_byte == 255) { errno = EOVERFLOW; return -1; }
+        ++memory_cpu_byte;
+        ++memory_cpu_generation;
+        memset(memory_pages + page, memory_cpu_byte, page);
+    }
+    const volatile unsigned char *bytes = memory_pages;
+    unsigned host_byte = bytes[0];
+    for (size_t index = 0; index < page; ++index) {
+        if (bytes[index] != host_byte || bytes[page + index] != memory_cpu_byte) {
+            errno = EIO; return -1;
+        }
+    }
+    return emit_record(output,
+        "OBS-BEGIN memory-buffer\n"
+        "{\"request_token\":\"%s\",\"host_gpa\":%" PRIu64 ",\"cpu_gpa\":%" PRIu64
+        ",\"bytes\":4096,\"host_byte\":%u,\"cpu_byte\":%u,\"cpu_generation\":%u,"
+        "\"mlocked\":true,\"pipe_page_refs_retained\":true,\"pipe_bytes\":8192,"
+        "\"pagemap_present\":true}\nOBS-END memory-buffer\n",
+        token, memory_gpa[0], memory_gpa[1], host_byte, memory_cpu_byte, memory_cpu_generation);
+}
+
 int main(void) {
     if (getpid() != 1) return 2;
     signal(SIGPIPE, SIG_IGN);
@@ -678,7 +761,10 @@ int main(void) {
                                 errno = EINVAL; fail("device-counter-request"); return 14;
                             }
                         }
-                        emit_devices(++sequence, pressure_command);
+                        if (pressure_forward == 2) emit_devices(++sequence, pressure_command);
+                        else if (memory_buffers(pressure_command, pressure_forward == 4)) {
+                            fail("memory-buffer"); return 17;
+                        }
                     }
                     pressure_length = 0; pressure_forward = 0;
                 } else if (pressure_length + 1 < sizeof(pressure_command)) pressure_command[pressure_length++] = input[i];
@@ -687,6 +773,8 @@ int main(void) {
             }
             if (input[i] == 'P' && pressure > 0) { pressure_forward = 1; continue; }
             if (input[i] == 'C') { pressure_forward = 2; continue; }
+            if (input[i] == 'H') { pressure_forward = 3; continue; }
+            if (input[i] == 'D') { pressure_forward = 4; continue; }
             if (input[i] == 'B') atomic_store(&console_burst, 1);
             if (input[i] == 'O') observations();
             if (input[i] == 'M' && network_mac(1)) fail("destination-mac");

@@ -22,10 +22,14 @@ use crate::vmm::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 use hvf::state::{CpuDisposition, CpuOn};
 
 use arch::ArchMemoryInfo;
-use arch::guest_memory::{RamLayout, RamPermissions, RamRegion, ReclaimError};
+use arch::guest_memory::{
+    BackingKind, ConstructionAuthority, CpuHarvest, CpuTrackingEpoch, DirtyEffect, DirtyFailure,
+    DirtyLocation, DirtyOperation, DirtyPageMap, MemoryCut, MemoryDomain, RamLayout,
+    RamPermissions, RamRegion, ReclaimError, TrackingMode,
+};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, after, never, select, unbounded};
 use devices::legacy::VcpuList;
-use hvf::reclaim::{ReclaimState, ReclaimStateError};
+use hvf::reclaim::{ReclaimInhibition, ReclaimState, ReclaimStateError};
 use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
 use polly::event_manager::{BarrierGeneration, BarrierKey, OperationId};
 use utils::eventfd::EventFd;
@@ -46,7 +50,10 @@ pub enum Error {
     /// Cannot set the memory regions.
     SetUserMemoryRegion(hvf::Error),
     /// Cannot restore a partially initialized HVF memory map.
-    MemoryMappingRollback(hvf::Error),
+    MemoryMappingRollback {
+        primary: hvf::Error,
+        cleanup: hvf::Error,
+    },
     /// Workload RAM does not match the authoritative architecture layout.
     ReclaimLayout(ReclaimError),
     /// The vCPU event channel was closed (the vCPU thread has exited).
@@ -84,8 +91,11 @@ impl Display for Error {
                 "The number of configured slots is bigger than the maximum reported by KVM"
             ),
             SetUserMemoryRegion(e) => write!(f, "Cannot set the memory regions: {e:?}"),
-            MemoryMappingRollback(e) => {
-                write!(f, "Cannot roll back partially mapped guest memory: {e:?}")
+            MemoryMappingRollback { primary, cleanup } => {
+                write!(
+                    f,
+                    "Cannot map guest RAM: {primary}; rollback also failed: {cleanup}"
+                )
             }
             ReclaimLayout(e) => write!(f, "Invalid workload RAM layout: {e}"),
             SignalVcpu(e) => write!(f, "Failed to signal Vcpu: {e}"),
@@ -110,6 +120,9 @@ pub struct Vm {
     hvf_vm: HvfVm,
     remapper: Option<Arc<hvf::remap::HostMemoryRemapper>>,
     live_facts: HvfVmFacts,
+    pending_reclaim: Option<RamLayout>,
+    memory_domain: Option<Arc<MemoryDomain>>,
+    registered_memory: Option<GuestMemoryMmap>,
 }
 
 impl Vm {
@@ -120,6 +133,9 @@ impl Vm {
         Ok(Vm {
             hvf_vm,
             remapper: None,
+            pending_reclaim: None,
+            memory_domain: None,
+            registered_memory: None,
             live_facts: HvfVmFacts {
                 gic_model: Observation::NotEvaluated,
                 nested: nested_enabled,
@@ -144,37 +160,96 @@ impl Vm {
         guest_mem: &GuestMemoryMmap,
         reclaim_layout: RamLayout,
     ) -> Result<()> {
-        if self.hvf_vm.reclaim_state().is_initialized() {
+        if self.pending_reclaim.is_some() || self.hvf_vm.reclaim_state().is_initialized() {
             return Err(Error::VmSetup(hvf::Error::ReclaimState(
                 ReclaimStateError::AlreadyInitialized,
             )));
         }
         let mappings = memory_mappings(guest_mem)?;
-        let mut mapped = Vec::new();
+        self.hvf_vm
+            .retain_memory_backing(guest_mem.clone())
+            .map_err(Error::VmSetup)?;
+        self.registered_memory = Some(guest_mem.clone());
+        self.pending_reclaim = Some(reclaim_layout);
+        self.hvf_vm
+            .ram_protection()
+            .reserve_mappings(mappings.len())
+            .map_err(|error| Error::VmSetup(hvf::Error::DirtyTracking(error)))?;
+        let mut mapped = Vec::with_capacity(mappings.len());
         for (host_addr, guest_start, len) in mappings {
             debug!(
                 "Guest memory host_addr={:x?} guest_addr={:x?} len={:x?}",
                 host_addr, guest_start, len
             );
             if let Err(error) = self.hvf_vm.map_memory(host_addr, guest_start, len) {
-                self.rollback_memory_mappings(&mapped)?;
+                if let Err(cleanup) = self.rollback_memory_mappings(&mapped) {
+                    return Err(Error::MemoryMappingRollback {
+                        primary: error,
+                        cleanup,
+                    });
+                }
                 return Err(Error::SetUserMemoryRegion(error));
             }
             mapped.push((guest_start, len));
         }
 
-        self.hvf_vm
-            .initialize_reclaim(reclaim_layout)
-            .map_err(Error::VmSetup)?;
-        self.remapper = hvf::remap::HostMemoryRemapper::new(self.reclaim_state()).map(Arc::new);
         Ok(())
+    }
+
+    pub fn bind_memory_domain(
+        &mut self,
+        domain: Arc<MemoryDomain>,
+    ) -> std::result::Result<(), DirtyFailure> {
+        if self
+            .registered_memory
+            .as_ref()
+            .is_none_or(|memory| !domain.matches_mapping(memory))
+        {
+            return Err(DirtyFailure {
+                operation: DirtyOperation::Bind,
+                location: DirtyLocation::Vm,
+                native_code: 0,
+                effect: DirtyEffect::PreEffectRefusal,
+            });
+        }
+        self.hvf_vm.bind_memory_domain(Arc::clone(&domain))?;
+        self.memory_domain = Some(domain);
+        Ok(())
+    }
+
+    pub fn arm_initial(
+        &mut self,
+        authority: &ConstructionAuthority,
+    ) -> std::result::Result<CpuTrackingEpoch, DirtyFailure> {
+        self.hvf_vm.ram_protection().arm_initial(authority)
+    }
+
+    pub fn collect_cpu_dirty(
+        &mut self,
+        cut: &MemoryCut,
+        retained: &mut DirtyPageMap,
+    ) -> std::result::Result<CpuHarvest, DirtyFailure> {
+        self.hvf_vm
+            .ram_protection()
+            .collect_cpu_dirty(cut, retained)
+    }
+
+    pub fn rearm_cpu_dirty(
+        &mut self,
+        cut: &MemoryCut,
+        harvested: CpuHarvest,
+    ) -> std::result::Result<CpuTrackingEpoch, DirtyFailure> {
+        self.hvf_vm.ram_protection().rearm_cpu_dirty(cut, harvested)
     }
 
     pub fn host_memory_remapper(&self) -> Option<Arc<hvf::remap::HostMemoryRemapper>> {
         self.remapper.clone()
     }
 
-    fn rollback_memory_mappings(&self, mapped: &[(u64, u64)]) -> Result<()> {
+    fn rollback_memory_mappings(
+        &self,
+        mapped: &[(u64, u64)],
+    ) -> std::result::Result<(), hvf::Error> {
         let mut first_error = None;
         for (guest_start, len) in mapped.iter().rev() {
             if let Err(error) = self.hvf_vm.unmap_memory(*guest_start, *len)
@@ -184,7 +259,7 @@ impl Vm {
             }
         }
         match first_error {
-            Some(error) => Err(Error::MemoryMappingRollback(error)),
+            Some(error) => Err(error),
             None => Ok(()),
         }
     }
@@ -197,25 +272,51 @@ impl Vm {
         len: u64,
     ) {
         debug!("add_mapping: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
+        if let Err(error) = self.hvf_vm.ram_protection().check_mapping_mutation() {
+            error!("Refusing tracked mapping replacement: {error:?}");
+            let _ = reply_sender.send(false);
+            return;
+        }
+        if self
+            .memory_domain
+            .as_ref()
+            .is_some_and(|domain| domain.with_external_mapping(|_| ()).is_err())
+        {
+            let _ = reply_sender.send(false);
+            return;
+        }
         if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
             error!("Error removing memory map: {e:?}");
         }
 
         if let Err(e) = self.hvf_vm.map_memory(host_addr, guest_addr, len) {
             error!("Error adding memory map: {e:?}");
-            reply_sender.send(false).unwrap();
+            let _ = reply_sender.send(false);
         } else {
-            reply_sender.send(true).unwrap();
+            let _ = reply_sender.send(true);
         }
     }
 
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
         debug!("remove_mapping: guest_addr={guest_addr:x}, len={len}");
+        if let Err(error) = self.hvf_vm.ram_protection().check_mapping_mutation() {
+            error!("Refusing tracked mapping removal: {error:?}");
+            let _ = reply_sender.send(false);
+            return;
+        }
+        if self
+            .memory_domain
+            .as_ref()
+            .is_some_and(|domain| domain.with_external_mapping(|_| ()).is_err())
+        {
+            let _ = reply_sender.send(false);
+            return;
+        }
         if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
             error!("Error removing memory map: {e:?}");
-            reply_sender.send(false).unwrap();
+            let _ = reply_sender.send(false);
         } else {
-            reply_sender.send(true).unwrap();
+            let _ = reply_sender.send(true);
         }
     }
 
@@ -223,13 +324,44 @@ impl Vm {
         self.hvf_vm.reclaim_state()
     }
 
-    pub fn configure_reclaim(
-        &self,
-        guest_mem: &GuestMemoryMmap,
-        mem_info: &ArchMemoryInfo,
-        requested: bool,
-    ) -> Result<()> {
+    pub fn configure_reclaim(&mut self, mem_info: &ArchMemoryInfo, requested: bool) -> Result<()> {
         let reclaim_state = self.hvf_vm.reclaim_state();
+        let domain = self
+            .memory_domain
+            .as_ref()
+            .ok_or(Error::VmSetup(hvf::Error::InvalidMemoryFault))?;
+        let guest_mem = self
+            .registered_memory
+            .as_ref()
+            .ok_or(Error::VmSetup(hvf::Error::InvalidMemoryFault))?;
+        let layout =
+            self.pending_reclaim
+                .take()
+                .ok_or(Error::VmSetup(hvf::Error::ReclaimState(
+                    ReclaimStateError::AlreadyInitialized,
+                )))?;
+        let reason = match (domain.backing_kind(), domain.tracking_mode()) {
+            (BackingKind::RestoredPrivate, Some(TrackingMode::Capture)) => {
+                Some(ReclaimInhibition::RestoredPrivateMapping)
+            }
+            (BackingKind::RestoredInput, Some(TrackingMode::Capture)) => {
+                Some(ReclaimInhibition::RestoredInput)
+            }
+            (_, Some(TrackingMode::Capture)) => Some(ReclaimInhibition::TrackedCapture),
+            (BackingKind::Boot, Some(TrackingMode::Disabled)) => None,
+            _ => return Err(Error::VmSetup(hvf::Error::InvalidMemoryFault)),
+        };
+        if let Some(reason) = reason {
+            reclaim_state
+                .initialize_inhibited(u64::from(domain.layout().granule()), reason)
+                .map_err(|error| Error::VmSetup(hvf::Error::ReclaimState(error)))?;
+            return Ok(());
+        }
+        self.hvf_vm
+            .initialize_reclaim(layout)
+            .map_err(Error::VmSetup)?;
+        self.remapper =
+            hvf::remap::HostMemoryRemapper::new(Arc::clone(&reclaim_state)).map(Arc::new);
         reclaim_state.set_policy_enabled(requested);
         if !requested {
             return Ok(());
@@ -349,7 +481,8 @@ pub struct Vcpu {
     response_sender: Sender<VcpuResponse>,
     control_receiver: Option<Receiver<CpuAck>>,
     control_sender: Sender<CpuAck>,
-    _resources: Option<(GuestMemoryMmap, hvf::HvfCpuResources)>,
+    _resources: Option<hvf::HvfCpuResources>,
+    memory_domain: Option<Arc<MemoryDomain>>,
 
     vcpu_list: Arc<VcpuList>,
     reclaim_state: Arc<ReclaimState>,
@@ -358,8 +491,21 @@ pub struct Vcpu {
 }
 
 impl Vcpu {
-    pub fn retain_resources(&mut self, guest_memory: GuestMemoryMmap, vm: &Vm) {
-        self._resources = Some((guest_memory, vm.hvf_vm.cpu_resources()));
+    pub fn retain_resources(&mut self, vm: &Vm) -> Result<()> {
+        let domain = vm
+            .memory_domain
+            .as_ref()
+            .ok_or(Error::VcpuResourcesMissing)?;
+        let memory = vm
+            .registered_memory
+            .as_ref()
+            .ok_or(Error::VcpuResourcesMissing)?;
+        if !domain.matches_mapping(memory) {
+            return Err(Error::VcpuResourcesMissing);
+        }
+        self._resources = Some(vm.hvf_vm.cpu_resources());
+        self.memory_domain = Some(Arc::clone(domain));
+        Ok(())
     }
 
     /// Constructs a new VCPU for `vm`.
@@ -398,6 +544,7 @@ impl Vcpu {
             control_receiver: Some(control_receiver),
             control_sender,
             _resources: None,
+            memory_domain: None,
             vcpu_list,
             reclaim_state,
             nested_enabled,
@@ -456,7 +603,12 @@ impl Vcpu {
     /// Moves the vcpu to its own thread and constructs a VcpuHandle.
     /// The handle can be used to control the remote vcpu.
     pub fn start_threaded(mut self) -> Result<VcpuHandle> {
-        if self._resources.is_none() {
+        if self._resources.is_none()
+            || self
+                .memory_domain
+                .as_ref()
+                .is_none_or(|domain| domain.tracking_mode().is_none())
+        {
             return Err(Error::VcpuResourcesMissing);
         }
         let event_sender = self.event_sender.take().ok_or(Error::VcpuChannelClosed)?;
@@ -581,7 +733,12 @@ impl Vcpu {
     }
 
     fn run(&mut self, ready_sender: Sender<(Option<u64>, Option<String>)>) {
-        let mut hvf_vcpu = match HvfVcpu::new(self.nested_enabled) {
+        let Some(resources) = &self._resources else {
+            let _ = ready_sender.send((None, Some("HVF vCPU resources missing".to_owned())));
+            return;
+        };
+        let protection = resources.ram_protection();
+        let mut hvf_vcpu = match HvfVcpu::new(self.nested_enabled, protection) {
             Ok(cpu) => cpu,
             Err(error) => {
                 let _ = ready_sender.send((None, Some(format!("CPU {} create: {error}", self.id))));
@@ -619,7 +776,7 @@ impl Vcpu {
         let mut completion_failed = false;
         let mut waiting: Option<Option<Duration>> = None;
         let framework = match &self._resources {
-            Some((_, resources)) => resources.framework(),
+            Some(resources) => resources.framework(),
             None => return,
         };
         let mut captured: Option<Arc<CpuExecutionState>> = None;
@@ -714,7 +871,7 @@ impl Vcpu {
                     }
                 }
             };
-            if let Some(command) = command {
+            if let Some(mut command) = command {
                 let ack_kind = match command.kind {
                     CpuCommandKind::Park => CpuAckKind::Parked,
                     CpuCommandKind::PrepareResume { .. } => CpuAckKind::Prepared,
@@ -727,7 +884,34 @@ impl Vcpu {
                 let mut stopped = false;
                 let mut execution = None;
                 let mut execution_mutated = false;
-                let outcome = match command.kind {
+                let authority = if matches!(
+                    command.kind,
+                    CpuCommandKind::CaptureExecution
+                        | CpuCommandKind::InstallExecution
+                        | CpuCommandKind::PrepareExecutionTime
+                ) {
+                    self.memory_domain
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "HVF native effects lack the retained memory domain".to_owned()
+                        })
+                        .and_then(|domain| {
+                            if domain.tracking_mode() != Some(TrackingMode::Capture) {
+                                return Err(
+                                    "HVF native effects require tracked capture memory".to_owned()
+                                );
+                            }
+                            command
+                                .native_effects
+                                .as_ref()
+                                .ok_or_else(|| "HVF native effects lack authority".to_owned())?
+                                .validate_domain(domain)
+                                .map_err(|error| error.to_string())
+                        })
+                } else {
+                    Ok(())
+                };
+                let outcome = authority.and_then(|()| match command.kind {
                     CpuCommandKind::Stop => {
                         parked = true;
                         hvf_vcpu
@@ -968,10 +1152,11 @@ impl Vcpu {
                             }
                         }
                     }
-                };
+                });
                 if outcome.is_err() && execution_mutated {
                     terminal_fault = outcome.as_ref().err().cloned();
                 }
+                drop(command.native_effects.take());
                 let _ = self.control_sender.send(CpuAck {
                     request: command.request,
                     key: command.barrier.key,
@@ -1114,6 +1299,7 @@ impl Drop for VcpuHandle {
                 },
                 kind: CpuCommandKind::Stop,
                 execution: None,
+                native_effects: None,
             });
             if let Some(id) = self.hvf_id
                 && let Err(error) = hvf::vcpu_request_exit(id)
@@ -1260,6 +1446,43 @@ mod tests {
     }
 
     #[test]
+    fn cpu_bitmap_uses_dense_registered_pages_across_holes_and_word_tails() {
+        use arch::guest_memory::{DirtyPageMap, PageIndex, RegisteredRamLayout};
+
+        let granule = 0x4000;
+        let memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0x4000_0000), 63 * granule),
+            (GuestAddress(0x8000_0000), 3 * granule),
+        ])
+        .unwrap();
+        let layout = RegisteredRamLayout::from_memory(&memory, granule as u32).unwrap();
+        assert_eq!(layout.page_count(), 66);
+        assert_eq!(
+            layout.page_at(0x4000_0000 + 62 * granule as u64),
+            Some(PageIndex::new(62))
+        );
+        assert_eq!(layout.page_at(0x8000_0000), Some(PageIndex::new(63)));
+        assert_eq!(layout.page_at(0x6000_0000), None);
+        let mut epoch = DirtyPageMap::new(&layout);
+        let mut retained = DirtyPageMap::new(&layout);
+        for page in [62, 63, 65] {
+            epoch.set(PageIndex::new(page)).unwrap();
+        }
+        retained.merge(&epoch).unwrap();
+        retained.merge(&epoch).unwrap();
+        assert_eq!(retained.count(), 3);
+        epoch.clear();
+        epoch.set(PageIndex::new(63)).unwrap();
+        epoch.set(PageIndex::new(64)).unwrap();
+        retained.merge(&epoch).unwrap();
+        assert_eq!(retained.count(), 4);
+        assert!(retained.contains(PageIndex::new(62)));
+        assert!(retained.contains(PageIndex::new(65)));
+        assert!(epoch.set(PageIndex::new(66)).is_err());
+        assert_eq!(retained.words()[1], 3);
+    }
+
+    #[test]
     fn test_vm_memory_init_rejects_duplicate_before_mapping() {
         let mut vm = Vm::new(false).expect("Cannot create new vm");
 
@@ -1280,6 +1503,8 @@ mod tests {
         let reclaim_layout = build_reclaim_layout(&gm, &mem_info).expect("invalid RAM layout");
         vm.memory_init(&gm, reclaim_layout)
             .expect("memory_init failed");
+        assert!(!vm.reclaim_state().is_initialized());
+        assert!(vm.host_memory_remapper().is_none());
 
         let second_gpa = first_gpa + 0x40_0000;
         let second_gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(second_gpa), len)]).unwrap();

@@ -1,5 +1,6 @@
 //! Owner-thread KVM execution operations. No method enters KVM_RUN.
 use crate::vmm::execution::kvm::{KvmCpuState, KvmCpuTimePlan};
+use arch::guest_memory::{NativeEffectsPermit, TrackingMode};
 use kvm_ioctls::VcpuFd;
 
 #[cfg(target_arch = "x86_64")]
@@ -32,38 +33,77 @@ pub(crate) struct CpuCaptureConfig {
     pub init: kvm_bindings::kvm_vcpu_init,
 }
 
+pub(crate) fn native_result<T>(
+    permit: &NativeEffectsPermit,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    if result.is_err() {
+        // An error or short native completion is not evidence that guest RAM was untouched.
+        permit.coverage_lost();
+    }
+    result
+}
+
+fn validate_native(permit: &NativeEffectsPermit) -> Result<(), String> {
+    permit
+        .validate_domain(permit.domain())
+        .map_err(|e| format!("kvm/native/authority: {e}"))?;
+    if permit.domain().tracking_mode() != Some(TrackingMode::Capture) {
+        return Err("kvm/native/memory-tracking-not-finalized".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn capture_cpu(
     fd: &VcpuFd,
     id: u8,
     config: &CpuCaptureConfig,
+    permit: &NativeEffectsPermit,
 ) -> Result<KvmCpuState, String> {
     if cfg!(feature = "tee") {
         return Err("kvm/execution/tee-excluded".into());
     }
-    native::capture_cpu(fd, id, config)
+    validate_native(permit)?;
+    native_result(permit, native::capture_cpu(fd, id, config))
 }
 pub(crate) fn install_cpu(
     fd: &VcpuFd,
     state: &KvmCpuState,
     config: &CpuCaptureConfig,
+    permit: &NativeEffectsPermit,
 ) -> Result<(), String> {
     state.validate()?;
-    native::install_cpu(fd, state, config)
+    validate_native(permit)?;
+    native_result(permit, native::install_cpu(fd, state, config))
 }
 pub(crate) fn prepare_cpu_time(
     fd: &VcpuFd,
     state: &KvmCpuState,
     plan: &KvmCpuTimePlan,
+    permit: &NativeEffectsPermit,
 ) -> Result<(), String> {
-    native::prepare_cpu_time(fd, state, plan)
+    validate_native(permit)?;
+    native_result(permit, native::prepare_cpu_time(fd, state, plan))
 }
 
-pub(crate) fn fence_cpu_timer(fd: &VcpuFd, state: &KvmCpuState) -> Result<(), String> {
-    native::fence_cpu_timer(fd, state)
+pub(crate) fn fence_cpu_timer(
+    fd: &VcpuFd,
+    state: &KvmCpuState,
+    permit: &NativeEffectsPermit,
+) -> Result<(), String> {
+    validate_native(permit)?;
+    native_result(permit, native::fence_cpu_timer(fd, state))
 }
 
 #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
-pub(crate) use native::initialize_device_witness;
+pub(crate) fn initialize_device_witness(
+    fd: &VcpuFd,
+    state: &crate::vmm::execution::kvm::X86CpuState,
+    permit: &NativeEffectsPermit,
+) -> Result<(), String> {
+    validate_native(permit)?;
+    native_result(permit, native::initialize_device_witness(fd, state))
+}
 #[cfg(target_arch = "x86_64")]
 pub(crate) use native::{KvmCaptureProfile, capture_vm, install_vm, prepare_vm_time};
 
@@ -80,7 +120,9 @@ pub(crate) struct KvmCaptureProfile {
 pub(crate) fn capture_arm_vm(
     profile: &KvmCaptureProfile,
     counter_model: crate::vmm::execution::kvm::ArmCounterModel,
+    permit: &NativeEffectsPermit,
 ) -> Result<crate::vmm::execution::kvm::KvmVmState, String> {
+    validate_native(permit)?;
     use crate::vmm::execution::kvm::{ArmVmState, KvmVmState};
     let mut mpidrs = Vec::with_capacity(profile.cpus.len());
     let mut counter = None;
@@ -168,4 +210,80 @@ pub(crate) fn prepare_arm_time(
             _ => Err("kvm/arm64/clock-backend".into()),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::task::Poll;
+
+    use arch::guest_memory::{BackingKind, DirtyPageMap, MemoryDomain, PageIndex};
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    use crate::vmm::linux::execution::{native_result, validate_native};
+
+    #[test]
+    fn native_execution_refuses_construction_and_disabled_domains() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let (_, construction, mut control) =
+            MemoryDomain::construct(memory, 4096, BackingKind::Boot).unwrap();
+        let constructing = construction.native_effects().unwrap();
+        assert!(validate_native(&constructing).is_err());
+        drop(constructing);
+        control.finish_untracked(construction).unwrap();
+        let disabled = control.runtime_native_effects().unwrap();
+        assert!(validate_native(&disabled).is_err());
+
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let (_, construction, mut control) =
+            MemoryDomain::construct(memory, 4096, BackingKind::Boot).unwrap();
+        let epoch = construction.issue_epoch(1).unwrap();
+        control.finish_tracked(construction, epoch).unwrap();
+        let tracked = control.runtime_native_effects().unwrap();
+        assert!(validate_native(&tracked).is_ok());
+    }
+
+    #[test]
+    fn native_partial_failure_invalidates_coverage_without_erasing_known_writes() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 8192)]).unwrap();
+        let (domain, construction, mut control) =
+            MemoryDomain::construct(memory, 4096, BackingKind::Boot).unwrap();
+        let initial = construction.issue_epoch(1).unwrap();
+        control.finish_tracked(construction, initial).unwrap();
+        let permit = control.runtime_native_effects().unwrap();
+        let write = permit.write(GuestAddress(4095), 2).unwrap();
+        write.write_view(0, 2).unwrap().copy_from(&[0x42, 0x17]);
+        drop(write);
+        let error =
+            native_result::<()>(&permit, Err("short SET_MSRS completion".into())).unwrap_err();
+        assert_eq!(error, "short SET_MSRS completion");
+        assert!(!domain.coverage_valid());
+        assert!(control.close().is_err());
+        drop(permit);
+        let closing = control.close().unwrap();
+        let Poll::Ready(Ok(drained)) = control.poll_drained(&closing) else {
+            panic!("completed native owner must drain");
+        };
+        let cut = control.seal(&drained).unwrap();
+        let mut retained = DirtyPageMap::new(domain.layout());
+        control.drain_host_dirty(&cut, &mut retained).unwrap();
+        assert!(retained.contains(PageIndex::new(0)));
+        assert!(retained.contains(PageIndex::new(1)));
+        let mut bytes = [0; 2];
+        domain.read_slice(&mut bytes, GuestAddress(4095)).unwrap();
+        assert_eq!(bytes, [0x42, 0x17]);
+    }
+
+    #[test]
+    fn successful_native_completion_does_not_restore_lost_coverage() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let (domain, construction, _) =
+            MemoryDomain::construct(memory, 4096, BackingKind::Boot).unwrap();
+        let permit = construction.native_effects().unwrap();
+        assert_eq!(native_result(&permit, Ok(7)).unwrap(), 7);
+        assert!(domain.coverage_valid());
+        assert!(native_result::<()>(&permit, Err("entered native failure".into())).is_err());
+        assert!(!domain.coverage_valid());
+        native_result(&permit, Ok(())).unwrap();
+        assert!(!domain.coverage_valid());
+    }
 }

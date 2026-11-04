@@ -17,12 +17,22 @@ those pages may already contain live guest allocations or device buffers.
 ## Automatic capabilities and terminology
 
 Attaching `BalloonDevice::new()` requests reporting qualification automatically.
-There is no additional `host_reclaim(true)` builder call. On macOS the reporting
-feature is initially absent and is advertised only after successful qualification
-of private anonymous RAM with guest EL2 disabled. Failed/inconclusive probes,
-nested guests, and incompatible providers retain the basic balloon without
-reporting. Unrelated balloon features are preserved. Probe cleanup failures
-remain fatal when safe VM reuse cannot be established.
+There is no additional `host_reclaim(true)` builder call. Balloon memory policy
+is bound after dormant device attachment and structural source selection, before
+the guest can read features. Ordinary untracked macOS VMs advertise reporting
+only after successful qualification of private anonymous RAM with guest EL2
+disabled. Failed/inconclusive probes, nested guests, and incompatible providers
+retain their existing basic balloon behavior. Unrelated features are preserved.
+Probe cleanup failures remain fatal when safe VM reuse cannot be established.
+
+Tracked-capture sources inhibit lazy advice from construction, before any
+qualification can mutate RAM, and install no periodic remapper. Restored private
+RAM independently inhibits destructive discard, advice, and remapping. These
+immutable policies exclude only the reclaim subset, never registered RAM from
+dirty tracking or capture. Reporting may remain offered with acknowledge-only
+semantics; restore preserves the exact validated saved feature offer. Skipped
+reports do not increase successfully released-byte counters and do not qualify
+the restored mapping's discard semantics.
 
 `FreePageReporter` names the guest-kernel/device protocol. `HostMemoryReclaimer`
 is the report-driven HVF release implementation (`ReclaimState`).
@@ -31,6 +41,37 @@ is the report-driven HVF release implementation (`ReclaimState`).
 consequence of attaching the balloon. Silo's macOS target is 26+; this work adds
 no older-version private-trap route and preserves the existing RAM provider and
 stock virtio protocol.
+
+## Capture permission ownership
+
+Tracked RAM has one VM-owned stage-two permission owner, retained by every vCPU
+resource owner. It binds the final registered-RAM geometry and original mapping
+permissions, separately from the reclaim subset. Before admitted execution it
+removes WRITE from originally writable RAM, preserving READ and EXECUTE.
+
+Supplied restore RAM (`RestoredInput`) is inhibited independently too, even when
+its actual backing has not been established as file-private. This policy does
+not claim sharing or file-private restore implementation.
+
+Only a qualified RAM data-abort permission fault with a usable address, WnR,
+and neither S1PTW nor cache-maintenance semantics can enable a page. The owner
+marks the CPU bitmap before restoring WRITE. Same-page faults queued in the same
+epoch retry idempotently; an old epoch never authorizes a new write. This path
+does not require scalar MMIO syndrome fields and returns `MemoryRetry` without
+advancing the PC, changing operands, or arming deferred MMIO emulation.
+
+Stopped/drained capture merges CPU dirties into the retained union, then rearms
+only written bitmap runs within each region. Maps clear only after every native
+protection operation succeeds; the retained union is never cleared by harvest
+or rearm. Unsupported faults, lost RAM mappings, stale epochs, poisoned ownership,
+and partial protection failures invalidate coverage and fence execution. Tracked
+mapping replacement/removal is refused before native effects. VM lifetime
+ownership retains backing through partial mapping rollback and native teardown.
+
+These are implementation invariants, not macOS runtime qualification. Actual HVF
+store classes, concurrent faults, exact instruction retry and protection-failure
+behavior remain pending the native macOS lane; Linux unit results cannot qualify
+them.
 
 ## Release path
 
@@ -91,9 +132,10 @@ using same-address `mach_vm_remap(copy=false, VM_FLAGS_FIXED | VM_FLAGS_OVERWRIT
 This shares the existing backing object; it is not anonymous backing replacement,
 zeroing, or a replay of old free-page reports. The owner of guest RAM remains alive
 throughout the operation. No detached maintenance thread or status reader owns
-this responsibility. Compatible memory setup creates HostMemoryRemapper even
-without a balloon, with failed reporting qualification, or with guest EL2.
-External/shared providers are excluded. A normalization failure is fatal rather
+this responsibility. Compatible ordinary untracked memory setup creates
+HostMemoryRemapper even without a balloon, with failed reporting qualification,
+or with guest EL2. Tracked capture, restored private RAM, and external/shared
+providers are excluded. A normalization failure is fatal rather
 than continuing with uncertain mappings, deliberately stricter than OrbStack's
 recovered timer retry policy.
 

@@ -746,7 +746,7 @@ mod tests {
     use std::sync::{Arc, Mutex, RwLock};
 
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
-    use vm_memory::{GuestAddress, GuestMemoryMmap};
+    use vm_memory::GuestAddress;
 
     use crate::virtio::vsock::muxer::ProxyMap;
     use crate::virtio::vsock::muxer_rxq::MuxerRxQ;
@@ -764,9 +764,7 @@ mod tests {
         )
         .unwrap();
         let id = ((guest_port as u64) << 32) | source_port as u64;
-        let memory = RuntimeGuestMemory::passthrough(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap(),
-        );
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap();
         let proxy = UnixProxy::new_mux_reverse(
             id,
             3,

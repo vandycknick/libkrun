@@ -213,7 +213,7 @@ mod tests {
             device_id: &str,
         ) -> Result<u64> {
             let mmio_device = devices::virtio::MmioTransport::new(
-                guest_mem,
+                crate::vmm::memory::runtime_memory_for_test(guest_mem),
                 DummyIrqChip::new().into(),
                 device,
                 None,

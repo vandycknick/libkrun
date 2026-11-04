@@ -4,7 +4,7 @@ use std::time;
 
 use crate::virtio::vsock::defs::uapi;
 use crate::virtio::vsock::packet::PacketQueue as VirtQueue;
-use crate::virtio::vsock::packet::VsockPacket;
+use crate::virtio::vsock::packet::RxPacket;
 use crate::virtio::vsock::worker_control::{Owner, WorkerControl};
 
 use crate::virtio::InterruptTransport;
@@ -47,7 +47,7 @@ impl TimesyncThread {
         let Some(head) = queue.pop(&self.mem) else {
             return false;
         };
-        let Ok(mut packet) = VsockPacket::from_rx_virtq_head(&head, &mut queue.snapshot) else {
+        let Ok(mut packet) = RxPacket::from_rx_virtq_head(&head, &mut queue.snapshot) else {
             queue.record_processing_failure();
             self.control.fail();
             if queue.add_used(&self.mem, head.index, 0).is_ok() {
@@ -74,7 +74,11 @@ impl TimesyncThread {
             .set_len(8);
         packet.write_time_sync(time);
         if queue
-            .add_used(&self.mem, head.index, packet.hdr().len() as u32 + 8)
+            .add_used(
+                &self.mem,
+                head.index,
+                crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE as u32 + 8,
+            )
             .is_err()
             || self.interrupt.try_signal_used_queue().is_err()
         {

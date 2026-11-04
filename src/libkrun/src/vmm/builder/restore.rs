@@ -10,6 +10,7 @@ use vm_memory::GuestMemoryMmap;
 
 use crate::api::capabilities::execution_state_producer;
 use crate::vmm::Vmm;
+#[cfg(any(target_os = "macos", feature = "native-execution-probe"))]
 use crate::vmm::builder::setup_vm;
 use crate::vmm::control::{
     BarrierGeneration, BarrierKey, BarrierRequest, ControlOwner, CpuCommandKind, OperationId,
@@ -57,16 +58,20 @@ fn barrier(generation: u64, deadline: Instant) -> BarrierRequest {
 }
 
 fn assemble(
-    memory: GuestMemoryMmap,
     info: ArchMemoryInfo,
     vm: Vm,
     controller: IrqChip,
     manager: MMIODeviceManager,
     exit: EventFd,
     generation: BarrierGeneration,
+    memory_coordinator: crate::vmm::memory::MemoryCoordinator,
 ) -> Result<Vmm, String> {
+    let memory_domain = memory_coordinator.control.domain().clone();
     Ok(Vmm {
-        guest_memory: memory,
+        guest_memory: devices::virtio::RuntimeGuestMemory::new(memory_domain.clone()),
+        memory_domain,
+        memory: memory_coordinator,
+        balloon_bindings: Vec::new(),
         arch_memory_info: info,
         vm,
         execution_controller: controller,
@@ -134,14 +139,47 @@ pub(crate) fn build_restore_prepared(
         return Err(refusal("restore backend/ISA mismatch"));
     }
     validate_legacy_bindings(saved, &devices).map_err(refusal)?;
-    devices.validate_memory(&memory).map_err(refusal)?;
+    devices
+        .validate_memory(&arch::guest_memory::ReadGuestMemory::new(&memory))
+        .map_err(refusal)?;
+    let (memory_domain, authority, memory_control) = arch::guest_memory::MemoryDomain::construct(
+        memory.clone(),
+        saved.page_granule,
+        arch::guest_memory::BackingKind::RestoredInput,
+    )
+    .map_err(refusal)?;
+    let mut memory_coordinator =
+        crate::vmm::memory::MemoryCoordinator::new(memory_control, authority);
     let exit = EventFd::new(EFD_NONBLOCK).map_err(refusal)?;
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    let vm = setup_vm(&memory, false).map_err(refusal)?;
+    #[cfg(target_os = "linux")]
+    let (vm, epoch) = crate::vmm::builder::setup_vm_tracked(
+        memory_domain.clone(),
+        memory_coordinator
+            .construction
+            .as_ref()
+            .ok_or_else(|| refusal("construction authority missing"))?,
+    )
+    .map_err(refusal)?;
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    let mut vm = setup_vm(&memory, false).map_err(refusal)?;
+    let mut vm = vm;
     #[cfg(target_os = "macos")]
-    let mut vm = setup_vm(&memory, &info, false, false, true).map_err(refusal)?;
+    let (mut vm, epoch) = {
+        let mut vm = setup_vm(&memory, &info, false, false, true).map_err(refusal)?;
+        vm.bind_memory_domain(memory_domain.clone())
+            .map_err(refusal)?;
+        let epoch = vm
+            .arm_initial(
+                memory_coordinator
+                    .construction
+                    .as_ref()
+                    .ok_or_else(|| refusal("construction authority missing"))?,
+            )
+            .map_err(refusal)?;
+        (vm, epoch)
+    };
+    memory_coordinator.finish_tracked(epoch).map_err(refusal)?;
+    #[cfg(target_os = "macos")]
+    vm.configure_reclaim(&info, false).map_err(refusal)?;
     let mut base = arch::MMIO_MEM_START;
     let mut manager = MMIODeviceManager::new(&mut base, (arch::IRQ_BASE, arch::IRQ_MAX));
     let mut io_bus = devices::Bus::new();
@@ -162,8 +200,9 @@ pub(crate) fn build_restore_prepared(
             else {
                 return Err(refusal("ARM CPU state required"));
             };
-            let mut cpu = Vcpu::new_aarch64(state.id, vm.fd(), exit.try_clone().map_err(refusal)?)
-                .map_err(refusal)?;
+            let mut cpu =
+                Vcpu::new_aarch64(state.id, vm.fd_owner(), exit.try_clone().map_err(refusal)?)
+                    .map_err(refusal)?;
             cpu.initialize_aarch64_saved(state).map_err(refusal)?;
             cpus.push(cpu);
         }
@@ -181,7 +220,8 @@ pub(crate) fn build_restore_prepared(
             registers: state.registers.clone(),
         };
         let gic =
-            devices::legacy::KvmGicV3::create_for_restore(vm.fd(), &state).map_err(refusal)?;
+            devices::legacy::KvmGicV3::create_for_restore(vm.fd(), &state, memory_domain.clone())
+                .map_err(refusal)?;
         gic.initialize().map_err(refusal)?;
         Arc::new(Mutex::new(IrqChipDevice::new(Box::new(gic))))
     };
@@ -242,7 +282,7 @@ pub(crate) fn build_restore_prepared(
         cpus.push(
             Vcpu::new_x86_64(
                 state.id(),
-                vm.fd(),
+                vm.fd_owner(),
                 vm.supported_cpuid().clone(),
                 vm.supported_msrs().clone(),
                 io_bus.clone(),
@@ -252,6 +292,13 @@ pub(crate) fn build_restore_prepared(
         );
     }
     let request = barrier(saved.binding.pause_generation, deadline);
+    memory_coordinator
+        .begin_close(request.key)
+        .map_err(refusal)?;
+    match memory_coordinator.poll_drained() {
+        std::task::Poll::Ready(result) => result.map_err(refusal)?,
+        std::task::Poll::Pending => return Err(refusal("unexpected restore writer ownership")),
+    }
     if events.dispatch_fence().is_some() {
         return Err(refusal(
             "restore requires an unfenced destination event manager",
@@ -264,19 +311,32 @@ pub(crate) fn build_restore_prepared(
         .park_callbacks(request.key)
         .map_err(|error| refusal(format!("restore callback park: {error:?}")))?;
     let mut attempt = assemble(
-        memory,
         info,
         vm,
         controller,
         manager,
         exit,
         request.key.generation,
+        memory_coordinator,
     )
     .map_err(refusal)?;
     let install_result = (|| {
+        let native = attempt.memory.native()?;
         // Bus clones snapshot their mappings. Finish dormant topology construction
         // before owners take their buses; install device payloads only after CPU state.
         attach_device_resources(&mut attempt, &devices)?;
+        attempt.balloon_bindings = std::mem::take(&mut devices.balloon_bindings);
+        for binding in &attempt.balloon_bindings {
+            binding
+                .finalize(
+                    devices::virtio::balloon::BalloonMemoryPolicy::RestoredInput,
+                    #[cfg(target_os = "macos")]
+                    attempt.vm.reclaim_state(),
+                    #[cfg(target_os = "macos")]
+                    attempt.vm.host_memory_remapper(),
+                )
+                .map_err(|error| error.to_string())?;
+        }
         attempt
             .start_vcpus_parked(cpus)
             .map_err(|error| error.to_string())?;
@@ -294,7 +354,7 @@ pub(crate) fn build_restore_prepared(
         }
         match &saved.vm {
             #[cfg(target_os = "linux")]
-            VmExecutionState::Kvm(state) => attempt.vm.install_execution(state)?,
+            VmExecutionState::Kvm(state) => attempt.vm.install_execution(state, &native)?,
             #[cfg(target_os = "macos")]
             VmExecutionState::Hvf(state) => attempt
                 .execution_controller
@@ -318,6 +378,7 @@ pub(crate) fn build_restore_prepared(
                 CpuCommandKind::InstallExecution,
                 &inputs,
                 &attempt.vcpus_handles,
+                Some(native),
             )
             .map_err(|error| error.to_string())?;
         attempt.wait_execution_command(request)?;
@@ -388,6 +449,12 @@ pub(crate) fn build_restore_prepared(
             cpus: saved.cpus.clone(),
             legacy: saved.legacy.clone(),
         });
+        while !attempt.finish_memory_cut(request.key)? {
+            if Instant::now() >= deadline {
+                return Err("restore native writer drain deadline".into());
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
         Ok::<(), String>(())
     })();
     if let Err(error) = install_result {
@@ -624,7 +691,16 @@ pub(crate) fn build_execution_fixture(
     if count == 0 || Instant::now() >= deadline {
         return Err("invalid diagnostic CPU topology/deadline".into());
     }
-    let vm = setup_vm(&memory, false).map_err(|error| error.to_string())?;
+    let mut vm = setup_vm(&memory, false).map_err(|error| error.to_string())?;
+    let (memory_domain, authority, memory_control) = arch::guest_memory::MemoryDomain::construct(
+        memory.clone(),
+        crate::vmm::execution::host_page_granule().map_err(|error| error.to_string())?,
+        arch::guest_memory::BackingKind::Boot,
+    )
+    .map_err(|error| error.to_string())?;
+    vm.bind_memory_domain(memory_domain.clone())
+        .map_err(|error| error.to_string())?;
+    let memory_coordinator = crate::vmm::memory::MemoryCoordinator::new(memory_control, authority);
     let controller = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(
         devices::legacy::KvmIoapic::new(vm.fd()).map_err(|error| error.to_string())?,
     ))));
@@ -636,7 +712,7 @@ pub(crate) fn build_execution_fixture(
     for id in 0..count {
         let mut cpu = Vcpu::new_x86_64(
             id,
-            vm.fd(),
+            vm.fd_owner(),
             vm.supported_cpuid().clone(),
             vm.supported_msrs().clone(),
             io_bus.clone(),
@@ -647,14 +723,17 @@ pub(crate) fn build_execution_fixture(
         cpus.push(cpu);
     }
     let mut attempt = assemble(
-        memory,
         info,
         vm,
         controller,
         manager,
         exit,
         BarrierGeneration(0),
+        memory_coordinator,
     )?;
+    attempt
+        .finalize_source_memory(true)
+        .map_err(|error| error.to_string())?;
     attempt
         .start_vcpus_parked(cpus)
         .map_err(|error| error.to_string())?;

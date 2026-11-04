@@ -1,6 +1,8 @@
 use std::num::Wrapping;
+use std::os::windows::io::OwnedSocket as OwnedFd;
 use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket, RawSocket};
 use std::path::PathBuf;
+use utils::windows::RawFd;
 use windows_sys::Win32::Networking::WinSock::{
     AF_UNIX, FIONBIO, INVALID_SOCKET, SD_BOTH, SD_RECEIVE, SD_SEND, SOCK_STREAM, SOCKADDR,
     SOCKADDR_UN, SOCKET, SOCKET_ERROR, WSAECONNREFUSED, WSAEWOULDBLOCK, WSAGetLastError, accept,
@@ -9,10 +11,10 @@ use windows_sys::Win32::Networking::WinSock::{
 
 use super::super::super::linux_errno::wsa_errno_to_linux;
 use super::super::muxer::{MuxerRx, push_packet};
-use super::super::packet::{TsiConnectReq, VsockPacket};
 use super::super::proxy::{
-    NewProxyType, OwnedFd, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RawFd, RecvPkt,
+    NewProxyType, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
 };
+use crate::virtio::vsock::packet::{RxPacket, TsiConnectReq, TxPacket};
 use utils::epoll::EventSet;
 
 pub(crate) fn create_socket(_id: u64) -> Result<OwnedFd, ProxyError> {
@@ -64,7 +66,7 @@ fn push_connect_rsp(proxy: &super::UnixProxy, result: i32) {
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 }
 
-pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> RecvPkt {
+pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut RxPacket) -> RecvPkt {
     if let Some(buf) = pkt.buf_mut() {
         let peer_credit = proxy.peer_avail_credit();
         let max_len = std::cmp::min(buf.len(), peer_credit);
@@ -102,7 +104,7 @@ pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> Re
 
 pub(crate) fn do_connect(
     proxy: &mut super::UnixProxy,
-    _pkt: &VsockPacket,
+    _pkt: &TxPacket,
     _req: TsiConnectReq,
 ) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
@@ -147,10 +149,7 @@ pub(crate) fn do_connect(
     update
 }
 
-pub(crate) fn confirm_connect(
-    proxy: &mut super::UnixProxy,
-    pkt: &VsockPacket,
-) -> Option<ProxyUpdate> {
+pub(crate) fn confirm_connect(proxy: &mut super::UnixProxy, pkt: &TxPacket) -> Option<ProxyUpdate> {
     proxy.peer_buf_alloc = pkt.buf_alloc();
     proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
     proxy.local_port = pkt.dst_port();
@@ -168,7 +167,7 @@ pub(crate) fn confirm_connect(
     })
 }
 
-pub(crate) fn sendmsg(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyUpdate {
+pub(crate) fn sendmsg(proxy: &mut super::UnixProxy, pkt: &TxPacket) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
 
     let ret = if let Some(buf) = pkt.buf() {
@@ -203,7 +202,7 @@ pub(crate) fn sendmsg(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyU
     update
 }
 
-pub(crate) fn update_peer_credit(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyUpdate {
+pub(crate) fn update_peer_credit(proxy: &mut super::UnixProxy, pkt: &TxPacket) -> ProxyUpdate {
     proxy.peer_buf_alloc = pkt.buf_alloc();
     proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
     let mut update = ProxyUpdate::default();
@@ -251,7 +250,7 @@ pub(crate) fn push_op_request(proxy: &super::UnixProxy) {
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 }
 
-pub(crate) fn process_op_response(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyUpdate {
+pub(crate) fn process_op_response(proxy: &mut super::UnixProxy, pkt: &TxPacket) -> ProxyUpdate {
     proxy.peer_buf_alloc = pkt.buf_alloc();
     proxy.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
     proxy.status = ProxyStatus::Connected;
@@ -262,7 +261,7 @@ pub(crate) fn process_op_response(proxy: &mut super::UnixProxy, pkt: &VsockPacke
     }
 }
 
-pub(crate) fn do_shutdown(proxy: &mut super::UnixProxy, pkt: &VsockPacket) {
+pub(crate) fn do_shutdown(proxy: &mut super::UnixProxy, pkt: &TxPacket) {
     let recv_off = pkt.flags() & super::uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
     let send_off = pkt.flags() & super::uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 

@@ -1,51 +1,15 @@
 // Copyright 2026 The libkrun Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Guest RAM layout description for host reclaim.
+//! Guest RAM ownership, runtime access, dirty tracking and reclaim geometry.
 //!
-//! This module contains no hypervisor or host-memory operations. It records
-//! which guest-physical ranges are private anonymous RAM, translates guest
-//! ranges to their host addresses, and validates the alignment a backend needs
-//! before it releases a range to the host.
+//! `RegisteredRamLayout` inventories all RAM. `RamLayout` remains the distinct
+//! private-anonymous subset eligible for host reclaim.
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
-
-/// Optional guard for host access to guest memory.
-///
-/// Devices route guest memory access through `RuntimeGuestMemory`, which
-/// consults an implementation only when one is installed. The macOS reclaim
-/// path installs none: the host mapping stays valid across a release, so host
-/// access needs no lease and pays no synchronization cost.
-pub trait HostMemoryAccess: Send + Sync {
-    fn access(
-        self: Arc<Self>,
-        range: GuestRange,
-    ) -> Result<Arc<dyn HostMemoryLease>, HostMemoryAccessError>;
-
-    /// Long-lived mappings handed to another process or library.
-    fn allows_external_mapping(&self) -> bool;
-}
-
-pub trait HostMemoryLease: Send + Sync {}
-
-#[derive(Debug, Eq, PartialEq)]
-pub struct HostMemoryAccessError(String);
-
-impl HostMemoryAccessError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
-    }
-}
-
-impl Display for HostMemoryAccessError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Error for HostMemoryAccessError {}
+mod domain;
+pub use crate::guest_memory::domain::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RamPermissions(u8);

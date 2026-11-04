@@ -3,7 +3,8 @@ use crate::vmm::execution::kvm::{
     MsrValue, PitChannel, Segment, X86CpuState, X86Special, X86VmState, XstateComponent,
     common_tsc_offset, lapic_u32,
 };
-use crate::vmm::linux::execution::CpuCaptureConfig;
+use crate::vmm::linux::execution::{CpuCaptureConfig, validate_native};
+use arch::guest_memory::NativeEffectsPermit;
 use arch::x86_state::{CpuFeatures, MsrClass};
 use kvm_bindings::*;
 use kvm_ioctls::{VcpuFd, VmFd};
@@ -939,7 +940,9 @@ pub(crate) fn capture_vm(
     profile: &KvmCaptureProfile,
     retained: &mut Option<kvm_pit_state2>,
     #[cfg(feature = "native-device-probe")] writes: &ControllerWrites,
+    permit: &NativeEffectsPermit,
 ) -> Result<KvmVmState, String> {
+    validate_native(permit)?;
     let (host_kernel, host_mode) = host_clock_profile()?;
     let pit = match retained {
         Some(p) => *p,
@@ -1071,7 +1074,9 @@ pub(crate) fn install_vm(
     fd: &VmFd,
     state: &KvmVmState,
     #[cfg(feature = "native-device-probe")] writes: &ControllerWrites,
+    permit: &NativeEffectsPermit,
 ) -> Result<(), String> {
+    validate_native(permit)?;
     state.validate()?;
     let KvmVmState::X86(s) = state else {
         return Err("kvm/vm/backend".into());
@@ -1096,7 +1101,9 @@ pub(crate) fn prepare_vm_time(
     cpus: &[KvmCpuState],
     observation: &mut Option<crate::vmm::linux::execution::KvmClockObservation>,
     #[cfg(feature = "native-device-probe")] writes: &ControllerWrites,
+    permit: &NativeEffectsPermit,
 ) -> Result<Vec<KvmCpuTimePlan>, String> {
+    validate_native(permit)?;
     let KvmVmState::X86(s) = state else {
         return Err("kvm/clock/backend".into());
     };

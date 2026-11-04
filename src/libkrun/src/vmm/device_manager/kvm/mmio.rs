@@ -17,6 +17,7 @@ use crate::vmm::device_manager::quiescence::LegacyHandle;
 use crate::vmm::device_manager::quiescence::{
     AttachmentIdentity, DeviceQuiescence, LegacyAttachment, LegacyKind, ManagerError,
 };
+use crate::vmm::linux::vstate::VmFdOwner;
 use devices::DeviceType;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::fdt::DeviceInfoForFDT;
@@ -174,7 +175,7 @@ struct RouteWorker {
     handle: JoinHandle<()>,
 }
 
-fn run_route_work(vm: Arc<VmFd>, work: &Mutex<RouteWork>) {
+fn run_route_work(vm: Arc<VmFdOwner>, work: &Mutex<RouteWork>) {
     let mut work = match work.lock() {
         Ok(work) => work,
         Err(_) => return,
@@ -408,7 +409,7 @@ impl MMIODeviceManager {
     /// The control owner must poll this completion while servicing control/exit.
     pub fn begin_irq_fence(
         &mut self,
-        vm: Arc<VmFd>,
+        vm: Arc<VmFdOwner>,
         request: BarrierRequest,
     ) -> std::result::Result<(), RouteError> {
         if self.route_request.is_some() {
@@ -438,7 +439,7 @@ impl MMIODeviceManager {
     /// Cancellation names the original fence but has its own absolute deadline.
     pub fn begin_irq_rearm(
         &mut self,
-        vm: Arc<VmFd>,
+        vm: Arc<VmFdOwner>,
         fenced: BarrierKey,
         request: BarrierRequest,
     ) -> std::result::Result<(), RouteError> {
@@ -553,7 +554,7 @@ impl MMIODeviceManager {
 
     fn start_route_work(
         &mut self,
-        vm: Arc<VmFd>,
+        vm: Arc<VmFdOwner>,
         request: BarrierRequest,
         transition: RouteTransition,
     ) -> std::result::Result<(), RouteError> {
@@ -970,7 +971,7 @@ mod tests {
         ) -> Result<u64> {
             let (mmio_base, _irq) = self.register_mmio_device(
                 vm,
-                guest_mem.into(),
+                crate::vmm::memory::runtime_memory_for_test(guest_mem),
                 DummyIrqChip::new().into(),
                 device,
                 device_id.to_string(),
@@ -1051,7 +1052,14 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
         #[cfg(target_arch = "aarch64")]
-        let _gic = KvmGicV3::new(vm.fd(), 1).unwrap();
+        let _gic = KvmGicV3::new(
+            vm.fd(),
+            1,
+            crate::vmm::memory::runtime_memory_for_test(guest_mem.clone())
+                .domain()
+                .clone(),
+        )
+        .unwrap();
 
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
         let dummy = Arc::new(Mutex::new(DummyDevice::new()));
@@ -1076,7 +1084,14 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
         #[cfg(target_arch = "aarch64")]
-        let _gic = KvmGicV3::new(vm.fd(), 1).unwrap();
+        let _gic = KvmGicV3::new(
+            vm.fd(),
+            1,
+            crate::vmm::memory::runtime_memory_for_test(guest_mem.clone())
+                .domain()
+                .clone(),
+        )
+        .unwrap();
 
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
 

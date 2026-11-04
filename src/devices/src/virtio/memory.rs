@@ -1,707 +1,289 @@
 // Copyright 2026 The libkrun Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io;
+use arch::guest_memory::{
+    HostReadGuard, HostWriteGuard, MemoryDomain, MemoryError, ReadView, WriteView,
+};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-
-use arch::guest_memory::{GuestRange, HostMemoryAccess, HostMemoryLease};
-use vm_memory::{
-    Address, AtomicAccess, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError,
-    GuestMemoryMmap, GuestMemoryRegion, VolatileMemoryError, VolatileSlice,
-};
+use vm_memory::{Address, AtomicAccess, ByteValued, GuestAddress, GuestMemoryError};
 
 #[derive(Clone)]
 pub struct RuntimeGuestMemory {
-    memory: GuestMemoryMmap,
-    access: Option<Arc<dyn HostMemoryAccess>>,
+    domain: Arc<MemoryDomain>,
 }
-
 impl RuntimeGuestMemory {
+    pub fn new(domain: Arc<MemoryDomain>) -> Self {
+        Self { domain }
+    }
+    pub fn domain(&self) -> &Arc<MemoryDomain> {
+        &self.domain
+    }
+    pub fn read_only(&self) -> arch::guest_memory::ReadGuestMemory<'_> {
+        self.domain.read_only()
+    }
     #[cfg(test)]
-    pub fn from_ranges(
-        ranges: &[(GuestAddress, usize)],
-    ) -> Result<Self, vm_memory::mmap::FromRangesError> {
-        GuestMemoryMmap::from_ranges(ranges).map(Self::passthrough)
+    pub fn from_ranges(ranges: &[(GuestAddress, usize)]) -> Result<Self, GuestMemoryError> {
+        use arch::guest_memory::BackingKind;
+        let memory = vm_memory::GuestMemoryMmap::from_ranges(ranges)
+            .map_err(|error| GuestMemoryError::IOError(std::io::Error::other(error)))?;
+        let (domain, authority, mut control) =
+            MemoryDomain::construct(memory, 4096, BackingKind::Boot)?;
+        control.finish_untracked(authority)?;
+        Ok(Self::new(domain))
     }
-
-    pub fn new(memory: GuestMemoryMmap, access: Arc<dyn HostMemoryAccess>) -> Self {
-        Self {
-            memory,
-            access: Some(access),
-        }
-    }
-
-    pub fn passthrough(memory: GuestMemoryMmap) -> Self {
-        Self {
-            memory,
-            access: None,
-        }
-    }
-
-    fn lease(
-        &self,
-        address: GuestAddress,
-        len: usize,
-    ) -> Result<Option<Arc<dyn HostMemoryLease>>, GuestMemoryError> {
-        if len == 0 {
-            return Ok(None);
-        }
-        let Some(access) = &self.access else {
-            return Ok(None);
-        };
-        let len = u64::try_from(len).map_err(|_| GuestMemoryError::InvalidBackendAddress)?;
-        let range = GuestRange::new(address.raw_value(), len).map_err(|error| {
-            GuestMemoryError::IOError(io::Error::new(io::ErrorKind::InvalidInput, error))
-        })?;
-        Arc::clone(access)
-            .access(range)
-            .map(Some)
-            .map_err(|error| GuestMemoryError::IOError(io::Error::other(error)))
-    }
-
     pub fn allows_external_mapping(&self) -> bool {
-        self.access
-            .as_ref()
-            .is_none_or(|access| access.allows_external_mapping())
+        self.domain.allows_external_mapping()
     }
-
     #[cfg(feature = "vhost-user")]
     pub(crate) fn with_external_mapping<T>(
         &self,
-        operation: impl for<'a> FnOnce(&'a GuestMemoryMmap) -> T,
+        operation: impl FnOnce(&vm_memory::GuestMemoryMmap) -> T,
     ) -> Result<T, GuestMemoryError> {
-        if !self.allows_external_mapping() {
-            return Err(GuestMemoryError::IOError(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "reclaimable guest RAM cannot be exported as a long-lived mapping",
-            )));
-        }
-        Ok(operation(&self.memory))
+        self.domain.with_external_mapping(operation)
     }
-
     #[cfg(feature = "vhost-user")]
     pub(crate) fn external_host_address(
         &self,
         address: GuestAddress,
     ) -> Result<*mut u8, GuestMemoryError> {
+        use vm_memory::GuestMemoryBackend;
         self.with_external_mapping(|memory| memory.get_host_address(address))?
     }
-
     pub fn checked_offset(&self, base: GuestAddress, offset: usize) -> Option<GuestAddress> {
-        self.memory.checked_offset(base, offset)
+        self.domain.checked_offset(base, offset)
     }
-
     pub fn address_in_range(&self, address: GuestAddress) -> bool {
-        self.memory.address_in_range(address)
+        self.domain.address_in_range(address)
     }
-
+    pub fn validate_range(
+        &self,
+        address: GuestAddress,
+        len: usize,
+    ) -> Result<(), GuestMemoryError> {
+        self.domain.validate_range(address, len)
+    }
+    pub fn region_remaining(&self, address: GuestAddress) -> Result<usize, GuestMemoryError> {
+        self.domain.region_remaining(address)
+    }
+    pub fn read(
+        &self,
+        address: GuestAddress,
+        len: usize,
+    ) -> Result<HostReadGuard, GuestMemoryError> {
+        self.domain.read(address, len)
+    }
+    pub fn write(
+        &self,
+        address: GuestAddress,
+        len: usize,
+    ) -> Result<HostWriteGuard, GuestMemoryError> {
+        self.domain.write(address, len)
+    }
+    pub fn read_at_most(
+        &self,
+        address: GuestAddress,
+        len: usize,
+    ) -> Result<Option<HostReadGuard>, GuestMemoryError> {
+        if len == 0 {
+            return Ok(None);
+        }
+        self.read(address, len.min(self.region_remaining(address)?))
+            .map(Some)
+    }
+    pub fn write_at_most(
+        &self,
+        address: GuestAddress,
+        len: usize,
+    ) -> Result<Option<HostWriteGuard>, GuestMemoryError> {
+        if len == 0 {
+            return Ok(None);
+        }
+        self.write(address, len.min(self.region_remaining(address)?))
+            .map(Some)
+    }
     pub fn read_obj<T: ByteValued>(&self, address: GuestAddress) -> Result<T, GuestMemoryError> {
-        let _lease = self.lease(address, size_of::<T>())?;
-        self.memory.read_obj(address)
+        self.domain.read_obj(address)
     }
-
     pub fn write_obj<T: ByteValued>(
         &self,
         value: T,
         address: GuestAddress,
     ) -> Result<(), GuestMemoryError> {
-        let _lease = self.lease(address, size_of::<T>())?;
-        self.memory.write_obj(value, address)
+        self.write_slice(value.as_slice(), address)
     }
-
     pub fn read_slice(
         &self,
         buffer: &mut [u8],
         address: GuestAddress,
     ) -> Result<(), GuestMemoryError> {
-        let _lease = self.lease(address, buffer.len())?;
-        self.memory.read_slice(buffer, address)
+        self.domain.read_slice(buffer, address)
     }
-
     pub fn write_slice(
         &self,
         buffer: &[u8],
         address: GuestAddress,
     ) -> Result<(), GuestMemoryError> {
-        let _lease = self.lease(address, buffer.len())?;
-        self.memory.write_slice(buffer, address)
+        self.try_write_access(buffer.len(), address, |completed, len, _, view| {
+            view.write_slice(&buffer[completed..completed + len], 0)
+                .map_err(GuestMemoryError::from)?;
+            Ok(len)
+        })?;
+        Ok(())
     }
-
     pub fn load<T: AtomicAccess>(
         &self,
         address: GuestAddress,
         order: Ordering,
     ) -> Result<T, GuestMemoryError> {
-        let _lease = self.lease(address, size_of::<T>())?;
-        self.memory.load(address, order)
+        self.domain.load(address, order)
     }
-
     pub fn store<T: AtomicAccess>(
         &self,
         value: T,
         address: GuestAddress,
         order: Ordering,
     ) -> Result<(), GuestMemoryError> {
-        let _lease = self.lease(address, size_of::<T>())?;
-        self.memory.store(value, address, order)
+        let guard = self.write(address, size_of::<T>())?;
+        guard
+            .write_view(0, size_of::<T>())?
+            .store(value, 0, order)
+            .map_err(GuestMemoryError::from)
     }
-
-    pub fn get_slice(
+    fn span(
         &self,
         address: GuestAddress,
-        len: usize,
-    ) -> Result<LeasedVolatileSlice<'_>, GuestMemoryError> {
-        let lease = self.lease(address, len)?;
-        let slice = self.memory.get_slice(address, len)?;
-        Ok(LeasedVolatileSlice { slice, lease })
-    }
-
-    pub(crate) fn get_slice_at_most(
-        &self,
-        address: GuestAddress,
-        len: usize,
-    ) -> Result<Option<LeasedVolatileSlice<'_>>, GuestMemoryError> {
-        if len == 0 {
-            return Ok(None);
-        }
+        remaining: usize,
+    ) -> Result<(usize, usize), GuestMemoryError> {
+        let len = remaining.min(self.region_remaining(address)?);
         let region = self
-            .memory
-            .find_region(address)
-            .ok_or(GuestMemoryError::InvalidGuestAddress(address))?;
-        let offset = address
-            .raw_value()
-            .checked_sub(region.start_addr().raw_value())
-            .ok_or(GuestMemoryError::InvalidBackendAddress)?;
-        let remaining = region
-            .len()
-            .checked_sub(offset)
-            .ok_or(GuestMemoryError::InvalidBackendAddress)?;
-        let remaining =
-            usize::try_from(remaining).map_err(|_| GuestMemoryError::InvalidBackendAddress)?;
-        let count = len.min(remaining);
-        if count == 0 {
-            return Err(GuestMemoryError::InvalidBackendAddress);
-        }
-        self.get_slice(address, count).map(Some)
+            .domain
+            .layout()
+            .regions()
+            .iter()
+            .find(|region| region.guest_range().contains_address(address.raw_value()))
+            .ok_or(MemoryError::Bounds)?;
+        let offset = usize::try_from(address.raw_value() - region.guest_range().start())
+            .map_err(|_| MemoryError::Overflow)?;
+        Ok((len, offset))
     }
-
-    pub fn get_host_address(
-        &self,
-        address: GuestAddress,
-        len: usize,
-    ) -> Result<LeasedHostAddress, GuestMemoryError> {
-        let lease = self.lease(address, len)?;
-        let pointer = if len == 0 {
-            self.memory.get_host_address(address)?
-        } else {
-            self.memory
-                .get_slice(address, len)?
-                .ptr_guard_mut()
-                .as_ptr()
-        };
-        Ok(LeasedHostAddress {
-            pointer,
-            lease,
-            _memory: self.memory.clone(),
-        })
-    }
-
-    pub fn try_access<F>(
+    pub fn try_read_access<F>(
         &self,
         count: usize,
         address: GuestAddress,
         mut callback: F,
     ) -> Result<usize, GuestMemoryError>
     where
-        F: for<'a> FnMut(usize, usize, usize, VolatileSlice<'a>) -> Result<usize, GuestMemoryError>,
+        F: for<'a> FnMut(usize, usize, usize, ReadView<'a>) -> Result<usize, GuestMemoryError>,
     {
+        let guard = self.read(address, count)?;
         let mut completed = 0;
         while completed < count {
             let current = address
                 .checked_add(completed as u64)
-                .ok_or(GuestMemoryError::InvalidBackendAddress)?;
-            let region = self
-                .memory
-                .find_region(current)
-                .ok_or(GuestMemoryError::InvalidGuestAddress(current))?;
-            let region_offset = current.raw_value() - region.start_addr().raw_value();
-            let len = (count - completed).min((region.len() - region_offset) as usize);
-            let leased = self.get_slice(current, len)?;
-            let done = callback(completed, len, region_offset as usize, leased.slice)?;
+                .ok_or(MemoryError::Overflow)?;
+            let (len, offset) = self.span(current, count - completed)?;
+            let done = callback(completed, len, offset, guard.read_view(completed, len)?)?;
+            if done > len {
+                return Err(MemoryError::Bounds.into());
+            }
             if done == 0 {
                 break;
             }
+            completed += done;
+        }
+        Ok(completed)
+    }
+    pub fn try_write_access<F>(
+        &self,
+        count: usize,
+        address: GuestAddress,
+        mut callback: F,
+    ) -> Result<usize, GuestMemoryError>
+    where
+        F: for<'a> FnMut(usize, usize, usize, WriteView<'a>) -> Result<usize, GuestMemoryError>,
+    {
+        let guard = self.write(address, count)?;
+        let mut completed = 0;
+        while completed < count {
+            let current = address
+                .checked_add(completed as u64)
+                .ok_or(MemoryError::Overflow)?;
+            let (len, offset) = self.span(current, count - completed)?;
+            let done = callback(completed, len, offset, guard.write_view(completed, len)?)?;
             if done > len {
-                return Err(GuestMemoryError::IOError(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "guest memory callback exceeded its leased range",
-                )));
+                return Err(MemoryError::Bounds.into());
             }
-            completed = completed
-                .checked_add(done)
-                .ok_or(GuestMemoryError::InvalidBackendAddress)?;
+            if done == 0 {
+                break;
+            }
+            completed += done;
         }
         Ok(completed)
     }
 }
 
-impl From<GuestMemoryMmap> for RuntimeGuestMemory {
-    fn from(memory: GuestMemoryMmap) -> Self {
-        Self::passthrough(memory)
-    }
-}
-
-#[derive(Clone)]
-pub struct LeasedVolatileSlice<'a> {
-    slice: VolatileSlice<'a>,
-    lease: Option<Arc<dyn HostMemoryLease>>,
-}
-
-impl<'a> LeasedVolatileSlice<'a> {
-    /// Reborrows this slice without allowing safe code to outlive its lease guard.
-    ///
-    /// ```compile_fail
-    /// use krun_devices::virtio::LeasedVolatileSlice;
-    /// use vm_memory::VolatileSlice;
-    ///
-    /// fn detach<'backing>(guard: &LeasedVolatileSlice<'backing>) -> VolatileSlice<'backing> {
-    ///     guard.slice()
-    /// }
-    /// ```
-    pub fn slice(&self) -> VolatileSlice<'_> {
-        self.slice
-    }
-
-    pub fn offset(&self, count: usize) -> Result<Self, VolatileMemoryError> {
-        Ok(Self {
-            slice: self.slice.offset(count)?,
-            lease: self.lease.clone(),
-        })
-    }
-
-    pub(crate) fn subslice(&self, offset: usize, len: usize) -> Result<Self, VolatileMemoryError> {
-        Ok(Self {
-            slice: self.slice.subslice(offset, len)?,
-            lease: self.lease.clone(),
-        })
-    }
-
-    pub fn len(&self) -> usize {
-        self.slice.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.slice.is_empty()
-    }
-
-    pub fn lease(&self) -> Option<Arc<dyn HostMemoryLease>> {
-        self.lease.clone()
-    }
-}
-
-pub struct LeasedHostAddress {
-    pointer: *mut u8,
-    lease: Option<Arc<dyn HostMemoryLease>>,
-    _memory: GuestMemoryMmap,
-}
-
-unsafe impl Send for LeasedHostAddress {}
-unsafe impl Sync for LeasedHostAddress {}
-
-impl LeasedHostAddress {
-    /// Returns the guest-memory pointer protected by this guard.
-    ///
-    /// Dereferencing the pointer remains unsafe. The pointer must not be used
-    /// after this guard and all clones of its lease have been dropped.
-    pub fn as_ptr(&self) -> *mut u8 {
-        self.pointer
-    }
-
-    pub fn lease(&self) -> Option<Arc<dyn HostMemoryLease>> {
-        self.lease.clone()
-    }
-}
-
-use std::mem::size_of;
-
 #[cfg(test)]
 mod tests {
-    use std::fs::{File, OpenOptions};
-    use std::io::{Read, Seek, Write};
-    use std::os::unix::net::UnixStream;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc::sync_channel;
-
-    use arch::guest_memory::{
-        GuestRange, HostMemoryAccess, HostMemoryAccessError, HostMemoryLease,
-    };
-    use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
-
-    use crate::virtio::RuntimeGuestMemory;
-    use crate::virtio::descriptor_utils::{
-        DescriptorType, Reader, Writer, create_descriptor_chain,
-    };
-    use crate::virtio::vsock::packet::{VSOCK_PKT_HDR_SIZE, VsockPacket};
-
-    struct CountingAccess {
-        active: Arc<AtomicUsize>,
-        peak: AtomicUsize,
-        limit: usize,
-    }
-
-    struct CountingLease(Arc<AtomicUsize>);
-
-    impl Drop for CountingLease {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-
-    impl HostMemoryLease for CountingLease {}
-
-    impl HostMemoryAccess for CountingAccess {
-        fn access(
-            self: Arc<Self>,
-            _range: GuestRange,
-        ) -> Result<Arc<dyn HostMemoryLease>, HostMemoryAccessError> {
-            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
-            if active > self.limit {
-                self.active.fetch_sub(1, Ordering::AcqRel);
-                return Err(HostMemoryAccessError::new("lease capacity exhausted"));
-            }
-            self.peak.fetch_max(active, Ordering::AcqRel);
-            Ok(Arc::new(CountingLease(Arc::clone(&self.active))))
-        }
-
-        fn allows_external_mapping(&self) -> bool {
-            false
-        }
-    }
-
-    fn memory(limit: usize) -> (RuntimeGuestMemory, Arc<CountingAccess>) {
-        let access = Arc::new(CountingAccess {
-            active: Arc::new(AtomicUsize::new(0)),
-            peak: AtomicUsize::new(0),
-            limit,
-        });
-        let provider: Arc<dyn HostMemoryAccess> = access.clone();
-        let memory = RuntimeGuestMemory::new(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap(),
-            provider,
-        );
-        (memory, access)
-    }
-
-    fn temporary_file() -> File {
-        let path = std::env::temp_dir().join(format!(
-            "libkrun-runtime-memory-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-        std::fs::remove_file(path).unwrap();
-        file
-    }
+    use crate::virtio::memory::RuntimeGuestMemory;
+    use arch::guest_memory::{BackingKind, DirtyPageMap, MemoryDomain, PageIndex};
+    use std::task::Poll;
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
 
     #[test]
-    fn raw_and_volatile_views_retain_leases_until_last_guard_drops() {
-        let (memory, access) = memory(4);
-        let raw = memory.get_host_address(GuestAddress(0x1000), 8).unwrap();
-        assert_eq!(access.active.load(Ordering::Acquire), 1);
-        unsafe { raw.as_ptr().write(0x5a) };
-
-        let volatile = memory.get_slice(GuestAddress(0x2000), 8).unwrap();
-        let clone = volatile.clone();
-        let subslice = clone.offset(4).unwrap();
-        subslice.slice().write_slice(&[1, 2, 3, 4], 0).unwrap();
-        assert_eq!(access.active.load(Ordering::Acquire), 2);
-        drop(volatile);
-        assert_eq!(access.active.load(Ordering::Acquire), 2);
-        drop(clone);
-        assert_eq!(access.active.load(Ordering::Acquire), 2);
-        drop(subslice);
-        drop(raw);
-        assert_eq!(access.active.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn zero_length_operations_preserve_memory_behavior_without_leases() {
-        let (memory, access) = memory(0);
-        let address = GuestAddress(0x1000);
-
-        memory.read_slice(&mut [], address).unwrap();
-        memory.write_slice(&[], address).unwrap();
-        assert!(memory.get_slice(address, 0).unwrap().is_empty());
-        let raw = memory.get_host_address(address, 0).unwrap();
-        assert_eq!(
-            raw.as_ptr(),
-            memory.memory.get_host_address(address).unwrap()
-        );
-        let mut called = false;
-        assert_eq!(
-            memory
-                .try_access(0, address, |_, _, _, _| {
-                    called = true;
-                    Ok(0)
-                })
-                .unwrap(),
-            0
-        );
-        assert!(!called);
-        assert_eq!(access.active.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn empty_descriptor_consumers_and_vsock_rx_do_not_lease_empty_ranges() {
-        let (memory, access) = memory(2);
-        let reader_chain = create_descriptor_chain(
-            &memory,
-            GuestAddress(0),
-            GuestAddress(0x1000),
-            vec![(DescriptorType::Readable, 0)],
-            0,
-        )
-        .unwrap();
-        let mut reader = Reader::new(&memory, reader_chain).unwrap();
-        assert_eq!(reader.available_bytes(), 0);
-        assert_eq!(reader.read(&mut []).unwrap(), 0);
-
-        let writer_chain = create_descriptor_chain(
-            &memory,
-            GuestAddress(0x100),
-            GuestAddress(0x2000),
-            vec![(DescriptorType::Writable, 0)],
-            0,
-        )
-        .unwrap();
-        let mut writer = Writer::new(&memory, writer_chain).unwrap();
-        assert_eq!(writer.available_bytes(), 0);
-        assert_eq!(writer.write(&[]).unwrap(), 0);
-        assert_eq!(access.active.load(Ordering::Acquire), 0);
-
-        let packet_chain = create_descriptor_chain(
-            &memory,
-            GuestAddress(0x200),
-            GuestAddress(0x3000),
-            vec![
-                (DescriptorType::Writable, VSOCK_PKT_HDR_SIZE as u32),
-                (DescriptorType::Writable, 0),
-            ],
-            0,
-        )
-        .unwrap();
-        let packet = VsockPacket::from_rx_virtq_head(
-            &packet_chain,
-            &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(256),
-        )
-        .unwrap();
-        assert!(packet.buf().unwrap().is_empty());
-        assert_eq!(access.active.load(Ordering::Acquire), 1);
-        drop(packet);
-        assert_eq!(access.active.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn raw_buffer_lease_survives_async_real_socket_operation() {
-        let (memory, access) = memory(2);
-        memory.write_slice(b"async", GuestAddress(0x1000)).unwrap();
-        let buffer = memory.get_host_address(GuestAddress(0x1000), 5).unwrap();
-        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
-        let (ready_sender, ready_receiver) = sync_channel(0);
-        let (go_sender, go_receiver) = sync_channel(0);
-        let worker = std::thread::spawn(move || {
-            ready_sender.send(()).unwrap();
-            go_receiver.recv().unwrap();
-            let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr(), 5) };
-            sender.write_all(bytes).unwrap();
-        });
-
-        ready_receiver.recv().unwrap();
-        assert_eq!(access.active.load(Ordering::Acquire), 1);
-        go_sender.send(()).unwrap();
-        let mut received = [0; 5];
-        receiver.read_exact(&mut received).unwrap();
-        worker.join().unwrap();
-        assert_eq!(&received, b"async");
-        assert_eq!(access.active.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn synchronous_access_releases_before_return_and_capacity_is_bounded() {
-        let (memory, access) = memory(1);
-        memory
-            .write_slice(&[1, 2, 3], GuestAddress(0x1000))
-            .unwrap();
-        assert_eq!(access.active.load(Ordering::Acquire), 0);
-
-        let first = memory.get_slice(GuestAddress(0x1000), 8).unwrap();
-        assert!(memory.get_slice(GuestAddress(0x2000), 8).is_err());
-        drop(first);
-        assert!(memory.get_slice(GuestAddress(0x2000), 8).is_ok());
-        assert_eq!(access.peak.load(Ordering::Acquire), 1);
-    }
-
-    #[test]
-    fn descriptor_reader_keeps_lease_during_real_file_io_and_cancel_cleans_up() {
-        let (memory, access) = memory(16);
-        memory.write_slice(b"socket", GuestAddress(0x1000)).unwrap();
-        let chain = create_descriptor_chain(
-            &memory,
-            GuestAddress(0),
-            GuestAddress(0x1000),
-            vec![(DescriptorType::Readable, 6)],
-            0,
-        )
-        .unwrap();
-        let mut reader = Reader::new(&memory, chain).unwrap();
-        assert!(access.active.load(Ordering::Acquire) > 0);
-
-        let mut file = temporary_file();
-        reader.read_to(&mut file, 6).unwrap();
-        file.rewind().unwrap();
-        let mut received = [0; 6];
-        file.read_exact(&mut received).unwrap();
-        assert_eq!(&received, b"socket");
-        assert_eq!(access.active.load(Ordering::Acquire), 0);
-        drop(reader);
-        assert_eq!(access.active.load(Ordering::Acquire), 0);
-
-        let chain = create_descriptor_chain(
-            &memory,
-            GuestAddress(0),
-            GuestAddress(0x2000),
-            vec![(DescriptorType::Readable, 8)],
-            0,
-        )
-        .unwrap();
-        let reader = Reader::new(&memory, chain).unwrap();
-        drop(reader);
-        assert_eq!(access.active.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn descriptor_writer_keeps_lease_during_real_file_io_and_error_cleanup() {
-        let (memory, access) = memory(16);
-        let chain = create_descriptor_chain(
-            &memory,
-            GuestAddress(0),
-            GuestAddress(0x3000),
-            vec![(DescriptorType::Writable, 4)],
-            0,
-        )
-        .unwrap();
-        let mut writer = Writer::new(&memory, chain).unwrap();
-        assert!(access.active.load(Ordering::Acquire) > 0);
-
-        let mut file = temporary_file();
-        file.write_all(b"file").unwrap();
-        writer.write_from_at(&file, 4, 0).unwrap();
-        assert_eq!(access.active.load(Ordering::Acquire), 0);
-        drop(writer);
-        assert_eq!(access.active.load(Ordering::Acquire), 0);
-
-        let chain = create_descriptor_chain(
-            &memory,
-            GuestAddress(0),
-            GuestAddress(0x4000),
-            vec![(DescriptorType::Writable, 4)],
-            0,
-        )
-        .unwrap();
-        let mut writer = Writer::new(&memory, chain).unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "libkrun-runtime-memory-write-only-{}",
-            std::process::id()
-        ));
-        let write_only = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-        std::fs::remove_file(path).unwrap();
-        assert!(writer.write_from_at(&write_only, 4, 0).is_err());
-        assert!(access.active.load(Ordering::Acquire) > 0);
-        drop(writer);
-        assert_eq!(access.active.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn raw_addresses_validate_the_full_range_in_guarded_and_passthrough_modes() {
-        let backing = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap();
-        let (guarded, _) = memory(4);
-        let passthrough = RuntimeGuestMemory::passthrough(backing);
-
-        for memory in [&guarded, &passthrough] {
-            assert!(memory.get_host_address(GuestAddress(0xffff), 1).is_ok());
-            assert!(memory.get_host_address(GuestAddress(0xffff), 2).is_err());
-            assert!(memory.get_host_address(GuestAddress(u64::MAX), 2).is_err());
-
-            let chain = create_descriptor_chain(
-                memory,
-                GuestAddress(0),
-                GuestAddress(0x10_000 - VSOCK_PKT_HDR_SIZE as u64 + 1),
-                vec![(DescriptorType::Writable, VSOCK_PKT_HDR_SIZE as u32)],
-                0,
-            )
-            .unwrap();
-            assert!(
-                VsockPacket::from_rx_virtq_head(
-                    &chain,
-                    &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(256)
-                )
-                .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn raw_address_guard_keeps_guest_memory_backing_alive() {
-        let raw = {
-            let (memory, _) = memory(1);
-            memory.write_slice(&[0x5a], GuestAddress(0x1000)).unwrap();
-            memory.get_host_address(GuestAddress(0x1000), 1).unwrap()
-        };
-
-        assert_eq!(unsafe { raw.as_ptr().read() }, 0x5a);
-    }
-
-    #[test]
-    fn memory_slice_at_most_preserves_region_boundaries_zero_length_and_holes() {
-        let memory = crate::virtio::RuntimeGuestMemory::from_ranges(&[
-            (GuestAddress(0), 0x2000),
-            (GuestAddress(0x2000), 0x1000),
+    fn writes_mark_adjacent_regions_and_reject_holes_before_mutation() {
+        let raw = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 4096),
+            (GuestAddress(4096), 4096),
+            (GuestAddress(16384), 4096),
         ])
         .unwrap();
-        assert_eq!(
-            memory
-                .get_slice_at_most(GuestAddress(0x1ff0), 32)
-                .unwrap()
-                .unwrap()
-                .len(),
-            16
-        );
-        assert_eq!(
-            memory
-                .get_slice_at_most(GuestAddress(0x2000), 16)
-                .unwrap()
-                .unwrap()
-                .len(),
-            16
-        );
+        let (domain, authority, mut control) =
+            MemoryDomain::construct(raw, 4096, BackingKind::Boot).unwrap();
+        let epoch = authority.issue_epoch(1).unwrap();
+        control.finish_tracked(authority, epoch).unwrap();
+        let memory = RuntimeGuestMemory::new(domain.clone());
+        memory.write_slice(&[1, 2], GuestAddress(4095)).unwrap();
+        assert!(memory.write_slice(&[9; 8192], GuestAddress(4096)).is_err());
+        let mut bytes = [0; 2];
+        memory.read_slice(&mut bytes, GuestAddress(4095)).unwrap();
+        assert_eq!(bytes, [1, 2]);
+        let closing = control.close().unwrap();
+        let Poll::Ready(Ok(drained)) = control.poll_drained(&closing) else {
+            panic!("writers not drained")
+        };
+        let cut = control.seal(&drained).unwrap();
+        let mut dirty = DirtyPageMap::new(domain.layout());
+        control.drain_host_dirty(&cut, &mut dirty).unwrap();
+        assert_eq!(dirty.count(), 2);
+        assert!(dirty.contains(PageIndex::new(0)));
+        assert!(dirty.contains(PageIndex::new(1)));
+        assert!(!dirty.contains(PageIndex::new(2)));
+    }
+
+    #[test]
+    fn partial_callback_failure_keeps_entire_exposed_destination_dirty() {
+        let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 8192)]).unwrap();
+        let (domain, authority, mut control) =
+            MemoryDomain::construct(raw, 4096, BackingKind::Boot).unwrap();
+        let epoch = authority.issue_epoch(1).unwrap();
+        control.finish_tracked(authority, epoch).unwrap();
+        let memory = RuntimeGuestMemory::new(domain.clone());
         assert!(
             memory
-                .get_slice_at_most(GuestAddress(u64::MAX), 0)
-                .unwrap()
-                .is_none()
+                .try_write_access(8192, GuestAddress(0), |_, _, _, view| {
+                    view.write_slice(&[7], 0)?;
+                    Err(vm_memory::GuestMemoryError::InvalidBackendAddress)
+                })
+                .is_err()
         );
-        assert!(memory.get_slice_at_most(GuestAddress(0x3000), 1).is_err());
-        assert!(memory.get_slice_at_most(GuestAddress(u64::MAX), 1).is_err());
+        let closing = control.close().unwrap();
+        let Poll::Ready(Ok(drained)) = control.poll_drained(&closing) else {
+            panic!("writers not drained")
+        };
+        let cut = control.seal(&drained).unwrap();
+        let mut dirty = DirtyPageMap::new(domain.layout());
+        control.drain_host_dirty(&cut, &mut dirty).unwrap();
+        assert_eq!(dirty.count(), 2);
     }
 }

@@ -1,4 +1,4 @@
-use arch::guest_memory::HostMemoryLease;
+use arch::guest_memory::MemoryDomain;
 use std::collections::BTreeMap;
 use std::env;
 use std::io::IoSliceMut;
@@ -18,7 +18,6 @@ use crossbeam_channel::{Sender, unbounded};
 use krun_display::{
     DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
 };
-use libc::c_void;
 #[cfg(any(
     all(target_os = "linux", feature = "virgl_resource_map2"),
     target_os = "macos"
@@ -40,7 +39,7 @@ use rutabaga_gfx::{
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
-use vm_memory::{GuestAddress, VolatileSlice};
+use vm_memory::{GuestAddress, GuestMemoryBackend, VolatileSlice};
 
 use crate::display::DisplayInfo;
 use crate::virtio::fs::ExportTable;
@@ -83,28 +82,32 @@ impl VirtioFsLookup for ExportTableLookup {
     }
 }
 
-type RutabagaBacking = (Vec<RutabagaIovec>, Vec<Arc<dyn HostMemoryLease>>);
+type RutabagaBacking = (Vec<RutabagaIovec>, Arc<MemoryDomain>);
 
 fn sglist_to_rutabaga_iovecs(
     vecs: &[(GuestAddress, usize)],
     mem: &RuntimeGuestMemory,
 ) -> Result<RutabagaBacking> {
-    let slices = vecs
-        .iter()
-        .map(|&(addr, len)| mem.get_slice(addr, len))
-        .collect::<std::result::Result<Vec<_>, _>>()
+    let iovecs = mem
+        .domain()
+        .with_external_mapping(|memory| {
+            vecs.iter()
+                .map(|&(address, len)| {
+                    let base = if len == 0 {
+                        std::ptr::NonNull::<u8>::dangling().as_ptr()
+                    } else {
+                        memory.get_slice(address, len)?.ptr_guard_mut().as_ptr()
+                    };
+                    Ok(RutabagaIovec {
+                        base: base.cast(),
+                        len,
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, vm_memory::GuestMemoryError>>()
+        })
+        .map_err(|_| GpuError::GuestMemory)?
         .map_err(|_| GpuError::GuestMemory)?;
-
-    let mut rutabaga_iovecs = Vec::with_capacity(slices.len());
-    let mut leases = Vec::new();
-    for (slice, &(_, len)) in slices.iter().zip(vecs) {
-        rutabaga_iovecs.push(RutabagaIovec {
-            base: slice.slice().ptr_guard_mut().as_ptr() as *mut c_void,
-            len,
-        });
-        leases.extend(slice.lease());
-    }
-    Ok((rutabaga_iovecs, leases))
+    Ok((iovecs, mem.domain().clone()))
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -189,7 +192,7 @@ pub struct VirtioGpuScanout {
 pub struct VirtioGpu {
     rutabaga: Rutabaga,
     resources: BTreeMap<u32, VirtioGpuResource>,
-    backing_leases: BTreeMap<u32, Vec<Arc<dyn HostMemoryLease>>>,
+    backing_domains: BTreeMap<u32, Arc<MemoryDomain>>,
     fence_state: Arc<Mutex<FenceState>>,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
@@ -388,7 +391,7 @@ impl VirtioGpu {
         Self {
             rutabaga,
             resources: Default::default(),
-            backing_leases: Default::default(),
+            backing_domains: Default::default(),
             fence_state,
             scanouts: Default::default(),
             displays,
@@ -473,7 +476,7 @@ impl VirtioGpu {
         }
 
         self.rutabaga.unref_resource(resource_id)?;
-        self.backing_leases.remove(&resource_id);
+        self.backing_domains.remove(&resource_id);
         Ok(OkNoData)
     }
 
@@ -650,17 +653,17 @@ impl VirtioGpu {
         mem: &RuntimeGuestMemory,
         vecs: Vec<(GuestAddress, usize)>,
     ) -> VirtioGpuResult {
-        let (rutabaga_iovecs, leases) =
+        let (rutabaga_iovecs, domain) =
             sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
         self.rutabaga.attach_backing(resource_id, rutabaga_iovecs)?;
-        self.backing_leases.insert(resource_id, leases);
+        self.backing_domains.insert(resource_id, domain);
         Ok(OkNoData)
     }
 
     /// Detaches any previously attached iovecs from the resource.
     pub fn detach_backing(&mut self, resource_id: u32) -> VirtioGpuResult {
         self.rutabaga.detach_backing(resource_id)?;
-        self.backing_leases.remove(&resource_id);
+        self.backing_domains.remove(&resource_id);
         Ok(OkNoData)
     }
 
@@ -778,15 +781,15 @@ impl VirtioGpu {
         mem: &RuntimeGuestMemory,
     ) -> VirtioGpuResult {
         let mut rutabaga_iovecs = None;
-        let mut backing_leases = None;
+        let mut backing_domain = None;
 
         if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
             panic!("GUEST_HANDLE unimplemented");
         } else if resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D {
-            let (iovecs, leases) =
+            let (iovecs, domain) =
                 sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
             rutabaga_iovecs = Some(iovecs);
-            backing_leases = Some(leases);
+            backing_domain = Some(domain);
         }
 
         self.rutabaga.resource_create_blob(
@@ -797,8 +800,8 @@ impl VirtioGpu {
             None,
         )?;
 
-        if let Some(leases) = backing_leases {
-            self.backing_leases.insert(resource_id, leases);
+        if let Some(domain) = backing_domain {
+            self.backing_domains.insert(resource_id, domain);
         }
 
         let resource = VirtioGpuResource::new(resource_id, 0, 0, None, resource_create_blob.size);
@@ -1113,12 +1116,7 @@ fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Op
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use arch::guest_memory::{
-        GuestRange, HostMemoryAccess, HostMemoryAccessError, HostMemoryLease,
-    };
+    use arch::guest_memory::{BackingKind, MemoryDomain};
     use vm_memory::{GuestAddress, GuestMemoryMmap};
 
     use crate::virtio::RuntimeGuestMemory;
@@ -1127,83 +1125,33 @@ mod tests {
         AssociatedScanouts, checked_blob_map_addr, sglist_to_rutabaga_iovecs,
     };
 
-    struct LimitedAccess {
-        active: Arc<AtomicUsize>,
-        limit: usize,
-    }
-
-    struct Lease(Arc<AtomicUsize>);
-
-    impl Drop for Lease {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-
-    impl HostMemoryLease for Lease {}
-
-    impl HostMemoryAccess for LimitedAccess {
-        fn access(
-            self: Arc<Self>,
-            _range: GuestRange,
-        ) -> Result<Arc<dyn HostMemoryLease>, HostMemoryAccessError> {
-            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
-            if active > self.limit {
-                self.active.fetch_sub(1, Ordering::AcqRel);
-                return Err(HostMemoryAccessError::new("lease capacity exhausted"));
-            }
-            Ok(Arc::new(Lease(Arc::clone(&self.active))))
-        }
-
-        fn allows_external_mapping(&self) -> bool {
-            false
-        }
-    }
-
-    fn memory(limit: usize) -> (RuntimeGuestMemory, Arc<AtomicUsize>) {
-        let active = Arc::new(AtomicUsize::new(0));
-        let access: Arc<dyn HostMemoryAccess> = Arc::new(LimitedAccess {
-            active: Arc::clone(&active),
-            limit,
-        });
-        (
-            RuntimeGuestMemory::new(
-                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap(),
-                access,
-            ),
-            active,
-        )
+    #[test]
+    fn sglist_exports_exclude_capture_and_retain_backing() {
+        let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let (domain, authority, mut control) =
+            MemoryDomain::construct(raw, 4096, BackingKind::Boot).unwrap();
+        let epoch = authority.issue_epoch(1).unwrap();
+        let memory = RuntimeGuestMemory::new(domain.clone());
+        memory.write_slice(&[17], GuestAddress(0x1000)).unwrap();
+        let (iovecs, owner) =
+            sglist_to_rutabaga_iovecs(&[(GuestAddress(0x1000), 1)], &memory).unwrap();
+        assert!(control.finish_tracked(authority, epoch).is_err());
+        drop(memory);
+        drop(domain);
+        assert_eq!(unsafe { *(iovecs[0].base.cast::<u8>()) }, 17);
+        drop(owner);
     }
 
     #[test]
-    fn sglist_collection_is_fallible_and_releases_partial_leases() {
-        let (memory, active) = memory(1);
-        let capacity_error = sglist_to_rutabaga_iovecs(
-            &[(GuestAddress(0x1000), 0x100), (GuestAddress(0x2000), 0x100)],
-            &memory,
-        );
-
-        assert!(capacity_error.is_err());
-        assert_eq!(active.load(Ordering::Acquire), 0);
-
-        let guest_input_error = sglist_to_rutabaga_iovecs(
-            &[(GuestAddress(0x1000), 0x100), (GuestAddress(0x5000), 0x100)],
-            &memory,
-        );
-        assert!(guest_input_error.is_err());
-        assert_eq!(active.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn empty_sg_entries_do_not_acquire_leases() {
-        let (memory, active) = memory(0);
-        let (iovecs, leases) =
-            sglist_to_rutabaga_iovecs(&[(GuestAddress(0x1000), 0)], &memory).unwrap();
-
-        assert_eq!(iovecs.len(), 1);
-        assert_eq!(iovecs[0].len, 0);
-        assert!(leases.is_empty());
-        assert_eq!(active.load(Ordering::Acquire), 0);
+    fn tracked_memory_cannot_be_exported_to_renderer() {
+        let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let (domain, authority, mut control) =
+            MemoryDomain::construct(raw, 4096, BackingKind::Boot).unwrap();
+        let epoch = authority.issue_epoch(1).unwrap();
+        control.finish_tracked(authority, epoch).unwrap();
+        let memory = RuntimeGuestMemory::new(domain);
+        assert!(sglist_to_rutabaga_iovecs(&[(GuestAddress(0x1000), 1)], &memory).is_err());
+        assert!(sglist_to_rutabaga_iovecs(&[(GuestAddress(0x5000), 1)], &memory).is_err());
     }
 
     #[test]

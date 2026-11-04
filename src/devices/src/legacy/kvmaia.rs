@@ -1,7 +1,9 @@
 // Copyright 2025 The libkrun Authors. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use arch::guest_memory::MemoryDomain;
 use std::io;
+use std::sync::Arc;
 
 use crate::Error as DeviceError;
 use crate::bus::BusDevice;
@@ -13,13 +15,14 @@ use utils::eventfd::EventFd;
 
 pub struct KvmAia {
     _device_fd: DeviceFd,
+    _memory_domain: Arc<MemoryDomain>,
 
     /// Number of CPUs handled by the device
     vcpu_count: u32,
 }
 
 impl KvmAia {
-    pub fn new(vm: &VmFd, vcpu_count: u32) -> Result<Self, DeviceError> {
+    pub fn new(vm: &VmFd, vcpu_count: u32, domain: Arc<MemoryDomain>) -> Result<Self, DeviceError> {
         // Create a KVM AIA device
         let mut aia_device = kvm_bindings::kvm_create_device {
             type_: kvm_bindings::kvm_device_type_KVM_DEV_TYPE_RISCV_AIA,
@@ -89,6 +92,7 @@ impl KvmAia {
 
         Ok(Self {
             _device_fd: device_fd,
+            _memory_domain: domain,
             vcpu_count,
         })
     }

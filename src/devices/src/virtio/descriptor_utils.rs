@@ -6,6 +6,7 @@ use std::cmp;
 use std::collections::VecDeque;
 use std::fmt::{self, Display};
 use std::io::{self, Read, Write};
+use std::marker::PhantomData;
 use std::mem::{MaybeUninit, size_of};
 use std::ptr::copy_nonoverlapping;
 use std::result;
@@ -13,11 +14,10 @@ use std::result;
 use crate::virtio::queue::{Descriptor, DescriptorChain};
 use vm_memory::{
     Address, ByteValued, GuestAddress, GuestMemoryError, Le16, Le32, Le64, VolatileMemoryError,
-    VolatileSlice,
 };
 
 use crate::virtio::file_traits::{FileReadWriteAtVolatile, FileReadWriteVolatile};
-use crate::virtio::{LeasedVolatileSlice, RuntimeGuestMemory};
+use crate::virtio::{HostReadGuard, HostWriteGuard, ReadView, RuntimeGuestMemory, WriteView};
 
 #[derive(Debug)]
 pub enum Error {
@@ -69,9 +69,7 @@ fn walk_descriptor_chain(
             return Err(Error::InvalidChain);
         }
         memory
-            .try_access(current.len as usize, current.addr, |_, length, _, _| {
-                Ok(length)
-            })
+            .validate_range(current.addr, current.len as usize)
             .map_err(Error::GuestMemoryError)?;
         visit(current.index, current.descriptor())?;
         if current.flags & VIRTQ_DESC_F_NEXT == 0 {
@@ -137,10 +135,92 @@ impl ValidatedDescriptorChain<'_> {
     }
 }
 
-fn append_descriptor_buffers<'a>(
-    memory: &'a RuntimeGuestMemory,
+const VIEW_BATCH_SIZE: usize = 64;
+
+trait DescriptorGuard: Sized + 'static {
+    type View<'a>: Copy
+    where
+        Self: 'a;
+
+    fn acquire(
+        memory: &RuntimeGuestMemory,
+        address: GuestAddress,
+        length: usize,
+    ) -> std::result::Result<Option<Self>, GuestMemoryError>;
+    fn len(&self) -> usize;
+    fn view(
+        &self,
+        offset: usize,
+        length: usize,
+    ) -> std::result::Result<Self::View<'_>, GuestMemoryError>;
+    fn split_at(self, offset: usize) -> std::result::Result<(Self, Self), GuestMemoryError>;
+}
+
+impl DescriptorGuard for HostReadGuard {
+    type View<'a> = ReadView<'a>;
+
+    fn acquire(
+        memory: &RuntimeGuestMemory,
+        address: GuestAddress,
+        length: usize,
+    ) -> std::result::Result<Option<Self>, GuestMemoryError> {
+        memory.read_at_most(address, length)
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn view(
+        &self,
+        offset: usize,
+        length: usize,
+    ) -> std::result::Result<ReadView<'_>, GuestMemoryError> {
+        self.read_view(offset, length)
+    }
+
+    fn split_at(self, offset: usize) -> std::result::Result<(Self, Self), GuestMemoryError> {
+        self.split_at(offset)
+    }
+}
+
+impl DescriptorGuard for HostWriteGuard {
+    type View<'a> = WriteView<'a>;
+
+    fn acquire(
+        memory: &RuntimeGuestMemory,
+        address: GuestAddress,
+        length: usize,
+    ) -> std::result::Result<Option<Self>, GuestMemoryError> {
+        memory.write_at_most(address, length)
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn view(
+        &self,
+        offset: usize,
+        length: usize,
+    ) -> std::result::Result<WriteView<'_>, GuestMemoryError> {
+        self.write_view(offset, length)
+    }
+
+    fn split_at(self, offset: usize) -> std::result::Result<(Self, Self), GuestMemoryError> {
+        self.split_at(offset)
+    }
+}
+
+struct DescriptorBuffer<G> {
+    guard: G,
+    offset: usize,
+}
+
+fn append_descriptor_buffers<G: DescriptorGuard>(
+    memory: &RuntimeGuestMemory,
     descriptor: Descriptor,
-    buffers: &mut VecDeque<LeasedVolatileSlice<'a>>,
+    buffers: &mut VecDeque<DescriptorBuffer<G>>,
 ) -> Result<()> {
     let length = descriptor.len as usize;
     let mut completed = 0_usize;
@@ -148,136 +228,139 @@ fn append_descriptor_buffers<'a>(
         let address = GuestAddress(descriptor.addr)
             .checked_add(completed as u64)
             .ok_or(Error::InvalidChain)?;
-        let slice = memory
-            .get_slice_at_most(address, length - completed)
+        let guard = G::acquire(memory, address, length - completed)
             .map_err(Error::GuestMemoryError)?
             .ok_or(Error::InvalidChain)?;
+        if guard.len() == 0 {
+            return Err(Error::InvalidChain);
+        }
         completed = completed
-            .checked_add(slice.len())
+            .checked_add(guard.len())
             .ok_or(Error::DescriptorChainOverflow)?;
-        buffers.push_back(slice);
+        buffers.push_back(DescriptorBuffer { guard, offset: 0 });
     }
     Ok(())
 }
 
-#[derive(Clone)]
-struct DescriptorChainConsumer<'a> {
-    buffers: VecDeque<LeasedVolatileSlice<'a>>,
+struct DescriptorChainConsumer<G> {
+    buffers: VecDeque<DescriptorBuffer<G>>,
     bytes_consumed: usize,
 }
 
-impl<'a> DescriptorChainConsumer<'a> {
+impl<G: DescriptorGuard> DescriptorChainConsumer<G> {
     fn available_bytes(&self) -> usize {
-        // This is guaranteed not to overflow because the total length of the chain
-        // is checked during all creations of `DescriptorChainConsumer` (see
-        // `Reader::new()` and `Writer::new()`).
         self.buffers
             .iter()
-            .fold(0usize, |count, vs| count + vs.len())
+            .map(|buffer| buffer.guard.len() - buffer.offset)
+            .sum()
     }
 
     fn bytes_consumed(&self) -> usize {
         self.bytes_consumed
     }
 
-    /// Consumes at most `count` bytes from the `DescriptorChain`. Callers must provide a function
-    /// that takes a `&[VolatileSlice]` and returns the total number of bytes consumed. This
-    /// function guarantees that the combined length of all the slices in the `&[VolatileSlice]` is
-    /// less than or equal to `count`.
-    ///
-    /// # Errors
-    ///
-    /// If the provided function returns any error then no bytes are consumed from the buffer and
-    /// the error is returned to the caller.
+    /// Borrows at most one bounded batch, clipping the final view to `count`.
+    /// Errors retain every guard and leave the cursor unchanged, even if I/O mutated a prefix.
     fn consume<F>(&mut self, count: usize, f: F) -> io::Result<usize>
     where
-        F: for<'b> FnOnce(&'b [VolatileSlice<'b>]) -> io::Result<usize>,
+        F: for<'b> FnOnce(&[G::View<'b>]) -> io::Result<usize>,
     {
-        let mut buflen = 0;
-        let mut leased = Vec::with_capacity(self.buffers.len());
-        for vs in &self.buffers {
-            if buflen >= count {
+        let (bytes_consumed, supplied) = {
+            let mut scratch = [const { MaybeUninit::<G::View<'_>>::uninit() }; VIEW_BATCH_SIZE];
+            let mut supplied = 0;
+            let mut initialized = 0;
+            for buffer in self.buffers.iter().take(VIEW_BATCH_SIZE) {
+                if supplied == count {
+                    break;
+                }
+                let length = cmp::min(count - supplied, buffer.guard.len() - buffer.offset);
+                let view = buffer
+                    .guard
+                    .view(buffer.offset, length)
+                    .map_err(io::Error::other)?;
+                scratch[initialized].write(view);
+                initialized += 1;
+                supplied += length;
+            }
+            if initialized == 0 {
+                return Ok(0);
+            }
+            // The prefix is initialized, views are Copy, and their guards remain borrowed
+            // until the synchronous callback (including the actual syscall) returns.
+            let views = unsafe {
+                std::slice::from_raw_parts(scratch.as_ptr().cast::<G::View<'_>>(), initialized)
+            };
+            (f(views)?, supplied)
+        };
+        if bytes_consumed > supplied {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "I/O completion exceeds supplied memory",
+            ));
+        }
+        let total = self
+            .bytes_consumed
+            .checked_add(bytes_consumed)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, Error::DescriptorChainOverflow)
+            })?;
+        let mut remaining = bytes_consumed;
+        while remaining != 0 {
+            let Some(buffer) = self.buffers.front_mut() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    Error::InvalidChain,
+                ));
+            };
+            let length = buffer.guard.len() - buffer.offset;
+            if remaining < length {
+                buffer.offset += remaining;
                 break;
             }
-
-            leased.push(vs.clone());
-
-            let rem = count - buflen;
-            if rem < vs.len() {
-                buflen += rem;
-            } else {
-                buflen += vs.len();
-            }
+            remaining -= length;
+            self.buffers.pop_front();
         }
-
-        if leased.is_empty() {
-            return Ok(0);
-        }
-
-        let bufs: Vec<VolatileSlice<'_>> = leased.iter().map(LeasedVolatileSlice::slice).collect();
-        let bytes_consumed = f(&bufs)?;
-
-        // This can happen if a driver tricks a device into reading/writing more data than
-        // fits in a `usize`.
-        let total_bytes_consumed =
-            self.bytes_consumed
-                .checked_add(bytes_consumed)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, Error::DescriptorChainOverflow)
-                })?;
-
-        let mut rem = bytes_consumed;
-        while let Some(vs) = self.buffers.pop_front() {
-            if rem < vs.len() {
-                // Split the slice and push the remainder back into the buffer list. Safe because we
-                // know that `rem` is not out of bounds due to the check and we checked the bounds
-                // on `vs` when we added it to the buffer list.
-                self.buffers.push_front(vs.offset(rem).unwrap());
-                break;
-            }
-
-            // No need for checked math because we know that `vs.size() <= rem`.
-            rem -= vs.len();
-        }
-
-        self.bytes_consumed = total_bytes_consumed;
-
+        self.bytes_consumed = total;
         Ok(bytes_consumed)
     }
 
-    fn split_at(&mut self, offset: usize) -> Result<DescriptorChainConsumer<'a>> {
-        let mut rem = offset;
-        let pos = self.buffers.iter().position(|vs| {
-            if rem < vs.len() {
+    fn split_at(&mut self, offset: usize) -> Result<Self> {
+        if offset > self.available_bytes() {
+            return Err(Error::SplitOutOfBounds(offset));
+        }
+        let mut remaining = offset;
+        let position = self.buffers.iter().position(|buffer| {
+            let length = buffer.guard.len() - buffer.offset;
+            if remaining < length {
                 true
             } else {
-                rem -= vs.len();
+                remaining -= length;
                 false
             }
         });
-
-        if let Some(at) = pos {
-            let mut other = self.buffers.split_off(at);
-
-            if rem > 0 {
-                let front = other.pop_front().ok_or(Error::InvalidChain)?;
-                self.buffers
-                    .push_back(front.subslice(0, rem).map_err(Error::VolatileMemoryError)?);
-                other.push_front(front.offset(rem).map_err(Error::VolatileMemoryError)?);
-            }
-
-            Ok(DescriptorChainConsumer {
-                buffers: other,
-                bytes_consumed: 0,
-            })
-        } else if rem == 0 {
-            Ok(DescriptorChainConsumer {
-                buffers: VecDeque::new(),
-                bytes_consumed: 0,
-            })
-        } else {
-            Err(Error::SplitOutOfBounds(offset))
+        let mut other = match position {
+            Some(position) => self.buffers.split_off(position),
+            None => VecDeque::new(),
+        };
+        if remaining != 0 {
+            let buffer = other.pop_front().ok_or(Error::InvalidChain)?;
+            let (prefix, suffix) = buffer
+                .guard
+                .split_at(buffer.offset + remaining)
+                .map_err(Error::GuestMemoryError)?;
+            self.buffers.push_back(DescriptorBuffer {
+                guard: prefix,
+                offset: buffer.offset,
+            });
+            other.push_front(DescriptorBuffer {
+                guard: suffix,
+                offset: 0,
+            });
         }
+        Ok(Self {
+            buffers: other,
+            bytes_consumed: 0,
+        })
     }
 }
 
@@ -287,9 +370,9 @@ impl<'a> DescriptorChainConsumer<'a> {
 /// Note that virtio spec requires driver to place any device-writable
 /// descriptors after any device-readable descriptors (2.6.4.2 in Virtio Spec v1.1).
 /// Reader exposes the readable prefix only after validating the complete chain.
-#[derive(Clone)]
 pub struct Reader<'a> {
-    buffer: DescriptorChainConsumer<'a>,
+    buffer: DescriptorChainConsumer<HostReadGuard>,
+    memory: PhantomData<&'a RuntimeGuestMemory>,
 }
 
 impl<'a> Reader<'a> {
@@ -307,6 +390,7 @@ impl<'a> Reader<'a> {
             Ok(())
         })?;
         Ok(Reader {
+            memory: PhantomData,
             buffer: DescriptorChainConsumer {
                 buffers,
                 bytes_consumed: 0,
@@ -332,6 +416,7 @@ impl<'a> Reader<'a> {
             append_descriptor_buffers(mem, *descriptor, &mut buffers)?;
         }
         Ok(Self {
+            memory: PhantomData,
             buffer: DescriptorChainConsumer {
                 buffers,
                 bytes_consumed: 0,
@@ -421,7 +506,10 @@ impl<'a> Reader<'a> {
     /// `Reader` can read up to `available_bytes() - offset` bytes.  Returns an error if
     /// `offset > self.available_bytes()`.
     pub fn split_at(&mut self, offset: usize) -> Result<Reader<'a>> {
-        self.buffer.split_at(offset).map(|buffer| Reader { buffer })
+        self.buffer.split_at(offset).map(|buffer| Reader {
+            buffer,
+            memory: PhantomData,
+        })
     }
 }
 
@@ -435,7 +523,7 @@ impl io::Read for Reader<'_> {
 
                 // Safe because we have already verified that `vs` points to valid memory.
                 unsafe {
-                    copy_nonoverlapping(vs.ptr_guard().as_ptr(), rem.as_mut_ptr(), copy_len);
+                    copy_nonoverlapping(vs.as_ptr(), rem.as_mut_ptr(), copy_len);
                 }
                 rem = &mut rem[copy_len..];
                 total += copy_len;
@@ -451,9 +539,9 @@ impl io::Read for Reader<'_> {
 /// Note that virtio spec requires driver to place any device-writable
 /// descriptors after any device-readable descriptors (2.6.4.2 in Virtio Spec v1.1).
 /// Writer exposes the writable suffix only after validating the complete chain.
-#[derive(Clone)]
 pub struct Writer<'a> {
-    buffer: DescriptorChainConsumer<'a>,
+    buffer: DescriptorChainConsumer<HostWriteGuard>,
+    memory: PhantomData<&'a RuntimeGuestMemory>,
 }
 
 impl<'a> Writer<'a> {
@@ -472,6 +560,7 @@ impl<'a> Writer<'a> {
         })?;
 
         Ok(Writer {
+            memory: PhantomData,
             buffer: DescriptorChainConsumer {
                 buffers,
                 bytes_consumed: 0,
@@ -497,6 +586,7 @@ impl<'a> Writer<'a> {
             append_descriptor_buffers(mem, *descriptor, &mut buffers)?;
         }
         Ok(Self {
+            memory: PhantomData,
             buffer: DescriptorChainConsumer {
                 buffers,
                 bytes_consumed: 0,
@@ -574,7 +664,10 @@ impl<'a> Writer<'a> {
     /// `Writer` can write up to `available_bytes() - offset` bytes.  Returns an error if
     /// `offset > self.available_bytes()`.
     pub fn split_at(&mut self, offset: usize) -> Result<Writer<'a>> {
-        self.buffer.split_at(offset).map(|buffer| Writer { buffer })
+        self.buffer.split_at(offset).map(|buffer| Writer {
+            buffer,
+            memory: PhantomData,
+        })
     }
 }
 
@@ -588,7 +681,7 @@ impl io::Write for Writer<'_> {
 
                 // Safe because we have already verified that `vs` points to valid memory.
                 unsafe {
-                    copy_nonoverlapping(rem.as_ptr(), vs.ptr_guard_mut().as_ptr(), copy_len);
+                    copy_nonoverlapping(rem.as_ptr(), vs.as_mut_ptr(), copy_len);
                 }
                 rem = &rem[copy_len..];
                 total += copy_len;
@@ -1370,5 +1463,313 @@ mod tests {
         assert_eq!(first, [0x41; 16]);
         assert_eq!(&second[..16], &[0x41; 16]);
         assert_eq!(second[16], 0x7e);
+    }
+
+    #[test]
+    fn descriptor_file_io_clips_final_read_and_write_views() {
+        use std::os::unix::fs::FileExt;
+        use utils::tempfile::TempFile;
+
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let source = TempFile::new().unwrap();
+        source.as_file().write_all_at(b"abcdefgh", 0).unwrap();
+        memory
+            .write_slice(&[0xee; 12], GuestAddress(0x1000))
+            .unwrap();
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0),
+            GuestAddress(0x1000),
+            vec![(DescriptorType::Writable, 4), (DescriptorType::Writable, 8)],
+            0,
+        )
+        .unwrap();
+        let mut writer = Writer::new(&memory, chain).unwrap();
+        assert_eq!(writer.write_from_at(source.as_file(), 5, 0).unwrap(), 5);
+        assert_eq!(writer.bytes_written(), 5);
+        assert_eq!(writer.available_bytes(), 7);
+        let mut bytes = [0; 12];
+        memory.read_slice(&mut bytes, GuestAddress(0x1000)).unwrap();
+        assert_eq!(&bytes[..5], b"abcde");
+        assert_eq!(&bytes[5..], &[0xee; 7]);
+
+        let destination = TempFile::new().unwrap();
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0),
+            GuestAddress(0x1000),
+            vec![(DescriptorType::Readable, 4), (DescriptorType::Readable, 8)],
+            0,
+        )
+        .unwrap();
+        let mut reader = Reader::new(&memory, chain).unwrap();
+        assert_eq!(reader.read_to_at(destination.as_file(), 5, 0).unwrap(), 5);
+        assert_eq!(destination.as_file().metadata().unwrap().len(), 5);
+        let mut copied = [0; 5];
+        destination.as_file().read_exact_at(&mut copied, 0).unwrap();
+        assert_eq!(&copied, b"abcde");
+    }
+
+    #[test]
+    fn descriptor_error_after_real_prefix_io_retains_cursor_and_backing() {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::FileExt;
+        use utils::tempfile::TempFile;
+
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let source = TempFile::new().unwrap();
+        source.as_file().write_all_at(b"prefix!!", 0).unwrap();
+        let write_only = OpenOptions::new()
+            .write(true)
+            .open(source.as_path())
+            .unwrap();
+        let mut buffers = VecDeque::new();
+        append_descriptor_buffers::<HostWriteGuard>(
+            &memory,
+            Descriptor {
+                addr: 0x1000,
+                len: 4,
+                flags: 2,
+                next: 0,
+            },
+            &mut buffers,
+        )
+        .unwrap();
+        append_descriptor_buffers::<HostWriteGuard>(
+            &memory,
+            Descriptor {
+                addr: 0x2000,
+                len: 4,
+                flags: 2,
+                next: 0,
+            },
+            &mut buffers,
+        )
+        .unwrap();
+        let mut consumer = DescriptorChainConsumer {
+            buffers,
+            bytes_consumed: 0,
+        };
+        drop(memory);
+        let error = consumer
+            .consume(8, |views| {
+                assert_eq!(source.as_file().read_at_volatile(views[0], 0)?, 4);
+                write_only.read_at_volatile(views[1], 4)
+            })
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        assert_eq!(consumer.bytes_consumed(), 0);
+        assert_eq!(consumer.available_bytes(), 8);
+        let mut prefix = [0; 4];
+        consumer.buffers[0]
+            .guard
+            .read_view(0, 4)
+            .unwrap()
+            .read_slice(&mut prefix, 0)
+            .unwrap();
+        assert_eq!(&prefix, b"pref");
+        assert_eq!(
+            consumer
+                .consume(8, |views| {
+                    source.as_file().read_vectored_at_volatile(views, 0)
+                })
+                .unwrap(),
+            8
+        );
+        assert_eq!(consumer.available_bytes(), 0);
+    }
+
+    #[test]
+    fn descriptor_consumer_rejects_impossible_completion_and_zero_exposure() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let mut buffers = VecDeque::new();
+        append_descriptor_buffers::<HostReadGuard>(
+            &memory,
+            Descriptor {
+                addr: 0x1000,
+                len: 8,
+                flags: 0,
+                next: 0,
+            },
+            &mut buffers,
+        )
+        .unwrap();
+        let mut consumer = DescriptorChainConsumer {
+            buffers,
+            bytes_consumed: 0,
+        };
+        assert_eq!(
+            consumer
+                .consume(0, |_| panic!("zero count exposed memory"))
+                .unwrap(),
+            0
+        );
+        let error = consumer
+            .consume(3, |views| {
+                assert_eq!(views.len(), 1);
+                assert_eq!(views[0].len(), 3);
+                Ok(4)
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(consumer.bytes_consumed(), 0);
+        assert_eq!(consumer.available_bytes(), 8);
+    }
+
+    #[test]
+    fn descriptor_read_sources_and_write_destinations_stay_disjoint() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        memory
+            .write_slice(b"read-only-source", GuestAddress(0x1000))
+            .unwrap();
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0),
+            GuestAddress(0x1000),
+            vec![
+                (DescriptorType::Readable, 16),
+                (DescriptorType::Writable, 16),
+            ],
+            0,
+        )
+        .unwrap();
+        let mut reader = Reader::new(&memory, chain.clone()).unwrap();
+        let mut writer = Writer::new(&memory, chain).unwrap();
+        let mut suffix = writer.split_at(7).unwrap();
+        writer.write_all(b"changed").unwrap();
+        suffix.write_all(b"-suffix!!").unwrap();
+        let mut source = [0; 16];
+        reader.read_exact(&mut source).unwrap();
+        assert_eq!(&source, b"read-only-source");
+        let mut destination = [0; 16];
+        memory
+            .read_slice(&mut destination, GuestAddress(0x1010))
+            .unwrap();
+        assert_eq!(&destination, b"changed-suffix!!");
+    }
+
+    #[test]
+    fn descriptor_file_io_reuses_bounded_view_batches() {
+        use std::os::unix::fs::FileExt;
+        use utils::tempfile::TempFile;
+
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let source = TempFile::new().unwrap();
+        let bytes = vec![0x51; VIEW_BATCH_SIZE + 3];
+        source.as_file().write_all_at(&bytes, 0).unwrap();
+        let chain = create_descriptor_chain(
+            &memory,
+            GuestAddress(0),
+            GuestAddress(0x4000),
+            vec![(DescriptorType::Writable, 1); VIEW_BATCH_SIZE + 3],
+            0,
+        )
+        .unwrap();
+        let mut writer = Writer::new(&memory, chain).unwrap();
+        assert_eq!(
+            writer
+                .write_from_at(source.as_file(), bytes.len(), 0)
+                .unwrap(),
+            VIEW_BATCH_SIZE
+        );
+        assert_eq!(
+            writer
+                .write_from_at(source.as_file(), 3, VIEW_BATCH_SIZE as u64)
+                .unwrap(),
+            3
+        );
+        let mut actual = vec![0; bytes.len()];
+        memory
+            .read_slice(&mut actual, GuestAddress(0x4000))
+            .unwrap();
+        assert_eq!(actual, bytes);
+    }
+
+    #[test]
+    fn descriptor_tracked_reads_stay_clean_and_writes_hold_close_through_io_errors() {
+        use arch::guest_memory::{BackingKind, DirtyPageMap, MemoryDomain, PageIndex};
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::FileExt;
+        use std::task::Poll;
+        use utils::tempfile::TempFile;
+
+        let raw = vm_memory::GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let (domain, construction, mut control) =
+            MemoryDomain::construct(raw, 4096, BackingKind::Boot).unwrap();
+        let memory = RuntimeGuestMemory::new(domain.clone());
+        memory
+            .write_slice(b"read-only-source", GuestAddress(0x1000))
+            .unwrap();
+        memory
+            .write_obj(
+                Descriptor {
+                    addr: 0x1000,
+                    len: 16,
+                    flags: 1,
+                    next: 1,
+                },
+                GuestAddress(0),
+            )
+            .unwrap();
+        memory
+            .write_obj(
+                Descriptor {
+                    addr: 0x2000,
+                    len: 16,
+                    flags: 2,
+                    next: 0,
+                },
+                GuestAddress(16),
+            )
+            .unwrap();
+        let epoch = construction.issue_epoch(1).unwrap();
+        control.finish_tracked(construction, epoch).unwrap();
+        let head = DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 0).unwrap();
+        let mut reader = Reader::new(&memory, head.clone()).unwrap();
+        let output = TempFile::new().unwrap();
+        assert_eq!(reader.read_to_at(output.as_file(), 7, 0).unwrap(), 7);
+        let closing = control.close().unwrap();
+        let Poll::Ready(Ok(drained)) = control.poll_drained(&closing) else {
+            panic!("read-only descriptor blocked writer drain");
+        };
+        let cut = control.seal(&drained).unwrap();
+        let mut dirty = DirtyPageMap::new(domain.layout());
+        control.drain_host_dirty(&cut, &mut dirty).unwrap();
+        assert_eq!(dirty.count(), 0);
+        let epoch = cut.issue_epoch(2).unwrap();
+        control.reopen(cut, epoch).unwrap();
+
+        let source = TempFile::new().unwrap();
+        source.as_file().write_all_at(b"data", 0).unwrap();
+        let write_only = OpenOptions::new()
+            .write(true)
+            .open(source.as_path())
+            .unwrap();
+        let mut writer = Writer::new(&memory, head).unwrap();
+        let mut closing = None;
+        writer
+            .buffer
+            .consume(4, |views| {
+                let token = control.close().unwrap();
+                assert!(control.poll_drained(&token).is_pending());
+                assert_eq!(source.as_file().read_at_volatile(views[0], 0)?, 4);
+                closing = Some(token);
+                Ok(4)
+            })
+            .unwrap();
+        let closing = closing.unwrap();
+        assert!(control.poll_drained(&closing).is_pending());
+        assert!(writer.write_from_at(&write_only, 4, 0).is_err());
+        assert_eq!(writer.bytes_written(), 4);
+        assert!(control.poll_drained(&closing).is_pending());
+        drop(writer);
+        let Poll::Ready(Ok(drained)) = control.poll_drained(&closing) else {
+            panic!("completed writer retained an obligation");
+        };
+        let cut = control.seal(&drained).unwrap();
+        control.drain_host_dirty(&cut, &mut dirty).unwrap();
+        assert_eq!(dirty.count(), 1);
+        assert!(dirty.contains(PageIndex::new(2)));
+        assert!(!dirty.contains(PageIndex::new(1)));
     }
 }

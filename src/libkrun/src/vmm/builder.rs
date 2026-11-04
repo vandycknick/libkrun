@@ -772,6 +772,20 @@ pub fn build_microvm(
         #[cfg(feature = "tee")]
         fw_range_for_mem,
     )?;
+    let granule = crate::vmm::execution::native_page_granule().map_err(|error| {
+        StartMicrovmError::Internal(Error::Control(
+            crate::vmm::control::ControlFailure::Participant(error.to_string()),
+        ))
+    })?;
+    let (memory_domain, construction, memory_control) =
+        arch::guest_memory::MemoryDomain::construct(
+            guest_memory.clone(),
+            granule,
+            arch::guest_memory::BackingKind::Boot,
+        )
+        .map_err(Error::Memory)
+        .map_err(StartMicrovmError::Internal)?;
+    let memory = crate::vmm::memory::MemoryCoordinator::new(memory_control, construction);
 
     let vcpu_config = vm_resources.vcpu_config();
 
@@ -864,6 +878,10 @@ pub fn build_microvm(
         )?;
         (kvm, vm)
     };
+    #[cfg(not(feature = "tee"))]
+    vm.bind_memory_domain(memory_domain.clone())
+        .map_err(Error::DirtyMemory)
+        .map_err(StartMicrovmError::Internal)?;
 
     #[cfg(feature = "tee")]
     let tee = vm_resources.tee_config().tee;
@@ -1115,11 +1133,15 @@ pub fn build_microvm(
             // GICv3. To relieve the users from having to configure the gic version manually,
             // try first to instantiate a GICv3, and fall back to a GICv2 if it fails.
             let vcpu_count = vm_resources.vm_config().vcpu_count.unwrap() as u64;
-            let gic = match KvmGicV3::new(vm.fd(), vcpu_count) {
+            let gic = match KvmGicV3::new(vm.fd(), vcpu_count, memory_domain.clone()) {
                 Ok(gicv3) => IrqChipDevice::new(Box::new(gicv3)),
                 Err(_) => {
                     warn!("KVM GICv3 creation failed, falling back to KVM GICv2");
-                    IrqChipDevice::new(Box::new(KvmGicV2::new(vm.fd(), vcpu_count)))
+                    IrqChipDevice::new(Box::new(KvmGicV2::new(
+                        vm.fd(),
+                        vcpu_count,
+                        memory_domain.clone(),
+                    )))
                 }
             };
             Arc::new(Mutex::new(gic))
@@ -1194,7 +1216,12 @@ pub fn build_microvm(
         .map_err(StartMicrovmError::Internal)?;
 
         intc = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(
-            KvmAia::new(vm.fd(), vm_resources.vm_config().vcpu_count.unwrap() as u32).unwrap(),
+            KvmAia::new(
+                vm.fd(),
+                vm_resources.vm_config().vcpu_count.unwrap() as u32,
+                memory_domain.clone(),
+            )
+            .unwrap(),
         ))));
 
         attach_legacy_devices(
@@ -1214,7 +1241,11 @@ pub fn build_microvm(
         .map_err(StartMicrovmError::Internal)?;
 
     let mut vmm = Vmm {
-        guest_memory,
+        guest_memory: RuntimeGuestMemory::new(memory_domain.clone()),
+        memory_domain,
+        memory,
+        #[cfg(not(feature = "tee"))]
+        balloon_bindings: Vec::new(),
         arch_memory_info,
         kernel_cmdline,
         vcpus_handles: Vec::new(),
@@ -1267,6 +1298,42 @@ pub fn build_microvm(
         payload_config.pvh,
     )
     .map_err(StartMicrovmError::Internal)?;
+    #[cfg(not(feature = "tee"))]
+    vmm.finalize_source_memory(
+        !vm_resources.nested_enabled
+            && !use_vhost_user
+            && gpu_shm_size.is_none()
+            && !requirements
+                .iter()
+                .any(|requirement| requirement.shm_size.is_some()),
+    )
+    .map_err(StartMicrovmError::Internal)?;
+    #[cfg(target_os = "macos")]
+    vmm.vm
+        .configure_reclaim(&vmm.arch_memory_info, host_reclaim)
+        .map_err(Error::Vm)
+        .map_err(StartMicrovmError::Internal)?;
+    #[cfg(not(feature = "tee"))]
+    {
+        let policy = if vmm.memory_domain.tracking_mode()
+            == Some(arch::guest_memory::TrackingMode::Capture)
+        {
+            devices::virtio::balloon::BalloonMemoryPolicy::TrackedCapture
+        } else {
+            devices::virtio::balloon::BalloonMemoryPolicy::Untracked
+        };
+        for binding in &vmm.balloon_bindings {
+            binding
+                .finalize(
+                    policy,
+                    #[cfg(target_os = "macos")]
+                    vmm.vm.reclaim_state(),
+                    #[cfg(target_os = "macos")]
+                    vmm.vm.host_memory_remapper(),
+                )
+                .map_err(|error| StartMicrovmError::AttachDevice(format!("{error:?}")))?;
+        }
+    }
 
     #[cfg(feature = "tee")]
     {
@@ -1281,7 +1348,7 @@ pub fn build_microvm(
                 vmm.kvm_vm()
                     .snp_secure_virt_measure(
                         cpuid,
-                        vmm.guest_memory(),
+                        &guest_memory,
                         measured_regions,
                         snp_launcher.unwrap(),
                     )
@@ -1301,6 +1368,9 @@ pub fn build_microvm(
 
         println!("Starting TEE/microVM.");
     }
+    #[cfg(feature = "tee")]
+    vmm.finalize_source_memory(false)
+        .map_err(StartMicrovmError::Internal)?;
 
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
@@ -1943,7 +2013,15 @@ pub fn create_guest_memory(
 #[cfg(all(target_arch = "x86_64", any(not(feature = "tee"), feature = "tdx")))]
 fn load_cmdline(vmm: &Vmm) -> std::result::Result<(), StartMicrovmError> {
     kernel::loader::load_cmdline(
-        vmm.guest_memory(),
+        vmm.memory
+            .construction
+            .as_ref()
+            .ok_or(StartMicrovmError::Internal(Error::Memory(
+                arch::guest_memory::MemoryError::State,
+            )))?
+            .memory()
+            .map_err(Error::Memory)
+            .map_err(StartMicrovmError::Internal)?,
         GuestAddress(arch::x86_64::layout::CMDLINE_START),
         &vmm.kernel_cmdline
             .as_cstring()
@@ -1967,6 +2045,24 @@ pub(crate) fn setup_vm(
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     Ok(vm)
+}
+
+#[cfg(all(target_os = "linux", not(feature = "tee")))]
+pub(crate) fn setup_vm_tracked(
+    domain: Arc<arch::guest_memory::MemoryDomain>,
+    construction: &arch::guest_memory::ConstructionAuthority,
+) -> std::result::Result<(Vm, arch::guest_memory::CpuTrackingEpoch), StartMicrovmError> {
+    let kvm = KvmContext::new()
+        .map_err(Error::KvmContext)
+        .map_err(StartMicrovmError::Internal)?;
+    let mut vm = Vm::new(kvm.fd())
+        .map_err(Error::Vm)
+        .map_err(StartMicrovmError::Internal)?;
+    let epoch = vm
+        .memory_init_tracked(domain, construction, kvm.max_memslots())
+        .map_err(Error::DirtyMemory)
+        .map_err(StartMicrovmError::Internal)?;
+    Ok((vm, epoch))
 }
 
 #[cfg(all(feature = "tee", target_arch = "x86_64"))]
@@ -2012,7 +2108,7 @@ pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
     arch_memory_info: &ArchMemoryInfo,
     nested_enabled: bool,
-    host_reclaim: bool,
+    _host_reclaim: bool,
     private_ram_compatible: bool,
 ) -> std::result::Result<Vm, StartMicrovmError> {
     let reclaim_layout = build_reclaim_layout(guest_memory, arch_memory_info)
@@ -2030,9 +2126,6 @@ pub(crate) fn setup_vm(
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     vm.memory_init(guest_memory, reclaim_layout)
-        .map_err(Error::Vm)
-        .map_err(StartMicrovmError::Internal)?;
-    vm.configure_reclaim(guest_memory, arch_memory_info, host_reclaim)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     Ok(vm)
@@ -2175,7 +2268,7 @@ fn create_vcpus_x86_64(
     for cpu_index in 0..vcpu_config.vcpu_count {
         let mut vcpu = Vcpu::new_x86_64(
             cpu_index,
-            vm.fd(),
+            vm.fd_owner(),
             vm.supported_cpuid().clone(),
             vm.supported_msrs().clone(),
             io_bus.clone(),
@@ -2205,7 +2298,7 @@ fn create_vcpus_aarch64(
     for cpu_index in 0..vcpu_config.vcpu_count {
         let mut vcpu = Vcpu::new_aarch64(
             cpu_index,
-            vm.fd(),
+            vm.fd_owner(),
             exit_evt.try_clone().map_err(Error::EventFd)?,
         )
         .map_err(Error::Vcpu)?;
@@ -2276,7 +2369,7 @@ fn create_vcpus_riscv64(
     for cpu_index in 0..vcpu_config.vcpu_count {
         let mut vcpu = Vcpu::new_riscv64(
             cpu_index,
-            vm.fd(),
+            vm.fd_owner(),
             exit_evt.try_clone().map_err(Error::EventFd)?,
         )
         .map_err(Error::Vcpu)?;
@@ -2297,9 +2390,7 @@ pub(crate) fn attach_mmio_device(
     intc: IrqChip,
     device: Arc<Mutex<dyn VirtioDevice>>,
 ) -> std::result::Result<(), device_manager::mmio::Error> {
-    // Host reclaim never guards device access: the host mapping stays valid
-    // across a release cycle, so devices use guest memory directly.
-    let runtime_memory = RuntimeGuestMemory::passthrough(vmm.guest_memory().clone());
+    let runtime_memory = RuntimeGuestMemory::new(vmm.memory_domain.clone());
     let _cmdline = &mut vmm.kernel_cmdline;
 
     #[cfg(target_os = "linux")]

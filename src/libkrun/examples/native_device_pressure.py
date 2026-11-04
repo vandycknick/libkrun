@@ -365,7 +365,8 @@ class Pressure:
                     for device in state["devices"]), "a real participant remained unsettled/faulted")
         devices = {device["id"]: device for device in state["devices"]}
         self.source_devices = devices
-        require(state["balloon"]["host_reclaim_enabled"] is True, "source report writer was not enabled")
+        require(state["balloon"]["host_reclaim_enabled"] is False,
+                "capture-tracked source admitted destructive balloon reclaim")
         for name in ("disk0", "disk1", "net0", "vsock0", "balloon0", "rng0", "hvc0"):
             require(name in devices and devices[name].get("queues"), f"missing actual retained queues for {name}")
         require(len(devices["vsock0"]["queues"]) == 3, "EVQ was lost at source closure")

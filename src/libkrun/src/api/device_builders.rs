@@ -32,8 +32,8 @@ use vm_memory::GuestMemoryMmap;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use vm_memory::{Address, GuestMemoryBackend};
 
-use super::error::VmmError;
-use super::export_bitflags;
+use crate::api::error::VmmError;
+use crate::api::export_bitflags;
 
 /// Requirements a device declares before the VM's memory layout is fixed.
 /// `#[non_exhaustive]` allows adding new fields in minor releases.
@@ -115,6 +115,11 @@ impl<'a> AttachContext<'a> {
         (self.register_fn)(self.vmm, id.to_string(), self.intc.clone(), device)
     }
 
+    #[cfg(not(feature = "tee"))]
+    pub(crate) fn retain_balloon_binding(&mut self, binding: BalloonBinding) {
+        self.vmm.balloon_bindings.push(binding);
+    }
+
     /// Subscribe a device to the event loop for epoll-based I/O.
     pub fn subscribe_events(
         &mut self,
@@ -136,44 +141,55 @@ impl<'a> AttachContext<'a> {
         &self.vmm.exit_code
     }
 
-    /// The VM's guest memory map.
-    pub fn guest_memory(&self) -> &GuestMemoryMmap {
-        &self.vmm.guest_memory
+    /// Exports the VM's memory map, permanently excluding tracked capture.
+    pub fn guest_memory(&self) -> Result<GuestMemoryMmap, VmmError> {
+        self.vmm
+            .memory_domain
+            .with_external_mapping(Clone::clone)
+            .map_err(|error| VmmError::Internal(format!("guest memory export: {error}")))
     }
 
     /// The resolved SHM region for the current device index, if one was
     /// allocated based on [`DeviceRequirements::shm_size`].
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-    pub fn resolved_shm_region(&self) -> Option<ResolvedShmRegion> {
-        self.shm_manager.fs_region(self.device_index).map(|r| {
-            let host_addr = self
-                .vmm
-                .guest_memory
-                .get_host_address(r.guest_addr)
-                .expect("shm region host address");
-            ResolvedShmRegion {
-                host_addr: host_addr as u64,
-                guest_addr: r.guest_addr.raw_value(),
-                size: r.size,
-            }
-        })
+    pub fn resolved_shm_region(&self) -> Result<Option<ResolvedShmRegion>, VmmError> {
+        self.shm_manager
+            .fs_region(self.device_index)
+            .map(|r| {
+                let host_addr = self
+                    .vmm
+                    .memory_domain
+                    .with_external_mapping(|memory| memory.get_host_address(r.guest_addr))
+                    .and_then(|address| address)
+                    .map_err(|error| VmmError::Internal(format!("shm memory export: {error}")))?;
+                Ok(ResolvedShmRegion {
+                    host_addr: host_addr as u64,
+                    guest_addr: r.guest_addr.raw_value(),
+                    size: r.size,
+                })
+            })
+            .transpose()
     }
 
     /// The resolved GPU SHM region, if GPU is enabled and a region was allocated.
     #[cfg(feature = "gpu")]
-    pub fn resolved_gpu_shm_region(&self) -> Option<ResolvedShmRegion> {
-        self.shm_manager.gpu_region().map(|r| {
-            let host_addr = self
-                .vmm
-                .guest_memory
-                .get_host_address(r.guest_addr)
-                .expect("gpu shm region host address");
-            ResolvedShmRegion {
-                host_addr: host_addr as u64,
-                guest_addr: r.guest_addr.raw_value(),
-                size: r.size,
-            }
-        })
+    pub fn resolved_gpu_shm_region(&self) -> Result<Option<ResolvedShmRegion>, VmmError> {
+        self.shm_manager
+            .gpu_region()
+            .map(|r| {
+                let host_addr = self
+                    .vmm
+                    .memory_domain
+                    .with_external_mapping(|memory| memory.get_host_address(r.guest_addr))
+                    .and_then(|address| address)
+                    .map_err(|error| VmmError::Internal(format!("gpu memory export: {error}")))?;
+                Ok(ResolvedShmRegion {
+                    host_addr: host_addr as u64,
+                    guest_addr: r.guest_addr.raw_value(),
+                    size: r.size,
+                })
+            })
+            .transpose()
     }
 
     /// The index of the current device within its device manager.
@@ -714,7 +730,7 @@ impl<'a> AttachDevice<'a> for FsDevice<'a> {
             }
             // Set up SHM region if allocated
             #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-            if let Some(region) = ctx.resolved_shm_region() {
+            if let Some(region) = ctx.resolved_shm_region()? {
                 fs.set_shm_region(region.into());
             }
         }
@@ -1034,6 +1050,39 @@ impl<'a> AttachDevice<'a> for ConsoleDevice<'a> {
     }
 }
 
+#[cfg(not(feature = "tee"))]
+#[derive(Clone)]
+pub(crate) struct BalloonBinding {
+    balloon: Arc<Mutex<devices::virtio::Balloon>>,
+}
+
+#[cfg(not(feature = "tee"))]
+impl BalloonBinding {
+    pub(crate) fn new(balloon: Arc<Mutex<devices::virtio::Balloon>>) -> Self {
+        Self { balloon }
+    }
+
+    pub(crate) fn finalize(
+        &self,
+        policy: devices::virtio::balloon::BalloonMemoryPolicy,
+        #[cfg(target_os = "macos")] state: Arc<hvf::reclaim::ReclaimState>,
+        #[cfg(target_os = "macos")] remapper: Option<Arc<hvf::remap::HostMemoryRemapper>>,
+    ) -> Result<(), VmmError> {
+        let mut balloon = self
+            .balloon
+            .lock()
+            .map_err(|_| VmmError::Internal("balloon lock poisoned".to_string()))?;
+        #[cfg(target_os = "macos")]
+        balloon.set_reclaim_state(state);
+        balloon
+            .finalize_memory_policy(policy)
+            .map_err(|error| VmmError::Internal(format!("balloon memory policy: {error:?}")))?;
+        #[cfg(target_os = "macos")]
+        balloon.set_host_memory_remapper(remapper);
+        Ok(())
+    }
+}
+
 /// A virtio balloon device for dynamic memory management.
 #[cfg(not(feature = "tee"))]
 pub struct BalloonDevice {
@@ -1067,7 +1116,6 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         #[cfg(target_os = "macos")]
         {
-            let reclaim_state = ctx.reclaim_state();
             let failure_event = ctx
                 .vmm
                 .exit_evt
@@ -1077,12 +1125,12 @@ impl<'a> AttachDevice<'a> for BalloonDevice {
                 .inner
                 .lock()
                 .map_err(|_| VmmError::Internal("balloon lock poisoned".to_string()))?;
-            balloon.set_reclaim_state(reclaim_state);
-            balloon.set_host_memory_remapper(ctx.vmm.vm.host_memory_remapper());
             balloon.set_failure_signal(failure_event, ctx.exit_code().clone());
         }
         ctx.subscribe_events(self.inner.clone())?;
-        ctx.register("balloon", self.inner)
+        ctx.register("balloon", self.inner.clone())?;
+        ctx.retain_balloon_binding(BalloonBinding::new(self.inner));
+        Ok(())
     }
 }
 
@@ -1644,7 +1692,7 @@ impl<'a> AttachDevice<'a> for GpuDevice {
 
         let inner = Arc::new(Mutex::new(gpu));
 
-        if let Some(region) = ctx.resolved_gpu_shm_region() {
+        if let Some(region) = ctx.resolved_gpu_shm_region()? {
             inner.lock().unwrap().set_shm_region(region.into());
         }
 
@@ -1900,6 +1948,56 @@ mod tests {
     fn balloon_automatically_requests_reporting_qualification() {
         let balloon = BalloonDevice::new().unwrap();
         assert!(balloon.requirements().host_reclaim);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn late_balloon_binding_preserves_saved_offer_and_rejects_second_policy() {
+        use crate::api::device_builders::BalloonBinding;
+        use devices::virtio::VirtioDevice;
+        use devices::virtio::balloon::BalloonMemoryPolicy;
+        use std::sync::{Arc, Mutex};
+
+        let base = devices::virtio::Balloon::new().unwrap().avail_features() & !(1 << 5);
+        for (offer, policy) in [
+            (base, BalloonMemoryPolicy::RestoredInput),
+            (base | (1 << 5), BalloonMemoryPolicy::RestoredInput),
+            (base, BalloonMemoryPolicy::RestoredPrivate),
+            (base | (1 << 5), BalloonMemoryPolicy::RestoredPrivate),
+        ] {
+            let balloon = Arc::new(Mutex::new(
+                devices::virtio::Balloon::new_restore_binding(offer).unwrap(),
+            ));
+            let binding = BalloonBinding::new(balloon.clone());
+            binding
+                .finalize(
+                    policy,
+                    #[cfg(target_os = "macos")]
+                    Arc::new(hvf::reclaim::ReclaimState::new()),
+                    #[cfg(target_os = "macos")]
+                    None,
+                )
+                .unwrap();
+            match balloon.lock() {
+                Ok(device) => assert_eq!(device.avail_features(), offer),
+                Err(error) => panic!("balloon lock poisoned: {error}"),
+            }
+            assert!(
+                binding
+                    .finalize(
+                        BalloonMemoryPolicy::Untracked,
+                        #[cfg(target_os = "macos")]
+                        Arc::new(hvf::reclaim::ReclaimState::new()),
+                        #[cfg(target_os = "macos")]
+                        None,
+                    )
+                    .is_err()
+            );
+            match balloon.lock() {
+                Ok(device) => assert_eq!(device.avail_features(), offer),
+                Err(error) => panic!("balloon lock poisoned: {error}"),
+            }
+        }
     }
 
     #[test]

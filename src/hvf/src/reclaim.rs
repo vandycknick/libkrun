@@ -9,14 +9,10 @@
 //! footprint drop alone is not evidence that backing was freed. Immediate
 //! remapping lets the kernel handle subsequent guest refaults.
 //!
-//! Host device access to guest memory is never guarded. The host mapping stays
-//! valid throughout the cycle, and the free-page-reporting protocol guarantees
-//! that the guest does not hand a reported page to a device before the report
-//! is acknowledged. The only shared state is one atomic per RAM extent so that
-//! a vCPU faulting inside the unmap window waits for the remap and retries
-//! instead of being treated as an invalid memory access. A global lease ledger
-//! here would put a mutex and extent scan on every device descriptor/payload
-//! access, even though report ownership already excludes use of those pages.
+//! Ordinary untracked RAM relies on report ownership while the host mapping
+//! stays valid throughout each cycle. Tracked capture and restored private RAM
+//! install an immutable empty reclaim subset before any advice or mapping
+//! maintenance can run. The full registered-memory inventory is separate.
 //!
 //! See `docs/macos-host-reclaim.md` for qualification, failure invariants and
 //! the distinction between discard eligibility, footprint and physical discard.
@@ -149,6 +145,13 @@ pub enum ReclaimQualification {
     Inconclusive = 3,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReclaimInhibition {
+    TrackedCapture,
+    RestoredInput,
+    RestoredPrivateMapping,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReclaimStats {
     /// Successfully advised ranges, not necessarily distinct extents.
@@ -189,17 +192,22 @@ impl RegionExtents {
 struct ExtentMap {
     layout: RamLayout,
     regions: Vec<RegionExtents>,
+    inhibition: Option<ReclaimInhibition>,
 }
 
 impl ExtentMap {
-    fn new(layout: RamLayout) -> Self {
+    fn new(layout: RamLayout, inhibition: Option<ReclaimInhibition>) -> Self {
         let regions = layout
             .regions()
             .iter()
             .copied()
             .map(RegionExtents::new)
             .collect();
-        Self { layout, regions }
+        Self {
+            layout,
+            regions,
+            inhibition,
+        }
     }
 
     fn region_for(&self, guest_address: u64) -> Option<&RegionExtents> {
@@ -259,6 +267,7 @@ impl std::fmt::Debug for ExtentMap {
         f.debug_struct("ExtentMap")
             .field("granule", &self.layout.granule())
             .field("regions", &self.layout.regions().len())
+            .field("inhibition", &self.inhibition)
             .finish()
     }
 }
@@ -287,9 +296,35 @@ impl ReclaimState {
         if layout.granule() != page_size as u64 {
             return Err(ReclaimError::InvalidAlignment.into());
         }
+        self.install(layout, None)
+    }
+
+    pub fn initialize_inhibited(
+        &self,
+        granule: u64,
+        reason: ReclaimInhibition,
+    ) -> Result<(), ReclaimStateError> {
+        let page_size = native_page_size().map_err(|_| ReclaimError::InvalidAlignment)?;
+        if granule != page_size as u64 {
+            return Err(ReclaimError::InvalidAlignment.into());
+        }
+        self.install(RamLayout::new(granule)?, Some(reason))?;
+        self.set_policy_enabled(false);
+        Ok(())
+    }
+
+    fn install(
+        &self,
+        layout: RamLayout,
+        inhibition: Option<ReclaimInhibition>,
+    ) -> Result<(), ReclaimStateError> {
         self.map
-            .set(ExtentMap::new(layout))
+            .set(ExtentMap::new(layout, inhibition))
             .map_err(|_| ReclaimStateError::AlreadyInitialized)
+    }
+
+    pub fn inhibition(&self) -> Option<ReclaimInhibition> {
+        self.map.get().and_then(|map| map.inhibition)
     }
 
     /// Removes host PTEs and their accounting without replacing backing or
@@ -349,7 +384,7 @@ impl ReclaimState {
     pub(crate) fn is_eligible(&self) -> bool {
         self.map
             .get()
-            .is_some_and(|map| map.layout.has_registered_regions())
+            .is_some_and(|map| map.inhibition.is_none() && map.layout.has_registered_regions())
     }
 
     /// Whether new reports may be advised free. HostMemoryRemapper is independent.
@@ -367,6 +402,7 @@ impl ReclaimState {
     }
 
     pub fn set_policy_enabled(&self, enabled: bool) {
+        let enabled = enabled && self.inhibition().is_none();
         self.policy_enabled.store(enabled, Ordering::Release);
         if !enabled {
             self.qualification
@@ -384,6 +420,11 @@ impl ReclaimState {
     }
 
     pub(crate) fn record_qualification(&self, result: ReclaimQualification, detail: &str) {
+        if self.inhibition().is_some() {
+            self.qualification
+                .store(ReclaimQualification::NotRun as u64, Ordering::Release);
+            return;
+        }
         let result = if result == ReclaimQualification::Passed
             && (!self.is_eligible() || !self.policy_enabled.load(Ordering::Acquire))
         {
@@ -723,6 +764,44 @@ mod tests {
     }
 
     #[test]
+    fn construction_inhibition_cannot_be_qualified_or_reenabled() {
+        use crate::reclaim::ReclaimInhibition;
+
+        let granule = crate::discard::native_page_size().unwrap() as u64;
+        for reason in [
+            ReclaimInhibition::TrackedCapture,
+            ReclaimInhibition::RestoredInput,
+            ReclaimInhibition::RestoredPrivateMapping,
+        ] {
+            let state = ReclaimState::new();
+            state.initialize_inhibited(granule, reason).unwrap();
+            assert_eq!(state.inhibition(), Some(reason));
+            assert!(state.is_initialized());
+            assert!(!state.is_eligible());
+            state.set_policy_enabled(true);
+            state.record_qualification(ReclaimQualification::Passed, "must not qualify");
+            assert!(!state.policy_enabled());
+            assert!(!state.is_effective());
+            assert_eq!(state.qualification(), ReclaimQualification::NotRun);
+            assert_eq!(state.vcpu_run_generation(), None);
+            assert_eq!(
+                state
+                    .release_report(GuestRange::new(RAM_START, granule).unwrap())
+                    .unwrap(),
+                ReleaseOutcome::Skipped
+            );
+            assert_eq!(state.stats().released_bytes, 0);
+            assert_eq!(state.stats().released_extents, 0);
+            assert_eq!(state.stats().failed_operations, 0);
+            assert_eq!(state.stats().skipped_reports, 1);
+            assert!(matches!(
+                state.initialize(RamLayout::new(granule).unwrap()),
+                Err(ReclaimStateError::AlreadyInitialized)
+            ));
+        }
+    }
+
+    #[test]
     fn empty_layout_never_qualifies() {
         let state = ReclaimState::new();
         state.initialize(RamLayout::new(0x4000).unwrap()).unwrap();
@@ -856,7 +935,7 @@ mod tests {
 
     #[test]
     fn extent_indexes_cover_partial_extents() {
-        let map = crate::reclaim::ExtentMap::new(layout());
+        let map = crate::reclaim::ExtentMap::new(layout(), None);
         let region = map.region_for(RAM_START).unwrap();
         assert_eq!(region.states.len(), 8);
         let range = GuestRange::new(RAM_START + EXTENT_BYTES - 0x4000, 0x8000).unwrap();

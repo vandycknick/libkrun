@@ -15,7 +15,6 @@ use super::defs;
 use super::defs::uapi;
 use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
-use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
 use super::reaper::ReaperThread;
 #[cfg(target_os = "macos")]
 use super::timesync::TimesyncThread;
@@ -27,6 +26,7 @@ use crate::virtio::vsock::control_proxy::{
     ControlHandle, ControlProxy, UnixSocketIdentity, prepare_stream,
 };
 use crate::virtio::vsock::packet::PacketQueue as VirtQueue;
+use crate::virtio::vsock::packet::{RxPacket, TsiConnectReq, TsiGetnameRsp, TxPacket};
 use crate::virtio::vsock::proxy::{Proxy, ProxyRemoval, ProxyStatus, ProxyUpdate};
 use crate::virtio::vsock::unix_proxy::UnixAcceptorProxy;
 use crossbeam_channel::{Sender, unbounded};
@@ -132,12 +132,16 @@ fn try_push_virtqueue(
         MuxerRx::CreditRequest { .. } | MuxerRx::CreditUpdate { .. }
     );
     if let Some(head) = queue.pop(mem) {
-        if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head, &mut queue.snapshot) {
+        if let Ok(mut pkt) = RxPacket::from_rx_virtq_head(&head, &mut queue.snapshot) {
             if let Err(rx) = rx_to_pkt(cid, rx, &mut pkt) {
                 let _ = queue.undo_pop(head.index);
                 return Err(rx);
             }
-            match queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len()) {
+            match queue.add_used(
+                mem,
+                head.index,
+                crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE as u32 + pkt.len(),
+            ) {
                 Ok(()) =>
                 {
                     #[cfg(feature = "native-device-probe")]
@@ -532,7 +536,7 @@ impl VsockMuxer {
         !self.rxq.lock().unwrap().is_empty()
     }
 
-    pub(crate) fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> crate::virtio::vsock::Result<()> {
+    pub(crate) fn recv_pkt(&mut self, pkt: &mut RxPacket) -> crate::virtio::vsock::Result<()> {
         let mut queue = self
             .rxq
             .lock()
@@ -642,7 +646,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_proxy_create(&self, pkt: &VsockPacket) {
+    fn process_proxy_create(&self, pkt: &TxPacket) {
         debug!("proxy create request");
         if let Some(req) = pkt.read_proxy_create() {
             debug!(
@@ -737,7 +741,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_connect(&self, pkt: &VsockPacket) {
+    fn process_connect(&self, pkt: &TxPacket) {
         debug!("proxy connect request");
         if let Some(req) = pkt.read_connect_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
@@ -755,7 +759,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_getname(&self, pkt: &VsockPacket) {
+    fn process_getname(&self, pkt: &TxPacket) {
         debug!("new getname request");
         if let Some(req) = pkt.read_getname_req() {
             let id = ((req.peer_port as u64) << 32) | (req.local_port as u64);
@@ -779,7 +783,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_sendto_addr(&self, pkt: &VsockPacket) {
+    fn process_sendto_addr(&self, pkt: &TxPacket) {
         debug!("new DGRAM sendto addr: src={}", pkt.src_port());
         if let Some(req) = pkt.read_sendto_addr() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
@@ -797,7 +801,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_sendto_data(&self, pkt: &VsockPacket) {
+    fn process_sendto_data(&self, pkt: &TxPacket) {
         let id = ((pkt.src_port() as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
         debug!("DGRAM sendto data: id={} src={}", id, pkt.src_port());
         if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
@@ -805,7 +809,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_listen_request(&self, pkt: &VsockPacket) {
+    fn process_listen_request(&self, pkt: &TxPacket) {
         debug!("DGRAM listen request: src={}", pkt.src_port());
         if let Some(req) = pkt.read_listen_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
@@ -824,7 +828,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_accept_request(&self, pkt: &VsockPacket) {
+    fn process_accept_request(&self, pkt: &TxPacket) {
         debug!("DGRAM accept request: src={}", pkt.src_port());
         if let Some(req) = pkt.read_accept_req() {
             let id = ((req.peer_port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
@@ -840,7 +844,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_proxy_release(&self, pkt: &VsockPacket) {
+    fn process_proxy_release(&self, pkt: &TxPacket) {
         debug!("DGRAM release request: src={}", pkt.src_port());
         if let Some(req) = pkt.read_release_req() {
             let id = ((req.peer_port as u64) << 32) | (req.local_port as u64);
@@ -869,7 +873,7 @@ impl VsockMuxer {
         );
     }
 
-    fn process_dgram_rw(&self, pkt: &VsockPacket) {
+    fn process_dgram_rw(&self, pkt: &TxPacket) {
         debug!("DGRAM OP_RW");
         let id = ((pkt.src_port() as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
 
@@ -890,7 +894,7 @@ impl VsockMuxer {
         }
     }
 
-    pub(crate) fn send_dgram_pkt(&mut self, pkt: &VsockPacket) -> super::Result<()> {
+    pub(crate) fn send_dgram_pkt(&mut self, pkt: &TxPacket) -> crate::virtio::vsock::Result<()> {
         debug!(
             "send_dgram_pkt: src_port={} dst_port={}",
             pkt.src_port(),
@@ -927,7 +931,7 @@ impl VsockMuxer {
         Ok(())
     }
 
-    fn process_op_request(&mut self, pkt: &VsockPacket) {
+    fn process_op_request(&mut self, pkt: &TxPacket) {
         debug!("OP_REQUEST");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
         let proxy_map = match self.proxy_map.read() {
@@ -1021,7 +1025,7 @@ impl VsockMuxer {
     }
 
     #[cfg(unix)]
-    fn process_mux_request(&self, pkt: &VsockPacket, proxy_id: u64) {
+    fn process_mux_request(&self, pkt: &TxPacket, proxy_id: u64) {
         use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 
         let Some(control) = &self.control_handle else {
@@ -1105,7 +1109,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_op_response(&self, pkt: &VsockPacket) {
+    fn process_op_response(&self, pkt: &TxPacket) {
         debug!("OP_RESPONSE");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
         let update = self
@@ -1130,7 +1134,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_op_shutdown(&self, pkt: &VsockPacket) {
+    fn process_op_shutdown(&self, pkt: &TxPacket) {
         debug!("OP_SHUTDOWN");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
         if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
@@ -1138,7 +1142,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_op_credit_update(&self, pkt: &VsockPacket) {
+    fn process_op_credit_update(&self, pkt: &TxPacket) {
         debug!("OP_CREDIT_UPDATE");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
         let update = self
@@ -1152,7 +1156,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_stream_rw(&self, pkt: &VsockPacket) {
+    fn process_stream_rw(&self, pkt: &TxPacket) {
         debug!("OP_RW");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
         let proxy_map = match self.proxy_map.read() {
@@ -1214,7 +1218,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_stream_rst(&self, pkt: &VsockPacket) {
+    fn process_stream_rst(&self, pkt: &TxPacket) {
         debug!("OP_RST");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
         let proxy_map = match self.proxy_map.read() {
@@ -1259,7 +1263,7 @@ impl VsockMuxer {
         }
     }
 
-    pub(crate) fn send_stream_pkt(&mut self, pkt: &VsockPacket) -> super::Result<()> {
+    pub(crate) fn send_stream_pkt(&mut self, pkt: &TxPacket) -> crate::virtio::vsock::Result<()> {
         debug!(
             "send_pkt: src_port={} dst_port={}, op={}",
             pkt.src_port(),
@@ -1341,13 +1345,13 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::sync::{Arc, Mutex};
 
-    use vm_memory::{GuestAddress, GuestMemoryMmap};
+    use vm_memory::GuestAddress;
 
     use crate::virtio::queue::tests::VirtQueue;
     use crate::virtio::vsock::TsiFlags;
     use crate::virtio::vsock::defs::{self, uapi};
     use crate::virtio::vsock::muxer::{MuxerRx, VsockMuxer};
-    use crate::virtio::vsock::packet::{VSOCK_PKT_HDR_SIZE, VsockPacket};
+    use crate::virtio::vsock::packet::{RxPacket, TxPacket, VSOCK_PKT_HDR_SIZE};
     use crate::virtio::vsock::proxy::{ProxyStatus, ProxyUpdate};
     #[cfg(unix)]
     use crate::virtio::vsock::unix_proxy::UnixProxy;
@@ -1356,9 +1360,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn guest_send_credit_update_reaches_the_receive_virtqueue() {
-        let mem = RuntimeGuestMemory::passthrough(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap(),
-        );
+        let mem = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
         let queue = VirtQueue::new(GuestAddress(0), &mem, 8);
         queue.dtable[0].set(0x1000, VSOCK_PKT_HDR_SIZE as u32, 3, 1);
         queue.dtable[1].set(0x1100, 4, 2, 0);
@@ -1409,7 +1411,7 @@ mod tests {
 
         assert_eq!(muxer.queue.as_ref().unwrap().lock().unwrap().next_used.0, 1);
         let head = DescriptorChain::checked_new(&mem, GuestAddress(0), 8, 0).unwrap();
-        let packet = VsockPacket::from_rx_virtq_head(
+        let packet = RxPacket::from_rx_virtq_head(
             &head,
             &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(8),
         )
@@ -1423,9 +1425,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn newer_credit_dispatch_cannot_bypass_deferred_credit_after_rx_refill() {
-        let mem = RuntimeGuestMemory::passthrough(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x8000)]).unwrap(),
-        );
+        let mem = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x8000)]).unwrap();
         let queue = VirtQueue::new(GuestAddress(0), &mem, 8);
         let queue_mutex = Arc::new(Mutex::new(
             crate::virtio::vsock::packet::PacketQueue::from_queue(queue.create_queue()),
@@ -1510,7 +1510,7 @@ mod tests {
         queue.dtable[7].set(0x6100, 4, 2, 0);
         mem.write_slice(b"wrap", GuestAddress(0x6100)).unwrap();
         let write_head = DescriptorChain::checked_new(&mem, GuestAddress(0), 8, 6).unwrap();
-        let mut guest_write = VsockPacket::from_rx_virtq_head(
+        let mut guest_write = RxPacket::from_rx_virtq_head(
             &write_head,
             &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(8),
         )
@@ -1523,12 +1523,22 @@ mod tests {
             .set_type(uapi::VSOCK_TYPE_STREAM)
             .set_op(uapi::VSOCK_OP_RW)
             .set_len(4);
+        drop(guest_write);
+        queue.dtable[6].set(0x6000, VSOCK_PKT_HDR_SIZE as u32, 1, 7);
+        queue.dtable[7].set(0x6100, 4, 0, 0);
+        let write_head = DescriptorChain::checked_new(&mem, GuestAddress(0), 8, 6).unwrap();
+        let guest_write = TxPacket::from_tx_virtq_head(
+            &write_head,
+            &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(8),
+            None,
+        )
+        .unwrap();
         muxer.send_stream_pkt(&guest_write).unwrap();
         assert!(!muxer.retry_deferred_credit());
 
         assert_eq!(queue_mutex.lock().unwrap().next_used.0, 2);
         let request_head = DescriptorChain::checked_new(&mem, GuestAddress(0), 8, 0).unwrap();
-        let request = VsockPacket::from_rx_virtq_head(
+        let request = RxPacket::from_rx_virtq_head(
             &request_head,
             &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(8),
         )
@@ -1536,7 +1546,7 @@ mod tests {
         assert_eq!(request.op(), uapi::VSOCK_OP_CREDIT_REQUEST);
         assert_eq!(request.fwd_cnt(), 2);
         let update_head = DescriptorChain::checked_new(&mem, GuestAddress(0), 8, 2).unwrap();
-        let update = VsockPacket::from_rx_virtq_head(
+        let update = RxPacket::from_rx_virtq_head(
             &update_head,
             &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(8),
         )
@@ -1548,9 +1558,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn guest_reset_discards_deferred_credit_before_deferred_removal_and_rx_refill() {
-        let mem = RuntimeGuestMemory::passthrough(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x8000)]).unwrap(),
-        );
+        let mem = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x8000)]).unwrap();
         let queue = VirtQueue::new(GuestAddress(0), &mem, 8);
         let queue_mutex = Arc::new(Mutex::new(
             crate::virtio::vsock::packet::PacketQueue::from_queue(queue.create_queue()),
@@ -1611,7 +1619,7 @@ mod tests {
         queue.dtable[4].set(0x5000, VSOCK_PKT_HDR_SIZE as u32, 3, 5);
         queue.dtable[5].set(0x5100, 4, 2, 0);
         let reset_head = DescriptorChain::checked_new(&mem, GuestAddress(0), 8, 4).unwrap();
-        let mut reset = VsockPacket::from_rx_virtq_head(
+        let mut reset = RxPacket::from_rx_virtq_head(
             &reset_head,
             &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(8),
         )
@@ -1624,6 +1632,16 @@ mod tests {
             .set_type(uapi::VSOCK_TYPE_STREAM)
             .set_op(uapi::VSOCK_OP_RST)
             .set_len(0);
+        drop(reset);
+        queue.dtable[4].set(0x5000, VSOCK_PKT_HDR_SIZE as u32, 1, 5);
+        queue.dtable[5].set(0x5100, 4, 0, 0);
+        let reset_head = DescriptorChain::checked_new(&mem, GuestAddress(0), 8, 4).unwrap();
+        let reset = TxPacket::from_tx_virtq_head(
+            &reset_head,
+            &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(8),
+            None,
+        )
+        .unwrap();
         muxer.send_stream_pkt(&reset).unwrap();
         assert_eq!(reaper_receiver.try_recv().unwrap().id, id);
         assert!(muxer.proxy_map.read().unwrap().get(&id).is_some());

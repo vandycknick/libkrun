@@ -22,6 +22,17 @@ reported as exercised by a RAM sentinel. If the ordinary production profile
 requires another component, its live workload/proof remains a local acceptance
 blocker, not permission to substitute the fixture or declare that Linux gate done.
 
+Fixture RAM is raw only during bounded cold loading. Once constructed, every
+runtime fixture read/write uses the production `RuntimeGuestMemory` domain.
+The existing execution coordinator closes and drains ordinary writers before
+native save, retains native-effects authority through terminal CPU ACKs, then
+seals, harvests and rearms the cut. Resume reopens that domain before preparation
+and fixture seed writes, which belong to the next epoch. CPU resources and
+accepted commands retain the domain and VM backing even when cleanup fails.
+The probe reports a cleanup deadline as failure, never as successful reap.
+These ownership rules do not turn `memory.fixture` into a baseline or production
+RAM image, and grant no additional qualification.
+
 ## Required evidence, not a reduced production gate
 
 The assembly fixture proves only the CPU execution sub-barrier. It does not boot
@@ -109,6 +120,43 @@ python3 -m unittest discover -s src/libkrun/examples -p 'test_native_device_exec
 Then run the closed whole-machine invocation below with fresh evidence and the
 existing exact production inputs; the implementation agent does not run gates.
 
+
+## KVM memory tracking and native effects
+
+The Linux backend retains each successful RAM registration, including its full
+address-space/slot ID, original flags and backing lifetime. Construction binds
+these records to the common memory domain. Source arming allocates every slot
+bitmap before enabling ordinary `KVM_MEM_LOG_DIRTY_PAGES` on the exact retained
+registrations, preserving other flags. The explicit tracked restore initializer
+preallocates all records and buffers, registers every slot with logging enabled
+from its first registration, and returns the initial epoch before execution
+installation, not merely before the first `KVM_RUN`.
+
+Exported VM descriptor owners retain the registered backing and bound domain,
+including while an asynchronous IRQ-route worker outlives a failed VMM owner.
+vCPU constructors retain that same owner before their native descriptors can
+escape. The final VM descriptor closes before the retained backing is released;
+ordinary Stop completion is not the lifetime guarantee.
+
+Native execution commands require the domain's native-effects authority through
+their terminal acknowledgment. In particular, `SET_MSRS` can write guest RAM via
+the KVM PV wall-clock MSRs. A failed or short native operation is not proof that
+RAM was unchanged; coverage is invalidated without discarding known dirty bits.
+CPU command journals retain the terminal result, not the completed authority.
+
+Final CPU harvest follows all native save operations and ordinary writer drain.
+It uses fixed, exact-size slot buffers, immediately retaining each result in the
+common dense page map, including non-word-aligned region starts and masked
+padding. An entered failing `GET_DIRTY_LOG` loses coverage even when a later
+retry might return no bits. The backend does not retry it, clear retained
+dirties, or accept a baseline. Successful ordinary GET already reprotects the
+slot; rearm only consumes its exact cut/epoch witness without another ioctl.
+Tracked registrations cannot be replaced or exported as an untracked mapping.
+
+These are implementation invariants, not native qualification evidence. Pure
+slot/bitmap regressions require no KVM. Main must separately exercise every
+actual slot, repeated writes across accepted generations, partial-harvest
+retention, and restore-time wall-clock writes before any guest entry.
 
 ## KVM arm64 source counter contract
 
@@ -1166,11 +1214,24 @@ All admitted providers now use the existing descriptor utility's preallocated
 queue-max snapshot. It validates the complete raw NEXT graph, TTL/bounds,
 duplicate indices/cycles, flags, direction order and mapped ranges before
 effects, and consumers use the same immutable descriptor metadata. Adjacent
-RAM regions use the existing runtime lease seam, not a new memory domain.
-Block data/status splitting retains the exact lease and disjoint prefix/suffix.
-Additional hypervisor-free selections for Main are `descriptor_snapshot_`,
-`memory_slice_at_most_`, `block_provider_full_chain_`,
-`block_provider_read_data_and_status_`, `execution_device_envelope_`,
+RAM regions use bounded directional guards from the VM's memory domain.
+Reader owns only read guards; Writer owns premarked write guards, including
+file-read destinations and console input. Split data/status retain independent,
+disjoint write obligations. Borrowed syscall views remain guard-bound through
+completion and errors; the final view is clipped to the requested byte count.
+Descriptor consumption and native iovecs use bounded 64-entry stack scratch,
+without per-call lease clones or temporary vectors. This does not remove pinned
+imago 0.2.4's existing internal vector and pointer-guard allocations.
+Block IN/OUT requests consume successive bounded batches until the validated
+request length is complete, advancing the file offset with checked arithmetic.
+A zero-progress or failed batch is not successful completion; already-completed
+prefix transfers retain their effects and existing error/status accounting.
+Additional hypervisor-free selections for Main (not executed results) are
+`descriptor_snapshot_`, `descriptor_file_io_`, `descriptor_error_after_`,
+`descriptor_consumer_`, `descriptor_read_sources_`, `descriptor_tracked_`,
+`file_views_`, `console_port_views_`, `memory_slice_at_most_`, `block_provider_full_chain_`,
+`block_provider_read_data_and_status_`, `block_provider_scattered_`,
+`execution_device_envelope_`,
 `execution_prefence_vm_refusal_`, `inactive_rng_provider_`,
 `legacy_resume_preflight_` and `lifecycle_queue_unready_`.
 
@@ -1356,3 +1417,72 @@ then rebuild the native driver/guest fixture through the existing Makefile
 lane and run the full native lane with these retained readiness artifacts.
 Implementation agents have not run checks or granted runtime qualification.
 
+
+### Native memory-domain dirty coverage
+
+The focused `--memory-dirty` mode uses the ordinary-kernel provider workload
+and final whole-machine paused cuts. It is standalone verification, not a
+Cargo hypervisor test or a public RAM capture API. Build the existing register
+fixture as described above, then run from the native checkout:
+
+```sh
+make BLK=1 NET=1 native-device-witness-probe
+cc -O2 -pthread -static \
+  -o target/native-device-inputs/native-device-linux \
+  src/libkrun/examples/native_device_linux.c
+python3 -m unittest discover \
+  -s src/libkrun/examples -p 'native_memory_controller.py'
+python3 src/libkrun/examples/native_device_controller.py \
+  --memory-dirty \
+  --probe target/debug/examples/native-device-probe \
+  --netd "$NETD_BIN" \
+  --guest-init target/native-device-inputs/native-device-linux \
+  --register-fixture target/native-device-inputs/native-execution-linux \
+  --kernel "$KERNEL_PATH" \
+  --evidence "$EVIDENCE_DIR"
+```
+
+`NETD_BIN` and `KERNEL_PATH` name actual executable/kernel inputs. Keep the
+kernel's actual emitted `.config` beside `KERNEL_PATH`; a kernel without
+`/proc/modules` requires that configuration to establish `CONFIG_MODULES=n`.
+The kernel's embedded IKCONFIG is also an authoritative source of those exact
+configuration bytes. Do not substitute an assumed configuration fragment.
+The evidence parent must already exist. `EVIDENCE_DIR` must be a new directory
+with at least 8 GiB available on its filesystem. The guest needs `vmsplice`
+and PID1 pagemap PFN visibility. Two
+guest-owned anonymous pages are mlocked and retained by an undrained real
+pipe; their observed physical addresses must remain stable. One page is
+changed only by the explicit host write, the other by the nonce-correlated
+guest CPU command.
+
+Each capture retains `memory-dirty.bitmap` in dense little-endian u64 form
+and `memory-dirty.json` with its actual granule, packed region geometry,
+page population and pause generation. The controller scans complete RAM
+cuts as an independent oracle and rejects changed pages missing from the
+harvested union. It also compares repeated frozen cuts, retains actual
+provider progress, and requires acknowledged stop plus process reaping.
+
+Host-writer attribution requires the existing active host bitmap to be
+clean before the production `RuntimeGuestMemory::write_slice` and dirty
+afterward, with byte-exact readback. The dedicated CPU page must remain
+clean in that host bitmap around the guest store. A bit already present in
+the cumulative union is not evidence of a new host mark.
+
+This mode does not accept or clear a baseline. CPU re-dirty after accepted
+generation clearing, incremental-versus-full image equivalence, file-private
+sharing and restored reclaim qualification require the later RAM-image
+gates. Source and binary hashes are retained separately, not presented as a
+reproducible-build attestation. No capability is granted by this mode.
+Preserve text reports, manifests and required inputs before removing
+successful generated RAM/disk payloads; retain failed samples for diagnosis.
+
+Capture-tracked source VMs disable destructive balloon reclaim from
+construction, not only after accepting a baseline or restoring RAM. Reporting
+queues still complete normally. The pressure gate checks the disabled reclaim
+policy separately from actual reporting used-ring progress; reporting
+acknowledgements do not establish discarded bytes or reclaim qualification.
+
+Pause admission performs read-only device preflight before checking the
+construction-time memory tracking mode. An unsupported attached provider
+therefore retains its named refusal instead of being masked by the resulting
+untracked-memory policy; neither check starts pause effects.

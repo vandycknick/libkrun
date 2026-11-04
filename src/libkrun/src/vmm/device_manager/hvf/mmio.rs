@@ -614,7 +614,7 @@ mod tests {
             device_id: &str,
         ) -> Result<u64> {
             let mmio_device = devices::virtio::MmioTransport::new(
-                guest_mem,
+                crate::vmm::memory::runtime_memory_for_test(guest_mem),
                 DummyIrqChip::new().into(),
                 device,
                 None,
@@ -824,9 +824,13 @@ mod tests {
         use polly::event_manager::{BarrierGeneration, OperationId};
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let device = Arc::new(Mutex::new(devices::virtio::Rng::new().unwrap()));
-        let transport =
-            devices::virtio::MmioTransport::new(memory, DummyIrqChip::new().into(), device, None)
-                .unwrap();
+        let transport = devices::virtio::MmioTransport::new(
+            crate::vmm::memory::runtime_memory_for_test(memory),
+            DummyIrqChip::new().into(),
+            device,
+            None,
+        )
+        .unwrap();
         let source = transport.interrupt_transport().clone();
         let mut manager = MMIODeviceManager::new(&mut 0xd000_0000, (32, 64));
         let (address, irq) = manager

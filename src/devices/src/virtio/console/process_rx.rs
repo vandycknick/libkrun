@@ -81,12 +81,12 @@ pub(crate) fn process_rx(
                 failed = true;
                 break;
             };
-            let result = mem.try_access(
+            let result = mem.try_write_access(
                 desc.len as usize,
                 GuestAddress(desc.addr),
-                |_, len, _, mut target| {
+                |_, len, _, target| {
                     loop {
-                        match input.read_volatile(&mut target) {
+                        match input.read_volatile(target) {
                             Ok(n) if n <= len => {
                                 eof = n == 0;
                                 bytes_read = bytes_read

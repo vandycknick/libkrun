@@ -83,7 +83,7 @@ impl BusDevice for ProbePort {
 }
 
 struct ProbeVm {
-    memory: GuestMemoryMmap,
+    memory: devices::virtio::RuntimeGuestMemory,
     vm: Vm,
     handles: Vec<VcpuHandle>,
     cpus: CpuController,
@@ -122,6 +122,19 @@ impl ProbeVm {
         memory
             .write_obj(HANDLER as u16, GuestAddress(0x20 * 4))
             .map_err(|error| format!("write IVT: {error}"))?;
+        let (domain, construction, mut memory_control) =
+            arch::guest_memory::MemoryDomain::construct(
+                memory,
+                crate::vmm::execution::native_page_granule().map_err(|error| error.to_string())?,
+                arch::guest_memory::BackingKind::Boot,
+            )
+            .map_err(|error| error.to_string())?;
+        vm.bind_memory_domain(domain.clone())
+            .map_err(|error| error.to_string())?;
+        memory_control
+            .finish_untracked(construction)
+            .map_err(|error| error.to_string())?;
+        let memory = devices::virtio::RuntimeGuestMemory::new(domain);
         Vcpu::register_kick_signal_handler().map_err(|error| format!("install kick: {error}"))?;
         let mut probe = Self {
             memory,
@@ -167,21 +180,17 @@ impl ProbeVm {
         let exit = EventFd::new(EFD_NONBLOCK).map_err(|error| format!("exit event: {error}"))?;
         let mut vcpu = Vcpu::new_x86_64(
             cpu,
-            self.vm.fd(),
+            self.vm.fd_owner(),
             self.vm.supported_cpuid().clone(),
             self.vm.supported_msrs().clone(),
             io,
             exit,
         )
         .map_err(|error| format!("create CPU {cpu}: {error}"))?;
-        vcpu.configure_control_probe(
-            self.memory.clone(),
-            self.vm.fd_owner(),
-            ENTRY,
-            0x1000 + u16::from(cpu) * 0x100,
-            mmio,
-        )
-        .map_err(|error| format!("configure CPU {cpu}: {error}"))?;
+        vcpu.configure_control_probe(ENTRY, 0x1000 + u16::from(cpu) * 0x100, mmio)
+            .map_err(|error| format!("configure CPU {cpu}: {error}"))?;
+        vcpu.retain_resources(&self.vm)
+            .map_err(|error| error.to_string())?;
         self.memory
             .write_obj(
                 0xc000u16 + u16::from(cpu),

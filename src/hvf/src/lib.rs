@@ -13,6 +13,7 @@ pub mod build_facts {
 #[allow(non_upper_case_globals)]
 #[allow(deref_nullptr)]
 pub mod bindings;
+pub mod dirty;
 mod discard;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 mod execution;
@@ -32,19 +33,19 @@ use bindings::*;
 use std::arch::asm;
 use std::cell::Cell;
 
-use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::dirty::{DirtyFaultResolution, HvfRamProtection};
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use crate::framework::{HvfFramework, OwnedConfig};
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name};
-use arch::guest_memory::RamLayout;
+use arch::guest_memory::{MemoryDomain, RamLayout, RamPermissions};
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use reclaim::ReclaimQualification;
 use reclaim::{FaultResolution, ReclaimState, ReclaimStateError};
@@ -139,6 +140,7 @@ pub enum Error {
     MemorySize,
     MemoryUnmap,
     InvalidMemoryFault,
+    DirtyTracking(arch::guest_memory::DirtyFailure),
     ReclaimState(ReclaimStateError),
     ReclaimProbeCleanup(String),
     ExecutionState(state::StateError),
@@ -175,6 +177,7 @@ impl Display for Error {
             MemorySize => write!(f, "Memory region size is not representable by HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
             InvalidMemoryFault => write!(f, "Invalid fault in mapped guest RAM"),
+            DirtyTracking(error) => write!(f, "HVF RAM protection failed: {error:?}"),
             ReclaimState(err) => write!(f, "Error tracking guest RAM in HVF: {err}"),
             ReclaimProbeCleanup(err) => write!(f, "Error cleaning up HVF reclaim probe: {err}"),
             ExecutionState(error) => write!(f, "Invalid HVF execution state: {error}"),
@@ -293,6 +296,7 @@ pub fn check_nested_virt() -> Result<bool, Error> {
 
 pub struct HvfVm {
     reclaim_state: Arc<ReclaimState>,
+    protection: Arc<HvfRamProtection>,
     nested_enabled: bool,
     ipa_bits: Option<u32>,
     lifetime: Arc<HvfVmLifetime>,
@@ -303,8 +307,15 @@ pub struct HvfVm {
 /// Keeps the VM and its resolved framework alive on a vCPU owner thread.
 pub struct HvfCpuResources {
     _lifetime: Arc<HvfVmLifetime>,
+    protection: Arc<HvfRamProtection>,
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     _framework: Arc<HvfFramework>,
+}
+
+impl HvfCpuResources {
+    pub fn ram_protection(&self) -> Arc<HvfRamProtection> {
+        Arc::clone(&self.protection)
+    }
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -316,12 +327,14 @@ impl HvfCpuResources {
 
 pub(crate) struct HvfVmLifetime {
     destroyed: AtomicBool,
+    backing: Mutex<Option<Box<dyn Send + Sync>>>,
 }
 
 impl HvfVmLifetime {
     pub(crate) fn new() -> Self {
         Self {
             destroyed: AtomicBool::new(false),
+            backing: Mutex::new(None),
         }
     }
 
@@ -343,6 +356,14 @@ impl Drop for HvfVmLifetime {
         if !self.destroyed.swap(true, Ordering::AcqRel) && unsafe { hv_vm_destroy() } != HV_SUCCESS
         {
             log::error!("failed to destroy HVF VM at final owner teardown");
+            // Native mappings can still dereference backing after failed teardown.
+            let backing = match self.backing.get_mut() {
+                Ok(backing) => backing,
+                Err(poison) => poison.into_inner(),
+            };
+            if let Some(owner) = backing.take() {
+                std::mem::forget(owner);
+            }
         }
     }
 }
@@ -351,6 +372,7 @@ impl HvfVm {
     pub fn cpu_resources(&self) -> HvfCpuResources {
         HvfCpuResources {
             _lifetime: Arc::clone(&self.lifetime),
+            protection: Arc::clone(&self.protection),
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             _framework: Arc::clone(&self.framework),
         }
@@ -399,6 +421,7 @@ impl HvfVm {
         } else {
             Ok(Self {
                 reclaim_state,
+                protection: Arc::new(HvfRamProtection::new()),
                 nested_enabled,
                 ipa_bits,
                 lifetime: Arc::new(HvfVmLifetime::new()),
@@ -418,20 +441,43 @@ impl HvfVm {
         guest_start_addr: u64,
         size: u64,
     ) -> Result<(), Error> {
-        let size = size.try_into().map_err(|_| Error::MemorySize)?;
-        let ret = unsafe {
-            hv_vm_map(
-                host_start_addr as *mut core::ffi::c_void,
-                guest_start_addr,
-                size,
-                (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
-            )
-        };
-        if ret != HV_SUCCESS {
-            Err(Error::MemoryMap)
-        } else {
-            Ok(())
+        self.map_memory_with_permissions(
+            host_start_addr,
+            guest_start_addr,
+            size,
+            RamPermissions::READ_WRITE_EXECUTE,
+        )
+    }
+
+    pub fn map_memory_with_permissions(
+        &self,
+        host_start_addr: u64,
+        guest_start_addr: u64,
+        size: u64,
+        permissions: RamPermissions,
+    ) -> Result<(), Error> {
+        self.protection
+            .map_memory(host_start_addr, guest_start_addr, size, permissions)
+    }
+
+    pub fn ram_protection(&self) -> Arc<HvfRamProtection> {
+        Arc::clone(&self.protection)
+    }
+
+    pub fn bind_memory_domain(
+        &self,
+        domain: Arc<MemoryDomain>,
+    ) -> Result<(), arch::guest_memory::DirtyFailure> {
+        self.protection.bind(domain)
+    }
+
+    pub fn retain_memory_backing<T: Send + Sync + 'static>(&self, backing: T) -> Result<(), Error> {
+        let mut owner = self.lifetime.backing.lock().map_err(|_| Error::MemoryMap)?;
+        if owner.is_some() {
+            return Err(Error::MemoryMap);
         }
+        *owner = Some(Box::new(backing));
+        Ok(())
     }
 
     pub fn reclaim_state(&self) -> Arc<ReclaimState> {
@@ -489,19 +535,16 @@ impl HvfVm {
 
     /// Installs the releasable RAM layout once every region is mapped.
     pub fn initialize_reclaim(&self, layout: RamLayout) -> Result<(), Error> {
+        self.protection
+            .finalize_untracked()
+            .map_err(Error::DirtyTracking)?;
         self.reclaim_state
             .initialize(layout)
             .map_err(Error::ReclaimState)
     }
 
     pub fn unmap_memory(&self, guest_start_addr: u64, size: u64) -> Result<(), Error> {
-        let size = size.try_into().map_err(|_| Error::MemorySize)?;
-        let ret = unsafe { hv_vm_unmap(guest_start_addr, size) };
-        if ret != HV_SUCCESS {
-            Err(Error::MemoryUnmap)
-        } else {
-            Ok(())
-        }
+        self.protection.unmap_memory(guest_start_addr, size)
     }
 
     /// Destroys the VM if this is its final lifetime owner.
@@ -526,7 +569,7 @@ pub enum VcpuExit<'a> {
     HypervisorCall,
     MmioRead(u64, &'a mut [u8]),
     MmioWrite(u64, &'a [u8]),
-    /// A stage-2 fault raced a RAM release cycle; re-run the vCPU.
+    /// A RAM protection/reclaim fault needs the exact instruction retried.
     MemoryRetry,
     PsciHandled,
     SecureMonitorCall,
@@ -591,11 +634,12 @@ pub struct HvfVcpu<'a> {
     // so the WFE deadline check doesn't issue a syscall on every wait.
     vtimer_offset: Cell<u64>,
     destroyed: bool,
+    protection: Arc<HvfRamProtection>,
     _owner_thread: PhantomData<Rc<()>>,
 }
 
 impl HvfVcpu<'_> {
-    pub fn new(nested_enabled: bool) -> Result<Self, Error> {
+    pub fn new(nested_enabled: bool, protection: Arc<HvfRamProtection>) -> Result<Self, Error> {
         let mut vcpuid: hv_vcpu_t = 0;
         let mut vcpu_exit_ptr: *mut hv_vcpu_exit_t = std::ptr::null_mut();
 
@@ -635,6 +679,7 @@ impl HvfVcpu<'_> {
             nested_enabled,
             vtimer_offset: Cell::new(0),
             destroyed: false,
+            protection,
             _owner_thread: PhantomData,
         })
     }
@@ -932,6 +977,10 @@ impl HvfVcpu<'_> {
             vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, true)?;
         }
 
+        let entered_epoch = self
+            .protection
+            .entered_epoch()
+            .map_err(Error::DirtyTracking)?;
         let ret = unsafe { hv_vcpu_run(self.vcpuid) };
         if ret != HV_SUCCESS {
             return Err(Error::NativeCall {
@@ -966,6 +1015,11 @@ impl HvfVcpu<'_> {
                 Ok(VcpuExit::Breakpoint)
             }
             EC_INSTRUCTIONABORT | EC_INSTRUCTIONABORT_CURRENT => {
+                if let Some(entered) = &entered_epoch {
+                    return Err(Error::DirtyTracking(
+                        self.protection.reject_instruction_fault(entered),
+                    ));
+                }
                 let pa = exit.exception.physical_address;
                 if is_translation_fault(syndrome)
                     && fault_address_is_valid(syndrome)
@@ -989,6 +1043,16 @@ impl HvfVcpu<'_> {
             }
             EC_DATAABORT | EC_DATAABORT_CURRENT => {
                 let pa = exit.exception.physical_address;
+                if let Some(entered) = &entered_epoch {
+                    match self
+                        .protection
+                        .handle_ram_write_fault(entered, syndrome, pa)
+                        .map_err(Error::DirtyTracking)?
+                    {
+                        DirtyFaultResolution::Retry => return Ok(VcpuExit::MemoryRetry),
+                        DirtyFaultResolution::NotHandled => {}
+                    }
+                }
                 if is_translation_fault(syndrome)
                     && fault_address_is_valid(syndrome)
                     && let Some(generation) = entered_generation
@@ -1250,6 +1314,27 @@ mod tests {
             .expect("last lifetime owner must be unique");
         assert!(!lifetime.destroyed.load(Ordering::Acquire));
         lifetime.destroyed.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn memory_backing_is_retained_by_the_last_native_vm_owner() {
+        struct Backing(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Backing {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut lifetime = HvfVmLifetime::new();
+        lifetime.backing = std::sync::Mutex::new(Some(Box::new(Backing(Arc::clone(&dropped)))));
+        let lifetime = Arc::new(lifetime);
+        let cpu_owner = Arc::clone(&lifetime);
+        lifetime.destroyed.store(true, Ordering::Release);
+        drop(lifetime);
+        assert!(!dropped.load(Ordering::Acquire));
+        drop(cpu_owner);
+        assert!(dropped.load(Ordering::Acquire));
     }
 
     #[test]

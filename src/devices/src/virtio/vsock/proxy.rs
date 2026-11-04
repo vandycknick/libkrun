@@ -11,7 +11,7 @@ use std::os::windows::io::OwnedSocket as OwnedFd;
 use utils::windows::{AsRawFd, RawFd};
 
 use super::muxer::MuxerRx;
-use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
+use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, TxPacket};
 #[cfg(unix)]
 use nix::sys::socket::AddressFamily;
 /// On Windows, reuse the WinSock `ADDRESS_FAMILY` type (a `u16`) directly so
@@ -175,27 +175,27 @@ pub trait Proxy: Send + AsRawFd {
     fn id(&self) -> u64;
     #[allow(dead_code)]
     fn status(&self) -> ProxyStatus;
-    fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate;
-    fn confirm_connect(&mut self, _pkt: &VsockPacket) -> Option<ProxyUpdate> {
+    fn connect(&mut self, pkt: &TxPacket, req: TsiConnectReq) -> ProxyUpdate;
+    fn confirm_connect(&mut self, _pkt: &TxPacket) -> Option<ProxyUpdate> {
         None
     }
-    fn getpeername(&mut self, pkt: &VsockPacket);
-    fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
+    fn getpeername(&mut self, pkt: &TxPacket);
+    fn sendmsg(&mut self, pkt: &TxPacket) -> ProxyUpdate;
     fn sendto_addr(&mut self, req: TsiSendtoAddr) -> ProxyUpdate;
-    fn sendto_data(&mut self, _pkt: &VsockPacket) {}
+    fn sendto_data(&mut self, _pkt: &TxPacket) {}
     fn listen(
         &mut self,
-        pkt: &VsockPacket,
+        pkt: &TxPacket,
         req: TsiListenReq,
         host_port_map: &Option<HashMap<u16, u16>>,
     ) -> ProxyUpdate;
     fn accept(&mut self, req: TsiAcceptReq) -> ProxyUpdate;
-    fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
+    fn update_peer_credit(&mut self, pkt: &TxPacket) -> ProxyUpdate;
     fn push_op_request(&self) {}
-    fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
+    fn process_op_response(&mut self, pkt: &TxPacket) -> ProxyUpdate;
     fn enqueue_accept(&mut self) {}
     fn push_accept_rsp(&self, _result: i32) {}
-    fn shutdown(&mut self, _pkt: &VsockPacket) {}
+    fn shutdown(&mut self, _pkt: &TxPacket) {}
     fn release(&mut self) -> ProxyUpdate;
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate;
     fn admit_mux(&mut self) -> Option<ProxyUpdate> {

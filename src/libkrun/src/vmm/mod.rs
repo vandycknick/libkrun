@@ -16,6 +16,7 @@ pub mod control;
 pub(crate) mod device_manager;
 #[allow(dead_code)]
 pub mod execution;
+pub mod memory;
 /// Resource store for configured microVM resources.
 pub mod resources;
 /// Signal handling utilities.
@@ -59,7 +60,6 @@ use polly::event_manager::{
 };
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
-use vm_memory::GuestMemoryMmap;
 
 /// Success exit code.
 pub const FC_EXIT_CODE_OK: u8 = 0;
@@ -101,6 +101,8 @@ pub enum Error {
     Control(control::ControlFailure),
     /// Vm error.
     Vm(vstate::Error),
+    Memory(arch::guest_memory::MemoryError),
+    DirtyMemory(arch::guest_memory::DirtyFailure),
 }
 
 impl Display for Error {
@@ -122,6 +124,8 @@ impl Display for Error {
             VcpuHandle(e) => write!(f, "Cannot create a vCPU handle. {e}"),
             Control(e) => write!(f, "Native control failed: {e}"),
             Vm(e) => write!(f, "Vm error: {e}"),
+            Memory(e) => write!(f, "Guest memory ownership failed: {e}"),
+            DirtyMemory(e) => write!(f, "Guest memory tracking failed: {e}"),
         }
     }
 }
@@ -132,7 +136,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Contains the state and associated methods required for the Firecracker VMM.
 pub struct Vmm {
     // Guest VM core resources.
-    pub(crate) guest_memory: GuestMemoryMmap,
+    pub(crate) guest_memory: devices::virtio::RuntimeGuestMemory,
+    pub(crate) memory_domain: Arc<arch::guest_memory::MemoryDomain>,
+    pub(crate) memory: memory::MemoryCoordinator,
+    #[cfg(not(feature = "tee"))]
+    pub(crate) balloon_bindings: Vec<crate::api::device_builders::BalloonBinding>,
     pub(crate) arch_memory_info: ArchMemoryInfo,
 
     pub(crate) kernel_cmdline: KernelCmdline,
@@ -168,7 +176,7 @@ impl Vmm {
 
         for mut vcpu in vcpus.drain(..) {
             vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
-            vcpu.retain_resources(self.guest_memory.clone(), &self.vm);
+            vcpu.retain_resources(&self.vm).map_err(Error::VcpuHandle)?;
 
             self.vcpus_handles
                 .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
@@ -217,6 +225,13 @@ impl Vmm {
         _smbios_oem_strings: &Option<Vec<String>>,
         _pvh: bool,
     ) -> Result<()> {
+        let memory = self
+            .memory
+            .construction
+            .as_ref()
+            .ok_or(Error::Memory(arch::guest_memory::MemoryError::State))?
+            .memory()
+            .map_err(Error::Memory)?;
         #[cfg(target_arch = "x86_64")]
         {
             let cmdline_len = if cfg!(feature = "tee") {
@@ -226,7 +241,7 @@ impl Vmm {
             };
 
             arch::x86_64::configure_system(
-                &self.guest_memory,
+                memory,
                 &self.arch_memory_info,
                 vm_memory::GuestAddress(arch::x86_64::layout::CMDLINE_START),
                 cmdline_len,
@@ -241,7 +256,7 @@ impl Vmm {
         {
             let vcpu_mpidr = vcpus.iter().map(|cpu| cpu.get_mpidr()).collect();
             fdt::create_fdt(
-                &self.guest_memory,
+                memory,
                 &self.arch_memory_info,
                 vcpu_mpidr,
                 self.kernel_cmdline.as_str(),
@@ -254,18 +269,14 @@ impl Vmm {
 
         #[cfg(target_arch = "aarch64")]
         {
-            arch::aarch64::configure_system(
-                &self.guest_memory,
-                &self.arch_memory_info,
-                _smbios_oem_strings,
-            )
-            .map_err(Error::ConfigureSystem)?;
+            arch::aarch64::configure_system(memory, &self.arch_memory_info, _smbios_oem_strings)
+                .map_err(Error::ConfigureSystem)?;
         }
 
         #[cfg(target_arch = "riscv64")]
         {
             fdt::create_fdt(
-                &self.guest_memory,
+                memory,
                 &self.arch_memory_info,
                 vcpus.len() as u32,
                 self.kernel_cmdline.as_str(),
@@ -275,15 +286,15 @@ impl Vmm {
             )
             .map_err(Error::SetupFDT)?;
 
-            arch::riscv64::configure_system(&self.guest_memory, _smbios_oem_strings)
+            arch::riscv64::configure_system(memory, _smbios_oem_strings)
                 .map_err(Error::ConfigureSystem)?;
         }
 
         Ok(())
     }
 
-    /// Returns a reference to the inner `GuestMemoryMmap` object if present, or `None` otherwise.
-    pub fn guest_memory(&self) -> &GuestMemoryMmap {
+    /// Returns the mandatory directional runtime memory facade.
+    pub fn guest_memory(&self) -> &devices::virtio::RuntimeGuestMemory {
         &self.guest_memory
     }
 

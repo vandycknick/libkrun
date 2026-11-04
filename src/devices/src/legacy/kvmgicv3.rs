@@ -4,9 +4,11 @@ use crate::Error as DeviceError;
 use crate::bus::BusDevice;
 use crate::legacy::gic::GICDevice;
 use crate::legacy::irqchip::IrqChipT;
+use arch::guest_memory::MemoryDomain;
 use kvm_bindings::*;
 use kvm_ioctls::{DeviceFd, Error, VmFd};
 use std::io;
+use std::sync::Arc;
 use utils::eventfd::EventFd;
 
 const KVM_VGIC_V3_BASE_SIZE: u64 = 0x10000;
@@ -16,6 +18,7 @@ use crate::legacy::kvm_state::{GicRegister, GicState, affinity, descriptors, sys
 
 pub struct KvmGicV3 {
     device_fd: DeviceFd,
+    _memory_domain: Arc<MemoryDomain>,
     properties: [u64; 4],
     vcpu_count: u64,
     irq_count: u32,
@@ -30,12 +33,12 @@ fn attribute(group: u32, attr: u64, addr: u64) -> kvm_device_attr {
     }
 }
 impl KvmGicV3 {
-    pub fn new(vm: &VmFd, vcpu_count: u64) -> Result<Self, Error> {
-        let gic = Self::create(vm, vcpu_count)?;
+    pub fn new(vm: &VmFd, vcpu_count: u64, domain: Arc<MemoryDomain>) -> Result<Self, Error> {
+        let gic = Self::create(vm, vcpu_count, domain)?;
         gic.initialize()?;
         Ok(gic)
     }
-    fn create(vm: &VmFd, vcpu_count: u64) -> Result<Self, Error> {
+    fn create(vm: &VmFd, vcpu_count: u64, domain: Arc<MemoryDomain>) -> Result<Self, Error> {
         if vcpu_count == 0 || vcpu_count > 255 {
             return Err(Error::new(libc::EINVAL));
         }
@@ -67,16 +70,21 @@ impl KvmGicV3 {
         ))?;
         Ok(Self {
             device_fd,
+            _memory_domain: domain,
             properties: [dist_addr, dist_size, redists_addr, redists_size],
             vcpu_count,
             irq_count,
         })
     }
     /// Called after the exact recorded vCPU creation order, never via a GICv2 fallback.
-    pub fn create_for_restore(vm: &VmFd, state: &GicState) -> Result<Self, String> {
+    pub fn create_for_restore(
+        vm: &VmFd,
+        state: &GicState,
+        domain: Arc<MemoryDomain>,
+    ) -> Result<Self, String> {
         state.validate()?;
-        let gic =
-            Self::create(vm, state.mpidrs.len() as u64).map_err(|e| format!("gic/create: {e}"))?;
+        let gic = Self::create(vm, state.mpidrs.len() as u64, domain)
+            .map_err(|e| format!("gic/create: {e}"))?;
         if gic.properties != state.properties || gic.irq_count != state.irq_count {
             return Err("gic/construction-topology".into());
         }

@@ -1,7 +1,9 @@
 // Copyright 2025 The libkrun Authors. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use arch::guest_memory::MemoryDomain;
 use std::io;
+use std::sync::Arc;
 
 use crate::Error as DeviceError;
 use crate::bus::BusDevice;
@@ -19,6 +21,7 @@ const ARCH_GIC_V2_MAINT_IRQ: u32 = 8;
 
 pub struct KvmGicV2 {
     _device_fd: DeviceFd,
+    _memory_domain: Arc<MemoryDomain>,
 
     /// GIC device properties, to be used for setting up the fdt entry
     properties: [u64; 4],
@@ -28,7 +31,7 @@ pub struct KvmGicV2 {
 }
 
 impl KvmGicV2 {
-    pub fn new(vm: &VmFd, vcpu_count: u64) -> Self {
+    pub fn new(vm: &VmFd, vcpu_count: u64, domain: Arc<MemoryDomain>) -> Self {
         let dist_size = KVM_VGIC_V2_DIST_SIZE;
         let dist_addr = arch::MMIO_MEM_START - dist_size;
         let cpu_size = KVM_VGIC_V2_CPU_SIZE;
@@ -77,6 +80,7 @@ impl KvmGicV2 {
 
         Self {
             _device_fd: device_fd,
+            _memory_domain: domain,
             properties: [dist_addr, dist_size, cpu_addr, cpu_size],
             vcpu_count,
         }

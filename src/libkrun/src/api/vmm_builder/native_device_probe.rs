@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use arch::guest_memory::ReadGuestMemory;
 use devices::legacy::{Serial, state::LegacyPayload};
 use devices::virtio::block::{Block, CacheType, DiskFormat, SyncMode};
 use devices::virtio::lifecycle::ProviderFault;
@@ -25,7 +26,7 @@ use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use crate::api::capabilities::execution_state_producer;
-use crate::api::device_builders::{AttachContext, AttachDevice, MmioDeviceManager};
+use crate::api::device_builders::{AttachContext, AttachDevice, BalloonBinding, MmioDeviceManager};
 use crate::api::error::VmmError;
 use crate::api::payload::{KernelFormat, Payload};
 use crate::api::vmm_builder::{VmmBuilder, VmmInner};
@@ -122,6 +123,7 @@ struct Resource {
     id: String,
     device: Arc<Mutex<dyn VirtioDevice>>,
     subscriber: Option<Arc<Mutex<dyn Subscriber + Send>>>,
+    balloon_binding: Option<BalloonBinding>,
 }
 impl<'a> AttachDevice<'a> for Resource {
     fn attach(self: Box<Self>, context: &mut AttachContext) -> Result<(), VmmError> {
@@ -136,7 +138,11 @@ impl<'a> AttachDevice<'a> for Resource {
         if let Some(subscriber) = &self.subscriber {
             context.subscribe_events(subscriber.clone())?;
         }
-        context.register(&self.id, self.device.clone())
+        context.register(&self.id, self.device.clone())?;
+        if let Some(binding) = self.balloon_binding {
+            context.retain_balloon_binding(binding);
+        }
+        Ok(())
     }
 }
 
@@ -267,10 +273,6 @@ impl Driver {
         profile: &KvmCaptureProfile,
         disks: [&Path; 2],
     ) -> Result<(), String> {
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(directory)
-            .map_err(|error| error.to_string())?;
         let mut vmm = self.vmm.try_lock().map_err(|_| "driver VMM lock")?;
         let active = vmm
             .control
@@ -280,25 +282,6 @@ impl Driver {
         let barrier = active.barrier;
         let request = active.request.id;
         vmm.flush_devices_for_capture(barrier.key)?;
-        for (index, source) in disks.into_iter().enumerate() {
-            let destination = directory.join(format!("disk{index}.raw"));
-            let mut input = File::open(source).map_err(|error| error.to_string())?;
-            if !input
-                .metadata()
-                .map_err(|error| error.to_string())?
-                .is_file()
-            {
-                return Err("standalone disk capture requires regular raw files".into());
-            }
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(destination)
-                .map_err(|error| error.to_string())?;
-            std::io::copy(&mut input, &mut output).map_err(|error| error.to_string())?;
-            output.sync_all().map_err(|error| error.to_string())?;
-        }
         vmm.begin_execution_capture(request, barrier, binding, profile, false)?;
         let execution = match vmm.poll_execution_capture() {
             Poll::Ready(result) => result?,
@@ -320,6 +303,37 @@ impl Driver {
             );
         }
         let devices = vmm.captured_devices()?;
+        #[cfg(feature = "native-device-probe")]
+        let dirty = diagnostic_dirty_memory(
+            &vmm,
+            self.token
+                .as_ref()
+                .ok_or("capture without exact pause token")?,
+            &execution,
+        )?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(directory)
+            .map_err(|error| error.to_string())?;
+        for (index, source) in disks.into_iter().enumerate() {
+            let destination = directory.join(format!("disk{index}.raw"));
+            let mut input = File::open(source).map_err(|error| error.to_string())?;
+            if !input
+                .metadata()
+                .map_err(|error| error.to_string())?
+                .is_file()
+            {
+                return Err("standalone disk capture requires regular raw files".into());
+            }
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(destination)
+                .map_err(|error| error.to_string())?;
+            std::io::copy(&mut input, &mut output).map_err(|error| error.to_string())?;
+            output.sync_all().map_err(|error| error.to_string())?;
+        }
         write_new(
             &directory.join("execution.state"),
             &execution.encode().map_err(|error| error.to_string())?,
@@ -329,13 +343,170 @@ impl Driver {
             &devices.encode().map_err(|error| error.to_string())?,
         )?;
         transfer_ram(
-            &vmm.guest_memory,
+            RamTransfer::Capture(vmm.guest_memory.read_only()),
             &execution,
             &directory.join("memory.ram"),
-            false,
         )?;
+        #[cfg(feature = "native-device-probe")]
+        {
+            write_new(&directory.join("memory-dirty.json"), &dirty.0)?;
+            write_new(&directory.join("memory-dirty.bitmap"), &dirty.1)?;
+        }
         Ok(())
     }
+}
+#[cfg(feature = "native-device-probe")]
+fn diagnostic_dirty_memory(
+    vmm: &Vmm,
+    token: &PauseToken,
+    execution: &ExecutionEnvelope,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    use std::fmt::Write as FmtWrite;
+    let layout = vmm.memory_domain.layout();
+    layout
+        .validate_capture()
+        .map_err(|error| error.to_string())?;
+    let dirty = vmm.memory_dirty_pages(token)?;
+    if layout.packed_len() > MAX_RAM
+        || layout.regions().len() != execution.memory_regions.len()
+        || layout.page_count() != dirty.page_count()
+        || dirty.words().len() != layout.page_count().div_ceil(64)
+    {
+        return Err("standalone dirty geometry exceeds bounds or differs from RAM".into());
+    }
+    let mut metadata = format!(
+        "{{\"schema\":1,\"scope\":\"cumulative-union-no-accepted-baseline\",\"bitmap_encoding\":\"u64-le-lsb0-dense\",\"granule\":{},\"packed_len\":{},\"page_count\":{},\"dirty_pages\":{},\"bitmap_bytes\":{},\"pause_generation\":{},\"regions\":[",
+        layout.granule(),
+        layout.packed_len(),
+        layout.page_count(),
+        dirty.count(),
+        dirty.words().len() * 8,
+        execution.binding.pause_generation,
+    );
+    for (index, (region, captured)) in layout
+        .regions()
+        .iter()
+        .zip(&execution.memory_regions)
+        .enumerate()
+    {
+        let guest = region.guest_range();
+        if guest.start() != captured.start() || guest.byte_len() != captured.byte_len() {
+            return Err("standalone dirty layout differs from packed execution RAM".into());
+        }
+        if index != 0 {
+            metadata.push(',');
+        }
+        write!(
+            metadata,
+            "{{\"id\":{},\"gpa\":{},\"byte_len\":{},\"stream_offset\":{},\"first_page\":{}}}",
+            region.id().index(),
+            guest.start(),
+            guest.byte_len(),
+            region.stream_offset(),
+            region.first_page(),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    metadata.push_str("]}\n");
+    let mut bitmap = Vec::with_capacity(dirty.words().len() * 8);
+    for word in dirty.words() {
+        bitmap.extend_from_slice(&word.to_le_bytes());
+    }
+    Ok((metadata.into_bytes(), bitmap))
+}
+
+#[cfg(feature = "native-device-probe")]
+fn diagnostic_host_write(driver: &Driver, operand: &str) -> Result<(), String> {
+    use crate::vmm::control::ControlState;
+    use devices::virtio::RuntimeGuestMemory;
+    let mut fields = operand.split_whitespace();
+    let address = fields
+        .next()
+        .ok_or("host write GPA")?
+        .parse::<u64>()
+        .map_err(|_| "host write GPA")?;
+    let before = fields
+        .next()
+        .ok_or("host write expected byte")?
+        .parse::<u8>()
+        .map_err(|_| "host write expected byte")?;
+    let after = fields
+        .next()
+        .ok_or("host write replacement byte")?
+        .parse::<u8>()
+        .map_err(|_| "host write replacement byte")?;
+    if fields.next().is_some() || address % 4096 != 0 || before == after {
+        return Err("host write requires one aligned fixture page and distinct bytes".into());
+    }
+    let vmm = driver.vmm.try_lock().map_err(|_| "driver VMM lock")?;
+    if !matches!(vmm.control.state, ControlState::Running) {
+        return Err("host write requires actual running/reopened memory admission".into());
+    }
+    let memory = RuntimeGuestMemory::new(vmm.memory_domain.clone());
+    let mut observed = [0u8; 4096];
+    memory
+        .read_slice(&mut observed, GuestAddress(address))
+        .map_err(|error| error.to_string())?;
+    if observed != [before; 4096] {
+        return Err("host write fixture ownership pattern differs".into());
+    }
+    let page = vmm
+        .memory_domain
+        .layout()
+        .page_at(address)
+        .ok_or("host write GPA outside registered RAM")?;
+    let host_dirty_before = vmm
+        .memory_domain
+        .host_page_dirty(page)
+        .map_err(|error| error.to_string())?;
+    if host_dirty_before {
+        return Err(
+            "host write proof requires a clean active host-page bit after prior cut".into(),
+        );
+    }
+    memory
+        .write_slice(&[after; 4096], GuestAddress(address))
+        .map_err(|error| error.to_string())?;
+    let host_dirty_after = vmm
+        .memory_domain
+        .host_page_dirty(page)
+        .map_err(|error| error.to_string())?;
+    if !host_dirty_after {
+        return Err("actual directional host write did not dirty the active host-page bit".into());
+    }
+    memory
+        .read_slice(&mut observed, GuestAddress(address))
+        .map_err(|error| error.to_string())?;
+    if observed != [after; 4096] {
+        return Err("host write production directional readback differs".into());
+    }
+    println!(
+        "HOST_MEMORY_WRITE {{\"gpa\":{address},\"dense_page\":{},\"bytes\":4096,\"before\":{before},\"after\":{after},\"host_dirty_before\":{host_dirty_before},\"host_dirty_after\":{host_dirty_after},\"readback_verified\":true,\"path\":\"RuntimeGuestMemory::write_slice\"}}",
+        page.index()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "native-device-probe")]
+fn diagnostic_host_page(driver: &Driver, operand: &str) -> Result<(), String> {
+    let address = operand
+        .parse::<u64>()
+        .map_err(|_| "host page observation GPA")?;
+    let vmm = driver.vmm.try_lock().map_err(|_| "driver VMM lock")?;
+    let page = vmm
+        .memory_domain
+        .layout()
+        .page_at(address)
+        .ok_or("host page observation GPA outside registered RAM")?;
+    let dirty = vmm
+        .memory_domain
+        .host_page_dirty(page)
+        .map_err(|error| error.to_string())?;
+    println!(
+        "HOST_MEMORY_PAGE {{\"gpa\":{address},\"dense_page\":{},\"host_dirty\":{dirty}}}",
+        page.index()
+    );
+    Ok(())
 }
 
 fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -386,12 +557,17 @@ fn binding(directory: &Path, generation: u64) -> Result<StateBinding, String> {
         pause_generation: generation,
     })
 }
+enum RamTransfer<'a> {
+    Capture(ReadGuestMemory<'a>),
+    Restore(&'a GuestMemoryMmap),
+}
+
 fn transfer_ram(
-    memory: &GuestMemoryMmap,
+    memory: RamTransfer<'_>,
     execution: &ExecutionEnvelope,
     path: &Path,
-    restore: bool,
 ) -> Result<(), String> {
+    let restore = matches!(&memory, RamTransfer::Restore(_));
     let total = execution
         .memory_regions
         .iter()
@@ -419,18 +595,21 @@ fn transfer_ram(
         while offset < region.byte_len() {
             let length = (region.byte_len() - offset).min(chunk.len() as u64) as usize;
             let address = GuestAddress(region.start() + offset);
-            if restore {
-                file.read_exact(&mut chunk[..length])
-                    .map_err(|error| error.to_string())?;
-                memory
-                    .write_slice(&chunk[..length], address)
-                    .map_err(|error| error.to_string())?;
-            } else {
-                memory
-                    .read_slice(&mut chunk[..length], address)
-                    .map_err(|error| error.to_string())?;
-                file.write_all(&chunk[..length])
-                    .map_err(|error| error.to_string())?;
+            match &memory {
+                RamTransfer::Restore(memory) => {
+                    file.read_exact(&mut chunk[..length])
+                        .map_err(|error| error.to_string())?;
+                    memory
+                        .write_slice(&chunk[..length], address)
+                        .map_err(|error| error.to_string())?;
+                }
+                RamTransfer::Capture(memory) => {
+                    memory
+                        .read_slice(&mut chunk[..length], address)
+                        .map_err(|error| error.to_string())?;
+                    file.write_all(&chunk[..length])
+                        .map_err(|error| error.to_string())?;
+                }
             }
             offset += length as u64;
         }
@@ -447,6 +626,7 @@ fn resource<T: VirtioDevice + Subscriber + 'static>(id: &str, device: T) -> Reso
         id: id.into(),
         device: device.clone(),
         subscriber: Some(device),
+        balloon_binding: None,
     }
 }
 fn owned_fd(arguments: &BTreeMap<String, String>, key: &str) -> Result<OwnedFd, String> {
@@ -549,6 +729,7 @@ fn resources(
             id,
             device: Arc::new(Mutex::new(disk)),
             subscriber: None,
+            balloon_binding: None,
         });
     }
     let net_fd = owned_fd(arguments, "net-fd")?;
@@ -574,6 +755,7 @@ fn resources(
         id: "net0".into(),
         device: Arc::new(Mutex::new(net)),
         subscriber: None,
+        balloon_binding: None,
     });
     let mut vsock = Vsock::new(3, None, None, TsiFlags::empty())
         .map_err(|error| format!("vsock: {error:?}"))?;
@@ -599,7 +781,13 @@ fn resources(
         Balloon::new()
     }
     .map_err(|error| format!("balloon: {error:?}"))?;
-    result.push(resource("balloon0", balloon));
+    let balloon = Arc::new(Mutex::new(balloon));
+    result.push(Resource {
+        id: "balloon0".into(),
+        device: balloon.clone(),
+        subscriber: Some(balloon.clone()),
+        balloon_binding: Some(BalloonBinding::new(balloon)),
+    });
     result.push(resource(
         "rng0",
         Rng::new().map_err(|error| format!("rng: {error:?}"))?,
@@ -711,7 +899,11 @@ fn restore(
         return Err("standalone RAM exceeds fixture bound".into());
     }
     let memory = GuestMemoryMmap::from_ranges(&ranges).map_err(|error| error.to_string())?;
-    transfer_ram(&memory, &execution, &directory.join("memory.ram"), true)?;
+    transfer_ram(
+        RamTransfer::Restore(&memory),
+        &execution,
+        &directory.join("memory.ram"),
+    )?;
     let mut bindings = Vec::new();
     for record in &saved.records {
         let resource = resources
@@ -743,8 +935,11 @@ fn restore(
             ));
         }
     }
-    #[allow(unused_mut)]
     let mut prepared = devices.prepare(bindings, serial, None)?;
+    prepared.balloon_bindings = resources
+        .iter()
+        .filter_map(|resource| resource.balloon_binding.clone())
+        .collect();
     #[cfg(feature = "native-device-probe")]
     if options_partial(arguments) {
         prepared.hold_device_probe_install_ack(2)?;
@@ -1153,6 +1348,10 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
                                 .profile = Some(profile);
                         }
                         "pause" => driver.pause()?,
+                        #[cfg(feature = "native-device-probe")]
+                        "memory-host-write" => diagnostic_host_write(&driver, operand)?,
+                        #[cfg(feature = "native-device-probe")]
+                        "memory-host-page" => diagnostic_host_page(&driver, operand)?,
                         "cancel" => {
                             let operation =
                                 operand.parse::<u64>().map_err(|_| "cancel operation")?;

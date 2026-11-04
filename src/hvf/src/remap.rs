@@ -133,6 +133,42 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn construction_inhibition_refuses_remapper_without_affecting_ordinary_eligibility() {
+        use crate::reclaim::{ReclaimInhibition, ReclaimState};
+        use crate::remap::HostMemoryRemapper;
+        use arch::guest_memory::{RamLayout, RamPermissions, RamRegion};
+        use std::sync::Arc;
+
+        let granule = crate::discard::native_page_size().unwrap() as u64;
+        for reason in [
+            ReclaimInhibition::TrackedCapture,
+            ReclaimInhibition::RestoredInput,
+            ReclaimInhibition::RestoredPrivateMapping,
+        ] {
+            let ram = Arc::new(ReclaimState::new());
+            ram.initialize_inhibited(granule, reason).unwrap();
+            ram.set_policy_enabled(true);
+            assert!(HostMemoryRemapper::new(ram).is_none());
+        }
+        let ordinary = Arc::new(ReclaimState::new());
+        let mut layout = RamLayout::new(granule).unwrap();
+        layout
+            .register_region(
+                RamRegion::new(
+                    granule,
+                    granule * 2,
+                    granule,
+                    RamPermissions::READ_WRITE_EXECUTE,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        ordinary.initialize(layout).unwrap();
+        assert!(!ordinary.is_effective());
+        assert!(HostMemoryRemapper::new(ordinary).is_some());
+    }
+
+    #[test]
     fn periodic_deadline_exists_without_reports() {
         let now = Instant::now();
         let schedule = Schedule::new(now);

@@ -15,6 +15,12 @@ pub(crate) fn submit_command(
     }
 }
 
+pub(crate) fn finish_native_command(command: &mut CpuCommand, ack: CpuAck) -> CpuAck {
+    // Publishing a terminal ACK must not race the worker's final authority release.
+    drop(command.native_effects.take());
+    ack
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CpuDisposition {
     Parked,
@@ -157,12 +163,19 @@ impl CpuMailbox {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::task::Poll;
     use std::time::Instant;
+
+    use arch::guest_memory::{BackingKind, MemoryDomain};
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
 
     use polly::event_manager::{BarrierGeneration, BarrierKey, BarrierRequest, OperationId};
 
     use crate::vmm::control::{CpuCommand, CpuCommandKind, CpuSubmission, RequestId};
-    use crate::vmm::linux::cpu_control::{CpuDisposition, CpuMailbox, submit_command};
+    use crate::vmm::linux::cpu_control::{
+        CpuDisposition, CpuMailbox, finish_native_command, submit_command,
+    };
 
     fn command(request: u64, generation: u64, kind: CpuCommandKind) -> CpuCommand {
         CpuCommand {
@@ -176,6 +189,37 @@ mod tests {
             },
             kind,
             execution: None,
+            native_effects: None,
+        }
+    }
+
+    #[test]
+    fn terminal_ack_retires_worker_native_authority_before_return() {
+        for kind in [
+            CpuCommandKind::InstallExecution,
+            CpuCommandKind::CaptureExecution,
+        ] {
+            let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+            let (_, construction, mut control) =
+                MemoryDomain::construct(memory, 4096, BackingKind::Boot).unwrap();
+            let epoch = construction.issue_epoch(1).unwrap();
+            control.finish_tracked(construction, epoch).unwrap();
+            let closing = control.close().unwrap();
+            let Poll::Ready(Ok(drained)) = control.poll_drained(&closing) else {
+                panic!("unused domain must drain");
+            };
+            let permit = Arc::new(control.native_effects(&drained).unwrap());
+            let mut command = command(1, 1, kind);
+            command.native_effects = Some(permit);
+            let mut mailbox = CpuMailbox::new();
+            let ack = mailbox.apply(0, command.clone());
+            let completed = ack.result.is_ok();
+            assert_eq!(completed, kind == CpuCommandKind::InstallExecution);
+            assert!(control.seal(&drained).is_err());
+            let ack = finish_native_command(&mut command, ack);
+            assert_eq!(ack.result.is_ok(), completed);
+            assert!(command.native_effects.is_none());
+            assert!(control.seal(&drained).is_ok());
         }
     }
 

@@ -9,13 +9,19 @@ use super::defs;
 use super::defs::uapi;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
-use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
 use crate::virtio::vsock::packet::PacketQueue as VirtQueue;
+use crate::virtio::vsock::packet::{
+    RxPacket, TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, TxPacket,
+};
 
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::OwnedSocket as OwnedFd;
+#[cfg(windows)]
+use utils::windows::{AsRawFd, RawFd};
 
 use super::proxy::{DeferredCredit, Proxy, ProxyError, ProxyStatus, ProxyUpdate, RecvPkt};
 
@@ -211,35 +217,38 @@ impl UnixProxy {
         let mut queue = self.queue.lock().unwrap();
 
         while let Some(head) = queue.pop(&self.mem) {
-            let len = match VsockPacket::from_rx_virtq_head(&head, &mut queue.snapshot) {
-                Ok(mut pkt) => match sys::recv_to_pkt(self, &mut pkt) {
-                    RecvPkt::WaitForCredit => {
-                        wait_credit = true;
-                        0
-                    }
-                    RecvPkt::Read(cnt) => {
-                        self.rx_cnt += Wrapping(cnt as u32);
-                        self.init_data_pkt(&mut pkt);
-                        pkt.set_len(cnt as u32);
-                        pkt.hdr().len() + cnt
-                    }
-                    RecvPkt::Close => {
-                        #[cfg(unix)]
-                        {
-                            self.status = if self.mux_transport {
-                                ProxyStatus::PeerHalfClosed
-                            } else {
-                                ProxyStatus::Closed
-                            };
+            let (len, _packet) = match RxPacket::from_rx_virtq_head(&head, &mut queue.snapshot) {
+                Ok(mut pkt) => {
+                    let len = match sys::recv_to_pkt(self, &mut pkt) {
+                        RecvPkt::WaitForCredit => {
+                            wait_credit = true;
+                            0
                         }
-                        #[cfg(windows)]
-                        {
-                            self.status = ProxyStatus::Closed;
+                        RecvPkt::Read(cnt) => {
+                            self.rx_cnt += Wrapping(cnt as u32);
+                            self.init_data_pkt(&mut pkt);
+                            pkt.set_len(cnt as u32);
+                            crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE + cnt
                         }
-                        0
-                    }
-                    RecvPkt::Error => 0,
-                },
+                        RecvPkt::Close => {
+                            #[cfg(unix)]
+                            {
+                                self.status = if self.mux_transport {
+                                    ProxyStatus::PeerHalfClosed
+                                } else {
+                                    ProxyStatus::Closed
+                                };
+                            }
+                            #[cfg(windows)]
+                            {
+                                self.status = ProxyStatus::Closed;
+                            }
+                            0
+                        }
+                        RecvPkt::Error => 0,
+                    };
+                    (len, pkt)
+                }
                 Err(e) => {
                     debug!("recv_pkt: RX queue error: {e:?}");
                     queue.record_processing_failure();
@@ -271,7 +280,7 @@ impl UnixProxy {
         (have_used, wait_credit)
     }
 
-    pub(crate) fn init_data_pkt(&self, pkt: &mut VsockPacket) {
+    pub(crate) fn init_data_pkt(&self, pkt: &mut RxPacket) {
         debug!(
             "init_data_pkt: id={}, local_port={}, peer_port={}",
             self.id, self.local_port, self.peer_port
@@ -337,19 +346,19 @@ impl Proxy for UnixProxy {
         self.deferred_credit.is_enabled()
     }
 
-    fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+    fn connect(&mut self, pkt: &TxPacket, req: TsiConnectReq) -> ProxyUpdate {
         sys::do_connect(self, pkt, req)
     }
 
-    fn confirm_connect(&mut self, pkt: &VsockPacket) -> Option<ProxyUpdate> {
+    fn confirm_connect(&mut self, pkt: &TxPacket) -> Option<ProxyUpdate> {
         sys::confirm_connect(self, pkt)
     }
 
-    fn getpeername(&mut self, _pkt: &VsockPacket) {
+    fn getpeername(&mut self, _pkt: &TxPacket) {
         todo!();
     }
 
-    fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
+    fn sendmsg(&mut self, pkt: &TxPacket) -> ProxyUpdate {
         sys::sendmsg(self, pkt)
     }
 
@@ -359,7 +368,7 @@ impl Proxy for UnixProxy {
 
     fn listen(
         &mut self,
-        _pkt: &VsockPacket,
+        _pkt: &TxPacket,
         _req: TsiListenReq,
         _host_port_map: &Option<HashMap<u16, u16>>,
     ) -> ProxyUpdate {
@@ -370,7 +379,7 @@ impl Proxy for UnixProxy {
         todo!();
     }
 
-    fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
+    fn update_peer_credit(&mut self, pkt: &TxPacket) -> ProxyUpdate {
         sys::update_peer_credit(self, pkt)
     }
 
@@ -378,7 +387,7 @@ impl Proxy for UnixProxy {
         sys::push_op_request(self)
     }
 
-    fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
+    fn process_op_response(&mut self, pkt: &TxPacket) -> ProxyUpdate {
         sys::process_op_response(self, pkt)
     }
 
@@ -386,7 +395,7 @@ impl Proxy for UnixProxy {
         todo!();
     }
 
-    fn shutdown(&mut self, pkt: &VsockPacket) {
+    fn shutdown(&mut self, pkt: &TxPacket) {
         sys::do_shutdown(self, pkt)
     }
 
@@ -443,13 +452,13 @@ impl Proxy for UnixAcceptorProxy {
     fn status(&self) -> ProxyStatus {
         ProxyStatus::WaitingOnAccept
     }
-    fn connect(&mut self, _: &VsockPacket, _: TsiConnectReq) -> ProxyUpdate {
+    fn connect(&mut self, _: &TxPacket, _: TsiConnectReq) -> ProxyUpdate {
         unreachable!()
     }
-    fn getpeername(&mut self, _: &VsockPacket) {
+    fn getpeername(&mut self, _: &TxPacket) {
         unreachable!()
     }
-    fn sendmsg(&mut self, _: &VsockPacket) -> ProxyUpdate {
+    fn sendmsg(&mut self, _: &TxPacket) -> ProxyUpdate {
         unreachable!()
     }
     fn sendto_addr(&mut self, _: TsiSendtoAddr) -> ProxyUpdate {
@@ -457,7 +466,7 @@ impl Proxy for UnixAcceptorProxy {
     }
     fn listen(
         &mut self,
-        _: &VsockPacket,
+        _: &TxPacket,
         _: TsiListenReq,
         _: &Option<HashMap<u16, u16>>,
     ) -> ProxyUpdate {
@@ -466,10 +475,10 @@ impl Proxy for UnixAcceptorProxy {
     fn accept(&mut self, _: TsiAcceptReq) -> ProxyUpdate {
         unreachable!()
     }
-    fn update_peer_credit(&mut self, _: &VsockPacket) -> ProxyUpdate {
+    fn update_peer_credit(&mut self, _: &TxPacket) -> ProxyUpdate {
         unreachable!()
     }
-    fn process_op_response(&mut self, _: &VsockPacket) -> ProxyUpdate {
+    fn process_op_response(&mut self, _: &TxPacket) -> ProxyUpdate {
         unreachable!()
     }
     fn release(&mut self) -> ProxyUpdate {

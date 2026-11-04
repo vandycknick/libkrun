@@ -1000,7 +1000,7 @@ mod tests {
 
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let mut transport = MmioTransport::new(
-            memory,
+            crate::vmm::memory::runtime_memory_for_test(memory),
             DummyIrqChip::new().into(),
             Arc::new(Mutex::new(Rng::new().unwrap())),
             None,
@@ -1139,7 +1139,9 @@ mod tests {
 
         let device = Arc::new(Mutex::new(Rng::new().unwrap()));
         let mut transport = MmioTransport::new(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+            crate::vmm::memory::runtime_memory_for_test(
+                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+            ),
             DummyIrqChip::new().into(),
             device.clone(),
             None,

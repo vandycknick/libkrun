@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arch::ArchMemoryInfo;
+use devices::virtio::RuntimeGuestMemory;
 use devices::{Bus, BusDevice};
 use polly::event_manager::{BarrierGeneration, BarrierKey, BarrierRequest, OperationId};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
@@ -147,19 +148,24 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 fn memory() -> Result<GuestMemoryMmap, String> {
     GuestMemoryMmap::from_ranges(&MEMORY).map_err(|e| format!("fixture RAM: {e}"))
 }
-fn ram_bytes(memory: &GuestMemoryMmap) -> Result<Vec<u8>, String> {
+fn ram_bytes(memory: &RuntimeGuestMemory) -> Result<Vec<u8>, String> {
     let mut bytes = vec![0; RAM_BYTES];
     memory
         .read_slice(&mut bytes, GuestAddress(0))
         .map_err(|e| e.to_string())?;
     Ok(bytes)
 }
-fn word(memory: &GuestMemoryMmap, cpu: usize, offset: u64) -> Result<u64, String> {
+fn word(memory: &RuntimeGuestMemory, cpu: usize, offset: u64) -> Result<u64, String> {
     memory
         .read_obj(GuestAddress(SLOT + cpu as u64 * STRIDE + offset))
         .map_err(|e| e.to_string())
 }
-fn set_word(memory: &GuestMemoryMmap, cpu: usize, offset: u64, value: u64) -> Result<(), String> {
+fn set_word(
+    memory: &RuntimeGuestMemory,
+    cpu: usize,
+    offset: u64,
+    value: u64,
+) -> Result<(), String> {
     memory
         .write_obj(value, GuestAddress(SLOT + cpu as u64 * STRIDE + offset))
         .map_err(|e| e.to_string())
@@ -236,7 +242,7 @@ fn x86(state: &CpuExecutionState) -> Result<&X86CpuState, String> {
 }
 fn validate_cut(
     envelope: &ExecutionEnvelope,
-    memory: &GuestMemoryMmap,
+    memory: &RuntimeGuestMemory,
     case: Case,
     count: u8,
 ) -> Result<(), String> {
@@ -563,12 +569,12 @@ fn capture_withheld(
     }
     Ok(recaptured)
 }
-fn progress(memory: &GuestMemoryMmap, count: u8) -> Result<Vec<u64>, String> {
+fn progress(memory: &RuntimeGuestMemory, count: u8) -> Result<Vec<u64>, String> {
     (0..usize::from(count))
         .map(|cpu| word(memory, cpu, 16))
         .collect()
 }
-fn identities(memory: &GuestMemoryMmap, count: u8) -> Result<(), String> {
+fn identities(memory: &RuntimeGuestMemory, count: u8) -> Result<(), String> {
     for cpu in 0..usize::from(count) {
         if word(memory, cpu, 0)? != MAGIC
             || word(memory, cpu, 8)? != 1
@@ -581,7 +587,7 @@ fn identities(memory: &GuestMemoryMmap, count: u8) -> Result<(), String> {
     }
     Ok(())
 }
-fn continued(memory: &GuestMemoryMmap, count: u8) -> Result<Vec<u64>, String> {
+fn continued(memory: &RuntimeGuestMemory, count: u8) -> Result<Vec<u64>, String> {
     let before = progress(memory, count)?;
     wait_until("guest sustained progress", || {
         Ok(progress(memory, count)?
@@ -593,7 +599,7 @@ fn continued(memory: &GuestMemoryMmap, count: u8) -> Result<Vec<u64>, String> {
     progress(memory, count)
 }
 fn bracket(
-    memory: &GuestMemoryMmap,
+    memory: &RuntimeGuestMemory,
     count: u8,
     offset_difference: u64,
 ) -> Result<Vec<u64>, String> {
@@ -727,6 +733,11 @@ impl Attempt {
                     failure.get_or_insert(error);
                 }
                 Poll::Pending => (),
+            }
+            if Instant::now() >= barrier.deadline {
+                return Err(format!(
+                    "terminal cleanup deadline; retained_failure={failure:?}; all_reaped=false"
+                ));
             }
             thread::sleep(Duration::from_millis(1));
         }
@@ -1087,7 +1098,6 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
         memory
             .write_slice(&ram, GuestAddress(0))
             .map_err(|e| e.to_string())?;
-        let observed = memory.clone();
         let gate = Arc::new(CompletionGate::default());
         let (io, mmio) = buses(&gate)?;
         let mut devices = PreparedDeviceInstall::diagnostic(&expected, io, mmio)?;
@@ -1125,8 +1135,8 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
             gate,
             stopped: false,
         };
-        let no_entry =
-            !attempt.vmm.control.cpus.release_may_have_run() && ram == ram_bytes(&observed)?;
+        let no_entry = !attempt.vmm.control.cpus.release_may_have_run()
+            && ram == ram_bytes(&attempt.vmm.guest_memory)?;
         let ack = attempt
             .vmm
             .vcpus_handles
@@ -1181,8 +1191,12 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
             return Err("expected HANDLER:IO_COMPLETE:MMIO_COMPLETE symbols".into());
         }
         let memory = fixture_memory(Path::new(&args[3]), symbols[0])?;
-        set_word(&memory, 0, 240, symbols[1])?;
-        set_word(&memory, 0, 248, symbols[2])?;
+        memory
+            .write_obj(symbols[1], GuestAddress(SLOT + 240))
+            .map_err(|error| error.to_string())?;
+        memory
+            .write_obj(symbols[2], GuestAddress(SLOT + 248))
+            .map_err(|error| error.to_string())?;
         let gate = Arc::new(CompletionGate::default());
         let (io, mmio) = buses(&gate)?;
         let vmm = build_execution_fixture(
@@ -1225,6 +1239,8 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
             // Observe actual native TSC frequency before allowing the fixture to arm.
             park(&mut attempt.vmm, 1, &attempt.gate)?;
             let seed = capture_withheld(&mut attempt.vmm, &expected, &out)?;
+            release(&mut attempt.vmm, 1)?;
+            // Seed writes belong to the reopened epoch, never to the sealed execution cut.
             for (cpu, state) in seed.cpus.iter().enumerate() {
                 set_word(
                     &attempt.vmm.guest_memory,
@@ -1233,7 +1249,6 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
                     u64::from(x86(state)?.tsc_khz) * 500,
                 )?;
             }
-            release(&mut attempt.vmm, 1)?;
             let mut next = expected;
             next.pause_generation = 2;
             if negative {
@@ -1405,12 +1420,16 @@ mod tests {
     #[test]
     fn native_execution_probe_fixture_ram_copy_preserves_boundaries() {
         use crate::api::native_execution_probe::{RAM_BYTES, memory, ram_bytes};
-        use vm_memory::{Bytes, GuestAddress};
-        let ram = memory().unwrap();
+        use crate::vmm::memory::runtime_memory_for_test;
+        use vm_memory::GuestAddress;
+        let ram = runtime_memory_for_test(memory().unwrap());
         ram.write_slice(&[0x35, 0xa7], GuestAddress(0)).unwrap();
         ram.write_slice(&[0x81, 0x19], GuestAddress(RAM_BYTES as u64 - 2))
             .unwrap();
-        let bytes = ram_bytes(&ram).unwrap();
+        let observed = ram.clone();
+        assert!(std::sync::Arc::ptr_eq(ram.domain(), observed.domain()));
+        drop(ram);
+        let bytes = ram_bytes(&observed).unwrap();
         assert_eq!(bytes.len(), RAM_BYTES);
         assert_eq!(&bytes[..2], &[0x35, 0xa7]);
         assert_eq!(&bytes[RAM_BYTES - 2..], &[0x81, 0x19]);

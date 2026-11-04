@@ -7,16 +7,16 @@ use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::socket::{
     AddressFamily, Backlog, MsgFlags, Shutdown, SockFlag, SockType, UnixAddr, accept, bind,
-    connect, listen, recv, send, shutdown, socket,
+    connect, listen, send, shutdown, socket,
 };
 
 #[cfg(target_os = "macos")]
 use super::super::super::linux_errno::linux_errno_raw;
 use super::super::muxer::{MuxerRx, push_packet};
-use super::super::packet::{TsiConnectReq, VsockPacket};
 use super::super::proxy::{
     NewProxyType, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
 };
+use crate::virtio::vsock::packet::{RxPacket, TsiConnectReq, TxPacket};
 use utils::epoll::EventSet;
 
 pub type PlatformHandle = OwnedFd;
@@ -94,7 +94,7 @@ fn push_connect_rsp(proxy: &super::UnixProxy, result: i32) {
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 }
 
-pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> RecvPkt {
+pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut RxPacket) -> RecvPkt {
     if let Some(buf) = pkt.buf_mut() {
         let peer_credit = proxy.peer_avail_credit();
         let max_len = std::cmp::min(buf.len(), peer_credit);
@@ -110,9 +110,10 @@ pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> Re
             return RecvPkt::WaitForCredit;
         }
 
-        match recv(
+        match crate::virtio::vsock::packet::recv_into(
             proxy.fd.as_raw_fd(),
-            &mut buf[..max_len],
+            buf,
+            max_len,
             MsgFlags::MSG_DONTWAIT,
         ) {
             Ok(cnt) => {
@@ -137,7 +138,7 @@ pub(crate) fn recv_to_pkt(proxy: &super::UnixProxy, pkt: &mut VsockPacket) -> Re
 
 pub(crate) fn do_connect(
     proxy: &mut super::UnixProxy,
-    _pkt: &VsockPacket,
+    _pkt: &TxPacket,
     _req: TsiConnectReq,
 ) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
@@ -176,10 +177,7 @@ pub(crate) fn do_connect(
     update
 }
 
-pub(crate) fn confirm_connect(
-    proxy: &mut super::UnixProxy,
-    pkt: &VsockPacket,
-) -> Option<ProxyUpdate> {
+pub(crate) fn confirm_connect(proxy: &mut super::UnixProxy, pkt: &TxPacket) -> Option<ProxyUpdate> {
     debug!(
         "confirm_connect: local_port={} peer_port={}, src_port={}, dst_port={}",
         pkt.dst_port(),
@@ -204,7 +202,7 @@ pub(crate) fn confirm_connect(
     None
 }
 
-pub(crate) fn sendmsg(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyUpdate {
+pub(crate) fn sendmsg(proxy: &mut super::UnixProxy, pkt: &TxPacket) -> ProxyUpdate {
     if proxy.mux_transport {
         return sendmsg_mux(proxy, pkt);
     }
@@ -217,7 +215,7 @@ pub(crate) fn sendmsg(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyU
         #[cfg(target_os = "linux")]
         let flags = MsgFlags::MSG_NOSIGNAL;
 
-        match send(proxy.fd.as_raw_fd(), buf, flags) {
+        match crate::virtio::vsock::packet::send_from(proxy.fd.as_raw_fd(), buf, flags) {
             Ok(sent) => {
                 if sent != buf.len() {
                     error!("couldn't set everything: buf={}, sent={}", buf.len(), sent);
@@ -259,7 +257,7 @@ pub(crate) fn sendmsg(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyU
 
 fn sendmsg_mux(
     proxy: &mut crate::virtio::vsock::unix_proxy::UnixProxy,
-    pkt: &VsockPacket,
+    pkt: &TxPacket,
 ) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
     if proxy.status == ProxyStatus::WaitingOnHost {
@@ -281,8 +279,10 @@ fn sendmsg_mux(
         update.signal_queue = true;
         return update;
     }
-    proxy.pending_tx_bytes += buf.len();
-    proxy.pending_tx.push_back(buf.to_vec());
+    let mut bytes = vec![0; buf.len()];
+    buf.copy_to(&mut bytes);
+    proxy.pending_tx_bytes += bytes.len();
+    proxy.pending_tx.push_back(bytes);
     flush_pending_tx(proxy, &mut update);
     update
 }
@@ -364,7 +364,7 @@ fn flush_pending_tx(
     }
 }
 
-pub(crate) fn update_peer_credit(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyUpdate {
+pub(crate) fn update_peer_credit(proxy: &mut super::UnixProxy, pkt: &TxPacket) -> ProxyUpdate {
     debug!(
         "update_credit: buf_alloc={} rx_cnt={} fwd_cnt={}",
         pkt.buf_alloc(),
@@ -414,7 +414,7 @@ pub(crate) fn push_op_request(proxy: &super::UnixProxy) {
     push_packet(proxy.cid, rx, &proxy.rxq, &proxy.queue, &proxy.mem);
 }
 
-pub(crate) fn process_op_response(proxy: &mut super::UnixProxy, pkt: &VsockPacket) -> ProxyUpdate {
+pub(crate) fn process_op_response(proxy: &mut super::UnixProxy, pkt: &TxPacket) -> ProxyUpdate {
     debug!(
         "process_op_response: id={} src_port={} dst_port={}",
         proxy.id,
@@ -521,7 +521,7 @@ pub(crate) fn fail_mux(
     })
 }
 
-pub(crate) fn do_shutdown(proxy: &mut super::UnixProxy, pkt: &VsockPacket) {
+pub(crate) fn do_shutdown(proxy: &mut super::UnixProxy, pkt: &TxPacket) {
     let recv_off = pkt.flags() & super::uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
     let send_off = pkt.flags() & super::uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
 
@@ -735,13 +735,13 @@ mod tests {
     use nix::sys::socket::{
         AddressFamily, MsgFlags, Shutdown, SockFlag, SockType, recv, send, socketpair,
     };
-    use vm_memory::{Address, GuestAddress, GuestMemoryMmap};
+    use vm_memory::{Address, GuestAddress};
 
     use crate::virtio::queue::tests::VirtQueue;
     use crate::virtio::vsock::control_proxy::prepare_stream;
     use crate::virtio::vsock::defs::uapi;
     use crate::virtio::vsock::muxer_rxq::MuxerRxQ;
-    use crate::virtio::vsock::packet::{VSOCK_PKT_HDR_SIZE, VsockPacket};
+    use crate::virtio::vsock::packet::{RxPacket, TxPacket, VSOCK_PKT_HDR_SIZE};
     use crate::virtio::vsock::unix_proxy::unix::*;
     use crate::virtio::{Descriptor, DescriptorChain, Queue, RuntimeGuestMemory};
 
@@ -785,7 +785,7 @@ mod tests {
     const CREDIT_PACKET_DESC: GuestAddress = GuestAddress(0x3000);
     const CREDIT_PACKET_HDR: GuestAddress = GuestAddress(0x3100);
 
-    fn credit_packet(mem: &RuntimeGuestMemory, buf_alloc: u32, fwd_cnt: u32) -> VsockPacket<'_> {
+    fn credit_packet(mem: &RuntimeGuestMemory, buf_alloc: u32, fwd_cnt: u32) -> TxPacket<'_> {
         mem.write_obj(
             Descriptor {
                 addr: CREDIT_PACKET_HDR.raw_value(),
@@ -798,15 +798,20 @@ mod tests {
         .unwrap();
         mem.write_slice(&[0; VSOCK_PKT_HDR_SIZE], CREDIT_PACKET_HDR)
             .unwrap();
+        mem.write_obj(
+            buf_alloc.to_le(),
+            CREDIT_PACKET_HDR.checked_add(36).unwrap(),
+        )
+        .unwrap();
+        mem.write_obj(fwd_cnt.to_le(), CREDIT_PACKET_HDR.checked_add(40).unwrap())
+            .unwrap();
         let chain = DescriptorChain::checked_new(mem, CREDIT_PACKET_DESC, 1, 0).unwrap();
-        let mut packet = VsockPacket::from_tx_virtq_head(
+        TxPacket::from_tx_virtq_head(
             &chain,
             &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(1),
             None,
         )
-        .unwrap();
-        packet.set_buf_alloc(buf_alloc).set_fwd_cnt(fwd_cnt);
-        packet
+        .unwrap()
     }
 
     fn socketpair_proxy_with_rx_buffers(
@@ -828,9 +833,7 @@ mod tests {
         .unwrap();
         prepare_stream(&fd).unwrap();
         prepare_stream(&peer).unwrap();
-        let mem = RuntimeGuestMemory::passthrough(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20_000)]).unwrap(),
-        );
+        let mem = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x20_000)]).unwrap();
         let virt_queue = VirtQueue::new(GuestAddress(0), &mem, QUEUE_SIZE);
         let mut data_addresses = Vec::with_capacity(buffer_count);
         for index in 0..buffer_count {
@@ -892,9 +895,7 @@ mod tests {
         .unwrap();
         prepare_stream(&fd).unwrap();
         prepare_stream(&peer).unwrap();
-        let memory = RuntimeGuestMemory::passthrough(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap(),
-        );
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap();
         let rxq = Arc::new(Mutex::new(MuxerRxQ::new()));
         let proxy = crate::virtio::vsock::unix_proxy::UnixProxy::new_waiting_on_host(
             (7u64 << 32) | 9,
@@ -924,7 +925,7 @@ mod tests {
             )
             .unwrap();
         let head = DescriptorChain::checked_new(memory, GuestAddress(0x3800), 1, 0).unwrap();
-        let mut packet = VsockPacket::from_rx_virtq_head(
+        let mut packet = RxPacket::from_rx_virtq_head(
             &head,
             &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(1),
         )
@@ -1034,7 +1035,7 @@ mod tests {
             (packet_count * 2) as u16,
         )
         .unwrap();
-        let shutdown_packet = VsockPacket::from_rx_virtq_head(
+        let shutdown_packet = RxPacket::from_rx_virtq_head(
             &shutdown_chain,
             &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(QUEUE_SIZE),
         )
@@ -1127,7 +1128,7 @@ mod tests {
         mem.write_obj((payload.len() as u32).to_le(), GuestAddress(0x3318))
             .unwrap();
         let head = DescriptorChain::checked_new(&mem, GuestAddress(0x3200), 2, 0).unwrap();
-        let packet = VsockPacket::from_tx_virtq_head(
+        let packet = TxPacket::from_tx_virtq_head(
             &head,
             &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(2),
             None,

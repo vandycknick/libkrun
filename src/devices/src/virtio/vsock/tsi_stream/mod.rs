@@ -7,8 +7,10 @@ use super::defs;
 use super::defs::uapi;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
-use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
 use crate::virtio::vsock::packet::PacketQueue as VirtQueue;
+use crate::virtio::vsock::packet::{
+    RxPacket, TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, TxPacket,
+};
 
 #[cfg(unix)]
 use nix::sys::socket::AddressFamily;
@@ -16,6 +18,12 @@ use nix::sys::socket::AddressFamily;
 use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::OwnedSocket as OwnedFd;
+#[cfg(windows)]
+use utils::windows::{AsRawFd, RawFd};
+#[cfg(windows)]
+use windows_sys::Win32::Networking::WinSock::ADDRESS_FAMILY as AddressFamily;
 
 use super::proxy::{
     DeferredCredit, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt,
@@ -136,7 +144,7 @@ impl TsiStreamProxy {
         }
     }
 
-    pub(crate) fn init_data_pkt(&self, pkt: &mut VsockPacket) {
+    pub(crate) fn init_data_pkt(&self, pkt: &mut RxPacket) {
         debug!(
             "init_data_pkt: id={}, local_port={}, peer_port={}",
             self.id, self.local_port, self.peer_port
@@ -161,24 +169,27 @@ impl TsiStreamProxy {
         let mut queue = self.queue.lock().unwrap();
 
         while let Some(head) = queue.pop(&self.mem) {
-            let len = match VsockPacket::from_rx_virtq_head(&head, &mut queue.snapshot) {
-                Ok(mut pkt) => match sys::recv_to_pkt(self, &mut pkt) {
-                    RecvPkt::WaitForCredit => {
-                        wait_credit = true;
-                        0
-                    }
-                    RecvPkt::Read(cnt) => {
-                        self.rx_cnt += Wrapping(cnt as u32);
-                        self.init_data_pkt(&mut pkt);
-                        pkt.set_len(cnt as u32);
-                        pkt.hdr().len() + cnt
-                    }
-                    RecvPkt::Close => {
-                        self.status = ProxyStatus::Closed;
-                        0
-                    }
-                    RecvPkt::Error => 0,
-                },
+            let (len, _packet) = match RxPacket::from_rx_virtq_head(&head, &mut queue.snapshot) {
+                Ok(mut pkt) => {
+                    let len = match sys::recv_to_pkt(self, &mut pkt) {
+                        RecvPkt::WaitForCredit => {
+                            wait_credit = true;
+                            0
+                        }
+                        RecvPkt::Read(cnt) => {
+                            self.rx_cnt += Wrapping(cnt as u32);
+                            self.init_data_pkt(&mut pkt);
+                            pkt.set_len(cnt as u32);
+                            crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE + cnt
+                        }
+                        RecvPkt::Close => {
+                            self.status = ProxyStatus::Closed;
+                            0
+                        }
+                        RecvPkt::Error => 0,
+                    };
+                    (len, pkt)
+                }
                 Err(e) => {
                     debug!("recv_pkt: RX queue error: {e:?}");
                     queue.record_processing_failure();
@@ -274,11 +285,11 @@ impl Proxy for TsiStreamProxy {
         self.deferred_credit.is_enabled()
     }
 
-    fn connect(&mut self, pkt: &VsockPacket, req: TsiConnectReq) -> ProxyUpdate {
+    fn connect(&mut self, pkt: &TxPacket, req: TsiConnectReq) -> ProxyUpdate {
         sys::do_connect(self, pkt, req)
     }
 
-    fn confirm_connect(&mut self, pkt: &VsockPacket) -> Option<ProxyUpdate> {
+    fn confirm_connect(&mut self, pkt: &TxPacket) -> Option<ProxyUpdate> {
         debug!(
             "confirm_connect: local_port={} peer_port={}, src_port={}, dst_port={}",
             pkt.dst_port(),
@@ -308,11 +319,11 @@ impl Proxy for TsiStreamProxy {
         })
     }
 
-    fn getpeername(&mut self, pkt: &VsockPacket) {
+    fn getpeername(&mut self, pkt: &TxPacket) {
         sys::do_getpeername(self, pkt)
     }
 
-    fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
+    fn sendmsg(&mut self, pkt: &TxPacket) -> ProxyUpdate {
         sys::sendmsg(self, pkt)
     }
 
@@ -322,7 +333,7 @@ impl Proxy for TsiStreamProxy {
 
     fn listen(
         &mut self,
-        pkt: &VsockPacket,
+        pkt: &TxPacket,
         req: TsiListenReq,
         host_port_map: &Option<HashMap<u16, u16>>,
     ) -> ProxyUpdate {
@@ -333,7 +344,7 @@ impl Proxy for TsiStreamProxy {
         sys::do_accept(self, req)
     }
 
-    fn update_peer_credit(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
+    fn update_peer_credit(&mut self, pkt: &TxPacket) -> ProxyUpdate {
         sys::update_peer_credit(self, pkt)
     }
 
@@ -351,7 +362,7 @@ impl Proxy for TsiStreamProxy {
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
 
-    fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
+    fn process_op_response(&mut self, pkt: &TxPacket) -> ProxyUpdate {
         sys::process_op_response(self, pkt)
     }
 
@@ -381,7 +392,7 @@ impl Proxy for TsiStreamProxy {
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
     }
 
-    fn shutdown(&mut self, pkt: &VsockPacket) {
+    fn shutdown(&mut self, pkt: &TxPacket) {
         sys::do_shutdown(self, pkt)
     }
 

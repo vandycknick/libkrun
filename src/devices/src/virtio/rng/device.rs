@@ -5,7 +5,7 @@ use rand::{TryRng, rngs::SysRng};
 use utils::eventfd::EventFd;
 use utils::state::{Reader, Writer};
 
-use vm_memory::{Bytes, GuestAddress, GuestMemoryError};
+use vm_memory::{GuestAddress, GuestMemoryError};
 
 use crate::virtio::InterruptTransport;
 use crate::virtio::descriptor_utils::{DescriptorChainSnapshot, ValidatedDescriptorChain};
@@ -165,8 +165,8 @@ fn execute_validated_request(
     let mut written = 0u32;
     let mut failed = false;
     for descriptor in snapshot.descriptors() {
-        // A later lease or entropy failure cannot rewind earlier real DMA.
-        let result = memory.try_access(
+        // A later admission or entropy failure cannot rewind earlier real DMA.
+        let result = memory.try_write_access(
             descriptor.len as usize,
             GuestAddress(descriptor.addr),
             |_, len, _, target| {

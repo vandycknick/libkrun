@@ -23,7 +23,7 @@ use crate::virtio::vsock::TsiFlags;
 #[cfg(unix)]
 use crate::virtio::vsock::UnixSocketIdentity;
 use crate::virtio::vsock::muxer::VsockMuxer;
-use crate::virtio::vsock::packet::{PacketQueue, VsockPacket};
+use crate::virtio::vsock::packet::{PacketQueue, RxPacket, TxPacket};
 use crate::virtio::vsock::state::ProviderState;
 use crate::virtio::vsock::{defs, defs::uapi};
 use crate::virtio::{
@@ -353,30 +353,36 @@ impl Vsock {
         };
         while let Some(head) = queue_rx.pop(mem) {
             debug!("process_rx inside while");
-            let used_len = match VsockPacket::from_rx_virtq_head(&head, &mut queue_rx.snapshot) {
-                Ok(mut pkt) => match self.muxer.recv_pkt(&mut pkt) {
-                    Ok(()) => pkt.hdr().len() as u32 + pkt.len(),
-                    Err(crate::virtio::vsock::VsockError::BufDescTooSmall) => 0,
-                    Err(crate::virtio::vsock::VsockError::NoData) => {
-                        if queue_rx.undo_pop(head.index).is_err() {
-                            self.provider.retain_fault(ProviderFault::QueueState);
-                        }
-                        break;
+            let (used_len, _packet) =
+                match RxPacket::from_rx_virtq_head(&head, &mut queue_rx.snapshot) {
+                    Ok(mut pkt) => {
+                        let len = match self.muxer.recv_pkt(&mut pkt) {
+                            Ok(()) => {
+                                crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE as u32 + pkt.len()
+                            }
+                            Err(crate::virtio::vsock::VsockError::BufDescTooSmall) => 0,
+                            Err(crate::virtio::vsock::VsockError::NoData) => {
+                                if queue_rx.undo_pop(head.index).is_err() {
+                                    self.provider.retain_fault(ProviderFault::QueueState);
+                                }
+                                break;
+                            }
+                            Err(_) => {
+                                queue_rx.record_processing_failure();
+                                self.provider.retain_fault(ProviderFault::QueueState);
+                                break;
+                            }
+                        };
+                        (len, pkt)
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        warn!("RX queue error: {e:?}");
                         queue_rx.record_processing_failure();
                         self.provider.retain_fault(ProviderFault::QueueState);
+                        have_used |= queue_rx.add_used(mem, head.index, 0).is_ok();
                         break;
                     }
-                },
-                Err(e) => {
-                    warn!("RX queue error: {e:?}");
-                    queue_rx.record_processing_failure();
-                    self.provider.retain_fault(ProviderFault::QueueState);
-                    have_used |= queue_rx.add_used(mem, head.index, 0).is_ok();
-                    break;
-                }
-            };
+                };
 
             debug!("process_rx: something to queue");
             have_used = true;
@@ -436,7 +442,7 @@ impl Vsock {
                 }
                 continue;
             }
-            let pkt = match VsockPacket::from_tx_virtq_head(
+            let pkt = match TxPacket::from_tx_virtq_head(
                 &head,
                 &mut self.tx_snapshot,
                 Some(&mut self.tx_buffer),

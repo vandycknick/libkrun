@@ -1,3 +1,4 @@
+use crate::virtio::{ReadView, WriteView};
 use libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ};
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -8,8 +9,6 @@ use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
-use vm_memory::bitmap::Bitmap;
-use vm_memory::{VolatileMemoryError, VolatileSlice, WriteVolatile};
 
 use crate::virtio::console::port_io::{
     PortInput, PortInputEmpty, PortOutput, PortTerminalProperties,
@@ -68,32 +67,15 @@ impl AsRawFd for PortInputFd {
 }
 
 impl PortInput for PortInputFd {
-    fn read_volatile(&mut self, buf: &mut VolatileSlice) -> io::Result<usize> {
-        // nix::read requires a Rust byte slice; guest memory is volatile and
-        // cannot be reborrowed as an ordinary mutable slice.
-
-        let fd = self.as_raw_fd();
-        let guard = buf.ptr_guard_mut();
-
-        let dst = guard.as_ptr().cast::<libc::c_void>();
-
-        // SAFETY: We got a valid file descriptor from `AsRawFd`. The memory pointed to by `dst` is
-        // valid for writes of length `buf.len() by the invariants upheld by the constructor
-        // of `VolatileSlice`.
-        let bytes_read = unsafe { libc::read(fd, dst, buf.len()) };
-
+    fn read_volatile(&mut self, buf: WriteView<'_>) -> io::Result<usize> {
+        // nix requires a Rust slice, which cannot represent concurrently accessed guest RAM.
+        // The write view keeps its premarked, bounded destination alive through this call.
+        let bytes_read =
+            unsafe { libc::read(self.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         if bytes_read < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() != ErrorKind::WouldBlock {
-                // We don't know if a partial read might have happened, so mark everything as dirty
-                buf.bitmap().mark_dirty(0, buf.len());
-            }
-
-            Err(err)
+            Err(io::Error::last_os_error())
         } else {
-            let bytes_read = bytes_read as usize;
-            buf.bitmap().mark_dirty(0, bytes_read);
-            Ok(bytes_read)
+            Ok(bytes_read as usize)
         }
     }
 
@@ -111,7 +93,7 @@ impl PortInput for PortInputFd {
 }
 
 impl PortInput for PortInputEmpty {
-    fn read_volatile(&mut self, _buf: &mut VolatileSlice) -> Result<usize, io::Error> {
+    fn read_volatile(&mut self, _buf: WriteView<'_>) -> Result<usize, io::Error> {
         Ok(0)
     }
 
@@ -137,14 +119,14 @@ impl AsRawFd for PortOutputFd {
 }
 
 impl PortOutput for PortOutputFd {
-    fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error> {
-        self.0.write_volatile(buf).map_err(|e| match e {
-            VolatileMemoryError::IOError(e) => e,
-            e => {
-                log::error!("Unsuported error from write_volatile: {e:?}");
-                io::Error::other(e)
-            }
-        })
+    fn write_volatile(&mut self, buf: ReadView<'_>) -> Result<usize, io::Error> {
+        // nix requires a Rust slice; this read-only pointer remains view-bounded.
+        let written = unsafe { libc::write(self.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
+        if written < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(written as usize)
+        }
     }
 
     fn wait_until_writable(&self, terminal_stopfd: &EventFd) -> io::Result<()> {
@@ -207,10 +189,13 @@ impl Default for PortInputSigInt {
 }
 
 impl PortInput for PortInputSigInt {
-    fn read_volatile(&mut self, buf: &mut VolatileSlice) -> Result<usize, io::Error> {
+    fn read_volatile(&mut self, buf: WriteView<'_>) -> Result<usize, io::Error> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         self.sigint_evt.read()?;
         log::trace!("SIGINT received");
-        buf.copy_from(&[3u8]); //ASCII 'ETX' -> generates SIGINIT in a terminal
+        buf.write_slice(&[3u8], 0).map_err(io::Error::other)?;
         Ok(1)
     }
 
@@ -256,3 +241,101 @@ struct WS {
 }
 
 ioctl_read_bad!(tiocgwinsz, TIOCGWINSZ, WS);
+
+#[cfg(test)]
+mod tests {
+    use crate::virtio::console::port_io::unix::{PortInputFd, PortOutputFd, make_non_blocking};
+    use crate::virtio::console::port_io::{PortInput, PortInputSigInt, PortOutput};
+    use crate::virtio::{ReadView, RuntimeGuestMemory};
+    use nix::unistd::{pipe, read, write};
+    use std::io::ErrorKind;
+    use vm_memory::GuestAddress;
+
+    #[test]
+    fn console_port_views_real_pipe_clipping_and_backing_lifetime() {
+        let (input_fd, producer) = pipe().unwrap();
+        make_non_blocking(&input_fd).unwrap();
+        assert_eq!(write(&producer, b"abcdef").unwrap(), 6);
+        let mut input = PortInputFd(input_fd);
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        memory.write_slice(&[0x77; 8], GuestAddress(0x100)).unwrap();
+        let destination = memory.write(GuestAddress(0x100), 8).unwrap();
+        drop(memory);
+        assert_eq!(
+            input
+                .read_volatile(destination.write_view(0, 3).unwrap())
+                .unwrap(),
+            3
+        );
+        let mut actual = [0; 8];
+        destination
+            .read_view(0, 8)
+            .unwrap()
+            .read_slice(&mut actual, 0)
+            .unwrap();
+        assert_eq!(&actual[..3], b"abc");
+        assert_eq!(&actual[3..], &[0x77; 5]);
+
+        let (consumer, output_fd) = pipe().unwrap();
+        let mut output = PortOutputFd(output_fd);
+        assert_eq!(
+            output
+                .write_volatile(destination.read_view(0, 3).unwrap())
+                .unwrap(),
+            3
+        );
+        let mut copied = [0; 8];
+        assert_eq!(read(&consumer, &mut copied).unwrap(), 3);
+        assert_eq!(&copied[..3], b"abc");
+        assert_eq!(
+            output
+                .write_volatile(ReadView::from_slice(b"host"))
+                .unwrap(),
+            4
+        );
+        assert_eq!(read(&consumer, &mut copied).unwrap(), 4);
+        assert_eq!(&copied[..4], b"host");
+
+        assert_eq!(
+            input
+                .read_volatile(destination.write_view(3, 5).unwrap())
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            input
+                .read_volatile(destination.write_view(6, 2).unwrap())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::WouldBlock
+        );
+        destination
+            .read_view(0, 8)
+            .unwrap()
+            .read_slice(&mut actual, 0)
+            .unwrap();
+        assert_eq!(&actual[..6], b"abcdef");
+        assert_eq!(&actual[6..], &[0x77; 2]);
+    }
+
+    #[test]
+    fn console_port_views_empty_ctrl_c_does_not_consume_signal() {
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let guard = memory.write(GuestAddress(0x100), 1).unwrap();
+        let mut input = PortInputSigInt::new();
+        input.sigint_evt().write(1).unwrap();
+        assert_eq!(
+            input
+                .read_volatile(guard.write_view(0, 0).unwrap())
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            input
+                .read_volatile(guard.write_view(0, 1).unwrap())
+                .unwrap(),
+            1
+        );
+        assert_eq!(guard.read_view(0, 1).unwrap().read_obj::<u8>(0).unwrap(), 3);
+    }
+}

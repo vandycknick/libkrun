@@ -481,13 +481,26 @@ impl BlockWorker {
                 if !data_len.is_multiple_of(512) {
                     Err(RequestError::InvalidDataLength)
                 } else {
-                    writer
-                        .write_from_at(
-                            &self.disk,
-                            data_len,
-                            self.checked_range(request_header.sector, data_len)?,
-                        )
-                        .map_err(RequestError::ReadingFromBackend)
+                    let mut offset = self.checked_range(request_header.sector, data_len)?;
+                    let mut remaining = data_len;
+                    while remaining != 0 {
+                        match writer.write_from_at(&self.disk, remaining, offset) {
+                            Ok(0) => {
+                                return Err(RequestError::ReadingFromBackend(io::Error::from(
+                                    io::ErrorKind::UnexpectedEof,
+                                )));
+                            }
+                            Ok(count) => {
+                                remaining -= count;
+                                offset = offset
+                                    .checked_add(count as u64)
+                                    .ok_or(RequestError::InvalidDataLength)?;
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(error) => return Err(RequestError::ReadingFromBackend(error)),
+                        }
+                    }
+                    Ok(data_len)
                 }
             }
             VIRTIO_BLK_T_OUT => {
@@ -495,13 +508,26 @@ impl BlockWorker {
                 if !data_len.is_multiple_of(512) {
                     Err(RequestError::InvalidDataLength)
                 } else {
-                    reader
-                        .read_to_at(
-                            &self.disk,
-                            data_len,
-                            self.checked_range(request_header.sector, data_len)?,
-                        )
-                        .map_err(RequestError::WritingToBackend)
+                    let mut offset = self.checked_range(request_header.sector, data_len)?;
+                    let mut remaining = data_len;
+                    while remaining != 0 {
+                        match reader.read_to_at(&self.disk, remaining, offset) {
+                            Ok(0) => {
+                                return Err(RequestError::WritingToBackend(io::Error::from(
+                                    io::ErrorKind::WriteZero,
+                                )));
+                            }
+                            Ok(count) => {
+                                remaining -= count;
+                                offset = offset
+                                    .checked_add(count as u64)
+                                    .ok_or(RequestError::InvalidDataLength)?;
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(error) => return Err(RequestError::WritingToBackend(error)),
+                        }
+                    }
+                    Ok(data_len)
                 }
             }
             VIRTIO_BLK_T_FLUSH => match self.disk.cache_type() {
@@ -958,6 +984,106 @@ mod tests {
             worker.device_queue.queue.capture_state().unwrap().next_used,
             3
         );
+    }
+
+    fn assert_scattered_request_crosses_view_batch(read_from_disk: bool) {
+        use virtio_bindings::virtio_blk::{VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
+
+        const SPANS: usize = 65;
+        const SPAN_LENGTH: usize = 512;
+        const DISK_OFFSET: usize = 3 * SPAN_LENGTH;
+        let payload: Vec<u8> = (0..SPANS * SPAN_LENGTH)
+            .map(|index| (index % 251 + 1) as u8)
+            .collect();
+        let backing = TempFile::new().unwrap();
+        let mut expected_disk = vec![0x99; 0x20000];
+        if read_from_disk {
+            expected_disk[DISK_OFFSET..DISK_OFFSET + payload.len()].copy_from_slice(&payload);
+        }
+        fs::write(backing.as_path(), &expected_disk).unwrap();
+        let (disk, _) = open_raw(backing.as_path());
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x60000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0), &memory, 128);
+        ring.dtable[0].set(0x8000, 16, 1, 1);
+        memory
+            .write_obj(
+                RequestHeader {
+                    request_type: if read_from_disk {
+                        VIRTIO_BLK_T_IN
+                    } else {
+                        VIRTIO_BLK_T_OUT
+                    },
+                    _reserved: 0,
+                    sector: (DISK_OFFSET / SPAN_LENGTH) as u64,
+                },
+                GuestAddress(0x8000),
+            )
+            .unwrap();
+        for span in 0..SPANS {
+            let address = GuestAddress(0x10000 + span as u64 * 0x1000);
+            ring.dtable[span + 1].set(
+                address.0,
+                SPAN_LENGTH as u32,
+                if read_from_disk { 3 } else { 1 },
+                (span + 2) as u16,
+            );
+            let initial = if read_from_disk {
+                &[0xcc; SPAN_LENGTH][..]
+            } else {
+                &payload[span * SPAN_LENGTH..(span + 1) * SPAN_LENGTH]
+            };
+            memory.write_slice(initial, address).unwrap();
+        }
+        ring.dtable[SPANS + 1].set(0x9000, 1, 2, 0);
+        memory.write_obj(0xff_u8, GuestAddress(0x9000)).unwrap();
+        ring.avail.ring[0].set(0);
+        ring.avail.idx.set(1);
+
+        let (mut worker, completion) = request_worker(&memory, &ring, disk);
+        worker.process_virtio_queues();
+        assert_eq!(worker.fault, None);
+        assert!(!worker.backend_failed);
+        assert_eq!(ring.used.idx.get(), 1);
+        assert_eq!(ring.used.ring[0].get().id, 0);
+        assert_eq!(
+            ring.used.ring[0].get().len,
+            if read_from_disk {
+                payload.len() as u32 + 1
+            } else {
+                1
+            }
+        );
+        assert_eq!(
+            memory.read_obj::<u8>(GuestAddress(0x9000)).unwrap(),
+            VIRTIO_BLK_S_OK as u8
+        );
+        assert_eq!(completion.read().unwrap(), 1);
+        assert!(worker.device_queue.queue.capture_state().is_ok());
+        for span in 0..SPANS {
+            let mut actual = [0; SPAN_LENGTH];
+            memory
+                .read_slice(&mut actual, GuestAddress(0x10000 + span as u64 * 0x1000))
+                .unwrap();
+            assert_eq!(
+                &actual,
+                &payload[span * SPAN_LENGTH..(span + 1) * SPAN_LENGTH],
+                "scatter span {span}"
+            );
+        }
+        if !read_from_disk {
+            expected_disk[DISK_OFFSET..DISK_OFFSET + payload.len()].copy_from_slice(&payload);
+        }
+        assert_eq!(fs::read(backing.as_path()).unwrap(), expected_disk);
+    }
+
+    #[test]
+    fn block_provider_scattered_read_completes_across_descriptor_view_batches() {
+        assert_scattered_request_crosses_view_batch(true);
+    }
+
+    #[test]
+    fn block_provider_scattered_write_completes_across_descriptor_view_batches() {
+        assert_scattered_request_crosses_view_batch(false);
     }
 
     #[test]

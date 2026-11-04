@@ -126,6 +126,10 @@ impl Vmm {
         {
             return Ok(());
         }
+        let native = self.memory.native()?;
+        native
+            .validate_domain(&self.memory_domain)
+            .map_err(|error| error.to_string())?;
         if let Some(pending) = &self.execution.pending {
             if pending.key.generation != barrier.key.generation {
                 return Err("foreign pending execution cut".into());
@@ -151,7 +155,7 @@ impl Vmm {
                 .profile
                 .as_ref()
                 .ok_or("execution clock/PIT profile not admitted")?;
-            let vm = match self.vm.capture_execution(profile) {
+            let vm = match self.vm.capture_execution(profile, &native) {
                 Ok(vm) => vm,
                 Err(error) => {
                     self.execution.retire_unmodified_vm_refusal(
@@ -191,11 +195,12 @@ impl Vmm {
         }
         self.control
             .cpus
-            .begin(
+            .begin_native(
                 request,
                 barrier,
                 CpuCommandKind::CaptureExecution,
                 &self.vcpus_handles,
+                native,
             )
             .map_err(|error| error.to_string())
     }
@@ -275,7 +280,8 @@ impl Vmm {
                 controller: self.execution_controller.clone(),
                 cpus: cpu_states,
             };
-            match self.vm.capture_execution(&profile) {
+            let native = self.memory.native()?;
+            match self.vm.capture_execution(&profile, &native) {
                 Ok(vm) => {
                     if let Some(pending) = &mut self.execution.pending {
                         pending.vm = Some(VmExecutionState::Kvm(vm));
@@ -359,6 +365,15 @@ impl Vmm {
         {
             self.execution.profile = Some(profile.clone());
         }
+        if cpu_only_fixture && self.execution.retained.is_none() {
+            self.memory
+                .begin_close(barrier.key)
+                .map_err(|error| error.to_string())?;
+            match self.memory.poll_drained() {
+                Poll::Pending => return Err("diagnostic host writers remain outstanding".into()),
+                Poll::Ready(result) => result.map_err(|error| error.to_string())?,
+            }
+        }
         self.execution.binding = Some(binding);
         if !cpu_only_fixture && self.execution.devices.is_none() {
             let records = self
@@ -410,6 +425,15 @@ impl Vmm {
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Ready(Ok(())) => {}
         }
+        let key = self
+            .execution
+            .retained
+            .as_ref()
+            .ok_or("capture cut absent")?
+            .key;
+        if !self.finish_memory_cut(key)? {
+            return Poll::Pending;
+        }
         if let Some(envelope) = &self.execution.envelope {
             return Poll::Ready(Ok(envelope.clone()));
         }
@@ -433,14 +457,14 @@ impl Vmm {
                 architectural_id,
             });
         }
-        let page_granule = match crate::vmm::execution::host_page_granule() {
-            Ok(value) => value,
-            Err(error) => return Poll::Ready(Err(error.to_string())),
-        };
-        let memory_regions = match crate::vmm::execution::memory_regions(&self.guest_memory) {
-            Ok(value) => value,
-            Err(error) => return Poll::Ready(Err(error.to_string())),
-        };
+        let page_granule = self.memory_domain.layout().granule();
+        let memory_regions = self
+            .memory_domain
+            .layout()
+            .regions()
+            .iter()
+            .map(|region| region.guest_range())
+            .collect();
         #[cfg(target_os = "linux")]
         let irq_routes = match self.mmio_device_manager.execution_irq_routes() {
             Ok(value) => value,
@@ -497,11 +521,12 @@ impl Vmm {
         }
         self.control
             .cpus
-            .begin(
+            .begin_native(
                 request,
                 barrier,
                 CpuCommandKind::CaptureExecution,
                 &self.vcpus_handles,
+                self.memory.native()?,
             )
             .map_err(|error| error.to_string())
     }
@@ -511,6 +536,10 @@ impl Vmm {
         request: RequestId,
         barrier: BarrierRequest,
     ) -> Result<(), String> {
+        let native = self.memory.native()?;
+        native
+            .validate_domain(&self.memory_domain)
+            .map_err(|error| error.to_string())?;
         if self.execution.failed_install {
             return Err("execution attempt is stop-only".into());
         }
@@ -550,7 +579,7 @@ impl Vmm {
             let VmExecutionState::Kvm(vm) = &cut.vm else {
                 return Err("wrong VM backend".into());
             };
-            self.vm.install_execution(vm)?;
+            self.vm.install_execution(vm, &native)?;
             let cpus = cut
                 .cpus
                 .iter()
@@ -560,7 +589,7 @@ impl Vmm {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             self.vm
-                .prepare_execution_time(vm, &cpus)?
+                .prepare_execution_time(vm, &cpus, &native)?
                 .into_iter()
                 .map(CpuTimePlan::Kvm)
                 .collect::<Vec<_>>()
@@ -616,6 +645,7 @@ impl Vmm {
                 CpuCommandKind::PrepareExecutionTime,
                 &inputs,
                 &self.vcpus_handles,
+                Some(native),
             )
             .map_err(|error| error.to_string())?;
         self.execution.prepared_time = Some(barrier.key);
@@ -627,6 +657,21 @@ impl Vmm {
         request: RequestId,
         barrier: BarrierRequest,
     ) -> Result<(), String> {
+        let cut_key = self
+            .execution
+            .retained
+            .as_ref()
+            .ok_or("missing retained memory cut")?
+            .key;
+        if cut_key.generation != barrier.key.generation {
+            return Err("memory resume generation mismatch".into());
+        }
+        while !self.reopen_memory_for_resume(cut_key)? {
+            if Instant::now() >= barrier.deadline {
+                return Err("native writer drain deadline".into());
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
         self.begin_execution_refence(request, barrier)?;
         self.wait_execution_command(barrier)?;
         self.begin_execution_time(request, barrier)?;
@@ -669,6 +714,7 @@ impl Vmm {
         {
             return Err("execution release is not prepared".into());
         }
+        self.memory.retire_native();
         self.control
             .cpus
             .begin(

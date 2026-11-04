@@ -167,6 +167,10 @@ impl Fixture {
         self.vm.as_ref().expect("live VM").reclaim_state()
     }
 
+    fn protection(&self) -> Arc<crate::dirty::HvfRamProtection> {
+        self.vm.as_ref().expect("live VM").ram_protection()
+    }
+
     fn mapping(&self, gpa: u64) -> &HostMapping {
         &self
             .mappings
@@ -204,8 +208,12 @@ fn get_reg(vcpu: &HvfVcpu<'_>, register: u32) -> u64 {
 
 /// Creates a vCPU on the calling thread (HVF vCPUs are thread-bound) that
 /// starts at `pc` with the MMU disabled and breakpoints trapped to the host.
-fn create_vcpu(mpidr: u64, pc: u64) -> HvfVcpu<'static> {
-    let vcpu = HvfVcpu::new(false).expect("create vCPU");
+fn create_vcpu(
+    mpidr: u64,
+    pc: u64,
+    protection: Arc<crate::dirty::HvfRamProtection>,
+) -> HvfVcpu<'static> {
+    let vcpu = HvfVcpu::new(false, protection).expect("create vCPU");
     vcpu.initialize(mpidr).expect("initialize MPIDR");
     vcpu.set_initial_state(pc, 0).expect("initialize vCPU");
     let mut sctlr = 0;
@@ -338,7 +346,7 @@ fn release_cycle_scenario() {
     fixture.mapping(CODE_GPA).write_words(&TOUCH_PROGRAM);
     let state = fixture.state();
     let pages = DATA_LEN / HOST_PAGE_SIZE;
-    let mut vcpu = create_vcpu(0, CODE_GPA);
+    let mut vcpu = create_vcpu(0, CODE_GPA, fixture.protection());
 
     let baseline = memory_sample().expect("baseline sample");
     let first = run_touch(&mut vcpu, &state, DATA_GPA, DATA_LEN, 0x1000);
@@ -423,8 +431,9 @@ fn fault_during_transition_scenario() {
 
     let (ready_tx, ready_rx) = sync_channel(0);
     let vcpu_state = Arc::clone(&state);
+    let protection = fixture.protection();
     let vcpu_worker = thread::spawn(move || {
-        let mut vcpu = create_vcpu(0, CODE_GPA);
+        let mut vcpu = create_vcpu(0, CODE_GPA, protection);
         let sentinels = [
             (hv_reg_t_HV_REG_X0, DATA_GPA),
             (hv_reg_t_HV_REG_X1, 0x2222_2222_2222_2222),
@@ -599,8 +608,9 @@ fn concurrent_release_stress_scenario() {
     });
 
     let vcpu_state = Arc::clone(&state);
+    let protection = fixture.protection();
     let vcpu_worker = thread::spawn(move || {
-        let mut vcpu = create_vcpu(0, CODE_GPA);
+        let mut vcpu = create_vcpu(0, CODE_GPA, protection);
         start_tx.send(()).expect("start releases");
         let mut retries = 0;
         let mut control_checksums_ok = 0;
@@ -643,7 +653,7 @@ fn partial_report_scenario(normalize: bool) {
     fixture.mapping(CODE_GPA).write_words(&TOUCH_PROGRAM);
     let state = fixture.state();
     let mapping = fixture.mapping(DATA_GPA);
-    let mut vcpu = create_vcpu(0, CODE_GPA);
+    let mut vcpu = create_vcpu(0, CODE_GPA, fixture.protection());
     for cycle in 0..16 {
         let seed = 0x1000 * (cycle + 1);
         let first = run_touch(&mut vcpu, &state, DATA_GPA, DATA_LEN, seed);
@@ -737,7 +747,7 @@ fn large_backing_scenario(normalize: bool) {
         fixture.mapping(CODE_GPA).write_words(&TOUCH_PROGRAM);
         let mapping = fixture.mapping(DATA_GPA);
         let state = fixture.state();
-        let mut vcpu = create_vcpu(0, CODE_GPA);
+        let mut vcpu = create_vcpu(0, CODE_GPA, fixture.protection());
         let touched = run_touch(&mut vcpu, &state, DATA_GPA, DATA_LEN, 0x1000);
         assert_eq!(
             touched.checksum,
@@ -829,7 +839,7 @@ fn concurrent_normalization_scenario() {
     let barrier = Barrier::new(3);
     thread::scope(|scope| {
         let vcpu_worker = scope.spawn(|| {
-            let mut vcpu = create_vcpu(0, CODE_GPA);
+            let mut vcpu = create_vcpu(0, CODE_GPA, fixture.protection());
             for cycle in 0..CYCLES {
                 barrier.wait();
                 let result = run_touch(&mut vcpu, &state, DATA_GPA, LENGTH, cycle * 0x1000);
@@ -881,7 +891,7 @@ fn unmap_control_scenario() {
     fixture.mapping(CODE_GPA).write_words(&TOUCH_PROGRAM);
     let state = fixture.state();
     let mapping = fixture.mapping(DATA_GPA);
-    let mut vcpu = create_vcpu(0, CODE_GPA);
+    let mut vcpu = create_vcpu(0, CODE_GPA, fixture.protection());
     let touched = run_touch(&mut vcpu, &state, DATA_GPA, DATA_SIZE, 0x1000);
     assert_eq!(
         touched.checksum,
@@ -943,7 +953,7 @@ fn pressure_reclaim_scenario(precompressed: bool) {
     fixture.mapping(CODE_GPA).write_words(&TOUCH_PROGRAM);
     let state = fixture.state();
     let mapping = fixture.mapping(DATA_GPA);
-    let mut vcpu = create_vcpu(0, CODE_GPA);
+    let mut vcpu = create_vcpu(0, CODE_GPA, fixture.protection());
     for gpa in [DATA_GPA, CONTROL_GPA] {
         let touched = run_touch(&mut vcpu, &state, gpa, DATA_LEN, 0x1000);
         assert_eq!(

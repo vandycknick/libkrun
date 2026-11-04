@@ -17,13 +17,21 @@ pub const MAX_EXECUTION_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_NATIVE_BINDING: usize = 64 * 1024;
 const MAGIC: &[u8; 8] = b"KRUNEXEC";
 
-pub(crate) fn host_page_granule() -> Result<u32, Error> {
+pub(crate) fn native_page_granule() -> Result<u32, Error> {
     let granule = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
         .map_err(|_| Error::Invalid("host page granule query"))?
         .ok_or(Error::Invalid("unknown host page granule"))?;
     let granule = u32::try_from(granule).map_err(|_| Error::Invalid("host page granule"))?;
-    if !granule.is_power_of_two() || !(4096..=65536).contains(&granule) {
+    if !granule.is_power_of_two() {
         return Err(Error::Invalid("unsupported host page granule"));
+    }
+    Ok(granule)
+}
+
+pub(crate) fn host_page_granule() -> Result<u32, Error> {
+    let granule = native_page_granule()?;
+    if !(4096..=65536).contains(&granule) {
+        return Err(Error::Invalid("unsupported capture page granule"));
     }
     Ok(granule)
 }
