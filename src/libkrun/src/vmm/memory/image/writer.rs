@@ -1325,8 +1325,35 @@ mod tests {
         let layout = layout(&domain);
         let current = cut(&mut control);
         let files = Outputs::new();
-        let mut finished = capture(&current, layout.clone(), RamWriteMode::Full, files.owned());
-        let output = finished.output.take().unwrap();
+        let output = files.owned();
+        #[cfg(target_os = "linux")]
+        let writers = {
+            use std::os::fd::AsRawFd;
+            [output.ram.as_raw_fd(), output.layout.as_raw_fd()].map(|fd| {
+                (
+                    fd,
+                    std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap(),
+                )
+            })
+        };
+        let finished = capture(&current, layout.clone(), RamWriteMode::Full, output);
+        assert!(finished.writers_closed());
+        #[cfg(target_os = "linux")]
+        for (fd, target) in writers {
+            assert_ne!(
+                std::fs::read_link(format!("/proc/self/fd/{fd}")).ok(),
+                Some(target)
+            );
+        }
+        let output = files.owned();
+        let completed_facts = finished.output_identities();
+        for (file, expected) in [
+            (&output.ram, completed_facts[0]),
+            (&output.layout, completed_facts[1]),
+        ] {
+            let metadata = file.metadata().unwrap();
+            assert_eq!((metadata.dev(), metadata.ino(), metadata.len()), expected);
+        }
         let preparation = preflight(
             &current,
             &binding(),

@@ -492,6 +492,25 @@ impl VirtioStateProvider for Vsock {
             fault,
         }))
     }
+    fn validate_terminal_drain(&self, key: BarrierKey) -> Result<(), ProviderFault> {
+        self.provider
+            .journal
+            .check(key)
+            .map_err(|error| error.fault)?;
+        if self.provider.journal.snapshot.stage != ProviderStage::Quiesced
+            || self.provider.resume_queues.is_some()
+            || self.queue_ev.is_some()
+        {
+            return Err(ProviderFault::InvalidTransition);
+        }
+        self.preflight()?;
+        if (!self.muxer.workers.is_empty() && !self.muxer.worker_control.parked())
+            || !self.muxer.producers_released()?
+        {
+            return Err(ProviderFault::LockBusy);
+        }
+        Ok(())
+    }
 
     fn begin_resume(
         &mut self,
@@ -667,6 +686,9 @@ impl VirtioStateProvider for Vsock {
         Ok(())
     }
 
+    fn activation_fenced(&self) -> Result<Option<bool>, ProviderFault> {
+        Ok(Some(self.muxer.worker_control.activation_fenced()))
+    }
     fn begin_activation_release(
         &mut self,
         request: BarrierRequest,
@@ -1015,6 +1037,7 @@ mod tests {
     #[test]
     fn provider_vsock_activation_owner_contention_retains_request_until_ready() {
         let (mut destination, control) = activation_destination();
+        assert_eq!(destination.activation_fenced(), Ok(Some(true)));
         let release = request(3);
         destination.begin_activation_release(release).unwrap();
         let gate = destination.muxer.worker_control.clone();
@@ -1058,6 +1081,7 @@ mod tests {
                 .unwrap()
                 .is_ready()
         });
+        assert_eq!(destination.activation_fenced(), Ok(Some(false)));
         assert_eq!(gate.epoch(), epoch, "accepted release must not be replayed");
         let released = connect(&control, 1028);
         until(|| {

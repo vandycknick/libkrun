@@ -14,6 +14,10 @@ use devices::virtio::lifecycle::{LifecycleError, LifecycleSnapshot, ProviderFaul
 use polly::event_manager::{BarrierKey, BarrierRequest};
 
 use devices::legacy::state::{LegacyPayload, LegacyState};
+type LiveDevice = (
+    AttachmentIdentity,
+    Arc<Mutex<dyn devices::virtio::VirtioDevice>>,
+);
 
 #[derive(Clone)]
 pub enum LegacyHandle {
@@ -343,6 +347,19 @@ impl DeviceQuiescence {
         self.attachments
             .iter()
             .map(|attachment| attachment.identity.clone())
+            .collect()
+    }
+    pub(crate) fn live_devices(&self) -> Result<Vec<LiveDevice>, ManagerError> {
+        self.attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| {
+                let transport = attachment
+                    .transport
+                    .try_lock()
+                    .map_err(|error| self.lock_error(index, error))?;
+                Ok((attachment.identity.clone(), transport.device()))
+            })
             .collect()
     }
 
@@ -847,6 +864,18 @@ impl DeviceQuiescence {
     }
 
     pub fn poll_stop(&mut self, request: BarrierRequest) -> Result<Poll<()>, ManagerError> {
+        self.poll_stop_inner(request, false)
+    }
+
+    pub fn poll_cleanup(&mut self, request: BarrierRequest) -> Result<Poll<()>, ManagerError> {
+        self.poll_stop_inner(request, true)
+    }
+
+    fn poll_stop_inner(
+        &mut self,
+        request: BarrierRequest,
+        cleanup: bool,
+    ) -> Result<Poll<()>, ManagerError> {
         let mut pending = false;
         let mut failure = None;
         for (index, attachment) in self.attachments.iter().enumerate() {
@@ -861,7 +890,12 @@ impl DeviceQuiescence {
                     continue;
                 }
             };
-            match transport.poll_stop(request) {
+            let stopped = if cleanup {
+                transport.poll_cleanup(request)
+            } else {
+                transport.poll_stop(request)
+            };
+            match stopped {
                 Ok(Poll::Ready(())) => {}
                 Ok(Poll::Pending) => pending = true,
                 Err(error) => {
@@ -998,6 +1032,8 @@ impl DeviceQuiescence {
 
 #[cfg(test)]
 mod tests {
+    use std::task::Poll;
+
     use crate::vmm::device_manager::quiescence::{
         DeviceQuiescence, LegacyAttachment, LegacyKind, ManagerFault,
     };
@@ -1459,6 +1495,92 @@ mod tests {
                 admission_snapshot(&second.transport).stage,
                 ProviderStage::Running
             );
+        }
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn cleanup_two_real_transports_retains_accepted_stop_and_admits_unstarted_after_timeout() {
+        use devices::virtio::lifecycle::{ProviderFault, ProviderStage};
+        use std::time::{Duration, Instant};
+        for admitted_second in [true, false] {
+            let AdmissionRng {
+                mut inventory,
+                transport,
+                ..
+            } = admission_rng(0xd000_0000, true);
+            let mut second = admission_rng(0xd000_1000, true);
+            inventory
+                .attachments
+                .append(&mut second.inventory.attachments);
+            let mut request = admission_request(70);
+            request.deadline = Instant::now() + Duration::from_millis(40);
+            if admitted_second {
+                assert!(inventory.poll_cleanup(request).unwrap().is_pending());
+            }
+            let held = match second.transport.lock() {
+                Ok(held) => held,
+                Err(error) => panic!("actual second transport poisoned: {error}"),
+            };
+            let limit = Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(inventory.poll_cleanup(request).unwrap().is_pending());
+                if admission_snapshot(&transport).stage == ProviderStage::Stopped {
+                    break;
+                }
+                assert!(Instant::now() < limit);
+                std::thread::yield_now();
+            }
+            let completed = admission_snapshot(&transport);
+            assert_eq!(completed.request, Some(request));
+            assert_eq!(held.lifecycle_snapshot().accepted, admitted_second);
+            if admitted_second {
+                assert_eq!(held.lifecycle_snapshot().request, Some(request));
+                assert_eq!(held.lifecycle_snapshot().stage, ProviderStage::Stopping);
+            } else {
+                assert_eq!(held.lifecycle_snapshot().request, None);
+                assert_eq!(held.lifecycle_snapshot().stage, ProviderStage::Running);
+            }
+            while Instant::now() < request.deadline {
+                std::thread::yield_now();
+            }
+            assert!(inventory.poll_cleanup(request).unwrap().is_pending());
+            assert_eq!(admission_snapshot(&transport), completed);
+            drop(held);
+            loop {
+                match inventory.poll_cleanup(request) {
+                    Ok(Poll::Ready(())) => break,
+                    Ok(Poll::Pending) => {}
+                    Err(error) => panic!("actual transport cleanup failed: {error:?}"),
+                }
+                assert!(Instant::now() < limit);
+                std::thread::yield_now();
+            }
+            assert_eq!(admission_snapshot(&transport), completed);
+            let final_second = admission_snapshot(&second.transport);
+            assert_eq!(final_second.stage, ProviderStage::Stopped);
+            let accepted = final_second.request.unwrap();
+            assert_eq!(accepted.key, request.key);
+            let mut second_transport = match second.transport.lock() {
+                Ok(held) => held,
+                Err(error) => panic!("actual second transport poisoned: {error}"),
+            };
+            if admitted_second {
+                assert_eq!(accepted, request);
+                assert_eq!(final_second.failure.unwrap().fault, ProviderFault::Deadline);
+                assert_eq!(
+                    second_transport.poll_stop(request).unwrap_err().fault,
+                    ProviderFault::Deadline
+                );
+            } else {
+                assert!(accepted.deadline > request.deadline);
+                assert_eq!(
+                    second_transport.poll_stop(request).unwrap_err().fault,
+                    ProviderFault::ForeignBarrier
+                );
+            }
+            assert!(second_transport.capture_transport(accepted.key).is_err());
+            assert!(second_transport.capture_device_state(accepted.key).is_err());
         }
     }
 

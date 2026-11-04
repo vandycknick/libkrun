@@ -45,6 +45,10 @@ pub(crate) struct ValidatedDevices {
 }
 
 impl ValidatedDevices {
+    pub(crate) fn into_envelope(self) -> DeviceEnvelope {
+        self.envelope
+    }
+
     pub fn validate(
         envelope: DeviceEnvelope,
         execution: &crate::vmm::execution::ExecutionEnvelope,

@@ -810,6 +810,9 @@ pub struct NativeLiveOperations {
 }
 
 impl NativeLiveOperations {
+    /// Pause is implemented on every recognized lane. Capture, restore, fork and
+    /// incremental capture have exported-API evidence only on KVM x86_64; the
+    /// arm64 lanes remain pending until their own runtime gates pass.
     pub const fn for_lane(lane: NativeLane) -> Self {
         let excluded = matches!(lane, NativeLane::Unsupported);
         let not_implemented = NativeOperationSupport::Unsupported(if excluded {
@@ -817,16 +820,21 @@ impl NativeLiveOperations {
         } else {
             NativeUnsupportedReason::NotImplemented
         });
+        let live_state = if matches!(lane, NativeLane::KvmX86_64) {
+            NativeOperationSupport::Supported
+        } else {
+            not_implemented
+        };
         Self {
             pause: if excluded {
                 NativeOperationSupport::Unsupported(NativeUnsupportedReason::BuildExcluded)
             } else {
                 NativeOperationSupport::Supported
             },
-            capture: not_implemented,
-            restore: not_implemented,
-            fork: not_implemented,
-            incremental: not_implemented,
+            capture: live_state,
+            restore: live_state,
+            fork: live_state,
+            incremental: live_state,
         }
     }
 }
@@ -1259,39 +1267,41 @@ mod tests {
     }
 
     #[test]
-    fn native_live_operations_expose_only_implemented_pause_for_recognized_lanes() {
+    fn native_live_operations_follow_the_explicit_lane_matrix() {
+        let supported = NativeOperationSupport::Supported;
+        let pending = NativeOperationSupport::Unsupported(NativeUnsupportedReason::NotImplemented);
+        let excluded = NativeOperationSupport::Unsupported(NativeUnsupportedReason::BuildExcluded);
         for lane in [
             NativeLane::KvmX86_64,
             NativeLane::KvmArm64GicV3,
             NativeLane::HvfArm64GicV3,
             NativeLane::Unsupported,
         ] {
+            // Exhaustive on purpose: a new lane must choose its row here.
+            let (pause, live_state) = match lane {
+                NativeLane::KvmX86_64 => (supported, supported),
+                NativeLane::KvmArm64GicV3 | NativeLane::HvfArm64GicV3 => (supported, pending),
+                NativeLane::Unsupported => (excluded, excluded),
+            };
             let operations = NativeLiveOperations::for_lane(lane);
-            let excluded = lane == NativeLane::Unsupported;
+            assert_eq!(operations.pause, pause, "{lane:?} pause");
             assert_eq!(
-                operations.pause,
-                if excluded {
-                    NativeOperationSupport::Unsupported(NativeUnsupportedReason::BuildExcluded)
-                } else {
-                    NativeOperationSupport::Supported
-                }
+                operations.pause.is_supported(),
+                lane != NativeLane::Unsupported,
+                "{lane:?} pause"
             );
-            assert_eq!(operations.pause.is_supported(), !excluded);
-            for operation in [
-                operations.capture,
-                operations.restore,
-                operations.fork,
-                operations.incremental,
+            for (name, operation) in [
+                ("capture", operations.capture),
+                ("restore", operations.restore),
+                ("fork", operations.fork),
+                ("incremental", operations.incremental),
             ] {
+                assert_eq!(operation, live_state, "{lane:?} {name}");
                 assert_eq!(
-                    operation,
-                    NativeOperationSupport::Unsupported(if excluded {
-                        NativeUnsupportedReason::BuildExcluded
-                    } else {
-                        NativeUnsupportedReason::NotImplemented
-                    })
+                    operation.is_supported(),
+                    lane == NativeLane::KvmX86_64,
+                    "{lane:?} {name}"
                 );
-                assert!(!operation.is_supported());
             }
         }
         let mut build = NativeBuildFacts {
@@ -1588,15 +1598,6 @@ mod tests {
                                 reduce_hvf_gic_admission(lane, &host, vm, providers),
                                 expected
                             );
-                            let operations = NativeLiveOperations::for_lane(lane);
-                            assert_eq!(
-                                operations.pause.is_supported(),
-                                lane != NativeLane::Unsupported
-                            );
-                            assert!(!operations.capture.is_supported());
-                            assert!(!operations.restore.is_supported());
-                            assert!(!operations.fork.is_supported());
-                            assert!(!operations.incremental.is_supported());
                         }
                     }
                 }

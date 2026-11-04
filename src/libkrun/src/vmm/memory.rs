@@ -18,7 +18,7 @@ use arch::guest_memory::{
     TrackingMode,
 };
 
-pub(crate) mod image;
+pub mod image;
 
 #[derive(Clone, Debug)]
 struct TrackerIdentity(Arc<()>);
@@ -30,24 +30,24 @@ impl PartialEq for TrackerIdentity {
 impl Eq for TrackerIdentity {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BaselineToken {
+pub struct BaselineToken {
     tracker: TrackerIdentity,
     topology: TopologyGeneration,
     memory_generation: u64,
 }
 impl BaselineToken {
-    pub(crate) fn memory_generation(&self) -> u64 {
+    pub fn memory_generation(&self) -> u64 {
         self.memory_generation
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AttemptId {
+pub struct AttemptId {
     tracker: TrackerIdentity,
     sequence: u64,
 }
 impl AttemptId {
-    pub(crate) fn sequence(&self) -> u64 {
+    pub fn sequence(&self) -> u64 {
         self.sequence
     }
     #[cfg(test)]
@@ -84,7 +84,7 @@ pub(crate) enum RamCaptureRequest<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FullCaptureReason {
+pub enum FullCaptureReason {
     Requested,
     NoBaseline,
     BaselineToken,
@@ -93,7 +93,7 @@ pub(crate) enum FullCaptureReason {
 }
 
 #[derive(Debug)]
-pub(crate) enum CaptureError {
+pub enum CaptureError {
     Busy,
     InvalidPause,
     InvalidAttempt,
@@ -147,15 +147,19 @@ struct CaptureAttempt {
     failure: Option<Arc<RamImageFailure>>,
 }
 
+#[derive(Clone)]
 pub(crate) struct CompletedCandidate {
     id: AttemptId,
     generation: u64,
-    receipt: RamCaptureReceipt,
+    receipt: Arc<RamCaptureReceipt>,
     full_reason: Option<FullCaptureReason>,
 }
 impl CompletedCandidate {
     pub(crate) fn receipt(&self) -> &RamCaptureReceipt {
         &self.receipt
+    }
+    pub(crate) fn shared_receipt(&self) -> Arc<RamCaptureReceipt> {
+        self.receipt.clone()
     }
     pub(crate) fn full_reason(&self) -> Option<FullCaptureReason> {
         self.full_reason
@@ -164,13 +168,20 @@ impl CompletedCandidate {
         self.generation
     }
     pub(crate) fn seal(
-        &mut self,
+        &self,
         ram: File,
         layout: File,
         authentication: RamImageAuthentication,
     ) -> Result<Arc<AuthenticatedRamImage>, RamImageError> {
-        image::seal_completed(&mut self.receipt, ram, layout, authentication).map(Arc::new)
+        image::seal_completed(&self.receipt, ram, layout, authentication).map(Arc::new)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RestoreInstallationEvidence {
+    pub tracking_before_install: bool,
+    pub complete: bool,
+    pub dirty_pages: usize,
 }
 
 pub struct MemoryCoordinator {
@@ -192,6 +203,7 @@ pub struct MemoryCoordinator {
     tracking_failure: Option<DirtyFailure>,
     layout: OnceLock<Arc<ValidatedRamLayout>>,
     scratch: Option<RamIoScratch>,
+    restore_installation: Option<RestoreInstallationEvidence>,
 }
 impl MemoryCoordinator {
     pub(crate) fn has_closing(&self) -> bool {
@@ -199,6 +211,87 @@ impl MemoryCoordinator {
     }
     pub(crate) fn has_attempt(&self) -> bool {
         self.attempt.is_some()
+    }
+    pub(crate) fn pending_dirty_count(&self) -> usize {
+        self.pending.as_ref().map_or(0, DirtyPageMap::count)
+    }
+    pub(crate) fn baseline_token(&self) -> Option<BaselineToken> {
+        self.baseline
+            .as_ref()
+            .map(|baseline| baseline.token.clone())
+    }
+    pub(crate) fn restore_installation(&self) -> Option<RestoreInstallationEvidence> {
+        self.restore_installation
+    }
+    #[cfg(any(
+        test,
+        all(
+            not(any(feature = "tee", feature = "aws-nitro")),
+            any(
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(target_os = "macos", target_arch = "aarch64")
+            )
+        )
+    ))]
+    pub(crate) fn observe_restore_install_begin(&mut self) -> Result<(), MemoryError> {
+        if self.restore_installation.is_some()
+            || self.control.domain().tracking_mode() != Some(TrackingMode::Capture)
+            || self.control.domain().backing_kind()
+                != arch::guest_memory::BackingKind::RestoredPrivate
+        {
+            return Err(MemoryError::State);
+        }
+        self.restore_installation = Some(RestoreInstallationEvidence {
+            tracking_before_install: true,
+            complete: false,
+            dirty_pages: 0,
+        });
+        Ok(())
+    }
+    #[cfg(any(
+        test,
+        all(
+            not(any(feature = "tee", feature = "aws-nitro")),
+            any(
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(target_os = "macos", target_arch = "aarch64")
+            )
+        )
+    ))]
+    pub(crate) fn observe_restore_install_complete(&mut self) -> Result<(), MemoryError> {
+        let dirty_pages = self.pending_dirty_count();
+        let evidence = self
+            .restore_installation
+            .as_mut()
+            .ok_or(MemoryError::State)?;
+        if evidence.complete || self.cut.is_none() || self.next.is_none() {
+            return Err(MemoryError::State);
+        }
+        evidence.dirty_pages = dirty_pages;
+        evidence.complete = true;
+        Ok(())
+    }
+    pub(crate) fn protects_output(&self, device: u64, inode: u64) -> Result<bool, std::io::Error> {
+        if self
+            .baseline
+            .as_ref()
+            .is_some_and(|baseline| baseline.image.aliases(device, inode))
+        {
+            return Ok(true);
+        }
+        for identity in self.control.domain().file_backing_identities() {
+            let identity = identity?;
+            if identity.device == device && identity.inode == inode {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     pub fn new(control: DomainControl, construction: ConstructionAuthority) -> Self {
         Self {
@@ -220,6 +313,7 @@ impl MemoryCoordinator {
             tracking_failure: None,
             layout: OnceLock::new(),
             scratch: None,
+            restore_installation: None,
         }
     }
     pub(crate) fn finish_untracked(&mut self) -> Result<(), MemoryError> {
@@ -449,7 +543,7 @@ impl MemoryCoordinator {
                 Ok(CompletedCandidate {
                     id: id.clone(),
                     generation: attempt.generation,
-                    receipt,
+                    receipt: Arc::new(receipt),
                     full_reason: attempt.full_reason,
                 })
             }
@@ -1579,6 +1673,109 @@ mod tests {
             },
         );
         assert_eq!(candidate.receipt().stats().live_bytes_read, 4096);
+    }
+
+    #[test]
+    fn result_release_and_abandon_keep_readonly_baseline_and_pending_union() {
+        let mut coordinator = coordinator();
+        coordinator
+            .control
+            .domain()
+            .write(GuestAddress(0), 1)
+            .unwrap()
+            .write_view(0, 1)
+            .unwrap()
+            .write_slice(&[9], 0)
+            .unwrap();
+        stop(&mut coordinator, key(1));
+        let (baseline, image, files) = accept_full(&mut coordinator, key(1));
+        drop(image);
+        drop(files);
+        assert_eq!(coordinator.baseline_token(), Some(baseline.clone()));
+        coordinator.reopen(key(1)).unwrap();
+        coordinator
+            .control
+            .domain()
+            .write(GuestAddress(4096), 1)
+            .unwrap()
+            .write_view(0, 1)
+            .unwrap()
+            .write_slice(&[7], 0)
+            .unwrap();
+        stop(&mut coordinator, key(2));
+        let request = RamCaptureRequest::Incremental {
+            baseline: Some(&baseline),
+            crossover: DirtyCrossoverPercent::default(),
+        };
+        let (attempt, candidate, output) = capture(&mut coordinator, key(2), request);
+        assert!(candidate.receipt().writers_closed());
+        assert_eq!(candidate.receipt().mode(), RamCaptureMode::Incremental);
+        assert_eq!(candidate.receipt().stats().live_bytes_read, 4096);
+        let bytes = std::fs::read(output.ram.as_path()).unwrap();
+        assert_eq!(bytes[0], 9);
+        assert_eq!(bytes[4096], 7);
+        drop(candidate);
+        drop(output);
+        assert!(
+            coordinator.has_attempt(),
+            "caller drop cannot resolve an accepted attempt"
+        );
+        assert_eq!(coordinator.reopen(key(2)), Err(ControlFailure::Busy));
+        coordinator.abandon_attempt(key(2), &attempt).unwrap();
+        assert_eq!(coordinator.baseline_token(), Some(baseline.clone()));
+        assert_eq!(coordinator.pending_dirty_count(), 1);
+        let request = RamCaptureRequest::Incremental {
+            baseline: Some(&baseline),
+            crossover: DirtyCrossoverPercent::default(),
+        };
+        let (_, mut candidate, output) = capture(&mut coordinator, key(2), request);
+        assert_eq!(candidate.receipt().mode(), RamCaptureMode::Incremental);
+        assert_eq!(std::fs::read(output.ram.as_path()).unwrap(), bytes);
+        let image = output.seal(&mut candidate, key(2));
+        let next = coordinator
+            .accept_attempt(key(2), candidate, image)
+            .unwrap();
+        assert_ne!(next, baseline);
+        assert_eq!(coordinator.pending_dirty_count(), 0);
+    }
+
+    #[test]
+    fn restore_installation_evidence_samples_armed_tracking_and_actual_dirty_union() {
+        let mut boot = coordinator();
+        assert_eq!(
+            boot.observe_restore_install_begin(),
+            Err(arch::guest_memory::MemoryError::State)
+        );
+        let mut coordinator = coordinator_with_backing(BackingKind::RestoredPrivate);
+        coordinator.begin_close(key(1)).unwrap();
+        assert!(matches!(coordinator.poll_drained(), Poll::Ready(Ok(()))));
+        coordinator.observe_restore_install_begin().unwrap();
+        let native = coordinator.native().unwrap();
+        native
+            .write(GuestAddress(4096), 1)
+            .unwrap()
+            .write_view(0, 1)
+            .unwrap()
+            .write_slice(&[8], 0)
+            .unwrap();
+        drop(native);
+        coordinator.retire_native();
+        let cut = coordinator
+            .control
+            .seal(coordinator.drained.as_ref().unwrap())
+            .unwrap();
+        coordinator
+            .control
+            .drain_host_dirty(&cut, coordinator.pending.as_mut().unwrap())
+            .unwrap();
+        coordinator.next = Some(cut.issue_epoch(2).unwrap());
+        coordinator.cut = Some(cut);
+        coordinator.observe_restore_install_complete().unwrap();
+        let evidence = coordinator.restore_installation().unwrap();
+        assert!(evidence.tracking_before_install);
+        assert!(evidence.complete);
+        assert_eq!(evidence.dirty_pages, 1);
+        assert_eq!(coordinator.pending_dirty_count(), 1);
     }
 
     #[test]

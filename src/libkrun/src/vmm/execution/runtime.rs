@@ -32,7 +32,7 @@ use crate::vmm::execution::{
 use devices::legacy::state::LegacyState;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) use crate::vmm::linux::execution::KvmCaptureProfile;
+pub use crate::vmm::linux::execution::KvmCaptureProfile;
 
 #[derive(Clone)]
 pub(crate) struct RetainedCut {
@@ -50,7 +50,7 @@ struct PendingCut {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct TimePreparation {
+pub struct TimePreparation {
     pub key: BarrierKey,
     pub plans: Vec<CpuTimePlan>,
     pub deadline: Instant,
@@ -81,6 +81,11 @@ pub(crate) struct ExecutionOwner {
 impl ExecutionOwner {
     pub(crate) fn captured_envelope(&self) -> Option<&Arc<ExecutionEnvelope>> {
         self.envelope.as_ref()
+    }
+    pub(crate) fn retire_serialization(&mut self) {
+        self.binding = None;
+        self.envelope = None;
+        self.devices = None;
     }
     pub fn preparation_observation(&self) -> Option<&TimePreparation> {
         self.preparation.as_ref()

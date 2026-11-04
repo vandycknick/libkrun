@@ -1,6 +1,7 @@
 pub mod capabilities;
 pub mod device_builders;
 pub mod error;
+pub mod live;
 pub mod logging;
 #[cfg(all(
     feature = "native-control-probe",

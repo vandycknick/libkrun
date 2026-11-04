@@ -1,4 +1,5 @@
 //! Correlated native control. Accepted work belongs to the VM, never to a waiting caller.
+pub(crate) mod live;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -146,6 +147,20 @@ impl PartialEq for PauseToken {
     }
 }
 impl Eq for PauseToken {}
+impl PauseToken {
+    pub fn generation(&self) -> BarrierGeneration {
+        self.generation
+    }
+    pub fn owner(&self) -> PauseOwner {
+        self.owner
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RestoreToken {
+    run: Arc<()>,
+    pub(crate) key: BarrierKey,
+}
 
 #[derive(Clone, Debug)]
 pub struct GenerationTicket {
@@ -158,8 +173,11 @@ impl GenerationTicket {
     pub(crate) fn observe(&self, now: Instant) -> GenerationObservation {
         self.attempt.observe(now)
     }
-    pub(crate) fn deadline(&self) -> Instant {
+    pub fn deadline(&self) -> Instant {
         self.attempt.deadline()
+    }
+    pub fn request(&self) -> devices::virtio::generation::GenerationTuple {
+        self.attempt.request()
     }
 }
 
@@ -167,6 +185,7 @@ impl GenerationTicket {
 pub(crate) enum GenerationAuthority {
     Pause(PauseToken),
     Restore(BarrierKey),
+    RestoreToken(RestoreToken),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -195,9 +214,10 @@ pub enum ControlReply {
     Complete,
     Generation(GenerationTicket),
     GenerationSnapshot(GenerationSnapshot),
+    Live(Result<live::LiveReply, crate::api::live::LiveError>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum RequestKind {
     Pause(PauseOwner),
     Resume(PauseToken),
@@ -205,6 +225,7 @@ pub(crate) enum RequestKind {
     CancelPause(OperationId),
     Status,
     Stop,
+    CleanupRestore,
     PrepareGeneration {
         authority: GenerationAuthority,
         mode: GenerationMode,
@@ -213,9 +234,11 @@ pub(crate) enum RequestKind {
     ResumeGeneration(PauseToken, GenerationTicket),
     ReleaseRestoreGeneration(GenerationTicket),
     GenerationSnapshot,
+    Live(live::LiveRequest),
+    ResumeRestored(RestoreToken, GenerationTicket),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ControlRequest {
     pub id: RequestId,
     pub operation: OperationId,
@@ -241,6 +264,29 @@ impl ControlClient {
             rx,
         ))
     }
+    fn request_id(&self) -> Result<RequestId, ControlFailure> {
+        self.next_request
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map(RequestId)
+            .map_err(|_| ControlFailure::Exhausted)
+    }
+
+    pub(crate) fn begin_restore_cleanup(&self, deadline: Instant) -> Result<(), ControlFailure> {
+        if Instant::now() >= deadline {
+            return Err(ControlFailure::Deadline);
+        }
+        let id = self.request_id()?;
+        let (reply, _) = bounded(1);
+        self.tx
+            .send(ControlRequest {
+                id,
+                operation: OperationId(0),
+                deadline,
+                kind: RequestKind::CleanupRestore,
+                reply,
+            })
+            .map_err(|error| ControlFailure::WakeUnknown(error.to_string()))
+    }
 
     pub fn call(
         &self,
@@ -251,11 +297,7 @@ impl ControlClient {
         if Instant::now() >= deadline {
             return Err(ControlFailure::Deadline);
         }
-        let id = self
-            .next_request
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map(RequestId)
-            .map_err(|_| ControlFailure::Exhausted)?;
+        let id = self.request_id()?;
         let (reply, receiver) = bounded(1);
         // The pollable channel enqueues before waking. A wake error is an unknown
         // outcome, not permission to discard or implicitly cancel the request.
@@ -748,6 +790,8 @@ pub(crate) struct ControlOwner {
     last_operation: u64,
     generation_ticket: Option<GenerationTicket>,
     release_generation: Option<GenerationTicket>,
+    restore_key: Option<BarrierKey>,
+    pub(crate) live: live::LiveOwner,
 }
 
 impl ControlOwner {
@@ -764,6 +808,8 @@ impl ControlOwner {
             last_operation: 0,
             generation_ticket: None,
             release_generation: None,
+            restore_key: None,
+            live: live::LiveOwner::default(),
         })
     }
 
@@ -785,6 +831,14 @@ impl ControlOwner {
             generation: BarrierGeneration(self.generation),
         })
     }
+    fn restore_cleanup_key(&self, request: RequestId) -> BarrierKey {
+        // Generation zero is forbidden in portable restore/capture bindings.
+        // Disposal stays available even after either caller counter is exhausted.
+        BarrierKey {
+            operation: OperationId(request.0),
+            generation: BarrierGeneration(0),
+        }
+    }
 
     pub fn token(&self, key: BarrierKey, owner: PauseOwner) -> PauseToken {
         PauseToken {
@@ -796,6 +850,42 @@ impl ControlOwner {
 
     pub fn validate_token(&self, token: &PauseToken) -> bool {
         matches!(&self.state, ControlState::Paused(current) if current == token)
+    }
+    #[cfg(any(
+        test,
+        all(
+            not(any(feature = "tee", feature = "aws-nitro")),
+            any(
+                all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ),
+                all(target_os = "macos", target_arch = "aarch64")
+            )
+        )
+    ))]
+    pub(crate) fn restore_token(&mut self) -> Result<RestoreToken, ControlFailure> {
+        let ControlState::RestorePrepared { key } = self.state else {
+            return Err(ControlFailure::InvalidToken);
+        };
+        if self.restore_key.is_some_and(|previous| previous != key) {
+            return Err(ControlFailure::InvalidToken);
+        }
+        self.restore_key = Some(key);
+        Ok(RestoreToken {
+            run: self.run.clone(),
+            key,
+        })
+    }
+    pub(crate) fn validate_restore_token(
+        &self,
+        token: &RestoreToken,
+    ) -> Result<(), ControlFailure> {
+        if Arc::ptr_eq(&token.run, &self.run) && self.restore_key == Some(token.key) {
+            Ok(())
+        } else {
+            Err(ControlFailure::InvalidToken)
+        }
     }
     pub(crate) fn validate_memory_resume(
         &self,
@@ -840,6 +930,14 @@ impl ControlOwner {
             GenerationAuthority::Restore(key) if matches!(self.state, ControlState::RestorePrepared { key: current } if current == *key) => {
                 Ok(*key)
             }
+            GenerationAuthority::RestoreToken(token) => {
+                self.validate_restore_token(token)?;
+                if !matches!(self.state, ControlState::RestorePrepared { key } if key == token.key)
+                {
+                    return Err(ControlFailure::InvalidToken);
+                }
+                Ok(token.key)
+            }
             _ => Err(ControlFailure::InvalidToken),
         }
     }
@@ -862,8 +960,10 @@ impl crate::vmm::Vmm {
         &self,
         authority: &GenerationAuthority,
     ) -> Result<BarrierKey, ControlFailure> {
-        self.control
-            .generation_authority(authority, self.memory.has_attempt())
+        self.control.generation_authority(
+            authority,
+            self.memory.has_attempt() || self.control.live.unresolved(),
+        )
     }
 
     fn prepare_generation_at(
@@ -955,6 +1055,7 @@ impl crate::vmm::Vmm {
 
     pub(crate) fn control_pending(&self) -> bool {
         (self.control.active.is_some() && !matches!(self.control.state, ControlState::Paused(_)))
+            || self.control.live.pending()
             || self
                 .control
                 .generation_ticket
@@ -968,6 +1069,7 @@ impl crate::vmm::Vmm {
     }
 
     pub(crate) fn service_control(&mut self, events: &mut polly::event_manager::EventManager) {
+        self.poll_live();
         while let Ok(Some(request)) = self.control.receiver.try_recv() {
             let reply = request.reply.clone();
             if let Err(error) = self.accept_control(request, events) {
@@ -975,6 +1077,7 @@ impl crate::vmm::Vmm {
             }
         }
         self.poll_control(events);
+        self.poll_live();
         if let Some(ticket) = &self.control.generation_ticket {
             let _ = ticket.observe(Instant::now());
         }
@@ -1050,17 +1153,60 @@ impl crate::vmm::Vmm {
         request: ControlRequest,
         events: &mut polly::event_manager::EventManager,
     ) -> Result<(), ControlFailure> {
+        if matches!(&request.kind, RequestKind::Live(_)) {
+            let ControlRequest {
+                id,
+                operation,
+                deadline,
+                kind,
+                reply,
+            } = request;
+            if let RequestKind::Live(live) = kind {
+                self.accept_live(live, id, operation, deadline, reply);
+            }
+            return Ok(());
+        }
+        if let RequestKind::ResumeRestored(token, _) = &request.kind {
+            self.control.validate_restore_token(token)?;
+            if !matches!(self.control.state, ControlState::RestorePrepared { key } if key == token.key)
+            {
+                return Err(ControlFailure::InvalidToken);
+            }
+        }
         if matches!(request.kind, RequestKind::Status) {
             let _ = request
                 .reply
                 .try_send(Ok(ControlReply::State(self.control.state.clone())));
             return Ok(());
         }
-        if Instant::now() >= request.deadline {
+        if !matches!(request.kind, RequestKind::CleanupRestore)
+            && Instant::now() >= request.deadline
+        {
             return Err(ControlFailure::Deadline);
         }
-        if matches!(request.kind, RequestKind::Stop) {
-            self.control.reserve(request.operation)?;
+        if matches!(
+            request.kind,
+            RequestKind::Stop | RequestKind::CleanupRestore
+        ) {
+            // Failed-owner cleanup cannot be blocked by caller operation-ID exhaustion.
+            if !matches!(request.kind, RequestKind::CleanupRestore) {
+                self.control.reserve(request.operation)?;
+            }
+            if matches!(request.kind, RequestKind::CleanupRestore)
+                && self.control.active.as_ref().is_some_and(|active| {
+                    matches!(active.request.kind, RequestKind::CleanupRestore)
+                })
+            {
+                return Err(ControlFailure::Busy);
+            }
+            let key = if matches!(request.kind, RequestKind::CleanupRestore) {
+                self.control.restore_cleanup_key(request.id)
+            } else {
+                BarrierKey {
+                    operation: request.operation,
+                    generation: BarrierGeneration(self.control.generation),
+                }
+            };
             self.fail_generation(GenerationFailure::Stopped);
             if let Some(previous) = self.control.active.take() {
                 let _ = previous
@@ -1069,10 +1215,7 @@ impl crate::vmm::Vmm {
                     .try_send(Err(ControlFailure::FailedFenced));
             }
             let barrier = BarrierRequest {
-                key: BarrierKey {
-                    operation: request.operation,
-                    generation: BarrierGeneration(self.control.generation),
-                },
+                key,
                 deadline: request.deadline,
             };
             self.control.state = ControlState::Stopping;
@@ -1108,6 +1251,11 @@ impl crate::vmm::Vmm {
                 mode,
                 deadline,
             } => {
+                if matches!(authority, GenerationAuthority::RestoreToken(_))
+                    && !matches!(mode, GenerationMode::Fresh)
+                {
+                    return Err(ControlFailure::InvalidToken);
+                }
                 let key = self.generation_authority(authority)?;
                 self.control.reserve(request.operation)?;
                 let ticket = self.prepare_generation_at(key, *mode, *deadline)?;
@@ -1168,8 +1316,13 @@ impl crate::vmm::Vmm {
                 Ok(())
             }
             RequestKind::Resume(token) | RequestKind::ResumeGeneration(token, _) => {
-                self.control
-                    .validate_memory_resume(token, self.memory.has_attempt())?;
+                if self.control.restore_key.is_some() && !self.control.live.activation_released {
+                    return Err(ControlFailure::InvalidToken);
+                }
+                self.control.validate_memory_resume(
+                    token,
+                    self.memory.has_attempt() || self.control.live.unresolved(),
+                )?;
                 self.control.reserve(request.operation)?;
                 let original = self
                     .control
@@ -1211,16 +1364,20 @@ impl crate::vmm::Vmm {
                 self.control.active = Some(active);
                 Ok(())
             }
-            RequestKind::ReleaseRestore | RequestKind::ReleaseRestoreGeneration(_) => {
-                let original = self
-                    .control
-                    .restore_release_key(self.memory.has_attempt())?;
+            RequestKind::ReleaseRestore
+            | RequestKind::ReleaseRestoreGeneration(_)
+            | RequestKind::ResumeRestored(_, _) => {
+                let original = self.control.restore_release_key(
+                    self.memory.has_attempt() || self.control.live.unresolved(),
+                )?;
                 if self.execution.failed_install || self.control.cpus.release_may_have_run() {
                     return Err(ControlFailure::FailedFenced);
                 }
                 let ticket = if self.generation_binding.is_some() {
-                    let RequestKind::ReleaseRestoreGeneration(ticket) = &request.kind else {
-                        return Err(ControlFailure::InvalidToken);
+                    let ticket = match &request.kind {
+                        RequestKind::ReleaseRestoreGeneration(ticket)
+                        | RequestKind::ResumeRestored(_, ticket) => ticket,
+                        _ => return Err(ControlFailure::InvalidToken),
                     };
                     self.validate_generation_ticket(ticket)?;
                     if ticket.stopped != original || ticket.attempt.request().flags != 1 {
@@ -1228,7 +1385,11 @@ impl crate::vmm::Vmm {
                     }
                     Some(ticket.clone())
                 } else {
-                    if matches!(&request.kind, RequestKind::ReleaseRestoreGeneration(_)) {
+                    if matches!(
+                        &request.kind,
+                        RequestKind::ReleaseRestoreGeneration(_)
+                            | RequestKind::ResumeRestored(_, _)
+                    ) {
                         return Err(ControlFailure::InvalidToken);
                     }
                     None
@@ -1326,7 +1487,10 @@ impl crate::vmm::Vmm {
                 }
                 Ok(())
             }
-            RequestKind::Status | RequestKind::Stop => Err(ControlFailure::InvalidOperation),
+            RequestKind::Status
+            | RequestKind::Stop
+            | RequestKind::CleanupRestore
+            | RequestKind::Live(_) => Err(ControlFailure::InvalidOperation),
         }
     }
 
@@ -1774,12 +1938,16 @@ impl crate::vmm::Vmm {
                     }
                     Poll::Ready(result) => result?,
                 }
-                match self
-                    .mmio_device_manager
-                    .quiescence
-                    .poll_stop(active.barrier)
-                    .map_err(|error| ControlFailure::Participant(error.to_string()))?
-                {
+                let stopped = if matches!(active.request.kind, RequestKind::CleanupRestore) {
+                    self.mmio_device_manager
+                        .quiescence
+                        .poll_cleanup(active.barrier)
+                } else {
+                    self.mmio_device_manager
+                        .quiescence
+                        .poll_stop(active.barrier)
+                };
+                match stopped.map_err(|error| ControlFailure::Participant(error.to_string()))? {
                     Poll::Pending => return Ok(false),
                     Poll::Ready(()) => {}
                 }
@@ -1787,6 +1955,11 @@ impl crate::vmm::Vmm {
                 // them before allowing the outer VM resources to be dropped.
                 if !self.mmio_device_manager.poll_irq_cleanup() {
                     return Ok(false);
+                }
+                if matches!(&active.request.kind, RequestKind::CleanupRestore) {
+                    self.control.state = ControlState::Stopped;
+                    let _ = active.request.reply.try_send(Ok(ControlReply::Complete));
+                    return Ok(true);
                 }
                 self.stop(i32::from(crate::vmm::FC_EXIT_CODE_OK));
                 return Ok(false);
@@ -1821,6 +1994,25 @@ mod tests {
             operation: OperationId(1),
             generation: BarrierGeneration(1),
         }
+    }
+
+    #[test]
+    fn retained_cleanup_identity_does_not_allocate_public_operation_or_generation() {
+        let mut owner = ControlOwner::new(BarrierGeneration(u64::MAX)).unwrap();
+        owner.last_operation = u64::MAX;
+        let cleanup = owner.restore_cleanup_key(RequestId(7));
+        assert_eq!(cleanup.operation, OperationId(7));
+        assert_eq!(cleanup.generation, BarrierGeneration(0));
+        assert_ne!(
+            cleanup,
+            BarrierKey {
+                operation: OperationId(0),
+                generation: BarrierGeneration(u64::MAX)
+            }
+        );
+        assert_eq!(owner.generation, u64::MAX);
+        assert_eq!(owner.last_operation, u64::MAX);
+        assert_ne!(owner.restore_cleanup_key(RequestId(8)), cleanup);
     }
 
     #[test]

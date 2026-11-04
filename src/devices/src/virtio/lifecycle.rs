@@ -148,6 +148,12 @@ pub trait VirtioStateProvider: Send {
     fn flush_for_capture(&self, _key: BarrierKey) -> Result<(), ProviderFault> {
         Ok(())
     }
+    fn backing_file_identity(&self) -> Result<Option<(u64, u64)>, ProviderFault> {
+        Ok(None)
+    }
+    fn activation_fenced(&self) -> Result<Option<bool>, ProviderFault> {
+        Ok(None)
+    }
     fn validate_payload(&self, payload: &[u8]) -> Result<(), ProviderFault>;
     fn validate_restore(&self, _payload: &[u8]) -> Result<(), ProviderFault> {
         Err(ProviderFault::Unsupported)
@@ -405,6 +411,17 @@ impl CallbackState {
             }
         }
         Ok(())
+    }
+    pub fn validate_terminal_drain(
+        &self,
+        key: BarrierKey,
+        queues: &Option<Vec<DeviceQueue>>,
+    ) -> Result<(), ProviderFault> {
+        self.journal.check(key).map_err(|error| error.fault)?;
+        if self.journal.snapshot.stage != ProviderStage::Quiesced || queues.is_some() {
+            return Err(ProviderFault::InvalidTransition);
+        }
+        self.preflight(queues)
     }
 
     pub fn begin_quiesce(

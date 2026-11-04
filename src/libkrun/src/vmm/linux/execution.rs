@@ -105,7 +105,9 @@ pub(crate) fn initialize_device_witness(
     native_result(permit, native::initialize_device_witness(fd, state))
 }
 #[cfg(target_arch = "x86_64")]
-pub(crate) use native::{KvmCaptureProfile, capture_vm, install_vm, prepare_vm_time};
+pub use native::KvmCaptureProfile;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use native::{capture_vm, install_vm, prepare_vm_time};
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) use native::initialize_counter_model;

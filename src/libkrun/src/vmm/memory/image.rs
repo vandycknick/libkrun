@@ -288,6 +288,11 @@ impl AuthenticatedRamImage {
     pub fn authentication(&self) -> &RamImageAuthentication {
         &self.authentication
     }
+    pub(crate) fn aliases(&self, device: u64, inode: u64) -> bool {
+        [self.ram_fact.identity, self.layout_fact.identity]
+            .iter()
+            .any(|identity| identity.device == device && identity.inode == inode)
+    }
     fn recheck(&self) -> Result<(), RamImageError> {
         self.recheck_before(None)
     }
@@ -327,7 +332,7 @@ pub struct RamCaptureReceipt {
     stats: RamIoStats,
     chunks: Vec<u64>,
     completion: Arc<()>,
-    output: Option<RamOutputFiles>,
+    writers_closed: bool,
 }
 impl fmt::Debug for RamCaptureReceipt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -336,7 +341,7 @@ impl fmt::Debug for RamCaptureReceipt {
             .field("cut_generation", &self.cut_generation)
             .field("mode", &self.mode)
             .field("stats", &self.stats)
-            .field("sealed", &self.output.is_none())
+            .field("writers_closed", &self.writers_closed)
             .finish()
     }
 }
@@ -379,6 +384,7 @@ impl RamCaptureReceipt {
             Ok(facts) => facts,
             Err(error) => return Err((error, output)),
         };
+        drop(output);
         Ok(Self {
             attempt,
             key,
@@ -393,8 +399,18 @@ impl RamCaptureReceipt {
             stats,
             chunks,
             completion: preparation.completion,
-            output: Some(output),
+            writers_closed: true,
         })
+    }
+    pub fn output_identities(&self) -> [(u64, u64, u64); 2] {
+        [self.ram_fact, self.layout_fact]
+            .map(|fact| (fact.identity.device, fact.identity.inode, fact.length))
+    }
+    pub fn binding(&self) -> &StateBinding {
+        &self.binding
+    }
+    pub fn writers_closed(&self) -> bool {
+        self.writers_closed
     }
     pub fn stats(&self) -> &RamIoStats {
         &self.stats
@@ -439,7 +455,7 @@ impl RamCaptureReceipt {
     ) -> Result<(), RamImageError> {
         cut.validate_domain(&self.domain)?;
         let origin = image.completion.as_ref().ok_or(RamImageError::Completion)?;
-        if self.output.is_some()
+        if !self.writers_closed
             || self.attempt != *attempt
             || self.key != key
             || self.cut_generation != cut.generation()
@@ -459,12 +475,12 @@ impl RamCaptureReceipt {
 }
 
 pub fn seal_completed(
-    receipt: &mut RamCaptureReceipt,
+    receipt: &RamCaptureReceipt,
     ram: File,
     layout: File,
     auth: RamImageAuthentication,
 ) -> Result<AuthenticatedRamImage, RamImageError> {
-    if receipt.output.is_none() {
+    if !receipt.writers_closed {
         return Err(RamImageError::Completion);
     }
     auth.state.validate()?;
@@ -491,7 +507,6 @@ pub fn seal_completed(
         layout_fact,
         completion: Some(receipt.completion.clone()),
     };
-    receipt.output = None;
     Ok(image)
 }
 
@@ -1189,6 +1204,59 @@ mod tests {
             .unwrap();
         bytes
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completed_receipt_closes_both_writers_before_authentication() {
+        use std::os::fd::AsRawFd;
+        let files = Files::new();
+        let (_, mut control, layout) = source();
+        let cut = seal(&mut control);
+        let ram = files.create("closed-ram", &[]);
+        let record = files.create("closed-layout", &[]);
+        let ram_fd = ram.as_raw_fd();
+        let layout_fd = record.as_raw_fd();
+        let ram_link = fs::read_link(format!("/proc/self/fd/{ram_fd}")).unwrap();
+        let layout_link = fs::read_link(format!("/proc/self/fd/{layout_fd}")).unwrap();
+        let receipt = write_ram_image(
+            AttemptId::for_test(),
+            key(),
+            &cut,
+            &binding(),
+            layout,
+            RamWriteMode::Full,
+            RamOutputFiles::new(ram, record),
+            &mut RamIoScratch::new().unwrap(),
+            deadline(),
+        )
+        .unwrap();
+        assert!(receipt.writers_closed());
+        assert_ne!(
+            fs::read_link(format!("/proc/self/fd/{ram_fd}")).ok(),
+            Some(ram_link)
+        );
+        assert_ne!(
+            fs::read_link(format!("/proc/self/fd/{layout_fd}")).ok(),
+            Some(layout_link)
+        );
+        let first = seal_completed(
+            &receipt,
+            files.readonly("closed-ram"),
+            files.readonly("closed-layout"),
+            auth(),
+        )
+        .unwrap();
+        let second = seal_completed(
+            &receipt,
+            files.readonly("closed-ram"),
+            files.readonly("closed-layout"),
+            auth(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            first.completion.as_ref().unwrap(),
+            second.completion.as_ref().unwrap()
+        ));
+    }
 
     #[test]
     fn descriptor_roles_reject_writable_inputs_and_readonly_append_path_direct_outputs() {
@@ -1423,12 +1491,12 @@ mod tests {
         let (_, mut control, layout) = source();
         let cut = seal(&mut control);
         let attempt = AttemptId::for_test();
-        let mut receipt = capture(&files, "first", &cut, layout.clone(), attempt.clone());
+        let receipt = capture(&files, "first", &cut, layout.clone(), attempt.clone());
         let mut wrong = auth();
         wrong.state.capture = [9; 16];
         assert!(
             seal_completed(
-                &mut receipt,
+                &receipt,
                 files.readonly("first-ram"),
                 files.readonly("first-layout"),
                 wrong
@@ -1438,7 +1506,7 @@ mod tests {
         fs::copy(files.path("first-ram"), files.path("copy-ram")).unwrap();
         assert!(
             seal_completed(
-                &mut receipt,
+                &receipt,
                 files.readonly("copy-ram"),
                 files.readonly("first-layout"),
                 auth()
@@ -1447,7 +1515,7 @@ mod tests {
         );
         assert!(
             seal_completed(
-                &mut receipt,
+                &receipt,
                 files.writable("first-ram"),
                 files.readonly("first-layout"),
                 auth()
@@ -1462,7 +1530,7 @@ mod tests {
         )
         .unwrap();
         let sealed = seal_completed(
-            &mut receipt,
+            &receipt,
             files.readonly("first-ram"),
             files.readonly("first-layout"),
             auth(),
@@ -1508,16 +1576,16 @@ mod tests {
         );
         assert!(
             seal_completed(
-                &mut receipt,
+                &receipt,
                 files.readonly("first-ram"),
                 files.readonly("first-layout"),
                 auth()
             )
-            .is_err()
+            .is_ok()
         );
-        let mut other = capture(&files, "other", &cut, layout.clone(), attempt.clone());
+        let other = capture(&files, "other", &cut, layout.clone(), attempt.clone());
         let other_sealed = seal_completed(
-            &mut other,
+            &other,
             files.readonly("other-ram"),
             files.readonly("other-layout"),
             auth(),
@@ -1533,11 +1601,11 @@ mod tests {
     }
 
     #[test]
-    fn seal_failure_retains_staging_and_detects_same_inode_layout_mutation() {
+    fn seal_failure_keeps_closed_writer_completion_and_detects_layout_mutation() {
         let files = Files::new();
         let (_, mut control, layout) = source();
         let cut = seal(&mut control);
-        let mut receipt = capture(
+        let receipt = capture(
             &files,
             "candidate",
             &cut,
@@ -1550,28 +1618,28 @@ mod tests {
             .unwrap();
         assert!(
             seal_completed(
-                &mut receipt,
+                &receipt,
                 files.readonly("candidate-ram"),
                 files.readonly("candidate-layout"),
                 auth()
             )
             .is_err()
         );
-        assert!(receipt.output.is_some());
+        assert!(receipt.writers_closed());
         files
             .writable("candidate-layout")
             .write_all_at(layout.canonical_bytes(), 0)
             .unwrap();
         assert!(
             seal_completed(
-                &mut receipt,
+                &receipt,
                 files.readonly("candidate-ram"),
                 files.readonly("candidate-layout"),
                 auth()
             )
             .is_ok()
         );
-        assert!(receipt.output.is_none());
+        assert!(receipt.writers_closed());
     }
 
     #[test]

@@ -312,6 +312,10 @@ impl VirtioStateProvider for Rng {
     ) -> std::result::Result<Poll<QuiesceCompletion>, ProviderFault> {
         self.callbacks.poll_quiesce(key, &mut self.queues)
     }
+    fn validate_terminal_drain(&self, key: BarrierKey) -> std::result::Result<(), ProviderFault> {
+        self.callbacks.validate_terminal_drain(key, &self.queues)?;
+        self.preflight()
+    }
 
     fn begin_resume(
         &mut self,

@@ -90,6 +90,8 @@ pub(crate) struct DiskProperties {
     pub(crate) file: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     nsectors: u64,
     image_id: Vec<u8>,
+    #[cfg(target_os = "macos")]
+    relaxed_sync_file: Option<File>,
 }
 
 impl DiskProperties {
@@ -117,6 +119,8 @@ impl DiskProperties {
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id: disk_image_id,
             file: disk_image,
+            #[cfg(target_os = "macos")]
+            relaxed_sync_file: None,
         })
     }
 
@@ -195,6 +199,11 @@ impl DiskProperties {
             .lock()
             .map_err(|_| io::Error::other("block backend lock poisoned"))?;
         file.flush()?;
+        #[cfg(target_os = "macos")]
+        if let Some(sync_file) = &self.relaxed_sync_file {
+            nix::unistd::fsync(sync_file)?;
+            return Ok(());
+        }
         file.sync()
     }
 }
@@ -289,6 +298,7 @@ pub struct Block {
     byte_length: u64,
     direct_io: bool,
     sync_mode: SyncMode,
+    backing_identity: Option<(u64, u64)>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -318,21 +328,48 @@ impl Block {
         direct_io: bool,
         sync_mode: SyncMode,
     ) -> io::Result<Block> {
-        let disk_image = OpenOptions::new()
-            .read(true)
-            .write(!is_disk_read_only)
-            .open(PathBuf::from(&disk_image_path))?;
+        let mut open = OpenOptions::new();
+        open.read(true).write(!is_disk_read_only);
+        #[cfg(target_os = "linux")]
+        if disk_image_format == DiskFormat::Raw && direct_io {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.custom_flags(nix::fcntl::OFlag::O_DIRECT.bits());
+        }
+        let disk_image = open.open(PathBuf::from(&disk_image_path))?;
 
         let disk_image_id = DiskProperties::build_disk_image_id(&disk_image, &id);
-
-        let file_opts = StorageOpenOptions::new()
-            .write(!is_disk_read_only)
-            .filename(disk_image_path)
-            .direct(direct_io);
-
+        #[cfg(unix)]
+        let backing_identity = if disk_image_format == DiskFormat::Raw {
+            let metadata = disk_image.metadata()?;
+            Some((
+                std::os::unix::fs::MetadataExt::dev(&metadata),
+                std::os::unix::fs::MetadataExt::ino(&metadata),
+            ))
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let backing_identity = None;
         #[cfg(target_os = "macos")]
-        let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
-        let file = ImagoFile::open(file_opts)?;
+        let relaxed_sync_file = if disk_image_format == DiskFormat::Raw {
+            Self::prepare_owned_raw_file(&disk_image, direct_io, sync_mode)?
+        } else {
+            None
+        };
+
+        let file = match disk_image_format {
+            #[cfg(unix)]
+            DiskFormat::Raw => ImagoFile::try_from(disk_image)?,
+            _ => {
+                let file_opts = StorageOpenOptions::new()
+                    .write(!is_disk_read_only)
+                    .filename(disk_image_path)
+                    .direct(direct_io);
+                #[cfg(target_os = "macos")]
+                let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
+                ImagoFile::open(file_opts)?
+            }
+        };
         let discard_alignment = file.discard_align();
 
         let disk_image = match disk_image_format {
@@ -359,6 +396,124 @@ impl Block {
             }
         };
 
+        Self::from_storage(
+            id,
+            partuuid,
+            cache_type,
+            disk_image,
+            discard_alignment,
+            disk_image_format,
+            is_disk_read_only,
+            direct_io,
+            sync_mode,
+            disk_image_id,
+            backing_identity,
+            #[cfg(target_os = "macos")]
+            relaxed_sync_file,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_owned_raw_file(
+        file: &File,
+        direct_io: bool,
+        sync_mode: SyncMode,
+    ) -> io::Result<Option<File>> {
+        if direct_io {
+            use std::os::fd::AsRawFd;
+            // nix has no F_NOCACHE fcntl operation.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if sync_mode == SyncMode::Relaxed {
+            file.try_clone().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn new_restore_binding(
+        id: String,
+        file: File,
+        read_only: bool,
+        payload: &[u8],
+    ) -> io::Result<Self> {
+        let saved = BlockPayload::decode(payload)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "block restore payload"))?;
+        let cache_type = match saved.cache_type {
+            0 => CacheType::Unsafe,
+            1 => CacheType::Writeback,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "block cache mode",
+                ));
+            }
+        };
+        let sync_mode = SyncMode::try_from(saved.sync_mode)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "block sync mode"))?;
+        #[cfg(target_os = "linux")]
+        {
+            let flags = nix::fcntl::OFlag::from_bits_truncate(nix::fcntl::fcntl(
+                &file,
+                nix::fcntl::FcntlArg::F_GETFL,
+            )?);
+            if flags.contains(nix::fcntl::OFlag::O_DIRECT) != saved.direct_io {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "block direct I/O mode",
+                ));
+            }
+        }
+        let metadata = file.metadata()?;
+        let backing_identity = Some((
+            std::os::unix::fs::MetadataExt::dev(&metadata),
+            std::os::unix::fs::MetadataExt::ino(&metadata),
+        ));
+        let disk_image_id = DiskProperties::build_disk_image_id(&file, &id);
+        #[cfg(target_os = "macos")]
+        let relaxed_sync_file = Self::prepare_owned_raw_file(&file, saved.direct_io, sync_mode)?;
+        let file = ImagoFile::try_from(file)?;
+        let discard_alignment = file.discard_align();
+        let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), !read_only)?;
+        let block = Self::from_storage(
+            id,
+            None,
+            cache_type,
+            FormatAccess::new(raw),
+            discard_alignment,
+            DiskFormat::Raw,
+            read_only,
+            saved.direct_io,
+            sync_mode,
+            disk_image_id,
+            backing_identity,
+            #[cfg(target_os = "macos")]
+            relaxed_sync_file,
+        )?;
+        block
+            .validate_block_payload(payload)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "block destination binding"))?;
+        Ok(block)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_storage(
+        id: String,
+        partuuid: Option<String>,
+        cache_type: CacheType,
+        disk_image: FormatAccess<Box<dyn DynStorage>>,
+        discard_alignment: usize,
+        disk_image_format: DiskFormat,
+        is_disk_read_only: bool,
+        direct_io: bool,
+        sync_mode: SyncMode,
+        disk_image_id: Vec<u8>,
+        backing_identity: Option<(u64, u64)>,
+        #[cfg(target_os = "macos")] relaxed_sync_file: Option<File>,
+    ) -> io::Result<Self> {
         let disk_image = Arc::new(Mutex::new(disk_image));
         let byte_length = disk_image
             .lock()
@@ -367,6 +522,12 @@ impl Block {
 
         let disk_properties =
             DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
+        #[cfg(target_os = "macos")]
+        let disk_properties = {
+            let mut disk_properties = disk_properties;
+            disk_properties.relaxed_sync_file = relaxed_sync_file;
+            disk_properties
+        };
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
@@ -421,6 +582,7 @@ impl Block {
             byte_length,
             direct_io,
             sync_mode,
+            backing_identity,
         })
     }
 
@@ -858,6 +1020,10 @@ impl Block {
 }
 
 impl VirtioStateProvider for Block {
+    fn backing_file_identity(&self) -> Result<Option<(u64, u64)>, ProviderFault> {
+        Ok(self.backing_identity)
+    }
+
     fn preflight(&self) -> Result<(), ProviderFault> {
         if self.disk_format != DiskFormat::Raw {
             return Err(ProviderFault::Unsupported);
@@ -1251,6 +1417,100 @@ mod tests {
             SyncMode::Relaxed,
         )
         .expect("open actual raw destination binding")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cold_raw_identity_and_io_remain_bound_to_adopted_inode_after_path_replacement()
+    -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let backing = TempFile::new().unwrap();
+        backing.as_file().set_len(4096).unwrap();
+        backing.as_file().write_all_at(&[17], 0).unwrap();
+        let metadata = backing.as_file().metadata().unwrap();
+        let identity = (
+            std::os::unix::fs::MetadataExt::dev(&metadata),
+            std::os::unix::fs::MetadataExt::ino(&metadata),
+        );
+        let block = raw_block(&backing, "data", false);
+        std::fs::remove_file(backing.as_path()).unwrap();
+        let replacement = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(backing.as_path())
+            .unwrap();
+        replacement.set_len(4096).unwrap();
+        replacement.write_all_at(&[29], 0).unwrap();
+        assert_eq!(block.backing_file_identity().unwrap(), Some(identity));
+        let mut observed = [0; 1];
+        {
+            let disk = block
+                .disk_image
+                .lock()
+                .map_err(|_| io::Error::other("actual Raw backend lock poisoned"))?;
+            let (mapping, _) = disk.get_mapping(0, 1)?;
+            let imago::Mapping::Raw { storage, .. } = mapping else {
+                panic!("Raw mapping required")
+            };
+            assert!(storage.get_filename().is_none());
+            disk.read(&mut observed[..], 0)?;
+            assert_eq!(observed, [17]);
+            disk.write(&[41u8][..], 0)?;
+        }
+        backing.as_file().read_exact_at(&mut observed, 0).unwrap();
+        assert_eq!(observed, [41]);
+        replacement.read_exact_at(&mut observed, 0).unwrap();
+        assert_eq!(observed, [29]);
+        #[cfg(target_os = "macos")]
+        {
+            assert!(block.disk.as_ref().unwrap().relaxed_sync_file.is_some());
+            block.disk.as_ref().unwrap().checked_sync().unwrap();
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_raw_constructor_consumes_exact_owned_file_without_reopening_path() {
+        let source_file = TempFile::new().unwrap();
+        source_file.as_file().set_len(4096).unwrap();
+        let mut source = raw_block(&source_file, "data", false);
+        let pause = request(1, 1);
+        quiesce(&mut source, pause);
+        let payload = source.capture_payload(pause.key).unwrap();
+        let destination = TempFile::new().unwrap();
+        destination.as_file().set_len(4096).unwrap();
+        let owned = destination.as_file().try_clone().unwrap();
+        let metadata = owned.metadata().unwrap();
+        let identity = (
+            std::os::unix::fs::MetadataExt::dev(&metadata),
+            std::os::unix::fs::MetadataExt::ino(&metadata),
+        );
+        std::fs::remove_file(destination.as_path()).unwrap();
+        let block = Block::new_restore_binding("data".into(), owned, false, &payload).unwrap();
+        assert_eq!(block.backing_file_identity().unwrap(), Some(identity));
+        block.validate_restore(&payload).unwrap();
+        let wrong = TempFile::new().unwrap();
+        wrong.as_file().set_len(8192).unwrap();
+        assert!(
+            Block::new_restore_binding(
+                "data".into(),
+                wrong.as_file().try_clone().unwrap(),
+                false,
+                &payload,
+            )
+            .is_err()
+        );
+        assert!(
+            Block::new_restore_binding(
+                "foreign".into(),
+                source_file.as_file().try_clone().unwrap(),
+                false,
+                &payload,
+            )
+            .is_err()
+        );
     }
 
     #[test]

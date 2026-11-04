@@ -529,6 +529,38 @@ impl VirtioStateProvider for Net {
         }
         Ok(Poll::Ready(QuiesceCompletion { queues, fault }))
     }
+    fn validate_terminal_drain(&self, key: BarrierKey) -> std::result::Result<(), ProviderFault> {
+        self.lifecycle.check(key).map_err(|error| error.fault)?;
+        if self.lifecycle.snapshot.stage != ProviderStage::Quiesced || self.worker.is_some() {
+            return Err(ProviderFault::InvalidTransition);
+        }
+        if self.device_state.is_activated() && (self.parked.is_none() || self.control.is_none()) {
+            return Err(ProviderFault::Worker);
+        }
+        let slot = self.slot.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => ProviderFault::LockBusy,
+            TryLockError::Poisoned(_) => ProviderFault::Worker,
+        })?;
+        if slot.is_some() {
+            return Err(ProviderFault::Worker);
+        }
+        drop(slot);
+        if let Some(parked) = &self.parked
+            && let Some(fault) = parked.fault
+        {
+            return Err(fault);
+        }
+        if let Some((control, _)) = &self.control {
+            let control = control.try_lock().map_err(|error| match error {
+                TryLockError::WouldBlock => ProviderFault::LockBusy,
+                TryLockError::Poisoned(_) => ProviderFault::Worker,
+            })?;
+            if !control.closed {
+                return Err(ProviderFault::InvalidTransition);
+            }
+        }
+        self.preflight()
+    }
     fn begin_resume(
         &mut self,
         request: BarrierRequest,
@@ -674,6 +706,16 @@ impl VirtioStateProvider for Net {
         self.lifecycle.begin(request, ProviderStage::Quiescing);
         self.lifecycle.snapshot.stage = ProviderStage::Quiesced;
         Ok(())
+    }
+    fn activation_fenced(&self) -> std::result::Result<Option<bool>, ProviderFault> {
+        let Some((control, _)) = &self.control else {
+            return Ok(None);
+        };
+        let control = control.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => ProviderFault::LockBusy,
+            TryLockError::Poisoned(_) => ProviderFault::Worker,
+        })?;
+        Ok(Some(control.mode == EndpointMode::ActivationFenced))
     }
     fn begin_activation_release(
         &mut self,
@@ -939,6 +981,7 @@ mod tests {
 
         for (poison, expire) in [(false, false), (true, false), (false, true)] {
             let (mut net, peer, mut release) = inactive_activation_net();
+            assert_eq!(net.activation_fenced(), Ok(Some(true)));
             if expire {
                 release.deadline = Instant::now() + Duration::from_millis(100);
             }
@@ -946,6 +989,7 @@ mod tests {
             let held = admission
                 .lock()
                 .expect("hold the unaccepted network owner gate");
+            assert_eq!(net.activation_fenced(), Err(ProviderFault::LockBusy));
             let rejected = net.begin_activation_release(release).unwrap_err();
             assert!(!rejected.accepted);
             assert_eq!(rejected.fault, ProviderFault::LockBusy);
@@ -1020,6 +1064,7 @@ mod tests {
                 {
                     assert!(Instant::now() < release.deadline);
                 }
+                assert_eq!(net.activation_fenced(), Ok(Some(false)));
                 let held = admission
                     .lock()
                     .expect("hold the completed network owner gate");

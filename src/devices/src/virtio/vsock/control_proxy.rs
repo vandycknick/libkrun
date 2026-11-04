@@ -653,6 +653,8 @@ fn validate_stream(fd: impl AsFd) -> std::io::Result<()> {
         ));
     }
     getsockname::<nix::sys::socket::UnixAddr>(fd.as_raw_fd()).map_err(std::io::Error::from)?;
+    nix::sys::socket::getpeername::<nix::sys::socket::UnixAddr>(fd.as_raw_fd())
+        .map_err(std::io::Error::from)?;
     Ok(())
 }
 
@@ -673,6 +675,32 @@ mod tests {
         prepare_stream(&pair.0).unwrap();
         prepare_stream(&pair.1).unwrap();
         pair
+    }
+
+    #[test]
+    fn mux_adoption_rejects_unconnected_or_nonstream_sockets_and_accepts_unnamed_pair() {
+        let unconnected = nix::sys::socket::socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        assert!(ControlProxy::new(unconnected, std::iter::empty()).is_err());
+        let (datagram, _peer) = socketpair(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        assert!(ControlProxy::new(datagram, std::iter::empty()).is_err());
+        let (connected, _peer) = pair();
+        let address =
+            nix::sys::socket::getpeername::<nix::sys::socket::UnixAddr>(connected.as_raw_fd())
+                .unwrap();
+        assert!(address.path().is_none());
+        assert!(ControlProxy::new(connected, std::iter::empty()).is_ok());
     }
 
     #[test]

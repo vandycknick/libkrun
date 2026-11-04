@@ -145,6 +145,28 @@ pub(crate) fn build_restore_prepared(
     if saved.lane != expected_lane {
         return Err(refusal("restore backend/ISA mismatch"));
     }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let restored_profile = if cpu_only_fixture {
+        None
+    } else {
+        #[cfg(feature = "native-device-probe")]
+        let reset_diagnostic = matches!(&saved.vm,
+            VmExecutionState::Kvm(crate::vmm::execution::kvm::KvmVmState::X86(state))
+                if state.pit_profile == 0
+        );
+        #[cfg(not(feature = "native-device-probe"))]
+        let reset_diagnostic = false;
+        if reset_diagnostic {
+            Some(crate::vmm::execution::runtime::KvmCaptureProfile::ResetPit)
+        } else {
+            Some(
+                crate::vmm::execution::runtime::KvmCaptureProfile::from_restored_execution(
+                    &execution,
+                )
+                .map_err(refusal)?,
+            )
+        }
+    };
     validate_legacy_bindings(saved, &devices).map_err(refusal)?;
     devices
         .validate_memory(&ram.domain().read_only())
@@ -332,7 +354,15 @@ pub(crate) fn build_restore_prepared(
         memory_coordinator,
     )
     .map_err(refusal)?;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        attempt.execution.profile = restored_profile;
+    }
     let install_result = (|| {
+        attempt
+            .memory
+            .observe_restore_install_begin()
+            .map_err(|error| error.to_string())?;
         let native = attempt.memory.native()?;
         // Bus clones snapshot their mappings. Finish dormant topology construction
         // before owners take their buses; install device payloads only after CPU state.
@@ -463,6 +493,9 @@ pub(crate) fn build_restore_prepared(
             {
                 std::task::Poll::Ready(()) => break,
                 std::task::Poll::Pending => {
+                    if Instant::now() >= deadline {
+                        return Err("restore IRQ fencing deadline".into());
+                    }
                     std::thread::sleep(std::time::Duration::from_micros(100));
                 }
             }
@@ -484,6 +517,10 @@ pub(crate) fn build_restore_prepared(
             }
             std::thread::sleep(std::time::Duration::from_micros(100));
         }
+        attempt
+            .memory
+            .observe_restore_install_complete()
+            .map_err(|error| error.to_string())?;
         Ok::<(), String>(())
     })();
     if let Err(error) = install_result {

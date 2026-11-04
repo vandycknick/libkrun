@@ -1393,6 +1393,121 @@ mod tests {
         assert!(state.validate().is_err());
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        not(any(feature = "tee", feature = "aws-nitro"))
+    ))]
+    #[test]
+    fn restored_capture_profile_requires_authenticated_retired_pit_codec_tag() {
+        use crate::vmm::execution::runtime::KvmCaptureProfile;
+        use crate::vmm::execution::{
+            CpuExecutionState, CpuIdentity, ExecutionEnvelope, ExecutionLane, StateBinding,
+            ValidatedExecution, VmExecutionState,
+        };
+        let expected = StateBinding {
+            native_producer: "exact-native-codec-fixture".into(),
+            silo_producer: [1; 32],
+            profile: [2; 32],
+            topology: [3; 32],
+            ram_layout: [4; 32],
+            source_run: [5; 16],
+            pause_generation: 1,
+            capture: [6; 16],
+        };
+        for tag in [0, 1] {
+            let mut cpu = cpu();
+            let KvmCpuState::X86(state) = &mut cpu else {
+                panic!()
+            };
+            state
+                .cpuid
+                .iter_mut()
+                .find(|leaf| leaf.function == 1)
+                .unwrap()
+                .values[1] = 1 << 16;
+            let mut vm = X86VmState {
+                clock: 1,
+                clock_flags: 10,
+                host_tsc: 1,
+                realtime: 1,
+                host_kernel: "unit-profile".into(),
+                host_mode: 0,
+                pit: std::array::from_fn(|_| PitChannel {
+                    count: 0,
+                    latched_count: 0,
+                    bytes: [0, 0, 0, 0, 0, 0, 0, 255, 0, 0],
+                    count_load_time: 0,
+                }),
+                pit_flags: 0,
+                pit_profile: tag,
+                pic: [[0; 16]; 2],
+                ioapic_base: 0,
+                ioapic_select: 0,
+                ioapic_id: 0,
+                ioapic_irr: 0,
+                ioapic_routes: [0; 24],
+            };
+            if tag == 1 {
+                vm.pit[0].bytes[7] = 0;
+                vm.pit[0].count = 65536;
+                vm.pic[0][2] = 1;
+                vm.ioapic_routes[0] = 1 << 16;
+            }
+            let envelope = ExecutionEnvelope {
+                binding: expected.clone(),
+                lane: ExecutionLane::KvmX86,
+                topology: vec![CpuIdentity {
+                    logical_id: 0,
+                    architectural_id: 0,
+                }],
+                attachments: Vec::new(),
+                irq_routes: Vec::new(),
+                page_granule: 4096,
+                memory_regions: vec![arch::guest_memory::GuestRange::new(0, 4096).unwrap()],
+                vm: VmExecutionState::Kvm(KvmVmState::X86(vm)),
+                cpus: vec![CpuExecutionState::Kvm(cpu)],
+                legacy: Vec::new(),
+            };
+            let bytes = envelope.encode().unwrap();
+            let validated = ValidatedExecution::decode(
+                &bytes,
+                &expected,
+                ExecutionLane::KvmX86,
+                &envelope.topology,
+                &[],
+            )
+            .unwrap();
+            let profile = KvmCaptureProfile::from_restored_execution(&validated);
+            if tag == 0 {
+                assert!(profile.is_err());
+            } else {
+                assert!(matches!(
+                    profile.unwrap(),
+                    KvmCaptureProfile::RetiredLinuxPit {
+                        clocksource_tsc: true,
+                        all_online_clockevents_deadline: true,
+                        broadcast_uses_pit: false,
+                        speaker_or_counter_consumer: false,
+                        ..
+                    }
+                ));
+            }
+            let mut foreign = expected.clone();
+            foreign.profile[0] ^= 1;
+            assert!(
+                ValidatedExecution::decode(
+                    &bytes,
+                    &foreign,
+                    ExecutionLane::KvmX86,
+                    &envelope.topology,
+                    &[],
+                )
+                .is_err()
+            );
+        }
+    }
+
     #[test]
     fn kvm_execution_dynamic_xsave_tail_is_never_truncated() {
         let mut state = cpu();

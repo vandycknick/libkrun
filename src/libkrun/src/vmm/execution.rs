@@ -235,6 +235,20 @@ impl ValidatedExecution {
         &self.envelope
     }
 
+    pub(crate) fn validate(
+        envelope: ExecutionEnvelope,
+        expected: &StateBinding,
+        lane: ExecutionLane,
+    ) -> Result<Self, Error> {
+        envelope.validate()?;
+        if &envelope.binding != expected || envelope.lane != lane {
+            return Err(Error::Invalid("exact destination execution binding"));
+        }
+        Ok(Self {
+            envelope: Arc::new(envelope),
+        })
+    }
+
     pub fn decode(
         bytes: &[u8],
         expected: &StateBinding,
@@ -761,6 +775,27 @@ mod tests {
             cpus: vec![CpuExecutionState::Hvf(cpu)],
             legacy: Vec::new(),
         }
+    }
+
+    #[test]
+    fn derived_restore_topology_requires_independent_binding_and_lane() {
+        let saved = envelope();
+        let expected = saved.binding.clone();
+        assert_eq!(
+            ValidatedExecution::validate(saved.clone(), &expected, saved.lane)
+                .unwrap()
+                .envelope(),
+            &saved,
+        );
+        let mut foreign = expected.clone();
+        foreign.profile[0] ^= 1;
+        assert!(ValidatedExecution::validate(saved.clone(), &foreign, saved.lane).is_err());
+        assert!(
+            ValidatedExecution::validate(saved.clone(), &expected, ExecutionLane::KvmX86).is_err()
+        );
+        let mut malformed = saved.clone();
+        malformed.topology.clear();
+        assert!(ValidatedExecution::validate(malformed, &expected, saved.lane).is_err());
     }
 
     #[test]

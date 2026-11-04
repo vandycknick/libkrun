@@ -222,6 +222,14 @@ impl Default for Generation {
 }
 
 impl Generation {
+    pub fn validate_live_restore_payload(payload: &[u8]) -> Result<(), ProviderFault> {
+        let saved = Self::decode_payload(payload)?;
+        if saved.words[1] != 0x0d {
+            return Err(ProviderFault::DeviceState);
+        }
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self {
             acked_features: 0,
@@ -770,6 +778,10 @@ impl VirtioStateProvider for Generation {
     fn poll_quiesce(&mut self, key: BarrierKey) -> Result<Poll<QuiesceCompletion>, ProviderFault> {
         self.callbacks.poll_quiesce(key, &mut self.queues)
     }
+    fn validate_terminal_drain(&self, key: BarrierKey) -> Result<(), ProviderFault> {
+        self.callbacks.validate_terminal_drain(key, &self.queues)?;
+        self.preflight()
+    }
 
     fn begin_resume(
         &mut self,
@@ -931,6 +943,19 @@ mod tests {
         device.write_config(4, &13u32.to_le_bytes());
         assert!(cut(&mut device, 1).is_empty());
         device
+    }
+
+    #[test]
+    fn generation_live_restore_requires_saved_ready_clock_capable_driver() {
+        let mut source = stopped();
+        let payload = source.capture_payload(barrier(1).key).unwrap();
+        assert!(Generation::validate_live_restore_payload(&payload).is_ok());
+        for status in [0, 1, 5, 9, 15] {
+            source.driver_status = status;
+            let payload = source.capture_payload(barrier(1).key).unwrap();
+            assert!(Generation::validate_live_restore_payload(&payload).is_err());
+        }
+        assert!(Generation::validate_live_restore_payload(&[]).is_err());
     }
 
     fn prepare(device: &mut Generation, id: [u8; 16], now: Instant) -> GenerationAttempt {

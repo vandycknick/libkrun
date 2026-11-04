@@ -5,8 +5,10 @@ standalone target. Its feature is a diagnostic build exclusion, not a qualificat
 input. It never grants a live bit, creates a machine pause token, exposes a capture
 C API, or bypasses a missing production provider. Diagnostic builds remain excluded
 from native availability. Commit 6 enables the implemented native pause primitive
-in supported normal builds; public operations remain `not-delivered`, and unrun
-lanes remain pending qualification.
+in supported normal builds. Native capture, restore, fork and incremental support
+is declared for the KVM x86_64 lane only (see “Native operation declarations”
+below); public operations remain `not-delivered`, and unrun lanes remain pending
+qualification.
 
 The probe uses the production `Vmm`, `CpuController`, typed owner commands,
 execution envelope codec, `ValidatedExecution`, and `build_restore_prepared`.
@@ -1743,3 +1745,64 @@ capability grants. No fresh-process restore/generation activation proof is
 claimed here: that additionally requires commit 11's exported restore path.
 The guest production patch remains unchanged.
 
+## Production Rust capture and restore API
+
+The Rust-only `libkrun::live` and `libkrun::live::restore` interfaces expose
+owned capture outputs, retained capture/baseline identities, descriptor-fed
+restore inputs, prepared restore tokens and explicit activation fences.
+The standalone diagnostic API above is not a substitute for exercising
+these production interfaces.
+
+Production execution identity requires complete, clean native build
+provenance. A dirty or unknown source tree cannot produce an authenticated
+production capture merely because it compiles. Rebuild after establishing
+the clean source revision; never relabel a diagnostic producer or bypass
+`execution_producer()` to run the production proof.
+
+Accepted operations belong to the VM, not to the caller waiting for a reply.
+A caller deadline is not cancellation. Reconcile capture status using the
+exact retained capture identity before accepting, abandoning or releasing
+the result. Unresolved captures block resume. Successful output receipts
+require closed native writers; accepting a baseline additionally requires
+the exact authenticated read-only files. Releasing a result does not discard
+the independently retained accepted baseline.
+
+Restore consumes owned RAM, layout, execution and device descriptors plus
+an exact destination resource inventory. Construction keeps CPUs parked and
+network/non-agent endpoints fenced. The generation acknowledgement and
+explicit endpoint release are separate operations. Construction and prepared
+callback failures may return a `FailedRestore` owner; retain and reconcile
+it through actual terminal cleanup rather than replacing its accepted stop
+identity when a caller deadline expires.
+
+The Silo checkout provides `virt/vmm/examples/native_live_api.rs` and
+`smoke/silo_smoke/native_live_api.py` for the real engine/public-API proof.
+See its `smoke/README.md`, “Public native capture/restore API proof”, for
+exact build commands, input roles, bounded cohorts and diagnostic-kernel
+separation. Cargo tests remain hypervisor-free. A passing compile, codec
+test or cold generation cohort does not establish fresh-process restore,
+incremental capture, sharing or endpoint-release correctness.
+
+Evidence from the actual exported path gates native support declarations.
+It does not deliver Silo's public monitor lifecycle commands or establish
+HVF/KVM arm64 qualification from a Linux x86_64 run.
+
+### Native operation declarations
+
+`NativeLiveOperations::for_lane` is a build-lane table. It does not observe the
+host, construct a VM or grant runtime qualification:
+
+| Lane | pause | capture / restore / fork / incremental |
+| --- | --- | --- |
+| KVM x86_64 | supported | supported |
+| KVM arm64 GICv3 | supported | unsupported, `NotImplemented` (pending) |
+| HVF arm64 GICv3 | supported | unsupported, `NotImplemented` (pending) |
+| excluded build | unsupported, `BuildExcluded` | unsupported, `BuildExcluded` |
+
+The KVM x86_64 declaration rests on the passed exported-API cohorts `api`,
+`incremental`, `partial`, `restore-failures`, `failures`, `late`, `absent`,
+`expiry`, `restore-timeout` and `faults`, each with every owner reaped. The
+arm64 lanes change only after their own exported-path gates pass. A supported native
+operation is a primitive, not public delivery: Silo still reports every public
+live operation `not-delivered`, and a lane declaration does not admit every
+storage or device profile (raw-only block admission still applies).

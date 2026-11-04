@@ -1,4 +1,16 @@
 #[cfg(all(
+    not(any(feature = "tee", feature = "aws-nitro")),
+    any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
+pub(crate) mod restored;
+
+#[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
     feature = "blk",
@@ -156,6 +168,7 @@ enum VmmInner {
 pub struct Vmm<'a> {
     inner: VmmInner,
     _lifetime: PhantomData<&'a ()>,
+    _restore_files: Vec<std::fs::File>,
 }
 
 /// Handle to the inner VMM, usable from another thread while the
@@ -166,7 +179,7 @@ pub struct Vmm<'a> {
 // so that run() returns a RunningVmm with wait(). Then this handle
 // can be obtained from RunningVmm instead of requiring a pre-run call.
 pub struct VmmHandle {
-    control: ControlClient,
+    pub(crate) control: ControlClient,
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     shutdown_efd: Option<Arc<EventFd>>,
     reclaim_observer: devices::virtio::balloon::ReclaimObserver,
@@ -506,6 +519,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         return Ok(Vmm {
             inner: VmmInner::Nitro(enclave),
             _lifetime: PhantomData,
+            _restore_files: Vec::new(),
         });
     }
 
@@ -656,5 +670,6 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
             shutdown_efd,
         },
         _lifetime: PhantomData,
+        _restore_files: Vec::new(),
     })
 }

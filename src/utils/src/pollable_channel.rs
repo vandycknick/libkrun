@@ -30,9 +30,15 @@ struct Inner<T: Send> {
     queue: Mutex<VecDeque<T>>,
 }
 
-#[derive(Clone)]
 pub struct PollableChannelSender<T: Send> {
     inner: Arc<Inner<T>>,
+}
+impl<T: Send> Clone for PollableChannelSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl<T: Send> PollableChannelSender<T> {
@@ -92,5 +98,34 @@ impl<T: Send> AsFd for PollableChannelReciever<T> {
         // SAFETY: The lifetime of the fd is the same as the lifetime of self.inner.eventfd which
         //         is the same as the lifetime of self.
         unsafe { BorrowedFd::borrow_raw(self.inner.eventfd.as_raw_fd()) }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+
+    use crate::pollable_channel::pollable_channel;
+    use crate::tempfile::TempFile;
+
+    #[test]
+    fn sender_clone_moves_nonclone_file_without_duplicating_its_descriptor() {
+        let temporary = TempFile::new().unwrap();
+        temporary.as_file().write_all_at(b"owned", 0).unwrap();
+        let file = File::open(temporary.as_path()).unwrap();
+        let descriptor = file.as_raw_fd();
+        let (sender, receiver) = pollable_channel::<File>().unwrap();
+        let cloned = sender.clone();
+        drop(sender);
+        cloned.send(file).unwrap();
+        let mut received = receiver.try_recv().unwrap().unwrap();
+        assert_eq!(received.as_raw_fd(), descriptor);
+        let mut bytes = Vec::new();
+        received.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"owned");
+        assert!(receiver.is_empty());
     }
 }

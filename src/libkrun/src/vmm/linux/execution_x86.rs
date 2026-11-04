@@ -783,13 +783,10 @@ pub(crate) fn prepare_cpu_time(
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum KvmCaptureProfile {
+pub enum KvmCaptureProfile {
     // Only the separately built execution diagnostic constructs an unprogrammed-PIT profile.
     #[cfg_attr(not(feature = "native-execution-probe"), allow(dead_code))]
     ResetPit,
-    // Normal-guest callers require commit6 providers and the commit11 capture API.
-    // Keeping the real predicate compiled does not satisfy the pending production-guest gate.
-    #[allow(dead_code)]
     RetiredLinuxPit {
         kernel_identity: String,
         clocksource_tsc: bool,
@@ -797,6 +794,29 @@ pub(crate) enum KvmCaptureProfile {
         broadcast_uses_pit: bool,
         speaker_or_counter_consumer: bool,
     },
+}
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+impl KvmCaptureProfile {
+    pub(crate) fn from_restored_execution(
+        execution: &crate::vmm::execution::ValidatedExecution,
+    ) -> Result<Self, String> {
+        let saved = execution.envelope();
+        let crate::vmm::execution::VmExecutionState::Kvm(KvmVmState::X86(state)) = &saved.vm else {
+            return Err("restored KVM execution required".into());
+        };
+        if state.pit_profile != 1 {
+            return Err("restored live capture requires admitted retired Linux PIT profile".into());
+        }
+        // Tag 1 is emitted only after the source's observed passive-PIT contract
+        // passes native validation. Its authenticated profile binding survives restore.
+        Ok(Self::RetiredLinuxPit {
+            kernel_identity: format!("authenticated-profile:{:02x?}", saved.binding.profile),
+            clocksource_tsc: true,
+            all_online_clockevents_deadline: true,
+            broadcast_uses_pit: false,
+            speaker_or_counter_consumer: false,
+        })
+    }
 }
 fn host_clock_profile() -> Result<(String, u8), String> {
     let disabled = |path: &str| -> Result<(), String> {

@@ -618,6 +618,63 @@ impl MmioTransport {
     }
 
     pub fn poll_stop(&mut self, request: BarrierRequest) -> Result<Poll<()>, LifecycleError> {
+        self.poll_stop_inner(request, false)
+    }
+
+    pub fn poll_cleanup(&mut self, request: BarrierRequest) -> Result<Poll<()>, LifecycleError> {
+        let snapshot = self.lifecycle.snapshot;
+        let accepted = snapshot.accepted
+            && matches!(
+                snapshot.stage,
+                ProviderStage::Stopping | ProviderStage::Stopped
+            );
+        let request = if accepted {
+            snapshot.request.ok_or_else(|| {
+                self.lifecycle
+                    .error(request.key, ProviderFault::ForeignBarrier)
+            })?
+        } else if Instant::now() >= request.deadline {
+            // Only an unaccepted participant receives a fresh admission window.
+            // An accepted native request, including its deadline, never changes.
+            BarrierRequest {
+                key: request.key,
+                deadline: Instant::now()
+                    .checked_add(std::time::Duration::from_secs(1))
+                    .ok_or_else(|| self.lifecycle.error(request.key, ProviderFault::Deadline))?,
+            }
+        } else {
+            request
+        };
+        let result = self.poll_stop_inner(request, true);
+        if self.lifecycle.snapshot.stage == ProviderStage::Stopped {
+            // Stopped is published only after real worker/queue reconciliation.
+            // This proves disposal, not success of the original timed operation.
+            return Ok(Poll::Ready(()));
+        }
+        if let Err(error) = result {
+            if !error.accepted
+                && matches!(
+                    error.fault,
+                    ProviderFault::LockBusy | ProviderFault::Deadline
+                )
+            {
+                self.lifecycle.snapshot = snapshot;
+                self.lifecycle
+                    .snapshot
+                    .previous_failure
+                    .get_or_insert(error);
+                return Ok(Poll::Pending);
+            }
+            return Err(error);
+        }
+        result
+    }
+
+    fn poll_stop_inner(
+        &mut self,
+        request: BarrierRequest,
+        cleanup: bool,
+    ) -> Result<Poll<()>, LifecycleError> {
         #[cfg(feature = "native-device-probe")]
         {
             // Terminal cleanup completes original callbacks even if the
@@ -629,7 +686,7 @@ impl MmioTransport {
             snapshot.stage,
             ProviderStage::Stopping | ProviderStage::Stopped
         ) {
-            return self.poll_terminal_stop(request);
+            return self.poll_terminal_stop(request, cleanup);
         }
         if Instant::now() >= request.deadline {
             return Err(self.lifecycle.error(request.key, ProviderFault::Deadline));
@@ -682,7 +739,7 @@ impl MmioTransport {
             }
             ProviderStage::Quiescing | ProviderStage::Quiesced => {
                 self.begin_terminal_drain(request)?;
-                self.poll_terminal_drain(request)
+                self.poll_terminal_drain(request, cleanup)
             }
             ProviderStage::Stopping | ProviderStage::Stopped => Err(self
                 .lifecycle
@@ -715,7 +772,11 @@ impl MmioTransport {
         Ok(())
     }
 
-    fn poll_terminal_drain(&mut self, request: BarrierRequest) -> Result<Poll<()>, LifecycleError> {
+    fn poll_terminal_drain(
+        &mut self,
+        request: BarrierRequest,
+        cleanup: bool,
+    ) -> Result<Poll<()>, LifecycleError> {
         self.lifecycle.expired(Instant::now());
         let mut drain = self.stop_drain.ok_or_else(|| {
             self.lifecycle
@@ -771,6 +832,7 @@ impl MmioTransport {
         if drain.complete {
             if drain.reconcile_failure
                 || (drain.provider_key != request.key && drain.completion_fault.is_some())
+                || (cleanup && drain.completion_fault == Some(ProviderFault::Deadline))
             {
                 // A provider must independently prove real cleanup before a
                 // historical operation failure can remain history only.
@@ -839,7 +901,11 @@ impl MmioTransport {
         }
     }
 
-    fn poll_terminal_stop(&mut self, request: BarrierRequest) -> Result<Poll<()>, LifecycleError> {
+    fn poll_terminal_stop(
+        &mut self,
+        request: BarrierRequest,
+        cleanup: bool,
+    ) -> Result<Poll<()>, LifecycleError> {
         if self.lifecycle.check(request.key)? != request {
             return Err(self
                 .lifecycle
@@ -858,7 +924,7 @@ impl MmioTransport {
             }));
         }
         if self.stop_drain.is_some() {
-            return self.poll_terminal_drain(request);
+            return self.poll_terminal_drain(request, cleanup);
         }
         self.lifecycle.expired(Instant::now());
         let device = Arc::clone(&self.device);
@@ -3140,6 +3206,253 @@ pub(crate) mod tests {
             drop(console);
             // The reader is never touched while terminal cleanup owns TX.
             drop(peer);
+        }
+    }
+
+    #[cfg(all(
+        feature = "native-device-probe",
+        target_os = "linux",
+        target_arch = "x86_64",
+        not(feature = "tee")
+    ))]
+    #[test]
+    fn cleanup_two_real_console_workers_continue_after_observer_deadline_without_rebinding() {
+        use crate::legacy::{IrqChipDevice, KvmIoapic};
+        use crate::virtio::console::port_io;
+        use polly::event_manager::{BarrierGeneration, OperationId};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+        fn console_owner(console: &Arc<Mutex<Console>>) -> std::sync::MutexGuard<'_, Console> {
+            match console.lock() {
+                Ok(owner) => owner,
+                Err(error) => panic!("actual console owner poisoned: {error}"),
+            }
+        }
+
+        let make_console = |address, blocked| {
+            let (host, peer) = UnixStream::pair().unwrap();
+            let console = Arc::new(Mutex::new(
+                Console::new(vec![PortDescription::output_pipe(
+                    "output",
+                    port_io::output_to_raw_fd_dup(host.as_raw_fd()).unwrap(),
+                )])
+                .unwrap(),
+            ));
+            let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 4 << 20)]).unwrap();
+            let mut transport = MmioTransport::new(
+                memory.clone(),
+                Arc::new(Mutex::new(IrqChipDevice::new(Box::new(KvmIoapic {})))),
+                console.clone(),
+                None,
+            )
+            .unwrap();
+            transport.set_attachment_address(address).unwrap();
+            for (index, queue) in transport.queues.as_mut().unwrap().iter_mut().enumerate() {
+                let base = index as u64 * 0x1000;
+                queue.size = 32;
+                queue.ready = true;
+                queue.desc_table = GuestAddress(base);
+                queue.avail_ring = GuestAddress(base + 0x400);
+                queue.used_ring = GuestAddress(base + 0x800);
+            }
+            transport.activate();
+            transport.device_status = 15;
+            {
+                let mut device = console_owner(&console);
+                device.ports[0].opened = true;
+                device.start_port(0).unwrap();
+            }
+            if blocked {
+                memory
+                    .write_slice(&vec![0x5a; 2 << 20], GuestAddress(0x10000))
+                    .unwrap();
+                memory.write_obj(0x10000u64, GuestAddress(0x1000)).unwrap();
+                memory.write_obj(2u32 << 20, GuestAddress(0x1008)).unwrap();
+                memory.write_obj(0u16, GuestAddress(0x100c)).unwrap();
+                memory.write_obj(0u16, GuestAddress(0x1404)).unwrap();
+                memory.write_obj(1u16, GuestAddress(0x1402)).unwrap();
+                console_owner(&console).ports[0].notify_tx();
+                let limit = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match console_owner(&console).output_observations() {
+                        Ok(observed) if observed[0].blocked_head == Some(0) => {
+                            assert!(observed[0].worker_handle_retained);
+                            assert!(!observed[0].worker_finished);
+                            assert!(observed[0].bytes_written > 0);
+                            assert!(observed[0].write_remaining > 0);
+                            break;
+                        }
+                        Ok(_) | Err(ProviderFault::LockBusy) => {}
+                        Err(fault) => panic!("real output observation: {fault:?}"),
+                    }
+                    assert!(Instant::now() < limit);
+                    std::thread::yield_now();
+                }
+            }
+            (transport, console, memory, peer)
+        };
+        for accepted_second in [true, false] {
+            let (mut first, first_console, _, first_peer) = make_console(0x1000, false);
+            let (mut second, second_console, second_memory, second_peer) =
+                make_console(0x2000, true);
+            let cleanup = BarrierRequest {
+                key: BarrierKey {
+                    operation: OperationId(70),
+                    generation: BarrierGeneration(9),
+                },
+                deadline: Instant::now() + Duration::from_millis(40),
+            };
+            assert!(first.poll_cleanup(cleanup).unwrap().is_pending());
+            if accepted_second {
+                assert!(second.poll_cleanup(cleanup).unwrap().is_pending());
+            }
+            let held = console_owner(&second_console);
+            let limit = Instant::now() + Duration::from_secs(5);
+            loop {
+                match first.poll_cleanup(cleanup) {
+                    Ok(Poll::Ready(())) => break,
+                    Ok(Poll::Pending) => {}
+                    Err(error) => panic!("first real worker cleanup: {error:?}"),
+                }
+                assert!(Instant::now() < limit);
+                std::thread::yield_now();
+            }
+            let completed = first.lifecycle_snapshot();
+            assert_eq!(completed.request, Some(cleanup));
+            assert_eq!(completed.stage, ProviderStage::Stopped);
+            assert!(
+                !console_owner(&first_console).output_observations().unwrap()[0]
+                    .worker_handle_retained
+            );
+            while Instant::now() < cleanup.deadline {
+                std::thread::yield_now();
+            }
+            let delayed = second.poll_cleanup(cleanup);
+            if accepted_second {
+                assert_eq!(delayed.unwrap_err().fault, ProviderFault::Deadline);
+                assert_eq!(second.lifecycle_snapshot().request, Some(cleanup));
+                assert_eq!(second.lifecycle_snapshot().stage, ProviderStage::Stopping);
+            } else {
+                assert!(delayed.unwrap().is_pending());
+                assert_eq!(second.lifecycle_snapshot().request, None);
+                assert_eq!(second.lifecycle_snapshot().stage, ProviderStage::Running);
+            }
+            assert!(held.output_observations().unwrap()[0].worker_handle_retained);
+            assert!(first.poll_cleanup(cleanup).unwrap().is_ready());
+            assert_eq!(first.lifecycle_snapshot(), completed);
+            drop(held);
+            let observed_later = BarrierRequest {
+                deadline: limit,
+                ..cleanup
+            };
+            let mut native_request = None;
+            loop {
+                let outcome = second.poll_cleanup(if accepted_second {
+                    observed_later
+                } else {
+                    cleanup
+                });
+                let snapshot = second.lifecycle_snapshot();
+                if native_request.is_none() {
+                    native_request = snapshot.request;
+                }
+                assert_eq!(snapshot.request, native_request);
+                match outcome {
+                    Ok(Poll::Ready(())) => break,
+                    Ok(Poll::Pending) => {}
+                    Err(error) if error.fault == ProviderFault::Deadline => {}
+                    Err(error) => panic!("second real worker cleanup: {error:?}"),
+                }
+                assert!(Instant::now() < limit);
+                std::thread::yield_now();
+            }
+            let native = native_request.unwrap();
+            assert_eq!(native.key, cleanup.key);
+            if accepted_second {
+                assert_eq!(native, cleanup);
+                assert_eq!(
+                    second.lifecycle_snapshot().failure.unwrap().fault,
+                    ProviderFault::Deadline
+                );
+                assert_eq!(
+                    second.poll_stop(cleanup).unwrap_err().fault,
+                    ProviderFault::Deadline
+                );
+            } else {
+                assert!(native.deadline > cleanup.deadline);
+                assert_eq!(
+                    second.poll_stop(cleanup).unwrap_err().fault,
+                    ProviderFault::ForeignBarrier
+                );
+            }
+            assert_eq!(second.lifecycle_snapshot().stage, ProviderStage::Stopped);
+            assert!(
+                !console_owner(&second_console)
+                    .output_observations()
+                    .unwrap()[0]
+                    .worker_handle_retained
+            );
+            assert_eq!(
+                second_memory.read_obj::<u16>(GuestAddress(0x1802)).unwrap(),
+                0
+            );
+            assert_eq!(second.interrupt.status().load(Ordering::SeqCst), 0);
+            assert!(second.capture_transport(native.key).is_err());
+            assert!(second.capture_device_state(native.key).is_err());
+            assert!(second.begin_resume(observed_later).is_err());
+            assert!(first.poll_cleanup(observed_later).unwrap().is_ready());
+            assert_eq!(first.lifecycle_snapshot(), completed);
+            drop(first_peer);
+            drop(second_peer);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[test]
+    fn cleanup_terminal_deadline_does_not_hide_invalid_retained_queue() {
+        use crate::legacy::{IrqChipDevice, KvmIoapic};
+        use polly::event_manager::{BarrierGeneration, OperationId};
+        use std::time::Duration;
+        let rng = Arc::new(Mutex::new(Rng::new().unwrap()));
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let mut transport = MmioTransport::new(
+            memory,
+            Arc::new(Mutex::new(IrqChipDevice::new(Box::new(KvmIoapic {})))),
+            rng,
+            None,
+        )
+        .unwrap();
+        transport.set_attachment_address(0x1000).unwrap();
+        let request = BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(71),
+                generation: BarrierGeneration(9),
+            },
+            deadline: Instant::now() + Duration::from_millis(20),
+        };
+        assert!(transport.poll_cleanup(request).unwrap().is_pending());
+        assert!(transport.queues.as_mut().unwrap()[0].undo_pop(0).is_err());
+        assert!(
+            transport.queues.as_ref().unwrap()[0]
+                .capture_state()
+                .is_err()
+        );
+        while Instant::now() < request.deadline {
+            std::thread::yield_now();
+        }
+        for _ in 0..3 {
+            assert!(transport.poll_cleanup(request).is_err());
+            assert_eq!(
+                transport.lifecycle_snapshot().stage,
+                ProviderStage::Stopping
+            );
+            assert_eq!(transport.lifecycle_snapshot().request, Some(request));
+            assert_eq!(
+                transport.lifecycle_snapshot().failure.unwrap().fault,
+                ProviderFault::Deadline
+            );
+            assert!(transport.capture_transport(request.key).is_err());
         }
     }
 
