@@ -73,6 +73,11 @@ impl PartialOrd for BusRange {
     }
 }
 
+#[cfg(feature = "native-device-probe")]
+pub trait BusAccessObserver: Send + Sync {
+    fn completed(&self, cpu: u64, address: u64, write: bool, data: &[u8]);
+}
+
 /// A device container for routing reads and writes over some address space.
 ///
 /// This doesn't have any restrictions on what kind of device or address space this applies to. The
@@ -80,6 +85,8 @@ impl PartialOrd for BusRange {
 #[derive(Clone, Default)]
 pub struct Bus {
     devices: BTreeMap<BusRange, Arc<Mutex<dyn BusDevice>>>,
+    #[cfg(feature = "native-device-probe")]
+    observer: Arc<Mutex<Option<Arc<dyn BusAccessObserver>>>>,
 }
 
 impl Bus {
@@ -87,6 +94,29 @@ impl Bus {
     pub fn new() -> Bus {
         Bus {
             devices: BTreeMap::new(),
+            #[cfg(feature = "native-device-probe")]
+            observer: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    pub fn observe_accesses(&self, observer: Arc<dyn BusAccessObserver>) -> io::Result<()> {
+        let mut slot = self
+            .observer
+            .lock()
+            .map_err(|_| io::Error::other("bus observer poisoned"))?;
+        if slot.is_some() {
+            return Err(io::Error::other("bus observer already installed"));
+        }
+        *slot = Some(observer);
+        Ok(())
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    fn observe_completion(&self, cpu: u64, address: u64, write: bool, data: &[u8]) {
+        let observer = self.observer.lock().ok().and_then(|slot| slot.clone());
+        if let Some(observer) = observer {
+            observer.completed(cpu, address, write, data);
         }
     }
 
@@ -149,6 +179,8 @@ impl Bus {
             dev.lock()
                 .expect("Failed to acquire device lock")
                 .read(vcpuid, offset, data);
+            #[cfg(feature = "native-device-probe")]
+            self.observe_completion(vcpuid, addr, false, data);
             true
         } else {
             false
@@ -164,6 +196,8 @@ impl Bus {
             dev.lock()
                 .expect("Failed to acquire device lock")
                 .write(vcpuid, offset, data);
+            #[cfg(feature = "native-device-probe")]
+            self.observe_completion(vcpuid, addr, true, data);
             true
         } else {
             false
@@ -284,5 +318,50 @@ mod tests {
             format!("{}", Error::Overlap),
             "New device overlaps with an old device."
         );
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    #[test]
+    fn bus_probe_real_serial_completion_is_observed_across_clones() {
+        use crate::bus::BusAccessObserver;
+        use crate::legacy::Serial;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use utils::eventfd::{EFD_NONBLOCK, EventFd};
+
+        #[derive(Default)]
+        struct SerialObservation {
+            count: AtomicU64,
+            written: AtomicU64,
+            read: AtomicU64,
+        }
+        impl BusAccessObserver for SerialObservation {
+            fn completed(&self, cpu: u64, address: u64, write: bool, data: &[u8]) {
+                assert_eq!(address, 0x3ef);
+                assert_eq!(cpu, 2);
+                assert_eq!(data, &[0x5a]);
+                self.count.fetch_add(1, Ordering::Relaxed);
+                if write {
+                    self.written.store(u64::from(data[0]), Ordering::Relaxed);
+                } else {
+                    self.read.store(u64::from(data[0]), Ordering::Relaxed);
+                }
+            }
+        }
+        let serial = Arc::new(Mutex::new(Serial::new_sink(
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+        )));
+        let mut bus = Bus::new();
+        bus.insert(serial, 0x3e8, 8).unwrap();
+        let owner_bus = bus.clone();
+        let observation = Arc::new(SerialObservation::default());
+        bus.observe_accesses(observation.clone()).unwrap();
+        assert!(owner_bus.write(2, 0x3ef, &[0x5a]));
+        let mut actual = [0u8];
+        assert!(owner_bus.read(2, 0x3ef, &mut actual));
+        assert_eq!(actual, [0x5a]);
+        assert_eq!(observation.count.load(Ordering::Relaxed), 2);
+        assert_eq!(observation.written.load(Ordering::Relaxed), 0x5a);
+        assert_eq!(observation.read.load(Ordering::Relaxed), 0x5a);
+        assert!(owner_bus.observe_accesses(observation.clone()).is_err());
     }
 }

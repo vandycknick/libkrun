@@ -8,6 +8,7 @@ use kernel::cmdline::Cmdline;
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vm_memory::GuestMemoryMmap;
 
+use crate::api::capabilities::execution_state_producer;
 use crate::vmm::Vmm;
 use crate::vmm::builder::setup_vm;
 use crate::vmm::control::{
@@ -85,6 +86,7 @@ pub(crate) fn build_restore_prepared(
     info: ArchMemoryInfo,
     execution: ValidatedExecution,
     mut devices: PreparedDeviceInstall,
+    events: &mut polly::event_manager::EventManager,
     deadline: Instant,
 ) -> Result<Vmm, RestoreFailure> {
     let saved = execution.envelope();
@@ -105,25 +107,21 @@ pub(crate) fn build_restore_prepared(
     {
         return Err(refusal("execution/device attachment identity mismatch"));
     }
-    let diagnostic = saved
-        .binding
-        .native_producer
-        .starts_with("diagnostic-only;");
-    if diagnostic {
-        if !cfg!(feature = "native-execution-probe")
-            || !devices.devices.is_empty()
-            || !saved.legacy.is_empty()
-        {
-            return Err(refusal(
-                "diagnostic restore cannot omit production participants",
-            ));
-        }
-    } else if saved.binding.native_producer
-        != crate::api::capabilities::compiled_live_build()
-            .execution_producer()
-            .map_err(refusal)?
-    {
+    if saved.binding.native_producer != execution_state_producer().map_err(refusal)? {
         return Err(refusal("restore exact native producer mismatch"));
+    }
+    #[cfg(feature = "native-execution-probe")]
+    let cpu_only_fixture = devices.diagnostic_buses.is_some();
+    #[cfg(not(feature = "native-execution-probe"))]
+    let cpu_only_fixture = false;
+    if cpu_only_fixture
+        && (!cfg!(feature = "native-execution-probe")
+            || !devices.devices.is_empty()
+            || !saved.legacy.is_empty())
+    {
+        return Err(refusal(
+            "diagnostic CPU-only restore cannot omit production participants",
+        ));
     }
     let expected_lane = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         ExecutionLane::KvmX86
@@ -233,6 +231,12 @@ pub(crate) fn build_restore_prepared(
         &mut devices,
     )
     .map_err(refusal)?;
+    #[cfg(all(
+        feature = "native-device-probe",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    manager.bind_probe_io_bus(io_bus.clone()).map_err(refusal)?;
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     for state in &saved.cpus {
         cpus.push(
@@ -248,6 +252,17 @@ pub(crate) fn build_restore_prepared(
         );
     }
     let request = barrier(saved.binding.pause_generation, deadline);
+    if events.dispatch_fence().is_some() {
+        return Err(refusal(
+            "restore requires an unfenced destination event manager",
+        ));
+    }
+    events
+        .begin_ingress_fence(request)
+        .map_err(|error| refusal(format!("restore ingress fence: {error:?}")))?;
+    events
+        .park_callbacks(request.key)
+        .map_err(|error| refusal(format!("restore callback park: {error:?}")))?;
     let mut attempt = assemble(
         memory,
         info,
@@ -259,6 +274,9 @@ pub(crate) fn build_restore_prepared(
     )
     .map_err(refusal)?;
     let install_result = (|| {
+        // Bus clones snapshot their mappings. Finish dormant topology construction
+        // before owners take their buses; install device payloads only after CPU state.
+        attach_device_resources(&mut attempt, &devices)?;
         attempt
             .start_vcpus_parked(cpus)
             .map_err(|error| error.to_string())?;
@@ -308,6 +326,17 @@ pub(crate) fn build_restore_prepared(
             .quiescence
             .install_legacy(&saved.legacy)?;
         install_devices(&mut attempt, request, &devices)?;
+        attempt
+            .mmio_device_manager
+            .quiescence
+            .register_legacy_events(events)?;
+        for binding in &devices.devices {
+            if let Some(subscriber) = &binding.subscriber {
+                events.add_subscriber(subscriber.clone()).map_err(|error| {
+                    format!("restore callback {:?}: {error:?}", binding.identity)
+                })?;
+            }
+        }
         #[cfg(target_os = "linux")]
         {
             for route in &saved.irq_routes {
@@ -329,6 +358,28 @@ pub(crate) fn build_restore_prepared(
             }
             if attempt.mmio_device_manager.execution_irq_routes()? != saved.irq_routes {
                 return Err("restored actual IRQ producer topology mismatch".into());
+            }
+        }
+        #[cfg(target_os = "linux")]
+        attempt
+            .mmio_device_manager
+            .begin_irq_fence(attempt.vm.fd_owner(), request)
+            .map_err(|error| error.to_string())?;
+        #[cfg(target_os = "macos")]
+        attempt
+            .mmio_device_manager
+            .begin_irq_fence(request)
+            .map_err(|error| error.to_string())?;
+        loop {
+            match attempt
+                .mmio_device_manager
+                .poll_irq_routes(request.key)
+                .map_err(|error| error.to_string())?
+            {
+                std::task::Poll::Ready(()) => break,
+                std::task::Poll::Pending => {
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
             }
         }
         attempt.execution.retained = Some(RetainedCut {
@@ -522,9 +573,9 @@ fn install_legacy_resources(
     Ok(())
 }
 
-fn install_devices(
+/// Construct transport mappings and native notification bindings without applying saved payloads.
+fn attach_device_resources(
     attempt: &mut Vmm,
-    request: BarrierRequest,
     bindings: &PreparedDeviceInstall,
 ) -> Result<(), String> {
     for binding in &bindings.devices {
@@ -540,6 +591,14 @@ fn install_devices(
         )
         .map_err(|error| error.to_string())?;
     }
+    Ok(())
+}
+
+fn install_devices(
+    attempt: &mut Vmm,
+    request: BarrierRequest,
+    bindings: &PreparedDeviceInstall,
+) -> Result<(), String> {
     attempt
         .mmio_device_manager
         .quiescence

@@ -5,10 +5,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+#[cfg(feature = "native-device-probe")]
+use std::collections::VecDeque;
+#[cfg(feature = "native-device-probe")]
+use std::sync::atomic::AtomicU64;
+
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::task::Poll;
 use std::time::Instant;
 
@@ -71,6 +76,25 @@ pub struct MmioTransportState {
     pub queues: Vec<QueueState>,
 }
 
+impl MmioTransportState {
+    pub fn validate_payload_binding(&self, payload: &[u8]) -> Result<(), ProviderFault> {
+        let mut reader = utils::state::Reader::new(payload);
+        let valid = (|| {
+            Ok::<_, utils::state::Error>(
+                reader.u16()? == 1
+                    && reader.u32()? == self.device_type
+                    && reader.u64()? == self.avail_features
+                    && reader.u64()? == self.acked_features,
+            )
+        })()
+        .map_err(|_| ProviderFault::DeviceState)?;
+        if !valid || self.acked_features & !self.avail_features != 0 {
+            return Err(ProviderFault::DeviceState);
+        }
+        Ok(())
+    }
+}
+
 /// Implements the
 /// [MMIO](http://docs.oasis-open.org/virtio/virtio/v1.0/cs04/virtio-v1.0-cs04.html#x1-1090002)
 /// transport for virtio devices.
@@ -109,6 +133,18 @@ pub struct MmioTransport {
     lifecycle: LifecycleJournal,
     escrow: QueueEscrow,
     quiesced_active: bool,
+    stop_drain: Option<StopDrain>,
+    #[cfg(feature = "native-device-probe")]
+    irq_ack_hold: bool,
+    #[cfg(feature = "native-device-probe")]
+    held_irq_acks: VecDeque<u32>,
+}
+#[derive(Clone, Copy)]
+struct StopDrain {
+    provider_key: BarrierKey,
+    complete: bool,
+    reconcile_failure: bool,
+    completion_fault: Option<ProviderFault>,
 }
 
 enum InterruptEvent {
@@ -123,6 +159,65 @@ struct InterruptTransportInner {
     event: InterruptEvent,
     intc: IrqChip,
     irq_line: Option<u32>,
+    #[cfg(feature = "native-device-probe")]
+    probe: IrqProbeCounters,
+}
+
+#[cfg(feature = "native-device-probe")]
+const MAX_HELD_IRQ_ACKS: usize = 4096;
+
+#[cfg(feature = "native-device-probe")]
+#[derive(Default)]
+struct IrqProbeCounters {
+    signal_attempts: AtomicU64,
+    signal_successes: AtomicU64,
+    ack_writes: AtomicU64,
+    ack_applied: AtomicU64,
+    overflow: AtomicBool,
+    // A delayed ACK may clear only causes not signalled again since a guest ACK.
+    held_ack_mask: Mutex<u32>,
+}
+
+#[cfg(feature = "native-device-probe")]
+impl IrqProbeCounters {
+    fn lock_held_ack_mask(&self) -> MutexGuard<'_, u32> {
+        match self.held_ack_mask.lock() {
+            Ok(held) => held,
+            Err(error) => {
+                self.overflow.store(true, Ordering::SeqCst);
+                let mut held = error.into_inner();
+                // Cleanup may complete original writes, but poisoned ownership
+                // must never authorize clearing a cause.
+                *held = 0;
+                held
+            }
+        }
+    }
+
+    fn increment(&self, counter: &AtomicU64) {
+        if counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                value.checked_add(1)
+            })
+            .is_err()
+        {
+            self.overflow.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(feature = "native-device-probe")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MmioIrqProbeSnapshot {
+    pub status: u32,
+    pub signal_attempts: u64,
+    /// Accepted native signal calls, not a native IRQ delivery counter.
+    pub signal_successes: u64,
+    pub ack_writes: u64,
+    pub ack_applied: u64,
+    pub held_acks: usize,
+    pub ack_hold: bool,
+    pub overflow: bool,
 }
 
 #[derive(Clone)]
@@ -146,6 +241,8 @@ impl InterruptTransport {
             },
             intc,
             irq_line: None,
+            #[cfg(feature = "native-device-probe")]
+            probe: IrqProbeCounters::default(),
         })))
     }
 
@@ -180,8 +277,21 @@ impl InterruptTransport {
         }
     }
 
-    fn try_signal(&self, status: u32) -> Result<(), crate::Error> {
+    fn publish_cause(&self, status: u32) {
+        #[cfg(feature = "native-device-probe")]
+        {
+            let mut held = self.0.probe.lock_held_ack_mask();
+            *held &= !status;
+            self.status().fetch_or(status as usize, Ordering::SeqCst);
+        }
+        #[cfg(not(feature = "native-device-probe"))]
         self.status().fetch_or(status as usize, Ordering::SeqCst);
+    }
+
+    fn try_signal(&self, status: u32) -> Result<(), crate::Error> {
+        #[cfg(feature = "native-device-probe")]
+        self.0.probe.increment(&self.0.probe.signal_attempts);
+        self.publish_cause(status);
         let result = self
             .intc()
             .lock()
@@ -189,6 +299,10 @@ impl InterruptTransport {
             .and_then(|intc| intc.set_irq(self.0.irq_line, Some(self.event())));
         if result.is_err() {
             self.0.notification_failed.store(true, Ordering::SeqCst);
+        }
+        #[cfg(feature = "native-device-probe")]
+        if result.is_ok() {
+            self.0.probe.increment(&self.0.probe.signal_successes);
         }
         result
     }
@@ -257,6 +371,11 @@ impl MmioTransport {
             lifecycle: LifecycleJournal::new(),
             escrow: QueueEscrow::new(bindings),
             quiesced_active: false,
+            stop_drain: None,
+            #[cfg(feature = "native-device-probe")]
+            irq_ack_hold: false,
+            #[cfg(feature = "native-device-probe")]
+            held_irq_acks: VecDeque::with_capacity(MAX_HELD_IRQ_ACKS),
         })
     }
 
@@ -318,24 +437,124 @@ impl MmioTransport {
         &self.interrupt
     }
 
+    #[cfg(feature = "native-device-probe")]
+    pub fn diagnostic_irq_snapshot(&self) -> MmioIrqProbeSnapshot {
+        let probe = &self.interrupt.0.probe;
+        MmioIrqProbeSnapshot {
+            status: self.interrupt.status().load(Ordering::SeqCst) as u32,
+            signal_attempts: probe.signal_attempts.load(Ordering::SeqCst),
+            signal_successes: probe.signal_successes.load(Ordering::SeqCst),
+            ack_writes: probe.ack_writes.load(Ordering::SeqCst),
+            ack_applied: probe.ack_applied.load(Ordering::SeqCst),
+            held_acks: self.held_irq_acks.len(),
+            ack_hold: self.irq_ack_hold,
+            overflow: probe.overflow.load(Ordering::SeqCst),
+        }
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    fn diagnostic_apply_irq_ack(&self, value: u32) {
+        self.interrupt
+            .status()
+            .fetch_and(!(value as usize), Ordering::SeqCst);
+        self.interrupt
+            .0
+            .probe
+            .increment(&self.interrupt.0.probe.ack_applied);
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    fn diagnostic_apply_held_irq_ack(&self, value: u32) {
+        let mut held = self.interrupt.0.probe.lock_held_ack_mask();
+        self.diagnostic_apply_irq_ack(value & *held);
+        *held &= !value;
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    pub fn diagnostic_hold_irq_acks(&mut self, hold: bool) -> Result<(), ProviderFault> {
+        if hold && self.interrupt.0.probe.overflow.load(Ordering::SeqCst) {
+            return Err(ProviderFault::DeviceState);
+        }
+        if hold && self.lifecycle.snapshot.stage != ProviderStage::Running {
+            return Err(ProviderFault::InvalidTransition);
+        }
+        self.irq_ack_hold = hold;
+        if !hold {
+            while let Some(value) = self.held_irq_acks.pop_front() {
+                self.diagnostic_apply_held_irq_ack(value);
+            }
+        }
+        if self.interrupt.0.probe.overflow.load(Ordering::SeqCst) {
+            return Err(ProviderFault::DeviceState);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    fn diagnostic_observe_irq_ack(&mut self, value: u32) {
+        self.interrupt
+            .0
+            .probe
+            .increment(&self.interrupt.0.probe.ack_writes);
+        if self.irq_ack_hold && self.held_irq_acks.len() < MAX_HELD_IRQ_ACKS {
+            *self.interrupt.0.probe.lock_held_ack_mask() |= value;
+            self.held_irq_acks.push_back(value);
+            return;
+        }
+        if self.irq_ack_hold {
+            *self.interrupt.0.probe.lock_held_ack_mask() |= value;
+            self.interrupt
+                .0
+                .probe
+                .overflow
+                .store(true, Ordering::SeqCst);
+            self.irq_ack_hold = false;
+            while let Some(pending) = self.held_irq_acks.pop_front() {
+                self.diagnostic_apply_held_irq_ack(pending);
+            }
+            self.diagnostic_apply_held_irq_ack(value);
+            return;
+        }
+        self.diagnostic_apply_irq_ack(value);
+    }
+
     pub fn preflight_quiesce(&self) -> Result<(), ProviderFault> {
-        let device = self
-            .device
-            .try_lock()
-            .map_err(|_| ProviderFault::DeviceLock)?;
-        let provider = device.state_provider().ok_or(ProviderFault::Unsupported)?;
-        if self.attachment_address.is_none() || device.shm_region().is_some() {
+        #[cfg(feature = "native-device-probe")]
+        if !self.held_irq_acks.is_empty() || self.interrupt.0.probe.overflow.load(Ordering::SeqCst)
+        {
+            return Err(ProviderFault::DeviceState);
+        }
+        if self.attachment_address.is_none() {
             return Err(ProviderFault::Unsupported);
         }
         if self.interrupt.0.notification_failed.load(Ordering::SeqCst) {
             return Err(ProviderFault::Notification);
         }
+        let device = self.device.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => ProviderFault::LockBusy,
+            TryLockError::Poisoned(_) => ProviderFault::DeviceLock,
+        })?;
+        let provider = device.state_provider().ok_or(ProviderFault::Unsupported)?;
+        if device.shm_region().is_some() {
+            return Err(ProviderFault::Unsupported);
+        }
         provider.preflight()
     }
 
     pub fn begin_quiesce(&mut self, request: BarrierRequest) -> Result<(), LifecycleError> {
+        self.begin_quiesce_inner(request, true)
+    }
+
+    fn begin_quiesce_inner(
+        &mut self,
+        request: BarrierRequest,
+        preflight: bool,
+    ) -> Result<(), LifecycleError> {
         if self.lifecycle.snapshot.stage != ProviderStage::Running
-            || (self.lifecycle.snapshot.accepted && self.lifecycle.snapshot.failure.is_some())
+            && (preflight || self.lifecycle.snapshot.stage != ProviderStage::Resuming)
+            || (preflight
+                && self.lifecycle.snapshot.accepted
+                && self.lifecycle.snapshot.failure.is_some())
             || self
                 .lifecycle
                 .snapshot
@@ -346,15 +565,23 @@ impl MmioTransport {
                 .lifecycle
                 .error(request.key, ProviderFault::InvalidTransition));
         }
-        self.preflight_quiesce()
-            .map_err(|fault| self.lifecycle.error(request.key, fault))?;
+        if preflight {
+            self.preflight_quiesce()
+                .map_err(|fault| self.lifecycle.error(request.key, fault))?;
+        }
         if Instant::now() >= request.deadline {
             return Err(self.lifecycle.error(request.key, ProviderFault::Deadline));
         }
         let device = Arc::clone(&self.device);
-        let mut locked = device
-            .try_lock()
-            .map_err(|_| self.lifecycle.error(request.key, ProviderFault::DeviceLock))?;
+        let mut locked = device.try_lock().map_err(|error| {
+            self.lifecycle.error(
+                request.key,
+                match error {
+                    TryLockError::WouldBlock => ProviderFault::LockBusy,
+                    TryLockError::Poisoned(_) => ProviderFault::DeviceLock,
+                },
+            )
+        })?;
         self.quiesced_active = locked.is_activated();
         let provider = locked.state_provider_mut().ok_or_else(|| {
             self.lifecycle
@@ -376,6 +603,285 @@ impl MmioTransport {
         }
     }
 
+    pub fn poll_stop(&mut self, request: BarrierRequest) -> Result<Poll<()>, LifecycleError> {
+        #[cfg(feature = "native-device-probe")]
+        {
+            // Terminal cleanup completes original callbacks even if the
+            // diagnostic sample overflowed; it does not certify a coherent cut.
+            let _ = self.diagnostic_hold_irq_acks(false);
+        }
+        let snapshot = self.lifecycle.snapshot;
+        if matches!(
+            snapshot.stage,
+            ProviderStage::Stopping | ProviderStage::Stopped
+        ) {
+            return self.poll_terminal_stop(request);
+        }
+        if Instant::now() >= request.deadline {
+            return Err(self.lifecycle.error(request.key, ProviderFault::Deadline));
+        }
+        let device = Arc::clone(&self.device);
+        let mut locked = match device.try_lock() {
+            Ok(locked) => locked,
+            Err(TryLockError::WouldBlock) => return Ok(Poll::Pending),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(self.lifecycle.error(request.key, ProviderFault::DeviceLock));
+            }
+        };
+        if let Some(provider) = locked.state_provider_mut() {
+            // Journal before the provider can accept any irreversible effect.
+            self.lifecycle.begin(request, ProviderStage::Stopping);
+            match provider.begin_terminal_stop(request) {
+                Ok(()) => return Ok(Poll::Pending),
+                Err(error) if !error.accepted && error.fault == ProviderFault::Unsupported => {
+                    self.lifecycle.snapshot = snapshot;
+                }
+                Err(error) => {
+                    self.lifecycle.snapshot.accepted = error.accepted;
+                    return Err(self.lifecycle.fail(request.key, error.fault));
+                }
+            }
+        }
+        let supported = locked
+            .state_provider()
+            .is_some_and(|provider| provider.preflight() != Err(ProviderFault::Unsupported));
+        if !supported {
+            self.lifecycle.begin(request, ProviderStage::Stopping);
+            // Inactive devices have no worker-owned queues to reset. Active
+            // legacy devices must explicitly acknowledge their existing reset.
+            if locked.is_activated() && !locked.reset() {
+                return Err(self.lifecycle.fail(request.key, ProviderFault::Unsupported));
+            }
+            self.lifecycle.expired(Instant::now());
+            self.lifecycle.snapshot.stage = ProviderStage::Stopped;
+            return match self.lifecycle.snapshot.failure {
+                Some(error) => Err(error),
+                None => Ok(Poll::Ready(())),
+            };
+        }
+        drop(locked);
+        match snapshot.stage {
+            ProviderStage::Running | ProviderStage::Resuming => {
+                self.begin_quiesce_inner(request, false)?;
+                self.begin_terminal_drain(request)?;
+                Ok(Poll::Pending)
+            }
+            ProviderStage::Quiescing | ProviderStage::Quiesced => {
+                self.begin_terminal_drain(request)?;
+                self.poll_terminal_drain(request)
+            }
+            ProviderStage::Stopping | ProviderStage::Stopped => Err(self
+                .lifecycle
+                .error(request.key, ProviderFault::InvalidTransition)),
+        }
+    }
+
+    fn begin_terminal_drain(&mut self, request: BarrierRequest) -> Result<(), LifecycleError> {
+        let snapshot = self.lifecycle.snapshot;
+        let original = snapshot.request.ok_or_else(|| {
+            self.lifecycle
+                .error(request.key, ProviderFault::ForeignBarrier)
+        })?;
+        if original.key == request.key && original != request {
+            return Err(self
+                .lifecycle
+                .error(request.key, ProviderFault::ForeignBarrier));
+        }
+        let same_request = original.key == request.key;
+        self.stop_drain = Some(StopDrain {
+            provider_key: original.key,
+            complete: snapshot.stage == ProviderStage::Quiesced,
+            reconcile_failure: !same_request && snapshot.failure.is_some(),
+            completion_fault: None,
+        });
+        self.lifecycle.begin(request, ProviderStage::Stopping);
+        if same_request {
+            self.lifecycle.snapshot.failure = snapshot.failure;
+        }
+        Ok(())
+    }
+
+    fn poll_terminal_drain(&mut self, request: BarrierRequest) -> Result<Poll<()>, LifecycleError> {
+        self.lifecycle.expired(Instant::now());
+        let mut drain = self.stop_drain.ok_or_else(|| {
+            self.lifecycle
+                .error(request.key, ProviderFault::InvalidTransition)
+        })?;
+        let device = Arc::clone(&self.device);
+        let mut locked = match device.try_lock() {
+            Ok(locked) => locked,
+            Err(TryLockError::WouldBlock) => {
+                return self
+                    .lifecycle
+                    .snapshot
+                    .failure
+                    .map_or(Ok(Poll::Pending), Err);
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(self.lifecycle.fail(request.key, ProviderFault::DeviceLock));
+            }
+        };
+        let provider = locked
+            .state_provider_mut()
+            .ok_or_else(|| self.lifecycle.fail(request.key, ProviderFault::Unsupported))?;
+        if !drain.complete {
+            // Poll the original accepted owner, not its first-failure journal.
+            // Every fresh poll error belongs to this stop, even if its kind
+            // happens to equal the historical command/wake failure.
+            match provider.poll_quiesce(drain.provider_key) {
+                Ok(Poll::Pending) => {}
+                Ok(Poll::Ready(completion)) => {
+                    let returned = if self.quiesced_active {
+                        self.escrow.receive(completion.queues, &self.mem)
+                    } else if completion.queues.is_empty() {
+                        Ok(())
+                    } else {
+                        self.escrow
+                            .receive(completion.queues, &self.mem)
+                            .and(Err(ProviderFault::QueueCount))
+                    };
+                    if let Err(fault) = returned {
+                        self.lifecycle.fail(request.key, fault);
+                    }
+                    drain.complete = true;
+                    drain.completion_fault = completion.fault;
+                    self.stop_drain = Some(drain);
+                }
+                Err(fault) => {
+                    self.lifecycle.fail(request.key, fault);
+                }
+            }
+        }
+        let mut pending = !drain.complete;
+        let mut clean = true;
+        if drain.complete {
+            if drain.reconcile_failure
+                || (drain.provider_key != request.key && drain.completion_fault.is_some())
+            {
+                // A provider must independently prove real cleanup before a
+                // historical operation failure can remain history only.
+                match provider.validate_terminal_drain(drain.provider_key) {
+                    Ok(()) => {
+                        if let Some(fault) = drain.completion_fault {
+                            self.lifecycle.snapshot.previous_failure.get_or_insert(
+                                LifecycleError {
+                                    key: drain.provider_key,
+                                    stage: ProviderStage::Quiescing,
+                                    accepted: true,
+                                    fault,
+                                },
+                            );
+                        }
+                    }
+                    Err(ProviderFault::LockBusy) => pending = true,
+                    Err(fault) => {
+                        self.lifecycle.fail(request.key, fault);
+                        clean = false;
+                    }
+                }
+            } else if let Some(fault) = drain.completion_fault {
+                self.lifecycle.fail(request.key, fault);
+                clean = false;
+            }
+            let retained = if self.quiesced_active {
+                self.escrow.validate_retained(&self.mem)
+            } else {
+                self.queues
+                    .as_ref()
+                    .ok_or(ProviderFault::QueueCount)
+                    .and_then(|queues| {
+                        for queue in queues {
+                            let state = queue
+                                .capture_state()
+                                .map_err(|_| ProviderFault::QueueState)?;
+                            queue
+                                .validate_state(&self.mem, &state)
+                                .map_err(|_| ProviderFault::QueueState)?;
+                        }
+                        Ok(())
+                    })
+            };
+            if let Err(fault) = retained {
+                self.lifecycle.fail(request.key, fault);
+                clean = false;
+            }
+        }
+        if self.interrupt.0.notification_failed.load(Ordering::SeqCst) {
+            self.lifecycle
+                .fail(request.key, ProviderFault::Notification);
+            clean = false;
+        }
+        self.lifecycle.expired(Instant::now());
+        if !pending && clean {
+            self.lifecycle.snapshot.stage = ProviderStage::Stopped;
+        }
+        match self.lifecycle.snapshot.failure {
+            Some(error) => Err(error),
+            None => Ok(if pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }),
+        }
+    }
+
+    fn poll_terminal_stop(&mut self, request: BarrierRequest) -> Result<Poll<()>, LifecycleError> {
+        if self.lifecycle.check(request.key)? != request {
+            return Err(self
+                .lifecycle
+                .error(request.key, ProviderFault::ForeignBarrier));
+        }
+        if self.lifecycle.snapshot.stage == ProviderStage::Stopped {
+            return match self.lifecycle.snapshot.failure {
+                Some(error) => Err(error),
+                None => Ok(Poll::Ready(())),
+            };
+        }
+        if !self.lifecycle.snapshot.accepted {
+            return Err(self.lifecycle.snapshot.failure.unwrap_or_else(|| {
+                self.lifecycle
+                    .error(request.key, ProviderFault::InvalidTransition)
+            }));
+        }
+        if self.stop_drain.is_some() {
+            return self.poll_terminal_drain(request);
+        }
+        self.lifecycle.expired(Instant::now());
+        let device = Arc::clone(&self.device);
+        let mut locked = match device.try_lock() {
+            Ok(locked) => locked,
+            Err(TryLockError::WouldBlock) => {
+                return match self.lifecycle.snapshot.failure {
+                    Some(error) => Err(error),
+                    None => Ok(Poll::Pending),
+                };
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(self.lifecycle.fail(request.key, ProviderFault::DeviceLock));
+            }
+        };
+        let result = match locked.state_provider_mut() {
+            Some(provider) => provider.poll_terminal_stop(request.key),
+            None => Err(ProviderFault::Unsupported),
+        };
+        match result {
+            Ok(Poll::Ready(())) => self.lifecycle.snapshot.stage = ProviderStage::Stopped,
+            Ok(Poll::Pending) => {}
+            Err(fault) => {
+                self.lifecycle.fail(request.key, fault);
+            }
+        }
+        if self.interrupt.0.notification_failed.load(Ordering::SeqCst) {
+            self.lifecycle
+                .fail(request.key, ProviderFault::Notification);
+        }
+        self.lifecycle.expired(Instant::now());
+        match self.lifecycle.snapshot.failure {
+            Some(error) => Err(error),
+            None => result.map_err(|fault| self.lifecycle.error(request.key, fault)),
+        }
+    }
+
     pub fn poll_quiesce(&mut self, key: BarrierKey) -> Result<Poll<()>, LifecycleError> {
         self.lifecycle.check(key)?;
         if !matches!(
@@ -388,9 +894,13 @@ impl MmioTransport {
             // Expiration is not cancellation: continue accepting late ownership.
             self.lifecycle.expired(Instant::now());
             let device = Arc::clone(&self.device);
-            let mut locked = device
-                .try_lock()
-                .map_err(|_| self.lifecycle.error(key, ProviderFault::DeviceLock))?;
+            let mut locked = match device.try_lock() {
+                Ok(locked) => locked,
+                Err(TryLockError::WouldBlock) => return Ok(Poll::Pending),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(self.lifecycle.error(key, ProviderFault::DeviceLock));
+                }
+            };
             let provider = locked
                 .state_provider_mut()
                 .ok_or_else(|| self.lifecycle.error(key, ProviderFault::Unsupported))?;
@@ -459,9 +969,15 @@ impl MmioTransport {
                 .error(request.key, ProviderFault::Notification));
         }
         let device = Arc::clone(&self.device);
-        let mut locked = device
-            .try_lock()
-            .map_err(|_| self.lifecycle.error(request.key, ProviderFault::DeviceLock))?;
+        let mut locked = device.try_lock().map_err(|error| {
+            self.lifecycle.error(
+                request.key,
+                match error {
+                    TryLockError::WouldBlock => ProviderFault::LockBusy,
+                    TryLockError::Poisoned(_) => ProviderFault::DeviceLock,
+                },
+            )
+        })?;
         let provider = locked.state_provider_mut().ok_or_else(|| {
             self.lifecycle
                 .error(request.key, ProviderFault::Unsupported)
@@ -497,20 +1013,41 @@ impl MmioTransport {
 
     pub fn poll_resume(&mut self, key: BarrierKey) -> Result<Poll<()>, LifecycleError> {
         self.lifecycle.check(key)?;
+        if self.lifecycle.snapshot.stage == ProviderStage::Running
+            && self.lifecycle.snapshot.accepted
+        {
+            // A completed same-key acknowledgement is terminal, even while peers
+            // are still pending. Preserve its existing late/fault outcome and
+            // current IRQ fault without re-running the provider or its queues.
+            if self.interrupt.0.notification_failed.load(Ordering::SeqCst) {
+                self.lifecycle.fail(key, ProviderFault::Notification);
+            }
+            return match self.lifecycle.snapshot.failure {
+                Some(error) => Err(error),
+                None => Ok(Poll::Ready(())),
+            };
+        }
         if self.lifecycle.snapshot.stage != ProviderStage::Resuming {
             return Err(self.lifecycle.error(key, ProviderFault::InvalidTransition));
         }
         self.lifecycle.expired(Instant::now());
         let device = Arc::clone(&self.device);
-        let mut locked = device
-            .try_lock()
-            .map_err(|_| self.lifecycle.error(key, ProviderFault::DeviceLock))?;
+        let mut locked = match device.try_lock() {
+            Ok(locked) => locked,
+            Err(TryLockError::WouldBlock) => return Ok(Poll::Pending),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(self.lifecycle.error(key, ProviderFault::DeviceLock));
+            }
+        };
         let provider = locked
             .state_provider_mut()
             .ok_or_else(|| self.lifecycle.error(key, ProviderFault::Unsupported))?;
         let result = provider.poll_resume(key);
         if let Err(fault) = result {
             self.lifecycle.fail(key, fault);
+        }
+        if self.interrupt.0.notification_failed.load(Ordering::SeqCst) {
+            self.lifecycle.fail(key, ProviderFault::Notification);
         }
         self.lifecycle.expired(Instant::now());
         if matches!(result, Ok(Poll::Ready(()))) {
@@ -523,10 +1060,16 @@ impl MmioTransport {
         result.map_err(|fault| self.lifecycle.error(key, fault))
     }
 
+    /// Serialize the retained terminal cut, not admission of running workers.
     pub fn capture_transport(&self, key: BarrierKey) -> Result<MmioTransportState, LifecycleError> {
         self.lifecycle.check(key)?;
         if self.lifecycle.snapshot.stage != ProviderStage::Quiesced {
             return Err(self.lifecycle.error(key, ProviderFault::InvalidTransition));
+        }
+        #[cfg(feature = "native-device-probe")]
+        if !self.held_irq_acks.is_empty() || self.interrupt.0.probe.overflow.load(Ordering::SeqCst)
+        {
+            return Err(self.lifecycle.error(key, ProviderFault::DeviceState));
         }
         if let Some(error) = self.lifecycle.snapshot.failure {
             return Err(error);
@@ -534,12 +1077,18 @@ impl MmioTransport {
         if self.interrupt.0.notification_failed.load(Ordering::SeqCst) {
             return Err(self.lifecycle.error(key, ProviderFault::Notification));
         }
-        self.preflight_quiesce()
-            .map_err(|fault| self.lifecycle.error(key, fault))?;
-        let device = self
-            .device
-            .try_lock()
-            .map_err(|_| self.lifecycle.error(key, ProviderFault::DeviceLock))?;
+        let device = self.device.try_lock().map_err(|error| {
+            self.lifecycle.error(
+                key,
+                match error {
+                    TryLockError::WouldBlock => ProviderFault::LockBusy,
+                    TryLockError::Poisoned(_) => ProviderFault::DeviceLock,
+                },
+            )
+        })?;
+        if device.shm_region().is_some() {
+            return Err(self.lifecycle.error(key, ProviderFault::Unsupported));
+        }
         let queues = if self.quiesced_active {
             self.escrow.states()
         } else {
@@ -588,10 +1137,10 @@ impl MmioTransport {
         state: &MmioTransportState,
         restoring: bool,
     ) -> Result<(), ProviderFault> {
-        let device = self
-            .device
-            .try_lock()
-            .map_err(|_| ProviderFault::DeviceLock)?;
+        let device = self.device.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => ProviderFault::LockBusy,
+            TryLockError::Poisoned(_) => ProviderFault::DeviceLock,
+        })?;
         if state.device_type != device.device_type()
             || state.device_name != device.device_name()
             || Some(state.attachment_address) != self.attachment_address
@@ -681,6 +1230,20 @@ impl MmioTransport {
         Ok(())
     }
 
+    pub fn flush_for_capture(&self, key: BarrierKey) -> Result<(), LifecycleError> {
+        self.capture_transport(key)?;
+        let device = self
+            .device
+            .try_lock()
+            .map_err(|_| self.lifecycle.error(key, ProviderFault::DeviceLock))?;
+        let provider = device
+            .state_provider()
+            .ok_or_else(|| self.lifecycle.error(key, ProviderFault::Unsupported))?;
+        provider
+            .flush_for_capture(key)
+            .map_err(|fault| self.lifecycle.error(key, fault))
+    }
+
     pub fn capture_device_state(&self, key: BarrierKey) -> Result<Vec<u8>, LifecycleError> {
         self.lifecycle.check(key)?;
         if self.lifecycle.snapshot.stage != ProviderStage::Quiesced {
@@ -689,12 +1252,16 @@ impl MmioTransport {
         if let Some(error) = self.lifecycle.snapshot.failure {
             return Err(error);
         }
-        self.preflight_quiesce()
-            .map_err(|fault| self.lifecycle.error(key, fault))?;
-        let device = self
-            .device
-            .try_lock()
-            .map_err(|_| self.lifecycle.error(key, ProviderFault::DeviceLock))?;
+        let state = self.capture_transport(key)?;
+        let device = self.device.try_lock().map_err(|error| {
+            self.lifecycle.error(
+                key,
+                match error {
+                    TryLockError::WouldBlock => ProviderFault::LockBusy,
+                    TryLockError::Poisoned(_) => ProviderFault::DeviceLock,
+                },
+            )
+        })?;
         let provider = device
             .state_provider()
             .ok_or_else(|| self.lifecycle.error(key, ProviderFault::Unsupported))?;
@@ -706,6 +1273,9 @@ impl MmioTransport {
         }
         provider
             .validate_payload(&payload)
+            .map_err(|fault| self.lifecycle.error(key, fault))?;
+        state
+            .validate_payload_binding(&payload)
             .map_err(|fault| self.lifecycle.error(key, fault))?;
         Ok(payload)
     }
@@ -761,6 +1331,9 @@ impl MmioTransport {
         }
         self.validate_transport_install(state, true)
             .map_err(|fault| self.lifecycle.error(request.key, fault))?;
+        state
+            .validate_payload_binding(payload)
+            .map_err(|fault| self.lifecycle.error(request.key, fault))?;
         self.validate_device_state(payload)
             .map_err(|fault| self.lifecycle.error(request.key, fault))?;
         let device = self.device.clone();
@@ -784,6 +1357,7 @@ impl MmioTransport {
                     memory: self.mem.clone(),
                     interrupt: self.interrupt.clone(),
                     activated: state.activated,
+                    reclaim_policy: crate::virtio::lifecycle::RestoredReclaimPolicy::Disabled,
                 },
             )
             .map_err(|fault| self.lifecycle.fail(request.key, fault))?;
@@ -859,6 +1433,10 @@ impl MmioTransport {
     }
 
     fn reset(&mut self) {
+        #[cfg(feature = "native-device-probe")]
+        {
+            let _ = self.diagnostic_hold_irq_acks(false);
+        }
         if self.locked_device().is_activated() {
             debug!("reset device while it's still in active state");
         }
@@ -1076,6 +1654,9 @@ impl BusDevice for MmioTransport {
                     }
                     0x64 => {
                         if self.check_device_status(device_status::DRIVER_OK, 0) {
+                            #[cfg(feature = "native-device-probe")]
+                            self.diagnostic_observe_irq_ack(v);
+                            #[cfg(not(feature = "native-device-probe"))]
                             self.interrupt
                                 .status()
                                 .fetch_and(!(v as usize), Ordering::SeqCst);
@@ -1112,15 +1693,25 @@ impl BusDevice for MmioTransport {
     }
 
     fn interrupt(&self, irq_mask: u32) -> std::io::Result<()> {
+        #[cfg(feature = "native-device-probe")]
         self.interrupt
-            .status()
-            .fetch_or(irq_mask as usize, Ordering::SeqCst);
+            .0
+            .probe
+            .increment(&self.interrupt.0.probe.signal_attempts);
+        self.interrupt.publish_cause(irq_mask);
         let result = self.interrupt.event().write(1);
         if result.is_err() {
             self.interrupt
                 .0
                 .notification_failed
                 .store(true, Ordering::SeqCst);
+        }
+        #[cfg(feature = "native-device-probe")]
+        if result.is_ok() {
+            self.interrupt
+                .0
+                .probe
+                .increment(&self.interrupt.0.probe.signal_successes);
         }
         result
     }
@@ -1130,8 +1721,8 @@ impl BusDevice for MmioTransport {
 pub(crate) mod tests {
     use utils::byte_order::{read_le_u32, write_le_u32};
 
-    use super::*;
     use crate::legacy::DummyIrqChip;
+    use crate::virtio::mmio::*;
     use vm_memory::GuestMemoryMmap;
 
     static QUEUE_CONFIG: [QueueConfig; 2] = [QueueConfig::new(16), QueueConfig::new(32)];
@@ -1926,7 +2517,7 @@ pub(crate) mod tests {
 
     #[cfg(not(feature = "tee"))]
     #[test]
-    fn lifecycle_real_rng_refuses_inactive_provider_without_mutation() {
+    fn lifecycle_real_rng_quiesces_inactive_provider_without_activation() {
         use polly::event_manager::{BarrierGeneration, OperationId};
         use std::time::Duration;
         let mem = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
@@ -1944,14 +2535,13 @@ pub(crate) mod tests {
             },
             deadline: Instant::now() + Duration::from_secs(1),
         };
+        transport.preflight_quiesce().unwrap();
+        transport.begin_quiesce(request).unwrap();
+        assert!(transport.poll_quiesce(request.key).unwrap().is_ready());
         assert_eq!(
-            transport.preflight_quiesce(),
-            Err(ProviderFault::Unsupported)
+            transport.lifecycle_snapshot().stage,
+            ProviderStage::Quiesced
         );
-        let error = transport.begin_quiesce(request).unwrap_err();
-        assert_eq!(error.fault, ProviderFault::Unsupported);
-        assert!(!error.accepted);
-        assert_eq!(transport.lifecycle_snapshot().stage, ProviderStage::Running);
         assert_eq!(transport.device_status, device_status::INIT);
         assert_eq!(
             transport.queues.as_ref().unwrap()[0]
@@ -2053,7 +2643,7 @@ pub(crate) mod tests {
         assert_eq!(transport.device_status, 0);
         assert_eq!(
             transport.validate_device_state(&[]),
-            Err(ProviderFault::Unsupported)
+            Err(ProviderFault::DeviceState)
         );
     }
 
@@ -2089,5 +2679,544 @@ pub(crate) mod tests {
                 .load(Ordering::SeqCst)
         );
         assert_eq!(line.read().unwrap(), u64::MAX - 1);
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "tee")))]
+    #[test]
+    fn lifecycle_resume_refuses_real_irq_failure_after_provider_acceptance() {
+        use polly::event_manager::{BarrierGeneration, OperationId};
+        use std::time::Duration;
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let line = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let mut transport = MmioTransport::new(
+            memory,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(Rng::new().unwrap())),
+            Some(line.clone()),
+        )
+        .unwrap();
+        transport.set_attachment_address(0x1000).unwrap();
+        let cut = BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(1),
+                generation: BarrierGeneration(1),
+            },
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        transport.begin_quiesce(cut).unwrap();
+        assert!(transport.poll_quiesce(cut.key).unwrap().is_ready());
+        let resume = BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(2),
+                ..cut.key
+            },
+            ..cut
+        };
+        transport.begin_resume(resume).unwrap();
+        line.write(u64::MAX - 1).unwrap();
+        assert!(transport.interrupt(VIRTIO_MMIO_INT_VRING).is_err());
+        assert_eq!(
+            transport.poll_resume(resume.key).unwrap_err().fault,
+            ProviderFault::Notification
+        );
+        assert!(transport.lifecycle_snapshot().accepted);
+        assert!(transport.lifecycle_snapshot().failure.is_some());
+    }
+
+    #[cfg(all(
+        feature = "native-device-probe",
+        target_os = "linux",
+        not(feature = "tee")
+    ))]
+    fn irq_probe_rng_transport(line: Arc<EventFd>) -> MmioTransport {
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let mut transport = MmioTransport::new(
+            memory,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(Rng::new().unwrap())),
+            Some(line),
+        )
+        .unwrap();
+        transport.set_attachment_address(0x1000).unwrap();
+        transport.set_irq_line(5);
+        for (offset, value) in [
+            (0x70, 1_u32),
+            (0x70, 3),
+            (0x24, 1),
+            (0x20, 1),
+            (0x70, 11),
+            (0x30, 0),
+            (0x38, 8),
+            (0x80, 0),
+            (0x90, 0x1000),
+            (0xa0, 0x2000),
+            (0x44, 1),
+            (0x70, 15),
+        ] {
+            transport.write(0, offset, &value.to_le_bytes());
+        }
+        assert!(transport.locked_device().is_activated());
+        transport
+    }
+
+    #[cfg(all(
+        feature = "native-device-probe",
+        target_os = "linux",
+        not(feature = "tee")
+    ))]
+    #[test]
+    fn irq_probe_held_original_ack_keeps_peer_status_independent_and_refuses_cut() {
+        use polly::event_manager::{BarrierGeneration, OperationId};
+        use std::time::Duration;
+        let line = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let mut first = irq_probe_rng_transport(line.clone());
+        let mut peer = irq_probe_rng_transport(line.clone());
+        first.diagnostic_hold_irq_acks(true).unwrap();
+        first.interrupt(VIRTIO_MMIO_INT_VRING).unwrap();
+        peer.interrupt(VIRTIO_MMIO_INT_VRING).unwrap();
+        first.write(0, 0x64, &VIRTIO_MMIO_INT_VRING.to_le_bytes());
+        peer.write(0, 0x64, &VIRTIO_MMIO_INT_VRING.to_le_bytes());
+        let held = first.diagnostic_irq_snapshot();
+        let completed = peer.diagnostic_irq_snapshot();
+        assert_eq!(
+            (
+                held.status,
+                held.ack_writes,
+                held.ack_applied,
+                held.held_acks
+            ),
+            (1, 1, 0, 1)
+        );
+        assert_eq!(
+            (
+                completed.status,
+                completed.ack_writes,
+                completed.ack_applied
+            ),
+            (0, 1, 1)
+        );
+        assert_eq!((held.signal_attempts, held.signal_successes), (1, 1));
+        let request = BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(1),
+                generation: BarrierGeneration(1),
+            },
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        let failure = first.begin_quiesce(request).unwrap_err();
+        assert_eq!(failure.fault, ProviderFault::DeviceState);
+        assert!(!failure.accepted);
+        first.diagnostic_hold_irq_acks(false).unwrap();
+        first.diagnostic_hold_irq_acks(false).unwrap();
+        let released = first.diagnostic_irq_snapshot();
+        assert_eq!(
+            (
+                released.status,
+                released.ack_writes,
+                released.ack_applied,
+                released.held_acks
+            ),
+            (0, 1, 1, 0)
+        );
+        first.preflight_quiesce().unwrap();
+        assert_eq!(line.read().unwrap(), 2);
+    }
+
+    #[cfg(all(
+        feature = "native-device-probe",
+        target_os = "linux",
+        not(feature = "tee")
+    ))]
+    #[test]
+    fn irq_probe_release_preserves_newer_cause_without_replaying_irq() {
+        let line = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let mut transport = irq_probe_rng_transport(line.clone());
+        let mut peer = irq_probe_rng_transport(line.clone());
+        transport.diagnostic_hold_irq_acks(true).unwrap();
+        transport.interrupt(VIRTIO_MMIO_INT_VRING).unwrap();
+        transport.interrupt(VIRTIO_MMIO_INT_CONFIG).unwrap();
+        transport.write(
+            0,
+            0x64,
+            &(VIRTIO_MMIO_INT_VRING | VIRTIO_MMIO_INT_CONFIG).to_le_bytes(),
+        );
+        transport.write(0, 0x64, &VIRTIO_MMIO_INT_VRING.to_le_bytes());
+        transport.interrupt(VIRTIO_MMIO_INT_VRING).unwrap();
+        peer.interrupt(VIRTIO_MMIO_INT_VRING).unwrap();
+        assert_eq!(line.read().unwrap(), 4);
+
+        transport.diagnostic_hold_irq_acks(false).unwrap();
+        transport.diagnostic_hold_irq_acks(false).unwrap();
+        let released = transport.diagnostic_irq_snapshot();
+        assert_eq!(released.status, VIRTIO_MMIO_INT_VRING);
+        assert_eq!(
+            (
+                released.ack_writes,
+                released.ack_applied,
+                released.held_acks
+            ),
+            (2, 2, 0)
+        );
+        assert_eq!(
+            (released.signal_attempts, released.signal_successes),
+            (3, 3)
+        );
+        assert_eq!(peer.diagnostic_irq_snapshot().status, VIRTIO_MMIO_INT_VRING);
+        assert_eq!(line.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+
+        transport.write(0, 0x64, &VIRTIO_MMIO_INT_VRING.to_le_bytes());
+        assert_eq!(transport.diagnostic_irq_snapshot().status, 0);
+        assert_eq!(peer.diagnostic_irq_snapshot().status, VIRTIO_MMIO_INT_VRING);
+
+        transport.diagnostic_hold_irq_acks(true).unwrap();
+        transport.interrupt(VIRTIO_MMIO_INT_VRING).unwrap();
+        transport.write(0, 0x64, &VIRTIO_MMIO_INT_VRING.to_le_bytes());
+        transport.interrupt(VIRTIO_MMIO_INT_VRING).unwrap();
+        transport.write(0, 0x64, &VIRTIO_MMIO_INT_VRING.to_le_bytes());
+        transport.diagnostic_hold_irq_acks(false).unwrap();
+        let acknowledged = transport.diagnostic_irq_snapshot();
+        assert_eq!(acknowledged.status, 0);
+        assert_eq!((acknowledged.ack_writes, acknowledged.ack_applied), (5, 5));
+        assert_eq!(line.read().unwrap(), 2);
+        assert_eq!(line.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[cfg(all(
+        feature = "native-device-probe",
+        target_os = "linux",
+        not(feature = "tee")
+    ))]
+    #[test]
+    fn irq_probe_poisoned_hold_completes_without_clearing_causes() {
+        let line = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let mut transport = irq_probe_rng_transport(line.clone());
+        transport.diagnostic_hold_irq_acks(true).unwrap();
+        transport.interrupt(VIRTIO_MMIO_INT_VRING).unwrap();
+        transport.write(0, 0x64, &VIRTIO_MMIO_INT_VRING.to_le_bytes());
+        assert_eq!(line.read().unwrap(), 1);
+        let interrupt = transport.interrupt.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _held = interrupt.0.probe.lock_held_ack_mask();
+                panic!("poison diagnostic ACK ownership");
+            })
+            .join()
+            .is_err()
+        );
+
+        assert_eq!(
+            transport.diagnostic_hold_irq_acks(false),
+            Err(ProviderFault::DeviceState)
+        );
+        let snapshot = transport.diagnostic_irq_snapshot();
+        assert!(snapshot.overflow);
+        assert_eq!(snapshot.status, VIRTIO_MMIO_INT_VRING);
+        assert_eq!(
+            (
+                snapshot.ack_writes,
+                snapshot.ack_applied,
+                snapshot.held_acks
+            ),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            transport.diagnostic_hold_irq_acks(false),
+            Err(ProviderFault::DeviceState)
+        );
+        assert_eq!(
+            transport.diagnostic_irq_snapshot().status,
+            VIRTIO_MMIO_INT_VRING
+        );
+        assert_eq!(
+            transport.preflight_quiesce(),
+            Err(ProviderFault::DeviceState)
+        );
+        assert_eq!(line.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[cfg(all(
+        feature = "native-device-probe",
+        target_os = "linux",
+        not(feature = "tee")
+    ))]
+    #[test]
+    fn irq_probe_hold_bound_completes_originals_and_marks_invalid_observation() {
+        let line = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let mut transport = irq_probe_rng_transport(line);
+        transport.diagnostic_hold_irq_acks(true).unwrap();
+        transport.interrupt(VIRTIO_MMIO_INT_VRING).unwrap();
+        for _ in 0..=crate::virtio::mmio::MAX_HELD_IRQ_ACKS {
+            transport.write(0, 0x64, &VIRTIO_MMIO_INT_VRING.to_le_bytes());
+        }
+        let snapshot = transport.diagnostic_irq_snapshot();
+        assert!(snapshot.overflow);
+        assert_eq!(snapshot.held_acks, 0);
+        assert_eq!(snapshot.status, 0);
+        assert_eq!(
+            snapshot.ack_writes,
+            (crate::virtio::mmio::MAX_HELD_IRQ_ACKS + 1) as u64
+        );
+        assert_eq!(snapshot.ack_applied, snapshot.ack_writes);
+        assert_eq!(
+            transport.preflight_quiesce(),
+            Err(ProviderFault::DeviceState)
+        );
+    }
+
+    #[cfg(all(
+        feature = "native-device-probe",
+        target_os = "linux",
+        target_arch = "x86_64",
+        not(feature = "tee")
+    ))]
+    #[test]
+    fn terminal_transport_console_reaps_blocked_tx_from_every_lifecycle_stage_without_drain() {
+        use crate::legacy::{IrqChipDevice, KvmIoapic};
+        use crate::virtio::console::port_io;
+        use crate::virtio::lifecycle::VirtioStateProvider;
+        use polly::event_manager::{BarrierGeneration, OperationId};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        for (stage, unsupported_shape) in [
+            (ProviderStage::Running, false),
+            (ProviderStage::Running, true),
+            (ProviderStage::Quiescing, false),
+            (ProviderStage::Quiesced, false),
+            (ProviderStage::Resuming, false),
+        ] {
+            let (host, peer) = UnixStream::pair().unwrap();
+            let console = Arc::new(Mutex::new(
+                Console::new(vec![PortDescription::output_pipe(
+                    if unsupported_shape {
+                        "x".repeat(257)
+                    } else {
+                        "output".into()
+                    },
+                    port_io::output_to_raw_fd_dup(host.as_raw_fd()).unwrap(),
+                )])
+                .unwrap(),
+            ));
+            let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 4 << 20)]).unwrap();
+            let mut transport = MmioTransport::new(
+                memory.clone(),
+                Arc::new(Mutex::new(IrqChipDevice::new(Box::new(KvmIoapic {})))),
+                console.clone(),
+                None,
+            )
+            .unwrap();
+            transport.set_attachment_address(0x1000).unwrap();
+            if unsupported_shape {
+                assert_eq!(
+                    transport.preflight_quiesce(),
+                    Err(ProviderFault::Unsupported)
+                );
+            }
+            for (index, queue) in transport.queues.as_mut().unwrap().iter_mut().enumerate() {
+                let base = index as u64 * 0x1000;
+                queue.size = 32;
+                queue.ready = true;
+                queue.desc_table = GuestAddress(base);
+                queue.avail_ring = GuestAddress(base + 0x400);
+                queue.used_ring = GuestAddress(base + 0x800);
+            }
+            let request = |operation| BarrierRequest {
+                key: BarrierKey {
+                    operation: OperationId(operation),
+                    generation: BarrierGeneration(1),
+                },
+                deadline: Instant::now() + Duration::from_secs(5),
+            };
+            transport.activate();
+            transport.device_status = 15;
+            {
+                let mut console = console.lock().expect("actual console owner");
+                console.ports[0].opened = true;
+                console.start_port(0).unwrap();
+            }
+            if matches!(stage, ProviderStage::Quiesced | ProviderStage::Resuming) {
+                let pause = request(1);
+                transport.begin_quiesce_inner(pause, false).unwrap();
+                while transport.poll_quiesce(pause.key).unwrap().is_pending() {
+                    assert!(Instant::now() < pause.deadline);
+                    std::thread::yield_now();
+                }
+            }
+            if stage != ProviderStage::Quiesced {
+                memory
+                    .write_slice(&vec![0x5a; 2 << 20], GuestAddress(0x10000))
+                    .unwrap();
+                memory.write_obj(0x10000u64, GuestAddress(0x1000)).unwrap();
+                memory.write_obj(2u32 << 20, GuestAddress(0x1008)).unwrap();
+                memory.write_obj(0u16, GuestAddress(0x100c)).unwrap();
+                memory.write_obj(0u16, GuestAddress(0x1404)).unwrap();
+                memory.write_obj(1u16, GuestAddress(0x1402)).unwrap();
+                if stage == ProviderStage::Resuming {
+                    transport.begin_resume(request(2)).unwrap();
+                } else {
+                    console.lock().expect("actual console owner").ports[0].notify_tx();
+                }
+                let observation_deadline = request(3).deadline;
+                loop {
+                    let observation = match console
+                        .lock()
+                        .expect("actual console owner")
+                        .output_observations()
+                    {
+                        Ok(observations) => observations[0],
+                        Err(ProviderFault::LockBusy) => {
+                            assert!(Instant::now() < observation_deadline);
+                            std::thread::yield_now();
+                            continue;
+                        }
+                        Err(fault) => panic!("actual output observation failed: {fault:?}"),
+                    };
+                    if observation.blocked_head == Some(0) {
+                        assert!(observation.worker_handle_retained);
+                        assert!(!observation.worker_finished);
+                        assert!(observation.bytes_written > 0);
+                        assert!(observation.write_remaining > 0);
+                        break;
+                    }
+                    assert!(Instant::now() < observation_deadline, "TX did not block");
+                    std::thread::yield_now();
+                }
+                if stage == ProviderStage::Quiescing {
+                    let mut pause = request(4);
+                    pause.deadline = Instant::now() + Duration::from_millis(40);
+                    transport.begin_quiesce_inner(pause, false).unwrap();
+                    assert!(transport.poll_quiesce(pause.key).unwrap().is_pending());
+                    while Instant::now() < pause.deadline {
+                        std::thread::yield_now();
+                    }
+                    assert_eq!(
+                        transport.poll_quiesce(pause.key).unwrap_err().fault,
+                        ProviderFault::Deadline
+                    );
+                }
+            }
+            assert_eq!(transport.lifecycle_snapshot().stage, stage);
+            let stop = request(5);
+            assert!(transport.poll_stop(stop).unwrap().is_pending());
+            assert_eq!(
+                transport.lifecycle_snapshot().stage,
+                ProviderStage::Stopping
+            );
+            assert!(transport.capture_transport(stop.key).is_err());
+            assert!(transport.capture_device_state(stop.key).is_err());
+            assert!(transport.begin_resume(request(6)).is_err());
+            while transport.poll_stop(stop).unwrap().is_pending() {
+                assert!(Instant::now() < stop.deadline, "terminal TX did not reap");
+                std::thread::yield_now();
+            }
+            assert_eq!(transport.lifecycle_snapshot().stage, ProviderStage::Stopped);
+            assert!(transport.poll_stop(stop).unwrap().is_ready());
+            assert!(transport.capture_transport(stop.key).is_err());
+            assert!(transport.capture_device_state(stop.key).is_err());
+            let console = console.lock().expect("actual console owner");
+            assert!(console.capture_payload(stop.key).is_err());
+            assert!(console.preflight().is_err());
+            let observation = console.output_observations().unwrap()[0];
+            assert!(!observation.worker_handle_retained);
+            assert_eq!(memory.read_obj::<u16>(GuestAddress(0x1802)).unwrap(), 0);
+            assert_eq!(transport.interrupt.status().load(Ordering::SeqCst), 0);
+            assert!(transport.escrow.returned.is_none() || stage == ProviderStage::Quiesced);
+            drop(console);
+            // The reader is never touched while terminal cleanup owns TX.
+            drop(peer);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[test]
+    fn terminal_transport_drained_provider_rebinds_stop_key_and_blocks_capture() {
+        use crate::legacy::{IrqChipDevice, KvmIoapic};
+        use polly::event_manager::{BarrierGeneration, OperationId};
+        use std::time::Duration;
+
+        for already_quiesced in [false, true] {
+            let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+            let rng = Arc::new(Mutex::new(Rng::new().unwrap()));
+            let mut transport = MmioTransport::new(
+                memory,
+                Arc::new(Mutex::new(IrqChipDevice::new(Box::new(KvmIoapic {})))),
+                rng,
+                None,
+            )
+            .unwrap();
+            transport.set_attachment_address(0x1000).unwrap();
+            let pause = BarrierRequest {
+                key: BarrierKey {
+                    operation: OperationId(1),
+                    generation: BarrierGeneration(1),
+                },
+                deadline: Instant::now() + Duration::from_secs(5),
+            };
+            transport.begin_quiesce(pause).unwrap();
+            if already_quiesced {
+                assert!(transport.poll_quiesce(pause.key).unwrap().is_ready());
+                transport.capture_transport(pause.key).unwrap();
+            }
+            let stop = BarrierRequest {
+                key: BarrierKey {
+                    operation: OperationId(2),
+                    ..pause.key
+                },
+                ..pause
+            };
+            assert!(transport.poll_stop(stop).unwrap().is_ready());
+            assert_eq!(transport.lifecycle_snapshot().stage, ProviderStage::Stopped);
+            assert!(transport.poll_stop(stop).unwrap().is_ready());
+            assert!(transport.capture_transport(stop.key).is_err());
+            assert!(transport.capture_transport(pause.key).is_err());
+            let changed_deadline = BarrierRequest {
+                deadline: stop.deadline + Duration::from_secs(1),
+                ..stop
+            };
+            assert_eq!(
+                transport.poll_stop(changed_deadline).unwrap_err().fault,
+                ProviderFault::ForeignBarrier
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
+    #[test]
+    fn terminal_transport_active_unsupported_reset_false_retains_owner_and_failure() {
+        use crate::legacy::{IrqChipDevice, KvmIoapic};
+        use polly::event_manager::{BarrierGeneration, OperationId};
+        use std::time::Duration;
+
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vsock = Arc::new(Mutex::new(
+            Vsock::new(3, None, None, TsiFlags::HIJACK_INET).unwrap(),
+        ));
+        let mut transport = MmioTransport::new(
+            memory,
+            Arc::new(Mutex::new(IrqChipDevice::new(Box::new(KvmIoapic {})))),
+            vsock.clone(),
+            None,
+        )
+        .unwrap();
+        transport.activate();
+        assert!(vsock.lock().expect("actual vsock owner").is_activated());
+        let stop = BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(1),
+                generation: BarrierGeneration(1),
+            },
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        let failure = transport.poll_stop(stop).unwrap_err();
+        assert_eq!(failure.fault, ProviderFault::Unsupported);
+        assert_eq!(
+            transport.lifecycle_snapshot().stage,
+            ProviderStage::Stopping
+        );
+        assert_eq!(transport.poll_stop(stop).unwrap_err(), failure);
+        assert!(vsock.lock().expect("retained vsock owner").is_activated());
+        assert!(transport.capture_device_state(stop.key).is_err());
+        assert!(transport.capture_transport(stop.key).is_err());
     }
 }

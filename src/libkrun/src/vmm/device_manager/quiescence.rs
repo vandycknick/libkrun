@@ -36,6 +36,61 @@ pub struct LegacyParticipant {
 }
 
 impl LegacyHandle {
+    pub fn preflight(&self) -> Result<Poll<()>, String> {
+        match self {
+            Self::Serial(serial) => Self::preflight_locked(serial, |serial| {
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                {
+                    serial.preflight_state().map_err(|error| error.to_string())
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                {
+                    let _ = serial;
+                    Err("unsupported legacy serial architecture".into())
+                }
+            }),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Self::InterruptController(controller) => {
+                Self::preflight_locked(controller, |controller| {
+                    if controller.execution_state_supported() {
+                        Ok(())
+                    } else {
+                        Err("native interrupt controller provider unavailable".into())
+                    }
+                })
+            }
+            #[cfg(target_arch = "x86_64")]
+            Self::Cmos(device) => Self::preflight_locked(device, |_| Ok(())),
+            #[cfg(target_arch = "x86_64")]
+            Self::I8042(device) => Self::preflight_locked(device, |device| {
+                device
+                    .capture_state()
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }),
+            #[cfg(target_arch = "aarch64")]
+            Self::Rtc(device) => Self::preflight_locked(device, |device| {
+                device
+                    .capture_state()
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }),
+            #[cfg(target_arch = "aarch64")]
+            Self::Gpio(device) => Self::preflight_locked(device, |_| Ok(())),
+        }
+    }
+
+    fn preflight_locked<T: ?Sized>(
+        device: &Arc<Mutex<T>>,
+        check: impl FnOnce(&T) -> Result<(), String>,
+    ) -> Result<Poll<()>, String> {
+        match device.try_lock() {
+            Ok(device) => check(&device).map(Poll::Ready),
+            Err(TryLockError::WouldBlock) => Ok(Poll::Pending),
+            Err(TryLockError::Poisoned(_)) => Err("legacy participant lock poisoned".into()),
+        }
+    }
+
     pub fn capture(&self) -> Result<LegacyPayload, String> {
         match self {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -166,6 +221,7 @@ pub enum ManagerFault {
     Provider(ProviderFault),
     Lifecycle(LifecycleError),
     MissingLegacyProvider(LegacyAttachment),
+    LegacyState(LegacyAttachment, String),
     ForeignBarrier,
     InvalidTransition,
     Deadline,
@@ -181,6 +237,11 @@ impl std::fmt::Display for ManagerFault {
             Self::MissingLegacyProvider(attachment) => write!(
                 f,
                 "missing {:?} provider at {:#x}, IRQ {:?}",
+                attachment.kind, attachment.address, attachment.irq
+            ),
+            Self::LegacyState(attachment, error) => write!(
+                f,
+                "legacy {:?} at {:#x}, IRQ {:?}: {error}",
                 attachment.kind, attachment.address, attachment.irq
             ),
             Self::ForeignBarrier => write!(f, "foreign barrier"),
@@ -245,6 +306,8 @@ pub struct DeviceQuiescence {
     attachments: Vec<TransportAttachment>,
     legacy: Vec<LegacyParticipant>,
     request: Option<BarrierRequest>,
+    /// Original cut authority while a bounded resume begin is still progressing.
+    resume_fenced: Option<BarrierKey>,
     transition: Transition,
 }
 
@@ -254,6 +317,7 @@ impl Default for DeviceQuiescence {
             attachments: Vec::new(),
             legacy: Vec::new(),
             request: None,
+            resume_fenced: None,
             transition: Transition::Quiesce,
         }
     }
@@ -280,6 +344,59 @@ impl DeviceQuiescence {
             .iter()
             .map(|attachment| attachment.identity.clone())
             .collect()
+    }
+
+    pub fn lifecycle_snapshots(
+        &self,
+    ) -> Result<Vec<(AttachmentIdentity, LifecycleSnapshot)>, ManagerError> {
+        self.attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| {
+                let transport = attachment
+                    .transport
+                    .try_lock()
+                    .map_err(|error| self.lock_error(index, error))?;
+                Ok((attachment.identity.clone(), transport.lifecycle_snapshot()))
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    pub fn diagnostic_irq_snapshots(
+        &self,
+    ) -> Result<Vec<(AttachmentIdentity, devices::virtio::MmioIrqProbeSnapshot)>, ManagerError>
+    {
+        self.attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| {
+                let transport = attachment
+                    .transport
+                    .try_lock()
+                    .map_err(|error| self.lock_error(index, error))?;
+                Ok((
+                    attachment.identity.clone(),
+                    transport.diagnostic_irq_snapshot(),
+                ))
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    pub fn diagnostic_hold_irq_acks(&self, address: u64, hold: bool) -> Result<(), ManagerError> {
+        let (index, attachment) = self
+            .attachments
+            .iter()
+            .enumerate()
+            .find(|(_, attachment)| attachment.identity.address == address)
+            .ok_or_else(|| self.error(None, ManagerFault::InvalidTransition))?;
+        attachment
+            .transport
+            .try_lock()
+            .map_err(|error| self.lock_error(index, error))?
+            .diagnostic_hold_irq_acks(hold)
+            .map_err(|fault| self.error(Some(index), ManagerFault::Provider(fault)))
     }
 
     pub fn prepare_restore(
@@ -310,6 +427,72 @@ impl DeviceQuiescence {
                 .map_err(|error| format!("restore {:?}: {error}", saved.identity))?;
         }
         Ok(())
+    }
+
+    pub fn register_legacy_events(
+        &self,
+        events: &mut polly::event_manager::EventManager,
+    ) -> Result<(), String> {
+        for participant in &self.legacy {
+            match &participant.handle {
+                Some(LegacyHandle::Serial(serial)) => {
+                    events.add_subscriber(serial.clone()).map_err(|error| {
+                        format!("legacy callback {:?}: {error:?}", participant.identity)
+                    })?
+                }
+                #[cfg(target_arch = "aarch64")]
+                Some(LegacyHandle::Gpio(gpio)) => {
+                    events.add_subscriber(gpio.clone()).map_err(|error| {
+                        format!("legacy callback {:?}: {error:?}", participant.identity)
+                    })?
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub fn flush_for_capture(&self, key: BarrierKey) -> Result<(), ManagerError> {
+        if !self.fully_quiesced(key)? {
+            return Err(self.error(None, ManagerFault::InvalidTransition));
+        }
+        for (index, attachment) in self.attachments.iter().enumerate() {
+            attachment
+                .transport
+                .try_lock()
+                .map_err(|error| self.lock_error(index, error))?
+                .flush_for_capture(key)
+                .map_err(|error| self.error(Some(index), ManagerFault::Lifecycle(error)))?;
+        }
+        Ok(())
+    }
+
+    pub fn capture_devices(
+        &self,
+        key: BarrierKey,
+    ) -> Result<Vec<crate::vmm::execution::device_restore::DeviceRecord>, ManagerError> {
+        if !self.fully_quiesced(key)? {
+            return Err(self.error(None, ManagerFault::InvalidTransition));
+        }
+        let mut records = Vec::with_capacity(self.attachments.len());
+        for (index, attachment) in self.attachments.iter().enumerate() {
+            let transport = attachment
+                .transport
+                .try_lock()
+                .map_err(|error| self.lock_error(index, error))?;
+            let state = transport
+                .capture_transport(key)
+                .map_err(|error| self.error(Some(index), ManagerFault::Lifecycle(error)))?;
+            let payload = transport
+                .capture_device_state(key)
+                .map_err(|error| self.error(Some(index), ManagerFault::Lifecycle(error)))?;
+            records.push(crate::vmm::execution::device_restore::DeviceRecord {
+                identity: attachment.identity.clone(),
+                state,
+                payload,
+            });
+        }
+        Ok(records)
     }
 
     pub fn retain_legacy_device(&mut self, identity: LegacyAttachment, handle: LegacyHandle) {
@@ -402,7 +585,7 @@ impl DeviceQuiescence {
         });
     }
 
-    pub fn preflight_quiesce(&self) -> Result<(), ManagerError> {
+    pub fn preflight_legacy(&self) -> Result<(), ManagerError> {
         if let Some(legacy) = self
             .legacy
             .iter()
@@ -410,51 +593,117 @@ impl DeviceQuiescence {
         {
             return Err(self.error(None, ManagerFault::MissingLegacyProvider(legacy.identity)));
         }
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let mut busy = false;
         for legacy in &self.legacy {
-            if let Some(LegacyHandle::InterruptController(controller)) = &legacy.handle {
-                let controller = controller
-                    .try_lock()
-                    .map_err(|_| self.error(None, ManagerFault::LockBusy))?;
-                if !controller.execution_state_supported() {
-                    return Err(
-                        self.error(None, ManagerFault::MissingLegacyProvider(legacy.identity))
-                    );
+            if let Some(handle) = &legacy.handle {
+                match handle.preflight().map_err(|error| {
+                    self.error(None, ManagerFault::LegacyState(legacy.identity, error))
+                })? {
+                    Poll::Ready(()) => {}
+                    Poll::Pending => busy = true,
                 }
             }
         }
-        for (index, attachment) in self.attachments.iter().enumerate() {
-            let transport = attachment
-                .transport
-                .try_lock()
-                .map_err(|error| self.lock_error(index, error))?;
-            transport
-                .preflight_quiesce()
-                .map_err(|fault| self.error(Some(index), ManagerFault::Provider(fault)))?;
+        if busy {
+            Err(self.error(None, ManagerFault::LockBusy))
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
-    pub fn begin_quiesce(&mut self, request: BarrierRequest) -> Result<(), ManagerError> {
-        if self.request.is_some() {
-            return Err(self.error(None, ManagerFault::InvalidTransition));
+    pub fn preflight_quiesce(&self) -> Result<(), ManagerError> {
+        let mut busy = match self.preflight_legacy() {
+            Ok(()) => None,
+            Err(error) if matches!(error.fault, ManagerFault::LockBusy) => Some(error),
+            Err(error) => return Err(error),
+        };
+        for (index, attachment) in self.attachments.iter().enumerate() {
+            let transport = match attachment.transport.try_lock() {
+                Ok(transport) => transport,
+                Err(TryLockError::WouldBlock) => {
+                    busy.get_or_insert_with(|| self.error(Some(index), ManagerFault::LockBusy));
+                    continue;
+                }
+                Err(error) => return Err(self.lock_error(index, error)),
+            };
+            match transport.preflight_quiesce() {
+                Ok(()) => {}
+                Err(ProviderFault::LockBusy) => {
+                    busy.get_or_insert_with(|| self.error(Some(index), ManagerFault::LockBusy));
+                }
+                Err(fault) => return Err(self.error(Some(index), ManagerFault::Provider(fault))),
+            }
         }
+        match busy {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn admit_quiesce(&mut self, request: BarrierRequest) -> Result<Poll<()>, ManagerError> {
         self.check_deadline(request)?;
-        self.preflight_quiesce()?;
-        self.request = Some(request);
-        self.transition = Transition::Quiesce;
+        match self.request {
+            None => {
+                match self.preflight_quiesce() {
+                    Ok(()) => {}
+                    Err(error) if matches!(error.fault, ManagerFault::LockBusy) => {
+                        return Ok(Poll::Pending);
+                    }
+                    Err(error) => return Err(error),
+                }
+                self.request = Some(request);
+                self.transition = Transition::Quiesce;
+            }
+            Some(previous) if previous == request && self.transition == Transition::Quiesce => {}
+            Some(_) => return Err(self.error(None, ManagerFault::InvalidTransition)),
+        }
+        Ok(Poll::Ready(()))
+    }
+
+    /// Each call makes at most one nonblocking admission attempt per untouched
+    /// attachment. Accepted transitions remain owned and are never resubmitted.
+    pub fn begin_quiesce(&mut self, request: BarrierRequest) -> Result<Poll<()>, ManagerError> {
+        if self.admit_quiesce(request)?.is_pending() {
+            return Ok(Poll::Pending);
+        }
+        let mut pending = false;
         for index in 0..self.attachments.len() {
-            self.attachments[index].attempted = true;
+            if self.attachments[index].attempted {
+                continue;
+            }
+            self.check_deadline(request)?;
             let handle = self.attachments[index].transport.clone();
-            let mut transport = handle
-                .try_lock()
-                .map_err(|error| self.lock_error(index, error))?;
+            let mut transport = match handle.try_lock() {
+                Ok(transport) => transport,
+                Err(TryLockError::WouldBlock) => {
+                    pending = true;
+                    continue;
+                }
+                Err(error) => return Err(self.lock_error(index, error)),
+            };
+            self.attachments[index].attempted = true;
             let result = transport.begin_quiesce(request);
             let snapshot = transport.lifecycle_snapshot();
+            if result.as_ref().is_err_and(|error| {
+                error.fault == ProviderFault::LockBusy
+                    && !error.accepted
+                    && snapshot
+                        .quiesce_request
+                        .is_none_or(|prior| prior.key != request.key)
+            }) {
+                self.attachments[index].attempted = false;
+                pending = true;
+                continue;
+            }
             self.record(index, snapshot);
             result.map_err(|error| self.error(Some(index), ManagerFault::Lifecycle(error)))?;
         }
-        self.check_deadline(request)
+        self.check_deadline(request)?;
+        Ok(if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        })
     }
 
     /// Late polling reconciles actual ownership even after the original deadline.
@@ -467,10 +716,11 @@ impl DeviceQuiescence {
         self.check_key(key, Transition::Quiesce)?;
         for (index, attachment) in self.attachments.iter().enumerate() {
             if attachment.accepted {
-                let transport = attachment
-                    .transport
-                    .try_lock()
-                    .map_err(|error| self.lock_error(index, error))?;
+                let transport = match attachment.transport.try_lock() {
+                    Ok(transport) => transport,
+                    Err(TryLockError::WouldBlock) => return Ok(false),
+                    Err(error) => return Err(self.lock_error(index, error)),
+                };
                 let snapshot = transport.lifecycle_snapshot();
                 if snapshot.stage != ProviderStage::Quiesced
                     || snapshot
@@ -506,36 +756,100 @@ impl DeviceQuiescence {
         &mut self,
         fenced: BarrierKey,
         request: BarrierRequest,
-    ) -> Result<(), ManagerError> {
-        self.check_key(fenced, Transition::Quiesce)?;
+    ) -> Result<Poll<()>, ManagerError> {
         self.check_deadline(request)?;
-        if request.key.generation != fenced.generation
-            || request.key.operation == fenced.operation
-            || !self.quiescence_settled(fenced)?
+        if request.key.generation != fenced.generation || request.key.operation == fenced.operation
         {
             return Err(self.error(None, ManagerFault::InvalidTransition));
         }
-        self.request = Some(request);
-        self.transition = Transition::Resume;
+        if self.transition != Transition::Resume || self.request != Some(request) {
+            self.check_key(fenced, Transition::Quiesce)?;
+            if !self.quiescence_settled(fenced)? {
+                return Ok(Poll::Pending);
+            }
+            self.request = Some(request);
+            self.transition = Transition::Resume;
+            self.resume_fenced = Some(fenced);
+        } else if self.resume_fenced != Some(fenced) {
+            return Err(self.error(None, ManagerFault::ForeignBarrier));
+        }
+        let mut pending = false;
         for index in 0..self.attachments.len() {
-            if !self.attachments[index].accepted {
+            if !self.attachments[index].accepted || self.attachments[index].resume_attempted {
                 continue;
             }
-            self.attachments[index].resume_attempted = true;
+            self.check_deadline(request)?;
             let handle = self.attachments[index].transport.clone();
-            let mut transport = handle
-                .try_lock()
-                .map_err(|error| self.lock_error(index, error))?;
+            let mut transport = match handle.try_lock() {
+                Ok(transport) => transport,
+                Err(TryLockError::WouldBlock) => {
+                    pending = true;
+                    continue;
+                }
+                Err(error) => return Err(self.lock_error(index, error)),
+            };
+            self.attachments[index].resume_attempted = true;
             let result = transport.begin_resume(request);
             let snapshot = transport.lifecycle_snapshot();
+            if result.as_ref().is_err_and(|error| {
+                error.fault == ProviderFault::LockBusy
+                    && !error.accepted
+                    && snapshot
+                        .request
+                        .is_none_or(|prior| prior.key != request.key)
+            }) {
+                self.attachments[index].resume_attempted = false;
+                pending = true;
+                continue;
+            }
             self.record(index, snapshot);
             result.map_err(|error| self.error(Some(index), ManagerFault::Lifecycle(error)))?;
         }
-        self.check_deadline(request)
+        self.check_deadline(request)?;
+        Ok(if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        })
     }
 
     pub fn poll_resume(&mut self, key: BarrierKey) -> Result<Poll<()>, ManagerError> {
         self.poll(key, Transition::Resume)
+    }
+
+    pub fn poll_stop(&mut self, request: BarrierRequest) -> Result<Poll<()>, ManagerError> {
+        let mut pending = false;
+        let mut failure = None;
+        for (index, attachment) in self.attachments.iter().enumerate() {
+            let mut transport = match attachment.transport.try_lock() {
+                Ok(transport) => transport,
+                Err(TryLockError::WouldBlock) => {
+                    pending = true;
+                    continue;
+                }
+                Err(error) => {
+                    failure.get_or_insert_with(|| self.lock_error(index, error));
+                    continue;
+                }
+            };
+            match transport.poll_stop(request) {
+                Ok(Poll::Ready(())) => {}
+                Ok(Poll::Pending) => pending = true,
+                Err(error) => {
+                    failure.get_or_insert_with(|| {
+                        self.error(Some(index), ManagerFault::Lifecycle(error))
+                    });
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        })
     }
 
     fn poll(&mut self, key: BarrierKey, transition: Transition) -> Result<Poll<()>, ManagerError> {
@@ -586,6 +900,7 @@ impl DeviceQuiescence {
         }
         if transition == Transition::Resume {
             self.request = None;
+            self.resume_fenced = None;
             for attachment in &mut self.attachments {
                 attachment.attempted = false;
                 attachment.accepted = false;
@@ -599,7 +914,11 @@ impl DeviceQuiescence {
     fn record(&mut self, index: usize, snapshot: LifecycleSnapshot) {
         let attachment = &mut self.attachments[index];
         match self.transition {
-            Transition::Quiesce => attachment.accepted |= snapshot.quiesce_accepted,
+            Transition::Quiesce => {
+                if snapshot.quiesce_request == self.request {
+                    attachment.accepted |= snapshot.quiesce_accepted;
+                }
+            }
             Transition::Resume => {
                 if snapshot.request == self.request {
                     attachment.resume_accepted |= snapshot.accepted;
@@ -669,7 +988,7 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "tee"))]
-    fn inactive_rng_refusal_retains_exact_attachment_and_no_accepted_work() {
+    fn inactive_rng_provider_retains_exact_attachment_and_transport_cut() {
         use crate::vmm::device_manager::quiescence::AttachmentIdentity;
         use devices::DeviceType;
         use devices::legacy::DummyIrqChip;
@@ -688,6 +1007,7 @@ mod tests {
         )
         .unwrap();
         transport.set_attachment_address(0xd000_0000).unwrap();
+        transport.set_irq_line(5);
         let mut inventory = DeviceQuiescence::default();
         let identity = AttachmentIdentity {
             device_type: DeviceType::Virtio(4),
@@ -696,8 +1016,7 @@ mod tests {
             irq: 5,
         };
         inventory.retain_transport(identity.clone(), Arc::new(Mutex::new(transport)));
-        let error = inventory.preflight_quiesce().unwrap_err();
-        assert_eq!(error.attachment, Some(identity.clone()));
+        inventory.preflight_quiesce().unwrap();
         let request = BarrierRequest {
             key: BarrierKey {
                 operation: OperationId(1),
@@ -705,11 +1024,15 @@ mod tests {
             },
             deadline: Instant::now() + Duration::from_secs(10),
         };
-        let error = inventory.begin_quiesce(request).unwrap_err();
-        assert_eq!(error.attachment, Some(identity));
-        assert!(!inventory.attachments[0].attempted);
-        assert!(!inventory.attachments[0].accepted);
-        assert!(inventory.request.is_none());
+        assert!(inventory.begin_quiesce(request).unwrap().is_ready());
+        assert!(inventory.poll_quiesce(request.key).unwrap().is_ready());
+        assert!(inventory.attachments[0].attempted);
+        assert!(inventory.attachments[0].accepted);
+        let records = inventory.capture_devices(request.key).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].identity, identity);
+        assert!(!records[0].state.activated);
+        assert_eq!(records[0].payload.len(), 22);
     }
 
     #[test]
@@ -751,6 +1074,541 @@ mod tests {
             ManagerFault::Provider(ProviderFault::Unsupported)
                 .to_string()
                 .contains("Unsupported")
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn legacy_resume_preflight_retains_real_closed_output_fault() {
+        use crate::vmm::device_manager::quiescence::LegacyHandle;
+        use devices::{BusDevice, legacy::Serial};
+        use std::os::unix::net::UnixStream;
+        use std::sync::{Arc, Mutex};
+        use utils::eventfd::{EFD_NONBLOCK, EventFd};
+        let (output, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        let serial = Arc::new(Mutex::new(Serial::new_out(
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            Box::new(output),
+        )));
+        let identity = LegacyAttachment {
+            kind: LegacyKind::Serial,
+            address: 0x3f8,
+            irq: Some(4),
+        };
+        let mut inventory = DeviceQuiescence::default();
+        inventory.retain_legacy_device(identity, LegacyHandle::Serial(serial.clone()));
+        inventory.preflight_legacy().unwrap();
+        let Ok(held) = serial.lock() else {
+            panic!("real UART lock poisoned");
+        };
+        assert!(matches!(
+            inventory.preflight_legacy().unwrap_err().fault,
+            ManagerFault::LockBusy
+        ));
+        drop(held);
+        let Ok(mut device) = serial.lock() else {
+            panic!("real UART lock poisoned");
+        };
+        device.write(0, 0, b"x");
+        drop(device);
+        assert!(matches!(
+            inventory.preflight_legacy().unwrap_err().fault,
+            ManagerFault::LegacyState(actual, _) if actual == identity
+        ));
+        let Ok(device) = serial.lock() else {
+            panic!("real UART lock poisoned");
+        };
+        assert!(device.capture_state().is_err());
+    }
+
+    #[cfg(not(feature = "tee"))]
+    struct AdmissionRng {
+        inventory: DeviceQuiescence,
+        transport: std::sync::Arc<std::sync::Mutex<devices::virtio::MmioTransport>>,
+        device: std::sync::Arc<std::sync::Mutex<devices::virtio::Rng>>,
+    }
+
+    #[cfg(not(feature = "tee"))]
+    fn admission_rng(address: u64, bound: bool) -> AdmissionRng {
+        use crate::vmm::device_manager::quiescence::AttachmentIdentity;
+        use devices::legacy::DummyIrqChip;
+        use devices::virtio::{MmioTransport, Rng};
+        use std::sync::{Arc, Mutex};
+        use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+        let device = Arc::new(Mutex::new(Rng::new().unwrap()));
+        let mut transport = MmioTransport::new(
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+            DummyIrqChip::new().into(),
+            device.clone(),
+            None,
+        )
+        .unwrap();
+        if bound {
+            transport.set_attachment_address(address).unwrap();
+        }
+        transport.set_irq_line(5);
+        let transport = Arc::new(Mutex::new(transport));
+        let mut inventory = DeviceQuiescence::default();
+        inventory.retain_transport(
+            AttachmentIdentity {
+                device_type: devices::DeviceType::Virtio(4),
+                configured_id: format!("rng-{address:x}"),
+                address,
+                irq: 5,
+            },
+            transport.clone(),
+        );
+        AdmissionRng {
+            inventory,
+            transport,
+            device,
+        }
+    }
+
+    #[cfg(not(feature = "tee"))]
+    fn admission_request(operation: u64) -> polly::event_manager::BarrierRequest {
+        use polly::event_manager::{BarrierGeneration, BarrierKey, BarrierRequest, OperationId};
+        BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(operation),
+                generation: BarrierGeneration(1),
+            },
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+        }
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn device_admission_contention_completes_same_owned_request_without_replay() {
+        let AdmissionRng {
+            mut inventory,
+            transport,
+            device,
+        } = admission_rng(0xd000_0000, true);
+        let request = admission_request(1);
+        let Ok(held) = transport.lock() else {
+            panic!("real transport poisoned");
+        };
+        assert!(matches!(
+            inventory.preflight_quiesce().unwrap_err().fault,
+            ManagerFault::LockBusy
+        ));
+        assert!(inventory.begin_quiesce(request).unwrap().is_pending());
+        assert!(inventory.request().is_none());
+        assert!(!inventory.attachments[0].attempted);
+        drop(held);
+        let Ok(held) = device.lock() else {
+            panic!("real RNG poisoned");
+        };
+        assert!(inventory.begin_quiesce(request).unwrap().is_pending());
+        assert!(inventory.request().is_none());
+        assert!(!inventory.attachments[0].accepted);
+        drop(held);
+        assert!(inventory.begin_quiesce(request).unwrap().is_ready());
+        let Ok(held) = transport.lock() else {
+            panic!("real transport poisoned");
+        };
+        assert!(inventory.poll_quiesce(request.key).unwrap().is_pending());
+        drop(held);
+        assert!(inventory.poll_quiesce(request.key).unwrap().is_ready());
+        assert!(inventory.fully_quiesced(request.key).unwrap());
+        let resume = admission_request(2);
+        let Ok(held) = device.lock() else {
+            panic!("real RNG poisoned");
+        };
+        assert!(
+            inventory
+                .begin_resume(request.key, resume)
+                .unwrap()
+                .is_pending()
+        );
+        assert!(!inventory.attachments[0].resume_attempted);
+        assert!(!inventory.attachments[0].resume_accepted);
+        let wrong_fenced = polly::event_manager::BarrierKey {
+            operation: polly::event_manager::OperationId(99),
+            ..request.key
+        };
+        assert!(matches!(
+            inventory
+                .begin_resume(wrong_fenced, resume)
+                .unwrap_err()
+                .fault,
+            ManagerFault::ForeignBarrier
+        ));
+        drop(held);
+        assert!(
+            inventory
+                .begin_resume(request.key, resume)
+                .unwrap()
+                .is_ready()
+        );
+        assert!(inventory.attachments[0].resume_accepted);
+        // Re-polling admission cannot reissue an already accepted provider begin.
+        assert!(
+            inventory
+                .begin_resume(request.key, resume)
+                .unwrap()
+                .is_ready()
+        );
+        assert!(inventory.poll_resume(resume.key).unwrap().is_ready());
+        assert!(inventory.request().is_none());
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn device_admission_contention_does_not_hide_real_unsupported_inventory() {
+        let AdmissionRng {
+            mut inventory,
+            transport,
+            ..
+        } = admission_rng(0xd000_0000, true);
+        let mut unsupported = admission_rng(0xd000_1000, false);
+        inventory
+            .attachments
+            .append(&mut unsupported.inventory.attachments);
+        let Ok(unbound_held) = unsupported.device.lock() else {
+            panic!("real unbound RNG poisoned");
+        };
+        let Ok(held) = transport.lock() else {
+            panic!("real transport poisoned");
+        };
+        assert!(matches!(
+            inventory.preflight_quiesce().unwrap_err().fault,
+            ManagerFault::Provider(devices::virtio::lifecycle::ProviderFault::Unsupported)
+        ));
+        assert!(inventory.begin_quiesce(admission_request(1)).is_err());
+        assert!(inventory.request().is_none());
+        assert!(
+            inventory
+                .attachments
+                .iter()
+                .all(|attachment| !attachment.attempted)
+        );
+        drop(held);
+        drop(unbound_held);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn device_admission_contention_does_not_hide_real_poisoned_transport() {
+        let AdmissionRng {
+            mut inventory,
+            transport,
+            ..
+        } = admission_rng(0xd000_0000, true);
+        let mut poisoned = admission_rng(0xd000_1000, true);
+        inventory
+            .attachments
+            .append(&mut poisoned.inventory.attachments);
+        let poison = poisoned.transport.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let Ok(_held) = poison.lock() else {
+                    panic!("unexpected earlier poison");
+                };
+                panic!("poison actual transport mutex");
+            })
+            .join()
+            .is_err()
+        );
+        let Ok(held) = transport.lock() else {
+            panic!("real transport poisoned");
+        };
+        let error = inventory.preflight_quiesce().unwrap_err();
+        assert!(matches!(error.fault, ManagerFault::LockPoisoned));
+        assert_eq!(error.attachment.unwrap().address, 0xd000_1000);
+        assert!(inventory.request().is_none());
+        drop(held);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn device_admission_expired_request_never_starts_contended_attachment() {
+        let AdmissionRng {
+            mut inventory,
+            transport,
+            ..
+        } = admission_rng(0xd000_0000, true);
+        let mut request = admission_request(1);
+        request.deadline = std::time::Instant::now();
+        let Ok(held) = transport.lock() else {
+            panic!("real transport poisoned");
+        };
+        assert!(matches!(
+            inventory.begin_quiesce(request).unwrap_err().fault,
+            ManagerFault::Deadline
+        ));
+        assert!(inventory.request().is_none());
+        assert!(!inventory.attachments[0].attempted);
+        assert!(!inventory.attachments[0].accepted);
+        drop(held);
+    }
+
+    #[cfg(not(feature = "tee"))]
+    fn admission_snapshot(
+        transport: &std::sync::Arc<std::sync::Mutex<devices::virtio::MmioTransport>>,
+    ) -> devices::virtio::lifecycle::LifecycleSnapshot {
+        let Ok(transport) = transport.lock() else {
+            panic!("actual transport poisoned");
+        };
+        transport.lifecycle_snapshot()
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn device_admission_two_real_rng_staggered_resume_is_terminal_for_same_key() {
+        use devices::virtio::lifecycle::ProviderStage;
+        for inner_contention in [false, true] {
+            let AdmissionRng {
+                mut inventory,
+                transport,
+                ..
+            } = admission_rng(0xd000_0000, true);
+            let mut second = admission_rng(0xd000_1000, true);
+            inventory
+                .attachments
+                .append(&mut second.inventory.attachments);
+            let pause = admission_request(1);
+            assert!(inventory.begin_quiesce(pause).unwrap().is_ready());
+            assert!(inventory.poll_quiesce(pause.key).unwrap().is_ready());
+            let resume = admission_request(2);
+            assert!(
+                inventory
+                    .begin_resume(pause.key, resume)
+                    .unwrap()
+                    .is_ready()
+            );
+            let mut observe_pending = || {
+                assert!(inventory.poll_resume(resume.key).unwrap().is_pending());
+                let snapshot = admission_snapshot(&transport);
+                assert_eq!(snapshot.stage, ProviderStage::Running);
+                assert_eq!(snapshot.request, Some(resume));
+                snapshot
+            };
+            let completed = if inner_contention {
+                let Ok(held) = second.device.lock() else {
+                    panic!("actual RNG poisoned");
+                };
+                let completed = observe_pending();
+                drop(held);
+                completed
+            } else {
+                let Ok(held) = second.transport.lock() else {
+                    panic!("actual transport poisoned");
+                };
+                let completed = observe_pending();
+                drop(held);
+                completed
+            };
+            assert!(inventory.poll_resume(resume.key).unwrap().is_ready());
+            assert!(inventory.request().is_none());
+            assert_eq!(admission_snapshot(&transport), completed);
+            assert_eq!(
+                admission_snapshot(&second.transport).stage,
+                ProviderStage::Running
+            );
+        }
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn device_admission_partial_real_begins_resume_and_new_key_never_replay_owners() {
+        use devices::virtio::lifecycle::ProviderStage;
+        let AdmissionRng {
+            mut inventory,
+            transport,
+            device,
+        } = admission_rng(0xd000_0000, true);
+        let mut second = admission_rng(0xd000_1000, true);
+        inventory
+            .attachments
+            .append(&mut second.inventory.attachments);
+        let pause = admission_request(1);
+        // Use the actual production admission step, then introduce contention
+        // before entering providers; no fabricated provider or acceptance state.
+        assert!(inventory.admit_quiesce(pause).unwrap().is_ready());
+        let Ok(held) = second.device.lock() else {
+            panic!("actual RNG poisoned");
+        };
+        assert!(inventory.begin_quiesce(pause).unwrap().is_pending());
+        assert_eq!(inventory.request(), Some(pause));
+        assert!(inventory.attachments[0].accepted);
+        assert!(!inventory.attachments[1].attempted);
+        assert!(!inventory.attachments[1].accepted);
+        let first_owned = admission_snapshot(&transport);
+        assert_eq!(first_owned.stage, ProviderStage::Quiescing);
+        assert!(inventory.begin_quiesce(pause).unwrap().is_pending());
+        assert_eq!(admission_snapshot(&transport), first_owned);
+        drop(held);
+        assert!(inventory.begin_quiesce(pause).unwrap().is_ready());
+        assert_eq!(admission_snapshot(&transport), first_owned);
+        assert!(inventory.poll_quiesce(pause.key).unwrap().is_ready());
+
+        let resume = admission_request(2);
+        let Ok(held) = second.device.lock() else {
+            panic!("actual RNG poisoned");
+        };
+        assert!(
+            inventory
+                .begin_resume(pause.key, resume)
+                .unwrap()
+                .is_pending()
+        );
+        assert!(inventory.attachments[0].resume_accepted);
+        assert!(!inventory.attachments[1].resume_attempted);
+        let first_released = admission_snapshot(&transport);
+        assert!(
+            inventory
+                .begin_resume(pause.key, resume)
+                .unwrap()
+                .is_pending()
+        );
+        assert_eq!(admission_snapshot(&transport), first_released);
+        drop(held);
+        assert!(
+            inventory
+                .begin_resume(pause.key, resume)
+                .unwrap()
+                .is_ready()
+        );
+        assert!(inventory.poll_resume(resume.key).unwrap().is_ready());
+
+        let previous = admission_snapshot(&transport);
+        assert!(previous.accepted);
+        assert_eq!(previous.request, Some(resume));
+        let next = admission_request(3);
+        assert!(inventory.admit_quiesce(next).unwrap().is_ready());
+        let Ok(held) = device.lock() else {
+            panic!("actual RNG poisoned");
+        };
+        assert!(inventory.begin_quiesce(next).unwrap().is_pending());
+        assert!(!inventory.attachments[0].attempted);
+        assert!(!inventory.attachments[0].accepted);
+        assert!(inventory.attachments[1].accepted);
+        assert_eq!(admission_snapshot(&transport), previous);
+        drop(held);
+        assert!(inventory.begin_quiesce(next).unwrap().is_ready());
+        assert!(inventory.poll_quiesce(next.key).unwrap().is_ready());
+        assert_eq!(admission_snapshot(&transport).quiesce_request, Some(next));
+    }
+
+    #[cfg(not(feature = "tee"))]
+    #[test]
+    fn device_admission_partial_expiry_drains_and_cancels_only_actual_accepted_owner() {
+        use devices::BusDevice;
+        use devices::virtio::lifecycle::ProviderStage;
+        use std::time::{Duration, Instant};
+        let AdmissionRng {
+            mut inventory,
+            transport,
+            ..
+        } = admission_rng(0xd000_0000, true);
+        let mut second = admission_rng(0xd000_1000, true);
+        inventory
+            .attachments
+            .append(&mut second.inventory.attachments);
+        {
+            let Ok(mut transport) = second.transport.lock() else {
+                panic!("actual transport poisoned");
+            };
+            for (offset, value) in [
+                (0x70, 1u32),
+                (0x70, 3),
+                (0x24, 1),
+                (0x20, 1),
+                (0x70, 11),
+                (0x30, 0),
+                (0x38, 8),
+                (0x80, 0x1234),
+                (0x90, 0x5678),
+                (0xa0, 0x9abc),
+            ] {
+                transport.write(0, offset, &value.to_le_bytes());
+            }
+        }
+        // Queue size/addresses are write-only MMIO registers. Negotiate
+        // FEATURES_OK above, then obtain the real complete queue baseline at
+        // an ordinary completed cut rather than reading those registers as 0.
+        let baseline = admission_request(1);
+        assert!(inventory.begin_quiesce(baseline).unwrap().is_ready());
+        assert!(inventory.poll_quiesce(baseline.key).unwrap().is_ready());
+        let queue_before = {
+            let Ok(transport) = second.transport.lock() else {
+                panic!("actual transport poisoned");
+            };
+            transport.capture_transport(baseline.key).unwrap().queues
+        };
+        assert_eq!(queue_before.len(), 1);
+        assert_eq!(queue_before[0].size, 8);
+        assert!(!queue_before[0].ready);
+        assert_eq!(queue_before[0].desc_table, 0x1234);
+        assert_eq!(queue_before[0].avail_ring, 0x5678);
+        assert_eq!(queue_before[0].used_ring, 0x9abc);
+        let baseline_resume = admission_request(2);
+        assert!(
+            inventory
+                .begin_resume(baseline.key, baseline_resume)
+                .unwrap()
+                .is_ready()
+        );
+        assert!(
+            inventory
+                .poll_resume(baseline_resume.key)
+                .unwrap()
+                .is_ready()
+        );
+        let untouched = admission_snapshot(&second.transport);
+        let mut pause = admission_request(3);
+        pause.deadline = Instant::now() + Duration::from_secs(1);
+        assert!(inventory.admit_quiesce(pause).unwrap().is_ready());
+        let Ok(held) = second.transport.lock() else {
+            panic!("actual transport poisoned");
+        };
+        assert!(inventory.begin_quiesce(pause).unwrap().is_pending());
+        assert!(inventory.attachments[0].accepted);
+        assert!(!inventory.attachments[1].attempted);
+        std::thread::sleep(pause.deadline.saturating_duration_since(Instant::now()));
+        assert!(matches!(
+            inventory.begin_quiesce(pause).unwrap_err().fault,
+            ManagerFault::Deadline
+        ));
+        assert!(inventory.poll_quiesce(pause.key).is_err());
+        assert_eq!(
+            admission_snapshot(&transport).stage,
+            ProviderStage::Quiesced
+        );
+        assert!(inventory.quiescence_settled(pause.key).unwrap());
+        assert!(!inventory.attachments[1].attempted);
+        assert_eq!(held.lifecycle_snapshot(), untouched);
+
+        let cancel = admission_request(4);
+        assert!(
+            inventory
+                .begin_resume(pause.key, cancel)
+                .unwrap()
+                .is_ready()
+        );
+        assert!(inventory.poll_resume(cancel.key).unwrap().is_ready());
+        assert_eq!(admission_snapshot(&transport).stage, ProviderStage::Running);
+        assert_eq!(held.lifecycle_snapshot(), untouched);
+        drop(held);
+        let next = admission_request(5);
+        assert!(inventory.begin_quiesce(next).unwrap().is_ready());
+        assert!(inventory.poll_quiesce(next.key).unwrap().is_ready());
+        let resume = admission_request(6);
+        assert!(inventory.begin_resume(next.key, resume).unwrap().is_ready());
+        assert!(inventory.poll_resume(resume.key).unwrap().is_ready());
+        let final_cut = admission_request(7);
+        assert!(inventory.begin_quiesce(final_cut).unwrap().is_ready());
+        assert!(inventory.poll_quiesce(final_cut.key).unwrap().is_ready());
+        let Ok(transport) = second.transport.lock() else {
+            panic!("actual transport poisoned");
+        };
+        assert_eq!(
+            transport.capture_transport(final_cut.key).unwrap().queues,
+            queue_before
         );
     }
 }

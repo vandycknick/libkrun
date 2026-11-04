@@ -2,32 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-/// `MuxerRxQ` implements a helper object that `VsockMuxer` can use for queuing RX (host -> guest)
-/// packets (or rather instructions on how to build said packets).
-///
-/// Under ideal operation, every connection, that has pending RX data, will be present in the muxer
-/// RX queue. However, since the RX queue is smaller than the connection pool, it may, under some
-/// conditions, become full, meaning that it can no longer account for all the connections that can
-/// yield RX data.  When that happens, we say that it is no longer "synchronized" (i.e. with the
-/// connection pool).  A desynchronized RX queue still holds valid data, and the muxer will
-/// continue to pop packets from it. However, when a desynchronized queue is drained, additional
-/// data may still be available, so the muxer will have to perform a more costly walk of the entire
-/// connection pool to find it.  This walk is performed here, as part of building an RX queue from
-/// the connection pool. When an out-of-sync is drained, the muxer will discard it, and attempt to
-/// rebuild a synced one.
+//! Bounded ordered protocol responses, retained with the source mux while parked.
 use std::collections::VecDeque;
 
-use super::defs;
-use super::defs::uapi;
-use super::muxer::MuxerRx;
-use super::packet::{TsiAcceptRsp, TsiConnectRsp, TsiListenRsp, VsockPacket};
+use crate::virtio::vsock::defs;
+use crate::virtio::vsock::defs::uapi;
+use crate::virtio::vsock::muxer::MuxerRx;
+use crate::virtio::vsock::packet::{TsiAcceptRsp, TsiConnectRsp, TsiListenRsp, VsockPacket};
 
 /// The muxer RX queue.
 pub struct MuxerRxQ {
     /// The RX queue data.
     q: VecDeque<MuxerRx>,
-    /// The RX queue sync status.
-    synced: bool,
 }
 
 impl MuxerRxQ {
@@ -37,24 +23,12 @@ impl MuxerRxQ {
     pub fn new() -> Self {
         Self {
             q: VecDeque::with_capacity(Self::SIZE),
-            synced: true,
         }
     }
 
-    /// Push a new RX item to the queue.
-    ///
-    /// A push will fail when:
-    /// - trying to push a connection key onto an out-of-sync, or full queue; or
-    /// - trying to push an RST onto a queue already full of RSTs.
-    ///
-    /// RSTs take precedence over connections, because connections can always be queried for
-    /// pending RX data later. Aside from this queue, there is no other storage for RSTs, so
-    /// failing to push one means that we have to drop the packet.
-    ///
-    /// Returns the item to the caller when there is no room left in the queue.
+    /// Refuses overflow without dropping an accepted protocol response.
     pub fn push(&mut self, rx: MuxerRx) -> Result<(), Box<MuxerRx>> {
-        // Pushing to a non-full, synchronized queue will always succeed.
-        if self.is_synced() && !self.is_full() {
+        if !self.is_full() {
             self.q.push_back(rx);
             return Ok(());
         }
@@ -62,14 +36,21 @@ impl MuxerRxQ {
         Err(Box::new(rx))
     }
 
-    /// Pop an RX item from the front of the queue.
-    pub fn pop(&mut self) -> Option<MuxerRx> {
-        self.q.pop_front()
-    }
-
-    /// Check if the RX queue is synchronized with the connection pool.
-    pub fn is_synced(&self) -> bool {
-        self.synced
+    pub(crate) fn fill_packet(
+        &mut self,
+        cid: u64,
+        packet: &mut VsockPacket,
+    ) -> crate::virtio::vsock::Result<()> {
+        let Some(rx) = self.q.pop_front() else {
+            return Err(crate::virtio::vsock::VsockError::NoData);
+        };
+        match rx_to_pkt(cid, rx, packet) {
+            Ok(()) => Ok(()),
+            Err(rx) => {
+                self.q.push_front(*rx);
+                Err(crate::virtio::vsock::VsockError::BufDescTooSmall)
+            }
+        }
     }
 
     /// Get the total number of items in the queue.
@@ -88,7 +69,18 @@ impl MuxerRxQ {
     }
 }
 
-pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
+pub(crate) fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> Result<(), Box<MuxerRx>> {
+    let required = match &rx {
+        MuxerRx::ConnResponse { .. }
+        | MuxerRx::ListenResponse { .. }
+        | MuxerRx::AcceptResponse { .. } => 4,
+        MuxerRx::GetnameResponse { data, .. } => (data.addr_len as usize + 8).max(132),
+        _ => 0,
+    };
+    let buffer_len = pkt.buf().map_or(0, |buffer| buffer.len() as u32);
+    if (buffer_len as usize) < required {
+        return Err(Box::new(rx));
+    }
     match rx {
         MuxerRx::Reset {
             local_port,
@@ -134,7 +126,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
             pkt.write_connect_rsp(TsiConnectRsp { result });
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.set_len(buffer_len);
         }
         MuxerRx::OpRequest {
             local_port,
@@ -148,7 +140,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_type(uapi::VSOCK_TYPE_STREAM)
                 .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32);
 
-            pkt.set_len(0);
+            pkt.set_len(0).set_flags(0).set_fwd_cnt(0);
         }
         MuxerRx::OpResponse {
             local_port,
@@ -162,7 +154,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_type(uapi::VSOCK_TYPE_STREAM)
                 .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32);
 
-            pkt.set_len(0);
+            pkt.set_len(0).set_flags(0).set_fwd_cnt(0);
         }
         MuxerRx::GetnameResponse {
             local_port,
@@ -177,7 +169,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
             pkt.write_getname_rsp(data);
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.set_len(buffer_len);
         }
         MuxerRx::CreditRequest {
             local_port,
@@ -191,7 +183,9 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_STREAM)
                 .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
-                .set_fwd_cnt(fwd_cnt);
+                .set_fwd_cnt(fwd_cnt)
+                .set_len(0)
+                .set_flags(0);
         }
         MuxerRx::CreditUpdate {
             local_port,
@@ -205,7 +199,9 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_STREAM)
                 .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
-                .set_fwd_cnt(fwd_cnt);
+                .set_fwd_cnt(fwd_cnt)
+                .set_len(0)
+                .set_flags(0);
         }
         MuxerRx::ListenResponse {
             local_port,
@@ -220,7 +216,7 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
             pkt.write_listen_rsp(TsiListenRsp { result });
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.set_len(buffer_len);
         }
         MuxerRx::AcceptResponse {
             local_port,
@@ -235,7 +231,8 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_type(uapi::VSOCK_TYPE_DGRAM);
 
             pkt.write_accept_rsp(TsiAcceptRsp { result });
-            pkt.set_len(pkt.buf().unwrap().len() as u32);
+            pkt.set_len(buffer_len);
         }
     }
+    Ok(())
 }

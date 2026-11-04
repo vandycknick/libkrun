@@ -25,6 +25,7 @@ mod defs {
 pub enum BalloonError {
     /// Failed to create event fd.
     EventFd(std::io::Error),
+    UnsupportedRestoreFeatures(u64),
 }
 
 type Result<T> = std::result::Result<T, BalloonError>;

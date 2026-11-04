@@ -1,31 +1,34 @@
 use std::collections::HashMap;
 #[cfg(unix)]
-use std::collections::HashSet;
-#[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
-#[cfg(unix)]
 use std::time::Instant;
 #[cfg(windows)]
 use utils::windows::RawFd;
 
-use super::super::Queue as VirtQueue;
-use super::muxer::{ProxyMap, push_proxy_credit};
-use super::muxer_rxq::MuxerRxQ;
-use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
-use super::tsi_stream::TsiStreamProxy;
 #[cfg(unix)]
 use crate::virtio::vsock::control_proxy::{ControlHandle, ControlProxy, Incoming};
+use crate::virtio::vsock::muxer::{ProxyMap, push_proxy_credit};
+use crate::virtio::vsock::muxer_rxq::MuxerRxQ;
+use crate::virtio::vsock::packet::PacketQueue as VirtQueue;
+use crate::virtio::vsock::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
+use crate::virtio::vsock::tsi_stream::TsiStreamProxy;
 
 use crate::virtio::InterruptTransport;
 use crate::virtio::RuntimeGuestMemory;
 use crate::virtio::vsock::defs;
+use crate::virtio::vsock::reaper::{RetiredProxy, defer_proxy};
 use crate::virtio::vsock::unix_proxy::{UnixAcceptorProxy, UnixProxy};
+use crate::virtio::vsock::worker_control::{Owner, WorkerControl};
 use crossbeam_channel::Sender;
 use rand::{RngExt, rng, rngs::ThreadRng};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+#[cfg(windows)]
+use utils::windows::AsRawFd;
 
 #[cfg(unix)]
 struct SourcePortAllocator {
@@ -44,11 +47,7 @@ impl SourcePortAllocator {
         }
     }
 
-    fn allocate(&mut self, live_proxy_ids: impl IntoIterator<Item = u64>) -> Option<u32> {
-        let live_source_ports: HashSet<u32> = live_proxy_ids
-            .into_iter()
-            .map(|proxy_id| proxy_id as u32)
-            .collect();
+    fn allocate(&mut self, live_proxy_ids: impl IntoIterator<Item = u64> + Clone) -> Option<u32> {
         for _ in self.start..self.end {
             let port = self.next;
             self.next = if port + 1 == self.end {
@@ -56,7 +55,11 @@ impl SourcePortAllocator {
             } else {
                 port + 1
             };
-            if !live_source_ports.contains(&port) {
+            if !live_proxy_ids
+                .clone()
+                .into_iter()
+                .any(|id| id as u32 == port)
+            {
                 return Some(port);
             }
         }
@@ -64,7 +67,7 @@ impl SourcePortAllocator {
     }
 }
 
-pub struct MuxerThread {
+pub(crate) struct MuxerThread {
     cid: u64,
     pub epoll: Epoll,
     rxq: Arc<Mutex<MuxerRxQ>>,
@@ -72,19 +75,24 @@ pub struct MuxerThread {
     mem: RuntimeGuestMemory,
     queue: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
-    reaper_sender: Sender<u64>,
+    reaper_sender: Sender<RetiredProxy>,
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
     #[cfg(unix)]
     control: Option<ControlProxy>,
     #[cfg(unix)]
+    control_registered: bool,
+    #[cfg(unix)]
     control_handle: Option<Arc<ControlHandle>>,
     #[cfg(unix)]
     source_ports: SourcePortAllocator,
+    worker_control: Arc<WorkerControl>,
+    retired_ports: Vec<u32>,
+    initialized: bool,
 }
 
 impl MuxerThread {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         cid: u64,
         epoll: Epoll,
         rxq: Arc<Mutex<MuxerRxQ>>,
@@ -92,10 +100,12 @@ impl MuxerThread {
         mem: RuntimeGuestMemory,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
-        reaper_sender: Sender<u64>,
+        reaper_sender: Sender<RetiredProxy>,
         unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
         #[cfg(unix)] control: Option<ControlProxy>,
         #[cfg(unix)] control_handle: Option<Arc<ControlHandle>>,
+        worker_control: Arc<WorkerControl>,
+        retired_ports: Vec<u32>,
     ) -> Self {
         MuxerThread {
             cid,
@@ -110,17 +120,21 @@ impl MuxerThread {
             #[cfg(unix)]
             control,
             #[cfg(unix)]
+            control_registered: false,
+            #[cfg(unix)]
             control_handle,
             #[cfg(unix)]
             source_ports: SourcePortAllocator::new(1 << 30, 1 << 31),
+            retired_ports,
+            worker_control,
+            initialized: false,
         }
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> std::io::Result<thread::JoinHandle<()>> {
         thread::Builder::new()
             .name("vsock muxer".into())
             .spawn(|| self.work())
-            .unwrap();
     }
 
     pub fn update_polling(&self, id: u64, fd: RawFd, evset: EventSet) {
@@ -181,8 +195,8 @@ impl MuxerThread {
             }
             ProxyRemoval::Deferred => {
                 debug!("deferring proxy removal: {id}");
-                if self.reaper_sender.send(id).is_err() {
-                    self.proxy_map.write().unwrap().remove(&id);
+                if defer_proxy(&self.reaper_sender, id, &self.proxy_map).is_err() {
+                    self.worker_control.fail();
                 }
             }
         }
@@ -192,8 +206,8 @@ impl MuxerThread {
         if let Some((peer_port, accept_fd, family, proxy_type)) = update.new_proxy {
             let local_port: u32 = thread_rng.random_range(1024..u32::MAX);
             let new_id: u64 = ((peer_port as u64) << 32) | (local_port as u64);
-            let new_proxy: Box<dyn Proxy> = match proxy_type {
-                NewProxyType::Tcp => Box::new(TsiStreamProxy::new_reverse(
+            let new_proxy: Arc<Mutex<dyn Proxy>> = match proxy_type {
+                NewProxyType::Tcp => Arc::new(Mutex::new(TsiStreamProxy::new_reverse(
                     new_id,
                     self.cid,
                     id,
@@ -204,8 +218,8 @@ impl MuxerThread {
                     self.mem.clone(),
                     self.queue.clone(),
                     self.rxq.clone(),
-                )),
-                NewProxyType::Unix => Box::new(UnixProxy::new_reverse(
+                ))),
+                NewProxyType::Unix => Arc::new(Mutex::new(UnixProxy::new_reverse(
                     new_id,
                     self.cid,
                     local_port,
@@ -214,12 +228,9 @@ impl MuxerThread {
                     self.mem.clone(),
                     self.queue.clone(),
                     self.rxq.clone(),
-                )),
+                ))),
             };
-            self.proxy_map
-                .write()
-                .unwrap()
-                .insert(new_id, Mutex::new(new_proxy));
+            self.proxy_map.write().unwrap().insert(new_id, new_proxy);
             if let Some(proxy) = self.proxy_map.read().unwrap().get(&new_id) {
                 proxy.lock().unwrap().push_op_request();
             };
@@ -232,31 +243,41 @@ impl MuxerThread {
         }
     }
 
-    fn create_listening_ipc_sockets(&self) {
-        for (port, (path, do_listen)) in &self.unix_ipc_port_map {
-            if !do_listen {
+    fn create_listening_ipc_sockets(&self) -> std::io::Result<()> {
+        let mut map = self
+            .proxy_map
+            .write()
+            .map_err(|_| std::io::Error::other("vsock proxy map poisoned"))?;
+        for (port, (path, listen)) in &self.unix_ipc_port_map {
+            if !listen {
                 continue;
             }
-            let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
-            let proxy = match UnixAcceptorProxy::new(id, path, *port) {
-                Ok(proxy) => proxy,
-                Err(e) => {
-                    warn!("Failed to create listening proxy at {path:?}: {e:?}");
-                    continue;
-                }
-            };
-            self.proxy_map
-                .write()
-                .unwrap()
-                .insert(id, Mutex::new(Box::new(proxy)));
-            if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-                self.update_polling(id, proxy.lock().unwrap().as_raw_fd(), EventSet::IN);
-            };
+            let id = (u64::from(*port) << 32) | u64::from(defs::TSI_PROXY_PORT);
+            if let std::collections::hash_map::Entry::Vacant(entry) = map.entry(id) {
+                let proxy = UnixAcceptorProxy::new(id, path, *port)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                entry.insert(Arc::new(Mutex::new(proxy)));
+            }
+            let proxy = map
+                .get(&id)
+                .ok_or_else(|| std::io::Error::other("missing vsock listener"))?;
+            let proxy = proxy
+                .lock()
+                .map_err(|_| std::io::Error::other("vsock listener poisoned"))?;
+            #[cfg(unix)]
+            self.epoll.ctl(
+                ControlOperation::Add,
+                proxy.as_raw_fd(),
+                &EpollEvent::new(EventSet::IN, id),
+            )?;
+            #[cfg(windows)]
+            self.update_polling(id, proxy.as_raw_fd(), EventSet::IN);
         }
+        Ok(())
     }
 
     #[cfg(unix)]
-    fn update_control_polling(&self) {
+    fn update_control_polling(&mut self) {
         const CONTROL_EVENT: u64 = u64::MAX;
         let Some(control) = &self.control else {
             return;
@@ -264,6 +285,21 @@ impl MuxerThread {
         let Some(fd) = control.as_raw_fd() else {
             return;
         };
+        if self.control_registered {
+            if let Err(error) = self
+                .epoll
+                .ctl(ControlOperation::Delete, fd, &EpollEvent::default())
+            {
+                self.fail_mux_transport(&format!("failed to suspend control fd: {error}"));
+                return;
+            }
+            self.control_registered = false;
+        }
+        // Keep the first request and its SCM_RIGHTS descriptor in the socket
+        // until the admitted Linux guest has retired the transport reset.
+        if !self.worker_control.transport_ready() {
+            return;
+        }
         let mut events = EventSet::IN;
         if self
             .control_handle
@@ -272,25 +308,32 @@ impl MuxerThread {
         {
             events |= EventSet::OUT;
         }
-        let _ = self
-            .epoll
-            .ctl(ControlOperation::Delete, fd, &EpollEvent::default());
-        let _ = self.epoll.ctl(
+        if let Err(error) = self.epoll.ctl(
             ControlOperation::Add,
             fd,
             &EpollEvent::new(events, CONTROL_EVENT),
-        );
+        ) {
+            self.fail_mux_transport(&format!("failed to register control fd: {error}"));
+        } else {
+            self.control_registered = true;
+        }
     }
 
     #[cfg(unix)]
     fn process_control_message(&mut self, message: Incoming) {
         match message {
             Incoming::Connect { port, fd } => {
+                if !self.worker_control.admits(port) {
+                    return;
+                }
                 let inserted_id = match self.proxy_map.write() {
                     Ok(mut proxy_map) => {
-                        let Some(local_port) =
-                            self.source_ports.allocate(proxy_map.keys().copied())
-                        else {
+                        let Some(local_port) = self.source_ports.allocate(
+                            proxy_map
+                                .keys()
+                                .copied()
+                                .chain(self.retired_ports.iter().copied().map(u64::from)),
+                        ) else {
                             warn!("vsock mux source-port range is exhausted");
                             return;
                         };
@@ -305,11 +348,16 @@ impl MuxerThread {
                             self.queue.clone(),
                             self.rxq.clone(),
                         );
-                        proxy_map.insert(id, Mutex::new(Box::new(proxy)));
+                        proxy_map.insert(id, Arc::new(Mutex::new(proxy)));
                         Ok(id)
                     }
                     Err(_) => Err(()),
                 };
+                #[cfg(feature = "native-device-probe")]
+                if inserted_id.is_ok() {
+                    self.worker_control
+                        .record(crate::virtio::vsock::worker_control::WorkerCounter::HostConnect);
+                }
                 let id = match inserted_id {
                     Ok(id) => id,
                     Err(()) => {
@@ -371,12 +419,19 @@ impl MuxerThread {
             return;
         }
         if let Some(update) = update {
+            #[cfg(feature = "native-device-probe")]
+            self.worker_control.record(if admit {
+                crate::virtio::vsock::worker_control::WorkerCounter::Admitted
+            } else {
+                crate::virtio::vsock::worker_control::WorkerCounter::Rejected
+            });
             self.process_proxy_update(proxy_id, update, &mut rng());
         }
     }
 
     #[cfg(unix)]
     fn fail_mux_transport(&mut self, reason: &str) {
+        self.worker_control.fail();
         warn!("vsock mux transport failed: {reason}");
         let pending = self
             .control
@@ -433,6 +488,10 @@ impl MuxerThread {
 
     #[cfg(unix)]
     fn service_control(&mut self, evset: EventSet) {
+        if !self.worker_control.transport_ready() {
+            self.update_control_polling();
+            return;
+        }
         let result = if let Some(control) = &mut self.control {
             let messages =
                 if evset.intersects(EventSet::IN | EventSet::READ_HANG_UP | EventSet::HANG_UP) {
@@ -475,29 +534,64 @@ impl MuxerThread {
         const CONTROL_EVENT: u64 = u64::MAX;
         #[cfg(unix)]
         const CONTROL_WAKE_EVENT: u64 = u64::MAX - 1;
+        const OWNER_WAKE_EVENT: u64 = u64::MAX - 2;
         let mut thread_rng = rng();
-        self.create_listening_ipc_sockets();
-        #[cfg(unix)]
-        if let Some(control) = &self.control
-            && let Some(fd) = control.as_raw_fd()
-            && let Err(error) = self.epoll.ctl(
+        if !self.worker_control.boundary(Owner::Mux) {
+            return;
+        }
+        if !self.initialized && !self.worker_control.activation_fenced() {
+            if self.create_listening_ipc_sockets().is_err() {
+                self.worker_control.fail();
+                return;
+            }
+            self.initialized = true;
+        }
+        if self
+            .epoll
+            .ctl(
                 ControlOperation::Add,
-                fd,
-                &EpollEvent::new(EventSet::IN, CONTROL_EVENT),
+                self.worker_control.wake.as_raw_fd(),
+                &EpollEvent::new(EventSet::IN, OWNER_WAKE_EVENT),
             )
+            .is_err()
         {
-            self.fail_mux_transport(&format!("failed to register control fd: {error}"));
+            self.worker_control.fail();
+            return;
         }
         #[cfg(unix)]
-        if let Some(handle) = &self.control_handle {
-            let _ = self.epoll.ctl(
-                ControlOperation::Add,
-                handle.wake_fd(),
-                &EpollEvent::new(EventSet::IN, CONTROL_WAKE_EVENT),
-            );
+        self.update_control_polling();
+        #[cfg(unix)]
+        if let Some(handle) = &self.control_handle
+            && self
+                .epoll
+                .ctl(
+                    ControlOperation::Add,
+                    handle.wake_fd(),
+                    &EpollEvent::new(EventSet::IN, CONTROL_WAKE_EVENT),
+                )
+                .is_err()
+        {
+            self.worker_control.fail();
+            return;
         }
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
-        loop {
+        let mut ready_proxies: [Option<Arc<Mutex<dyn Proxy>>>; 32] = std::array::from_fn(|_| None);
+        'work: loop {
+            if !self.worker_control.boundary(Owner::Mux) {
+                return;
+            }
+            let epoch = self.worker_control.epoch();
+            if !self.initialized
+                && (!self.worker_control.activation_fenced()
+                    || self.worker_control.release_pending())
+            {
+                if self.create_listening_ipc_sockets().is_err() {
+                    self.worker_control.fail();
+                    return;
+                }
+                self.initialized = true;
+                self.worker_control.complete_activation_release(epoch);
+            }
             #[cfg(unix)]
             {
                 let now = Instant::now();
@@ -529,6 +623,7 @@ impl MuxerThread {
                     }
                 }
             }
+            self.worker_control.reconciled(Owner::Mux, epoch);
             #[cfg(unix)]
             let queue_timeout = self
                 .control_handle
@@ -552,9 +647,35 @@ impl MuxerThread {
                 .wait(epoll_events.len(), timeout, epoll_events.as_mut_slice())
             {
                 Ok(ev_cnt) => {
-                    for ev in &epoll_events[0..ev_cnt] {
+                    {
+                        let Ok(map) = self.proxy_map.read() else {
+                            self.worker_control.fail();
+                            return;
+                        };
+                        for (slot, event) in ready_proxies.iter_mut().zip(&epoll_events[..ev_cnt]) {
+                            *slot = map.get(&event.data()).cloned();
+                        }
+                    }
+                    for (index, ev) in epoll_events[..ev_cnt].iter().enumerate() {
+                        if !self
+                            .worker_control
+                            .boundary_releasing(Owner::Mux, || ready_proxies.fill_with(|| None))
+                        {
+                            return;
+                        }
+                        if self.worker_control.epoch() != epoch {
+                            ready_proxies.fill_with(|| None);
+                            continue 'work;
+                        }
+                        let ready_proxy = ready_proxies[index].take();
+                        if ev.data() == OWNER_WAKE_EVENT {
+                            while self.worker_control.wake.read().is_ok() {}
+                            #[cfg(unix)]
+                            self.update_control_polling();
+                            continue;
+                        }
                         debug!("Event: ev.data={} ev.fd={}", ev.data(), ev.fd());
-                        let evset = EventSet::from_bits(ev.events).unwrap();
+                        let evset = EventSet::from_bits_truncate(ev.events);
                         let id = ev.data();
 
                         #[cfg(unix)]
@@ -575,9 +696,17 @@ impl MuxerThread {
                             continue;
                         }
 
-                        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
-                            let mut proxy = proxy_lock.lock().unwrap();
-                            proxy.process_event(evset)
+                        if !self.worker_control.admits((id >> 32) as u32) {
+                            continue;
+                        }
+                        let update = ready_proxy.and_then(|proxy| {
+                            match process_ready_proxy(&self.proxy_map, id, &proxy, evset) {
+                                Ok(update) => update,
+                                Err(()) => {
+                                    self.worker_control.fail();
+                                    None
+                                }
+                            }
                         });
 
                         if let Some(update) = update {
@@ -593,6 +722,23 @@ impl MuxerThread {
     }
 }
 
+fn process_ready_proxy(
+    proxies: &ProxyMap,
+    id: u64,
+    ready: &Arc<Mutex<dyn Proxy>>,
+    events: EventSet,
+) -> Result<Option<ProxyUpdate>, ()> {
+    let map = proxies.read().map_err(|_| ())?;
+    if map
+        .get(&id)
+        .is_none_or(|current| !Arc::ptr_eq(current, ready))
+    {
+        return Ok(None);
+    }
+    let mut proxy = ready.lock().map_err(|_| ())?;
+    Ok(Some(proxy.process_event(events)))
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::collections::HashMap;
@@ -604,9 +750,10 @@ mod tests {
 
     use crate::virtio::vsock::muxer::ProxyMap;
     use crate::virtio::vsock::muxer_rxq::MuxerRxQ;
-    use crate::virtio::vsock::muxer_thread::SourcePortAllocator;
+    use crate::virtio::vsock::muxer_thread::{SourcePortAllocator, process_ready_proxy};
     use crate::virtio::vsock::unix_proxy::UnixProxy;
     use crate::virtio::{Queue, RuntimeGuestMemory};
+    use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 
     fn insert_host_proxy(proxy_map: &ProxyMap, guest_port: u32, source_port: u32) -> OwnedFd {
         let (fd, peer) = socketpair(
@@ -627,13 +774,15 @@ mod tests {
             guest_port,
             fd,
             memory,
-            Arc::new(Mutex::new(Queue::new(256))),
+            Arc::new(Mutex::new(
+                crate::virtio::vsock::packet::PacketQueue::from_queue(Queue::new(256)),
+            )),
             Arc::new(Mutex::new(MuxerRxQ::new())),
         );
         proxy_map
             .write()
             .unwrap()
-            .insert(id, Mutex::new(Box::new(proxy)));
+            .insert(id, Arc::new(Mutex::new(proxy)));
         peer
     }
 
@@ -664,5 +813,45 @@ mod tests {
                 .keys()
                 .all(|id| *id as u32 != first)
         );
+    }
+
+    #[test]
+    fn provider_vsock_cached_ready_event_cannot_target_reused_session_id() {
+        let map: ProxyMap = Arc::new(RwLock::new(HashMap::new()));
+        let port = 1027;
+        let source = 1 << 30;
+        let id = (u64::from(port) << 32) | u64::from(source);
+        let original_peer = insert_host_proxy(&map, port, source);
+        let original = map.read().expect("proxy map").get(&id).unwrap().clone();
+        let mut epoll = Epoll::new().unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                original.lock().expect("original proxy").as_raw_fd(),
+                &EpollEvent::new(EventSet::IN, id),
+            )
+            .unwrap();
+        nix::unistd::write(&original_peer, b"old").unwrap();
+        let mut events = [EpollEvent::default(); 1];
+        assert_eq!(epoll.wait(1, 1000, &mut events).unwrap(), 1);
+        let replacement_peer = insert_host_proxy(&map, port, source);
+        nix::unistd::write(&replacement_peer, b"new").unwrap();
+        assert!(
+            process_ready_proxy(&map, events[0].data(), &original, events[0].event_set())
+                .unwrap_or_else(|_| panic!("proxy dispatch failed"))
+                .is_none()
+        );
+        let replacement = map.read().expect("proxy map").get(&id).unwrap().clone();
+        let mut bytes = [0u8; 3];
+        assert_eq!(
+            nix::sys::socket::recv(
+                replacement.lock().expect("replacement proxy").as_raw_fd(),
+                &mut bytes,
+                nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(&bytes, b"new");
     }
 }

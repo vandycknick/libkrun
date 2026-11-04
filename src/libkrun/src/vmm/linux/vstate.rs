@@ -395,6 +395,8 @@ pub struct Vm {
     retained_pit: Option<kvm_bindings::kvm_pit_state2>,
     #[cfg(target_arch = "x86_64")]
     execution_clock_observation: std::sync::Mutex<Option<execution::KvmClockObservation>>,
+    #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+    execution_controller_writes: [std::sync::atomic::AtomicU64; 5],
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     retained_execution: Option<KvmVmState>,
     #[cfg(target_arch = "aarch64")]
@@ -442,6 +444,8 @@ impl Vm {
             retained_pit: None,
             #[cfg(target_arch = "x86_64")]
             execution_clock_observation: std::sync::Mutex::new(None),
+            #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+            execution_controller_writes: [const { std::sync::atomic::AtomicU64::new(0) }; 5],
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             retained_execution: None,
             #[cfg(target_arch = "aarch64")]
@@ -486,6 +490,8 @@ impl Vm {
             supported_msrs,
             retained_pit: None,
             execution_clock_observation: std::sync::Mutex::new(None),
+            #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+            execution_controller_writes: [const { std::sync::atomic::AtomicU64::new(0) }; 5],
             retained_execution: None,
             tee,
             guest_memfds: Vec::new(),
@@ -533,6 +539,8 @@ impl Vm {
             supported_msrs,
             retained_pit: None,
             execution_clock_observation: std::sync::Mutex::new(None),
+            #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+            execution_controller_writes: [const { std::sync::atomic::AtomicU64::new(0) }; 5],
             retained_execution: None,
             tdx: Some(IntelTdx::new()),
             guest_memfds: Vec::new(),
@@ -797,14 +805,25 @@ impl Vm {
         if let Some(state) = &self.retained_execution {
             return Ok(state.clone());
         }
-        let state = execution::capture_vm(&self.fd, profile, &mut self.retained_pit)?;
+        let state = execution::capture_vm(
+            &self.fd,
+            profile,
+            &mut self.retained_pit,
+            #[cfg(feature = "native-device-probe")]
+            &self.execution_controller_writes,
+        )?;
         self.retained_execution = Some(state.clone());
         Ok(state)
     }
 
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn install_execution(&self, state: &KvmVmState) -> std::result::Result<(), String> {
-        execution::install_vm(&self.fd, state)
+        execution::install_vm(
+            &self.fd,
+            state,
+            #[cfg(feature = "native-device-probe")]
+            &self.execution_controller_writes,
+        )
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -818,7 +837,14 @@ impl Vm {
             .lock()
             .map_err(|_| "kvm/clock/observation-lock")?;
         *observation = None;
-        execution::prepare_vm_time(&self.fd, state, cpus, &mut observation)
+        execution::prepare_vm_time(
+            &self.fd,
+            state,
+            cpus,
+            &mut observation,
+            #[cfg(feature = "native-device-probe")]
+            &self.execution_controller_writes,
+        )
     }
 
     #[cfg(all(feature = "native-execution-probe", target_arch = "x86_64"))]
@@ -829,6 +855,23 @@ impl Vm {
             .execution_clock_observation
             .lock()
             .map_err(|_| "kvm/clock/observation-lock")?)
+    }
+
+    #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+    pub(crate) fn execution_controller_writes(&self) -> [u64; 5] {
+        std::array::from_fn(|index| {
+            self.execution_controller_writes[index].load(std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+
+    /// Whether x86 VM capture may already have fenced PIT or retained its controller cut.
+    ///
+    /// Only a failed VM capture before CPU command dispatch can use `false` to
+    /// distinguish a read-only predicate refusal. This does not account for CPU
+    /// owners, providers, or destination installs and is not a global no-effects proof.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn execution_fence_started(&self) -> bool {
+        self.retained_pit.is_some() || self.retained_execution.is_some()
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -933,9 +976,13 @@ pub struct Vcpu {
     execution_journal: Vec<(CpuCommand, CpuAck)>,
     execution_stop_only: bool,
     execution_time_ready: bool,
+    #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+    device_witness_source: bool,
     retained_resources: Option<(GuestMemoryMmap, Arc<VmFd>)>,
     #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
     probe_park_state: ProbeParkJournal,
+    #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+    native_run_observer: NativeRunObserver,
 
     #[cfg(feature = "tee")]
     pm_sender: Sender<WorkerMessage>,
@@ -1086,9 +1133,13 @@ impl Vcpu {
             execution_journal: Vec::new(),
             execution_stop_only: false,
             execution_time_ready: false,
+            #[cfg(feature = "native-device-probe")]
+            device_witness_source: true,
             retained_resources: None,
             #[cfg(feature = "native-control-probe")]
             probe_park_state: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "native-device-probe")]
+            native_run_observer: NativeRunObserver::new(id),
             #[cfg(feature = "tee")]
             pm_sender,
         })
@@ -1409,6 +1460,8 @@ impl Vcpu {
         let (init_tls_sender, init_tls_receiver) = unbounded();
         #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
         let probe_park_state = Arc::clone(&self.probe_park_state);
+        #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+        let native_run_observer = self.native_run_observer.clone();
         let vcpu_thread = thread::Builder::new()
             .name(format!("fc_vcpu {}", self.cpu_index()))
             .spawn(move || {
@@ -1440,6 +1493,8 @@ impl Vcpu {
             vcpu_thread,
             #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
             probe_park_state,
+            #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+            native_run_observer,
         ))
     }
 
@@ -1477,6 +1532,10 @@ impl Vcpu {
             }
         }
 
+        // Count attempts, not successful guest entries: immediate_exit or MP state
+        // may prevent entry. Zero after all owners join is the conservative proof.
+        #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+        self.native_run_observer.record_attempt();
         match self.fd.run() {
             Ok(run) => match run {
                 #[cfg(feature = "tee")]
@@ -1512,12 +1571,12 @@ impl Vcpu {
                 }
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::IoIn(addr, data) => {
-                    self.io_bus.read(0, u64::from(addr), data);
+                    self.io_bus.read(u64::from(self.id), u64::from(addr), data);
                     Ok(VcpuEmulation::Handled)
                 }
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::IoOut(addr, data) => {
-                    self.io_bus.write(0, u64::from(addr), data);
+                    self.io_bus.write(u64::from(self.id), u64::from(addr), data);
                     Ok(VcpuEmulation::Handled)
                 }
                 #[cfg(feature = "tee")]
@@ -1546,13 +1605,13 @@ impl Vcpu {
                 }
                 VcpuExit::MmioRead(addr, data) => {
                     if let Some(ref mmio_bus) = self.mmio_bus {
-                        mmio_bus.read(0, addr, data);
+                        mmio_bus.read(u64::from(self.id), addr, data);
                     }
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioWrite(addr, data) => {
                     if let Some(ref mmio_bus) = self.mmio_bus {
-                        mmio_bus.write(0, addr, data);
+                        mmio_bus.write(u64::from(self.id), addr, data);
                     }
                     Ok(VcpuEmulation::Handled)
                 }
@@ -1644,6 +1703,49 @@ impl Vcpu {
     ) -> std::result::Result<Option<Arc<CpuExecutionState>>, String> {
         use crate::vmm::control::CpuCommandKind;
         match command.kind {
+            #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+            CpuCommandKind::InitializeDeviceWitness => {
+                let Some(CpuExecutionInput::InitializeDeviceWitness(bootstrap)) =
+                    command.execution.as_deref()
+                else {
+                    return Err("source witness bootstrap input missing".into());
+                };
+                if self.id != 2
+                    || !self.device_witness_source
+                    || self
+                        .fd
+                        .get_mp_state()
+                        .map_err(|e| format!("witness/GET_MP_STATE: {e}"))?
+                        .mp_state
+                        != 1
+                {
+                    return Err("source witness requires original uninitialized AP2".into());
+                }
+                let state = self
+                    .execution_cut
+                    .as_mut()
+                    .ok_or("source witness requires original CPU cut")?;
+                let CpuExecutionState::Kvm(KvmCpuState::X86(cpu)) = Arc::make_mut(state) else {
+                    return Err("source witness native CPU backend mismatch".into());
+                };
+                if cpu.id != 2
+                    || cpu.mp_state != 1
+                    || bootstrap.special.values[6] != cpu.special.values[6]
+                {
+                    return Err("source witness retained identity/APIC base mismatch".into());
+                }
+                self.device_witness_source = false;
+                self.execution_time_ready = false;
+                cpu.regs = bootstrap.regs;
+                cpu.special = bootstrap.special.clone();
+                cpu.mp_state = 0;
+                let result = execution::initialize_device_witness(&self.fd, cpu);
+                if result.is_err() {
+                    self.execution_stop_only = true;
+                }
+                result?;
+                Ok(None)
+            }
             CpuCommandKind::CaptureExecution => {
                 self.execution_time_ready = false;
                 if command.execution.is_some() {
@@ -1665,6 +1767,10 @@ impl Vcpu {
                 Ok(Some(Arc::clone(state)))
             }
             CpuCommandKind::InstallExecution => {
+                #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+                {
+                    self.device_witness_source = false;
+                }
                 let Some(input) = command.execution.as_deref() else {
                     return Err("install input missing".into());
                 };
@@ -1715,6 +1821,9 @@ impl Vcpu {
                 | CpuCommandKind::InstallExecution
                 | CpuCommandKind::PrepareExecutionTime
         );
+        #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+        let execution_kind =
+            execution_kind || command.kind == CpuCommandKind::InitializeDeviceWitness;
         if let Some((original, result)) = self.execution_journal.iter().find(|(original, _)| {
             original.request == command.request
                 && original.barrier.key == command.barrier.key
@@ -1888,6 +1997,8 @@ pub struct VcpuHandle {
     probe_ack_hold: std::sync::Mutex<ProbeAckHold>,
     #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
     probe_park_state: ProbeParkJournal,
+    #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+    native_run_observer: NativeRunObserver,
 }
 
 impl VcpuHandle {
@@ -1898,6 +2009,8 @@ impl VcpuHandle {
         vcpu_thread: thread::JoinHandle<()>,
         #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
         probe_park_state: ProbeParkJournal,
+        #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+        native_run_observer: NativeRunObserver,
     ) -> Self {
         Self {
             event_sender,
@@ -1911,6 +2024,8 @@ impl VcpuHandle {
             probe_ack_hold: std::sync::Mutex::new(ProbeAckHold::default()),
             #[cfg(all(feature = "native-control-probe", target_arch = "x86_64"))]
             probe_park_state,
+            #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+            native_run_observer,
         }
     }
 
@@ -1993,6 +2108,12 @@ impl VcpuHandle {
         Ok(true)
     }
 
+    /// Retain before draining handles; the observation survives owner stop and join.
+    #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+    pub(crate) fn native_run_observer(&self) -> NativeRunObserver {
+        self.native_run_observer.clone()
+    }
+
     #[cfg(all(
         any(feature = "native-control-probe", feature = "native-execution-probe"),
         target_arch = "x86_64"
@@ -2014,6 +2135,8 @@ impl VcpuHandle {
             CpuCommandKind::CaptureExecution => CpuAckKind::Captured,
             CpuCommandKind::InstallExecution => CpuAckKind::Installed,
             CpuCommandKind::PrepareExecutionTime => CpuAckKind::TimePrepared,
+            #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+            CpuCommandKind::InitializeDeviceWitness => CpuAckKind::DeviceWitnessInitialized,
         });
         Ok(())
     }
@@ -2041,6 +2164,46 @@ impl VcpuHandle {
 
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
         &self.response_receiver
+    }
+}
+
+/// Per-owner diagnostic observation, never a guest-entry claim or a control registry.
+#[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+#[derive(Clone, Debug)]
+pub(crate) struct NativeRunObserver {
+    cpu_id: u8,
+    attempts: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+impl NativeRunObserver {
+    fn new(cpu_id: u8) -> Self {
+        Self {
+            cpu_id,
+            attempts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn record_attempt(&self) {
+        use std::sync::atomic::Ordering;
+        // Saturate rather than ever wrapping into a false zero-attempt proof.
+        let _ = self
+            .attempts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_add(1)
+            });
+    }
+
+    pub(crate) fn cpu_id(&self) -> u8 {
+        self.cpu_id
+    }
+
+    pub(crate) fn attempts(&self) -> std::result::Result<u64, String> {
+        let count = self.attempts.load(std::sync::atomic::Ordering::SeqCst);
+        if count == u64::MAX {
+            return Err("native KVM_RUN attempt counter exhausted".into());
+        }
+        Ok(count)
     }
 }
 
@@ -2358,5 +2521,45 @@ mod tests {
     #[test]
     fn test_vcpu_rtsig_offset() {
         assert!(validate_signal_num(sigrtmin() + VCPU_RTSIG_OFFSET).is_ok());
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    #[test]
+    fn kvm_execution_native_run_observer_retains_attempts_after_owner_join() {
+        use crate::vmm::linux::vstate::NativeRunObserver;
+        let owner = NativeRunObserver::new(2);
+        let retained = owner.clone();
+        let other_cpu = NativeRunObserver::new(3);
+        assert_eq!(retained.attempts().unwrap(), 0);
+        let thread = std::thread::spawn(move || {
+            owner.record_attempt();
+            owner.record_attempt();
+        });
+        thread.join().unwrap();
+        assert_eq!(retained.cpu_id(), 2);
+        assert_eq!(retained.attempts().unwrap(), 2);
+        assert_eq!(other_cpu.cpu_id(), 3);
+        assert_eq!(other_cpu.attempts().unwrap(), 0);
+        let after_handles_drain = retained.clone();
+        drop(retained);
+        assert_eq!(after_handles_drain.attempts().unwrap(), 2);
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    #[test]
+    fn kvm_execution_native_run_observer_never_wraps_into_zero_proof() {
+        use crate::vmm::linux::vstate::NativeRunObserver;
+        let observer = NativeRunObserver {
+            cpu_id: 2,
+            attempts: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX - 1)),
+        };
+        observer.record_attempt();
+        assert!(observer.attempts().is_err());
+        observer.record_attempt();
+        assert!(observer.attempts().is_err());
+        assert_eq!(
+            observer.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            u64::MAX
+        );
     }
 }

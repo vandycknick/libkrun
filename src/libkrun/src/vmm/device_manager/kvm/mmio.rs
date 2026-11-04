@@ -99,6 +99,16 @@ pub struct IrqRoute {
     registered: bool,
 }
 
+#[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeIrqRouteProbe {
+    pub gsi: u32,
+    pub members: Vec<u64>,
+    pub registered: bool,
+    pub ioapic_irr: Option<bool>,
+    pub ioapic_route: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteTransition {
     Fence,
@@ -211,9 +221,71 @@ pub struct MMIODeviceManager {
     route_worker: Option<RouteWorker>,
     #[cfg(target_arch = "x86_64")]
     legacy_route_range: Option<std::ops::Range<usize>>,
+    #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+    diagnostic_io_bus: Option<devices::Bus>,
 }
 
 impl MMIODeviceManager {
+    #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+    pub fn diagnostic_irq_routes(
+        &self,
+        vm: &VmFd,
+    ) -> std::result::Result<Vec<NativeIrqRouteProbe>, String> {
+        if self.route_worker.is_some() {
+            return Err("IRQ route ownership still in flight".into());
+        }
+        let mut chip = kvm_bindings::kvm_irqchip {
+            chip_id: kvm_bindings::KVM_IRQCHIP_IOAPIC,
+            ..Default::default()
+        };
+        vm.get_irqchip(&mut chip)
+            .map_err(|error| format!("GET_IRQCHIP/observe: {error}"))?;
+        if chip.chip_id != kvm_bindings::KVM_IRQCHIP_IOAPIC {
+            return Err("native IOAPIC observation tag mismatch".into());
+        }
+        // GET_IRQCHIP returns the union member selected by chip_id.
+        let ioapic = unsafe { chip.chip.ioapic };
+        self.routes
+            .iter()
+            .map(|route| {
+                let native = usize::try_from(route.gsi)
+                    .ok()
+                    .and_then(|index| ioapic.redirtbl.get(index));
+                Ok(NativeIrqRouteProbe {
+                    gsi: route.gsi,
+                    members: route.members.clone(),
+                    registered: route.registered,
+                    ioapic_irr: native
+                        .and_then(|_| 1_u32.checked_shl(route.gsi))
+                        .map(|mask| ioapic.irr & mask != 0),
+                    // Each redirection entry is the documented raw 64-bit union.
+                    ioapic_route: native.map(|entry| unsafe { entry.bits }),
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+    pub fn bind_probe_io_bus(&mut self, bus: devices::Bus) -> std::result::Result<(), String> {
+        if self.diagnostic_io_bus.is_some() {
+            return Err("actual diagnostic IO bus already bound".into());
+        }
+        self.diagnostic_io_bus = Some(bus);
+        Ok(())
+    }
+
+    #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+    pub fn observe_probe_io(
+        &self,
+        observer: Arc<dyn devices::bus::BusAccessObserver>,
+    ) -> std::result::Result<(), String> {
+        self.diagnostic_io_bus
+            .as_ref()
+            .ok_or("actual legacy IO bus not retained")?
+            .observe_accesses(observer)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn execution_irq_routes(
         &self,
     ) -> std::result::Result<Vec<crate::vmm::execution::IrqRouteIdentity>, String> {
@@ -294,6 +366,8 @@ impl MMIODeviceManager {
             route_worker: None,
             #[cfg(target_arch = "x86_64")]
             legacy_route_range: None,
+            #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+            diagnostic_io_bus: None,
         }
     }
 
@@ -547,6 +621,10 @@ impl MMIODeviceManager {
         }
         let start = self.routes.len();
         self.legacy_route_range = Some(start..start);
+        #[cfg(feature = "native-device-probe")]
+        {
+            self.diagnostic_io_bus = Some(legacy.io_bus.clone());
+        }
         legacy.retain_live_inventory(&mut self.quiescence);
         for ((gsi, event), address) in legacy
             .irq_events()

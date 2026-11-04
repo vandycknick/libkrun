@@ -1,108 +1,173 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::virtio::console::defs::QUEUE_SIZE;
+use crate::virtio::console::port::Direction;
+use crate::virtio::console::port_io::PortOutput;
+use crate::virtio::descriptor_utils::DescriptorChainSnapshot;
+use crate::virtio::lifecycle::ProviderFault;
+use crate::virtio::{InterruptTransport, RuntimeGuestMemory};
 use std::sync::{Arc, Mutex};
 use std::{io, thread};
-
-use vm_memory::GuestMemoryError;
-
-use crate::virtio::console::port_io::PortOutput;
-use crate::virtio::{DescriptorChain, InterruptTransport, Queue, RuntimeGuestMemory};
+use utils::eventfd::EventFd;
+use vm_memory::{GuestAddress, GuestMemoryError};
 
 pub(crate) fn process_tx(
     mem: RuntimeGuestMemory,
-    mut queue: Queue,
+    owner: Arc<Mutex<Direction>>,
     interrupt: InterruptTransport,
     output: Arc<Mutex<Box<dyn PortOutput + Send>>>,
-    stop: Arc<AtomicBool>,
+    terminal_stopfd: Arc<EventFd>,
 ) {
+    let mut snapshot = DescriptorChainSnapshot::new(QUEUE_SIZE);
     loop {
-        let Some(head) = pop_head_blocking(&mut queue, &mem, &interrupt, &stop) else {
-            return;
-        };
-
-        let head_index = head.index;
-        let mut bytes_written = 0;
-
-        for desc in head.into_iter().readable() {
-            let desc_len = desc.len as usize;
-            match write_desc_to_output(desc, output.lock().unwrap().as_mut(), &interrupt) {
-                Ok(0) => {
-                    break;
-                }
-                Ok(n) => {
-                    assert_eq!(n, desc_len);
-                    bytes_written += n;
-                }
-                Err(e) => {
-                    log::error!("Failed to write output: {e}");
-                    if matches!(e, GuestMemoryError::IOError(e) if e.kind() == io::ErrorKind::BrokenPipe)
-                    {
-                        // Errors could conceivably be spurious. Broken
-                        // pipe is not and there is no point in attempting
-                        // to write more.
+        let head = {
+            let Ok(mut state) = owner.lock() else {
+                return;
+            };
+            state.started = true;
+            if state.closed || state.fault.is_some() {
+                return;
+            }
+            let Some(queue) = state.queue.as_mut() else {
+                return;
+            };
+            if !queue.queue.ready {
+                drop(state);
+                thread::park();
+                continue;
+            }
+            match queue.queue.pop(&mem) {
+                Some(head) => head,
+                None => {
+                    if queue.queue.capture_state().is_err() {
+                        state.fail(ProviderFault::QueueState);
                         return;
                     }
+                    drop(state);
+                    thread::park();
+                    continue;
                 }
             }
-        }
-
-        if bytes_written == 0 {
-            log::trace!("Tx Add used {bytes_written}");
-            if let Err(error) = queue.undo_pop(head_index) {
-                log::error!("failed to return unconsumed TX head: {error}");
-            }
-        } else {
-            log::trace!("Tx add used {bytes_written}");
-            if let Err(e) = queue.add_used(&mem, head_index, bytes_written as u32) {
-                error!("failed to add used elements to the queue: {e:?}");
-            }
-        }
-    }
-}
-
-fn pop_head_blocking<'mem>(
-    queue: &mut Queue,
-    mem: &'mem RuntimeGuestMemory,
-    interrupt: &InterruptTransport,
-    stop: &AtomicBool,
-) -> Option<DescriptorChain<'mem>> {
-    loop {
-        match queue.pop(mem) {
-            Some(descriptor) => break Some(descriptor),
-            None => {
-                interrupt.signal_used_queue();
-                if stop.load(Ordering::Acquire) {
-                    break None;
+        };
+        let head_index = head.index;
+        let chain = match snapshot.read(head) {
+            Ok(chain) => chain,
+            Err(_) => {
+                if let Ok(mut state) = owner.lock() {
+                    state.fail(ProviderFault::QueueState);
                 }
-                thread::park();
-                log::trace!("tx unparked, queue len {}", queue.len(mem))
+                return;
             }
+        };
+        if chain
+            .descriptors()
+            .iter()
+            .any(|descriptor| descriptor.flags & 2 != 0)
+        {
+            if let Ok(mut state) = owner.lock() {
+                state.fail(ProviderFault::QueueState);
+            }
+            return;
         }
-    }
-}
-
-fn write_desc_to_output(
-    desc: DescriptorChain,
-    output: &mut (dyn PortOutput + Send),
-    interrupt: &InterruptTransport,
-) -> Result<usize, GuestMemoryError> {
-    // TODO: Switch to using `get_slices()` with the next vm-memory
-    //       bump.
-    #[allow(deprecated)]
-    desc.mem
-        .try_access(desc.len as usize, desc.addr, |_, len, _, src| {
-            loop {
-                log::trace!("Tx {src:?}, write_volatile {len} bytes");
-                match output.write_volatile(&src) {
-                    // try_access seem to handle partial write for us (we will be invoked again with an offset)
-                    Ok(n) => break Ok(n),
-                    // We can't return an error otherwise we would not know how many bytes were processed before WouldBlock
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        log::trace!("Tx wait for output (would block)");
-                        interrupt.signal_used_queue();
-                        output.wait_until_writable();
+        let mut bytes_written = 0u32;
+        let mut failed = false;
+        let mut cancelled = false;
+        for desc in chain.descriptors() {
+            let Ok(mut output) = output.lock() else {
+                failed = true;
+                break;
+            };
+            let result = mem.try_access(
+                desc.len as usize,
+                GuestAddress(desc.addr),
+                |_, len, _, src| {
+                    loop {
+                        match output.write_volatile(&src) {
+                            Ok(n) if n > 0 && n <= len => {
+                                bytes_written = bytes_written
+                                    .checked_add(n as u32)
+                                    .ok_or(GuestMemoryError::InvalidBackendAddress)?;
+                                return Ok(n);
+                            }
+                            Ok(_) => {
+                                return Err(GuestMemoryError::IOError(io::Error::new(
+                                    io::ErrorKind::WriteZero,
+                                    "console output made no progress",
+                                )));
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                #[cfg(feature = "native-device-probe")]
+                                {
+                                    owner
+                                        .lock()
+                                        .map_err(|_| GuestMemoryError::InvalidBackendAddress)?
+                                        .blocked_output = Some((head_index, bytes_written, len));
+                                }
+                                let result = output.wait_until_writable(&terminal_stopfd);
+                                #[cfg(feature = "native-device-probe")]
+                                {
+                                    owner
+                                        .lock()
+                                        .map_err(|_| GuestMemoryError::InvalidBackendAddress)?
+                                        .blocked_output = None;
+                                }
+                                result.map_err(GuestMemoryError::IOError)?;
+                                if owner
+                                    .lock()
+                                    .map_err(|_| GuestMemoryError::InvalidBackendAddress)?
+                                    .terminal
+                                {
+                                    cancelled = true;
+                                    return Err(GuestMemoryError::InvalidBackendAddress);
+                                }
+                            }
+                            Err(error) => return Err(GuestMemoryError::IOError(error)),
+                        }
                     }
-                    Err(e) => break Err(GuestMemoryError::IOError(e)),
-                }
+                },
+            );
+            if result.is_err() {
+                failed = true;
+                break;
             }
-        })
+        }
+        let Ok(mut state) = owner.lock() else {
+            return;
+        };
+        if cancelled {
+            return;
+        }
+        if failed {
+            state.fail(ProviderFault::Worker);
+            return;
+        }
+        // Destructive shutdown abandons the accepted head without publishing a completion.
+        // Reversible close never sets terminal and must finish the entire accepted write.
+        if state.terminal {
+            return;
+        }
+        let Some(queue) = state.queue.as_mut() else {
+            state.fail(ProviderFault::QueueCount);
+            return;
+        };
+        if queue
+            .queue
+            .add_used(&mem, head_index, bytes_written)
+            .is_err()
+        {
+            state.fail(ProviderFault::QueueState);
+            return;
+        }
+        let notification = queue.queue.needs_notification(&mem);
+        match notification {
+            Ok(true) if interrupt.try_signal_used_queue().is_err() => {
+                state.fail(ProviderFault::Notification);
+                return;
+            }
+            Err(_) => {
+                state.fail(ProviderFault::QueueState);
+                return;
+            }
+            _ => {}
+        }
+    }
 }

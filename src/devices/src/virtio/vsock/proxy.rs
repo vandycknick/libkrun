@@ -40,6 +40,14 @@ pub enum ProxyError {
     SettingReusePort(std::io::Error),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProxyKind {
+    UnixStream,
+    UnixListener,
+    TsiStream,
+    TsiDatagram,
+}
+
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
 pub enum ProxyStatus {
     Idle,
@@ -148,6 +156,11 @@ impl DeferredCredit {
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
+
+    #[cfg(feature = "native-device-probe")]
+    pub fn pending_count(&self) -> usize {
+        usize::from(self.request.is_some()) + usize::from(self.update.is_some())
+    }
 }
 
 impl fmt::Display for ProxyError {
@@ -157,6 +170,7 @@ impl fmt::Display for ProxyError {
 }
 
 pub trait Proxy: Send + AsRawFd {
+    fn kind(&self) -> ProxyKind;
     #[allow(dead_code)]
     fn id(&self) -> u64;
     #[allow(dead_code)]
@@ -202,6 +216,10 @@ pub trait Proxy: Send + AsRawFd {
     fn disable_deferred_credit(&mut self) {}
     fn deferred_credit_enabled(&self) -> bool {
         false
+    }
+    #[cfg(feature = "native-device-probe")]
+    fn pending_credit_count(&self) -> usize {
+        0
     }
 }
 

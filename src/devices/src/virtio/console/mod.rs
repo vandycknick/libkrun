@@ -6,9 +6,12 @@ pub mod port_io;
 mod port_queue_mapping;
 mod process_rx;
 mod process_tx;
+mod state;
 
 pub use self::defs::uapi::VIRTIO_ID_CONSOLE as TYPE_CONSOLE;
 pub use self::device::Console;
+#[cfg(feature = "native-device-probe")]
+pub use self::port::ConsoleOutputObservation;
 pub use self::port::PortDescription;
 
 mod defs {
@@ -40,6 +43,7 @@ mod defs {
 
 #[derive(Debug)]
 pub enum ConsoleError {
+    InvalidConfiguration,
     /// Failed to create event fd.
     EventFd(std::io::Error),
     /// Failed to create SIGWINCH pipe.

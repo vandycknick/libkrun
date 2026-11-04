@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,36 +88,65 @@ static void *run(void *opaque) {
 #error Actual KVM arm64 and HVF workload implementation and runtime are pending owner lane; never infer from x86.
 #endif
 
+static void report_error(const char *operation, int error) {
+    char record[256];
+    int length = snprintf(record, sizeof(record), "%s errno=%d\n", operation, error);
+    if (length > 0 && (size_t)length < sizeof(record)) {
+        if (write(STDERR_FILENO, record, (size_t)length) != length) return;
+    }
+}
+static int append_record(char *record, size_t capacity, size_t *used, const char *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    int length = vsnprintf(record + *used, capacity - *used, format, arguments);
+    va_end(arguments);
+    if (length < 0 || (size_t)length >= capacity - *used) {
+        errno = EOVERFLOW; return -1;
+    }
+    *used += (size_t)length;
+    return 0;
+}
+
 int main(void) {
     cpu_set_t online;
-    if (sched_getaffinity(0, sizeof(online), &online)) { perror("sched_getaffinity"); return 1; }
+    if (sched_getaffinity(0, sizeof(online), &online)) { report_error("sched_getaffinity", errno); return 1; }
     unsigned count = CPU_COUNT(&online);
-    if (!count || count > 255) { fprintf(stderr, "unsupported CPU count %u\n", count); return 1; }
+    if (!count || count > 255) { report_error("unsupported CPU count", E2BIG); return 1; }
     struct worker *workers = calloc(count, sizeof(*workers));
     pthread_t *threads = calloc(count, sizeof(*threads));
-    if (!workers || !threads) { perror("calloc"); free(workers); free(threads); return 1; }
+    if (!workers || !threads) { report_error("calloc", errno); free(workers); free(threads); return 1; }
     unsigned index = 0;
     for (unsigned cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
         if (!CPU_ISSET(cpu, &online)) continue;
         workers[index].cpu = cpu;
         int error = pthread_create(&threads[index], NULL, run, &workers[index]);
-        if (error) { fprintf(stderr, "pthread_create: %s\n", strerror(error)); return 1; }
+        if (error) { report_error("pthread_create", error); return 1; }
         ++index;
     }
-    setvbuf(stdout, NULL, _IOLBF, 0);
     uint64_t sequence = 0;
     for (;;) {
         struct timespec mono, boot;
-        if (clock_gettime(CLOCK_MONOTONIC, &mono) || clock_gettime(CLOCK_BOOTTIME, &boot)) { perror("clock_gettime"); return 1; }
-        printf("{\"schema\":1,\"fixture\":\"production-linux-live-registers\",\"pid\":%ld,\"sequence\":%" PRIu64 ",\"monotonic_ns\":%" PRIu64 ",\"boottime_ns\":%" PRIu64 ",\"cpus\":[", (long)getpid(), ++sequence,
+        if (clock_gettime(CLOCK_MONOTONIC, &mono) || clock_gettime(CLOCK_BOOTTIME, &boot)) { report_error("clock_gettime", errno); return 1; }
+        char record[65536]; size_t used = 0;
+        if (append_record(record, sizeof(record), &used, "{\"schema\":1,\"fixture\":\"production-linux-live-registers\",\"pid\":%ld,\"sequence\":%" PRIu64 ",\"monotonic_ns\":%" PRIu64 ",\"boottime_ns\":%" PRIu64 ",\"cpus\":[", (long)getpid(), ++sequence,
             (uint64_t)mono.tv_sec * UINT64_C(1000000000) + mono.tv_nsec,
-            (uint64_t)boot.tv_sec * UINT64_C(1000000000) + boot.tv_nsec);
+            (uint64_t)boot.tv_sec * UINT64_C(1000000000) + boot.tv_nsec)) {
+            report_error("register-record-bound", errno); return 1;
+        }
+        int report_failed = 0;
         for (unsigned cpu = 0; cpu < count; ++cpu) {
             int failed = atomic_load(&workers[cpu].failed);
-            printf("%s{\"cpu\":%u,\"progress\":%" PRIuFAST64 ",\"failed\":%d}", cpu ? "," : "", workers[cpu].cpu, atomic_load(&workers[cpu].progress), failed);
-            if (failed) return 1;
+            if (append_record(record, sizeof(record), &used, "%s{\"cpu\":%u,\"progress\":%" PRIuFAST64 ",\"failed\":%d}", cpu ? "," : "", workers[cpu].cpu, atomic_load(&workers[cpu].progress), failed)) {
+                report_error("register-record-bound", errno); return 1;
+            }
+            if (failed) report_failed = 1;
         }
-        puts("]}");
+        if (append_record(record, sizeof(record), &used, "]}\n")) { report_error("register-record-bound", errno); return 1; }
+        ssize_t written = write(STDOUT_FILENO, record, used);
+        if (written < 0 || (size_t)written != used) {
+            report_error("register-record-output", written < 0 ? errno : EIO); return 1;
+        }
+        if (report_failed) return 1;
         struct timespec wait = { .tv_sec = 0, .tv_nsec = 100000000 };
         while (nanosleep(&wait, &wait) && errno == EINTR) {}
     }

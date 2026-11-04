@@ -1944,6 +1944,52 @@
           "ffi_name": "krun_net_device_new_unixgram_fd"
         },
         {
+          "name": "new_managed_unixgram_fd",
+          "doc": [
+            " Binds a connected datagram endpoint whose reservation is owned by the",
+            " caller's managed network service, including its activation ingress fence."
+          ],
+          "receiver": "none",
+          "params": [
+            {
+              "name": "id",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "fd",
+              "param_kind": "regular",
+              "type": "OwnedFd"
+            },
+            {
+              "name": "mac",
+              "param_kind": "regular",
+              "type": "[u8]",
+              "ref_kind": "shared"
+            },
+            {
+              "name": "features",
+              "param_kind": "regular",
+              "type": "u32"
+            },
+            {
+              "name": "flags",
+              "param_kind": "regular",
+              "type": "NetFlags"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "NetDevice"
+            },
+            "err_type": "VmmError",
+            "c_convention": "handle_or_null"
+          },
+          "ffi_name": "krun_net_device_new_managed_unixgram_fd"
+        },
+        {
           "name": "new_unixstream_path",
           "doc": [
             " Create a net device backed by a Unix stream socket path."

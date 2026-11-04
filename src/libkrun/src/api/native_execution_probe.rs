@@ -17,7 +17,7 @@ use devices::{Bus, BusDevice};
 use polly::event_manager::{BarrierGeneration, BarrierKey, BarrierRequest, OperationId};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
-use crate::api::capabilities::compiled_live_build;
+use crate::api::capabilities::execution_state_producer;
 use crate::vmm::Vmm;
 use crate::vmm::builder::restore::{
     PreparedDeviceInstall, build_execution_fixture, build_restore_prepared,
@@ -183,22 +183,6 @@ fn key(generation: u64) -> BarrierKey {
         generation: BarrierGeneration(generation),
     }
 }
-fn producer() -> Result<String, String> {
-    let mut value = String::from("diagnostic-only;");
-    let build = compiled_live_build();
-    write!(
-        value,
-        "{};{:?};{:?};{:?};",
-        build.query_abi, build.control_abi, build.backend, build.architecture
-    )
-    .map_err(|e| e.to_string())?;
-    for package in build.packages {
-        package
-            .write_canonical(&mut value)
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(value)
-}
 fn binding(path: &Path, generation: u64) -> Result<StateBinding, String> {
     // Digests are supplied by the external controller over exact fixture/build/layout bytes.
     // They correlate diagnostic inputs, never grant production admission or pause authority.
@@ -226,7 +210,7 @@ fn binding(path: &Path, generation: u64) -> Result<StateBinding, String> {
         .try_into()
         .map_err(|_| "capture identity width")?;
     Ok(StateBinding {
-        native_producer: producer()?,
+        native_producer: execution_state_producer()?,
         silo_producer,
         profile,
         topology,
@@ -1113,6 +1097,8 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
             ArchMemoryInfo::default(),
             validated,
             devices,
+            &mut polly::event_manager::EventManager::new()
+                .map_err(|error| format!("restore event manager: {error:?}"))?,
             Instant::now() + Duration::from_millis(200),
         ) {
             Ok(vmm) => {
@@ -1315,6 +1301,8 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
         ArchMemoryInfo::default(),
         validated,
         devices,
+        &mut polly::event_manager::EventManager::new()
+            .map_err(|error| format!("restore event manager: {error:?}"))?,
         Instant::now() + WAIT,
     ) {
         Ok(vmm) => vmm,

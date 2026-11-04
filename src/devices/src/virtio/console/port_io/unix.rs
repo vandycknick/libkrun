@@ -1,7 +1,6 @@
-use libc::{
-    F_GETFL, F_SETFL, O_NONBLOCK, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ, fcntl,
-};
+use libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ};
 use nix::errno::Errno;
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::ioctl_read_bad;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::unistd::{dup, isatty};
@@ -12,7 +11,9 @@ use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{VolatileMemoryError, VolatileSlice, WriteVolatile};
 
-use super::{PortInput, PortInputEmpty, PortOutput, PortTerminalProperties};
+use crate::virtio::console::port_io::{
+    PortInput, PortInputEmpty, PortOutput, PortTerminalProperties,
+};
 
 pub fn stdin() -> Result<Box<dyn PortInput + Send>, nix::Error> {
     let fd = dup_raw_fd_into_owned(STDIN_FILENO)?;
@@ -38,10 +39,9 @@ pub fn term_fd(
     term_fd: RawFd,
 ) -> Result<Box<dyn PortTerminalProperties + Send + Sync>, nix::Error> {
     let fd = dup_raw_fd_into_owned(term_fd)?;
-    assert!(
-        isatty(&fd).is_ok_and(|v| v),
-        "Expected fd {fd:?}, to be a tty, to query the window size!"
-    );
+    if !isatty(&fd)? {
+        return Err(Errno::ENOTTY);
+    }
     Ok(Box::new(PortTerminalPropertiesFd(fd)))
 }
 
@@ -69,8 +69,8 @@ impl AsRawFd for PortInputFd {
 
 impl PortInput for PortInputFd {
     fn read_volatile(&mut self, buf: &mut VolatileSlice) -> io::Result<usize> {
-        // This source code is copied from vm-memory, except it fixes an issue, where
-        // the original code would does not handle handle EWOULDBLOCK
+        // nix::read requires a Rust byte slice; guest memory is volatile and
+        // cannot be reborrowed as an ordinary mutable slice.
 
         let fd = self.as_raw_fd();
         let guard = buf.ptr_guard_mut();
@@ -91,21 +91,22 @@ impl PortInput for PortInputFd {
 
             Err(err)
         } else {
-            let bytes_read = bytes_read.try_into().unwrap();
+            let bytes_read = bytes_read as usize;
             buf.bitmap().mark_dirty(0, bytes_read);
             Ok(bytes_read)
         }
     }
 
-    fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
-        let mut poll_fds = Vec::new();
-        poll_fds.push(PollFd::new(self.0.as_fd(), PollFlags::POLLIN));
-        if let Some(stopfd) = stopfd {
-            // SAFETY: we trust stopfd won't go away to avoid a dup call here.
-            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(stopfd.as_raw_fd()) };
-            poll_fds.push(PollFd::new(borrowed_fd, PollFlags::POLLIN));
-        }
-        poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");
+    fn wait_until_readable(&self, stopfd: Option<&EventFd>) -> io::Result<()> {
+        let stop = stopfd.map(|fd| unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) });
+        let mut poll_fds = [
+            PollFd::new(self.0.as_fd(), PollFlags::POLLIN),
+            PollFd::new(
+                stop.as_ref().map_or(self.0.as_fd(), AsFd::as_fd),
+                PollFlags::POLLIN,
+            ),
+        ];
+        wait_poll(&mut poll_fds)
     }
 }
 
@@ -114,14 +115,15 @@ impl PortInput for PortInputEmpty {
         Ok(0)
     }
 
-    fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
+    fn wait_until_readable(&self, stopfd: Option<&EventFd>) -> io::Result<()> {
         if let Some(stopfd) = stopfd {
-            // SAFETY: we trust stopfd won't go away to avoid a dup call here.
-            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(stopfd.as_raw_fd()) };
-            let mut poll_fds = [PollFd::new(borrowed_fd, PollFlags::POLLIN)];
-            poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");
+            let fd = unsafe { BorrowedFd::borrow_raw(stopfd.as_raw_fd()) };
+            wait_poll(&mut [PollFd::new(fd, PollFlags::POLLIN)])
         } else {
-            std::thread::sleep(std::time::Duration::MAX);
+            Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "empty console input needs a wake endpoint",
+            ))
         }
     }
 }
@@ -145,9 +147,12 @@ impl PortOutput for PortOutputFd {
         })
     }
 
-    fn wait_until_writable(&self) {
-        let mut poll_fds = [PollFd::new(self.0.as_fd(), PollFlags::POLLOUT)];
-        poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");
+    fn wait_until_writable(&self, terminal_stopfd: &EventFd) -> io::Result<()> {
+        let stop = unsafe { BorrowedFd::borrow_raw(terminal_stopfd.as_raw_fd()) };
+        wait_poll(&mut [
+            PollFd::new(self.0.as_fd(), PollFlags::POLLOUT),
+            PollFd::new(stop, PollFlags::POLLIN),
+        ])
     }
 }
 
@@ -158,18 +163,9 @@ fn dup_raw_fd_into_owned(raw_fd: RawFd) -> Result<OwnedFd, nix::Error> {
     Ok(fd)
 }
 
-fn make_non_blocking(as_rw_fd: &impl AsRawFd) -> Result<(), nix::Error> {
-    let fd = as_rw_fd.as_raw_fd();
-    unsafe {
-        let flags = fcntl(fd, F_GETFL, 0);
-        if flags < 0 {
-            return Err(Errno::last());
-        }
-
-        if fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 {
-            return Err(Errno::last());
-        }
-    }
+fn make_non_blocking(fd: &impl AsFd) -> Result<(), nix::Error> {
+    let flags = OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL)?);
+    fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
     Ok(())
 }
 
@@ -218,18 +214,35 @@ impl PortInput for PortInputSigInt {
         Ok(1)
     }
 
-    fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
-        let mut poll_fds = Vec::with_capacity(2);
-        // SAFETY: we trust sigint_evt won't go away to avoid a dup call here.
-        let sigint_bfd = unsafe { BorrowedFd::borrow_raw(self.sigint_evt.as_raw_fd()) };
-        poll_fds.push(PollFd::new(sigint_bfd, PollFlags::POLLIN));
-        if let Some(stopfd) = stopfd {
-            // SAFETY: we trust stopfd won't go away to avoid a dup call here.
-            let stop_bfd = unsafe { BorrowedFd::borrow_raw(stopfd.as_raw_fd()) };
-            poll_fds.push(PollFd::new(stop_bfd, PollFlags::POLLIN));
-        }
+    fn wait_until_readable(&self, stopfd: Option<&EventFd>) -> io::Result<()> {
+        let sigint = unsafe { BorrowedFd::borrow_raw(self.sigint_evt.as_raw_fd()) };
+        let stop = stopfd.map(|fd| unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) });
+        let mut fds = [
+            PollFd::new(sigint, PollFlags::POLLIN),
+            PollFd::new(stop.as_ref().map_or(sigint, AsFd::as_fd), PollFlags::POLLIN),
+        ];
+        wait_poll(&mut fds)
+    }
+}
 
-        poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");
+fn wait_poll(fds: &mut [PollFd<'_>]) -> io::Result<()> {
+    loop {
+        match poll(fds, PollTimeout::NONE) {
+            Ok(_) => {
+                if fds.iter().any(|fd| {
+                    fd.revents()
+                        .is_some_and(|events| events.contains(PollFlags::POLLNVAL))
+                }) {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "invalid console endpoint",
+                    ));
+                }
+                return Ok(());
+            }
+            Err(Errno::EINTR) => continue,
+            Err(error) => return Err(io::Error::from(error)),
+        }
     }
 }
 

@@ -997,4 +997,46 @@ mod tests {
             Some((request, DispatchPhase::Parked))
         );
     }
+
+    #[test]
+    fn callback_fence_actual_epoll_failure_retains_installed_ingress_ownership() {
+        let mut manager = EventManager::new().unwrap();
+        let ingress = consumer(&mut manager, DispatchRole::Ingress);
+        let fd = {
+            let Ok(ingress) = ingress.lock() else {
+                panic!("actual ingress poisoned");
+            };
+            ingress.event.write(1).unwrap();
+            ingress.event.as_raw_fd()
+        };
+        let count = manager
+            .epoll
+            .wait(128, 0, &mut manager.ready_events)
+            .unwrap();
+        assert_eq!(count, 1);
+        // Cause a real DEL/ENOENT without closing or duplicating fd ownership.
+        manager
+            .epoll
+            .ctl(
+                epoll::ControlOperation::Delete,
+                fd,
+                &EpollEvent::new(EventSet::IN, fd as u64),
+            )
+            .unwrap();
+        let request = barrier_request(9);
+        assert!(matches!(
+            manager.begin_ingress_fence(request),
+            Err(Error::Poll(_))
+        ));
+        assert_eq!(
+            manager.dispatch_fence(),
+            Some((request, DispatchPhase::Draining))
+        );
+        assert!(manager.subscribers.contains_key(&fd));
+        manager.dispatch_events(count).unwrap();
+        let Ok(ingress) = ingress.lock() else {
+            panic!("actual ingress poisoned");
+        };
+        assert_eq!(ingress.consumed, 0);
+    }
 }

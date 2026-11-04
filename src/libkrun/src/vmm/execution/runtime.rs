@@ -46,6 +46,7 @@ struct PendingCut {
     key: BarrierKey,
     vm: Option<VmExecutionState>,
     legacy: Vec<LegacyState>,
+    cpu_dispatched: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -68,6 +69,7 @@ pub(crate) struct ExecutionOwner {
     pub retained: Option<RetainedCut>,
     pending: Option<PendingCut>,
     envelope: Option<Arc<ExecutionEnvelope>>,
+    devices: Option<Arc<crate::vmm::execution::device_restore::DeviceEnvelope>>,
     binding: Option<StateBinding>,
     pub failed_install: bool,
     pub prepared_time: Option<BarrierKey>,
@@ -83,6 +85,20 @@ impl ExecutionOwner {
 
     pub fn has_cut_work(&self) -> bool {
         self.pending.is_some() || self.retained.is_some()
+    }
+
+    fn retire_unmodified_vm_refusal(&mut self, key: BarrierKey, vm_fence_started: bool) -> bool {
+        if !vm_fence_started
+            && self.retained.is_none()
+            && self.pending.as_ref().is_some_and(|pending| {
+                pending.key == key && pending.vm.is_none() && !pending.cpu_dispatched
+            })
+        {
+            self.pending = None;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -120,6 +136,7 @@ impl Vmm {
                 key: barrier.key,
                 vm: None,
                 legacy,
+                cpu_dispatched: false,
             });
         }
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -134,7 +151,16 @@ impl Vmm {
                 .profile
                 .as_ref()
                 .ok_or("execution clock/PIT profile not admitted")?;
-            let vm = self.vm.capture_execution(profile)?;
+            let vm = match self.vm.capture_execution(profile) {
+                Ok(vm) => vm,
+                Err(error) => {
+                    self.execution.retire_unmodified_vm_refusal(
+                        barrier.key,
+                        self.vm.execution_fence_started(),
+                    );
+                    return Err(error);
+                }
+            };
             if let Some(pending) = &mut self.execution.pending {
                 pending.vm = Some(VmExecutionState::Kvm(vm));
             }
@@ -160,6 +186,9 @@ impl Vmm {
                 }));
             }
         }
+        if let Some(pending) = &mut self.execution.pending {
+            pending.cpu_dispatched = true;
+        }
         self.control
             .cpus
             .begin(
@@ -171,7 +200,41 @@ impl Vmm {
             .map_err(|error| error.to_string())
     }
 
+    pub(crate) fn poll_execution_cut_for_rollback(
+        &mut self,
+        fenced: BarrierKey,
+        rollback: BarrierRequest,
+    ) -> Poll<Result<(), String>> {
+        if Instant::now() >= rollback.deadline {
+            return Poll::Ready(Err("execution rollback deadline expired".into()));
+        }
+        if rollback.key.generation != fenced.generation
+            || rollback.key.operation == fenced.operation
+            || self
+                .execution
+                .pending
+                .as_ref()
+                .is_some_and(|cut| cut.key != fenced)
+            || self
+                .execution
+                .retained
+                .as_ref()
+                .is_some_and(|cut| cut.key != fenced)
+            || !self.control.cpus.capture_owned(fenced)
+        {
+            return Poll::Ready(Err("foreign execution capture rollback".into()));
+        }
+        self.poll_execution_cut_inner(Some((fenced, rollback)))
+    }
+
     pub(crate) fn poll_execution_cut(&mut self) -> Poll<Result<(), String>> {
+        self.poll_execution_cut_inner(None)
+    }
+
+    fn poll_execution_cut_inner(
+        &mut self,
+        rollback: Option<(BarrierKey, BarrierRequest)>,
+    ) -> Poll<Result<(), String>> {
         if self.execution.pending.is_none() {
             return Poll::Ready(if self.execution.retained.is_some() {
                 Ok(())
@@ -179,7 +242,15 @@ impl Vmm {
                 Err("no retained execution cut".into())
             });
         }
-        match self.control.cpus.poll(&mut self.vcpus_handles) {
+        let cpu_poll = match rollback {
+            Some((fenced, rollback)) => self.control.cpus.poll_capture_for_rollback(
+                &mut self.vcpus_handles,
+                fenced,
+                rollback,
+            ),
+            None => self.control.cpus.poll(&mut self.vcpus_handles),
+        };
+        match cpu_poll {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error.to_string())),
             Poll::Ready(Ok(())) => {}
@@ -236,13 +307,17 @@ impl Vmm {
         barrier: BarrierRequest,
         binding: StateBinding,
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))] profile: &KvmCaptureProfile,
-        diagnostic: bool,
+        cpu_only_fixture: bool,
     ) -> Result<(), String> {
+        use crate::api::capabilities::execution_state_producer;
         binding.validate().map_err(|error| error.to_string())?;
         if binding.pause_generation != barrier.key.generation.0 {
             return Err("capture pause generation mismatch".into());
         }
-        if diagnostic {
+        if binding.native_producer != execution_state_producer()? {
+            return Err("capture exact native producer mismatch".into());
+        }
+        if cpu_only_fixture {
             if !cfg!(feature = "native-execution-probe")
                 || !binding.native_producer.starts_with("diagnostic-only;")
                 || self.mmio_device_manager.quiescence.has_transports()
@@ -259,21 +334,16 @@ impl Vmm {
             if self.execution.retained.is_none() && !self.control.cpus.parked(barrier.key) {
                 return Err("diagnostic capture requires exact completed CPU park".into());
             }
-        } else {
-            let native = crate::api::capabilities::compiled_live_build().execution_producer()?;
-            if binding.native_producer != native
-                || !matches!(
-                    self.control.state,
-                    crate::vmm::control::ControlState::Paused(_)
-                )
-                || !self
-                    .mmio_device_manager
-                    .quiescence
-                    .fully_quiesced(barrier.key)
-                    .map_err(|error| error.to_string())?
-            {
-                return Err("capture requires exact admitted whole-machine pause".into());
-            }
+        } else if !matches!(
+            self.control.state,
+            crate::vmm::control::ControlState::Paused(_)
+        ) || !self
+            .mmio_device_manager
+            .quiescence
+            .fully_quiesced(barrier.key)
+            .map_err(|error| error.to_string())?
+        {
+            return Err("capture requires exact admitted whole-machine pause".into());
         }
         if let Some(previous) = &self.execution.binding
             && self
@@ -290,7 +360,46 @@ impl Vmm {
             self.execution.profile = Some(profile.clone());
         }
         self.execution.binding = Some(binding);
+        if !cpu_only_fixture && self.execution.devices.is_none() {
+            let records = self
+                .mmio_device_manager
+                .quiescence
+                .capture_devices(barrier.key)
+                .map_err(|error| error.to_string())?;
+            let devices = crate::vmm::execution::device_restore::DeviceEnvelope {
+                binding: self
+                    .execution
+                    .binding
+                    .clone()
+                    .ok_or("device cut binding absent")?,
+                records,
+            };
+            devices.validate().map_err(|error| error.to_string())?;
+            self.execution.devices = Some(Arc::new(devices));
+        }
         self.begin_execution_cut(request, barrier)
+    }
+
+    pub(crate) fn flush_devices_for_capture(&self, key: BarrierKey) -> Result<(), String> {
+        if !matches!(
+            self.control.state,
+            crate::vmm::control::ControlState::Paused(_)
+        ) {
+            return Err("device flush requires whole-machine pause".into());
+        }
+        self.mmio_device_manager
+            .quiescence
+            .flush_for_capture(key)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn captured_devices(
+        &self,
+    ) -> Result<Arc<crate::vmm::execution::device_restore::DeviceEnvelope>, String> {
+        self.execution
+            .devices
+            .clone()
+            .ok_or("device cut not captured".into())
     }
 
     pub(crate) fn poll_execution_capture(
@@ -585,6 +694,7 @@ impl Vmm {
         self.execution.retained = None;
         self.execution.pending = None;
         self.execution.envelope = None;
+        self.execution.devices = None;
         self.execution.binding = None;
         self.execution.prepared_time = None;
         #[cfg(target_os = "linux")]
@@ -617,27 +727,41 @@ impl Vmm {
         barrier: BarrierRequest,
     ) -> Poll<Result<(), String>> {
         self.execution.failed_install = true;
-        if self.vcpus_handles.is_empty() {
-            return Poll::Ready(Ok(()));
+        if !self.vcpus_handles.is_empty() {
+            if !self
+                .control
+                .cpus
+                .active_request()
+                .is_some_and(|(id, key, kind)| {
+                    id == request && key.key == barrier.key && kind == CpuCommandKind::Stop
+                })
+                && let Err(error) = self.control.cpus.begin(
+                    request,
+                    barrier,
+                    CpuCommandKind::Stop,
+                    &self.vcpus_handles,
+                )
+            {
+                return Poll::Ready(Err(error.to_string()));
+            }
+            match self.control.cpus.poll(&mut self.vcpus_handles) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error.to_string())),
+                Poll::Ready(Ok(())) => {}
+            }
         }
-        if !self
-            .control
-            .cpus
-            .active_request()
-            .is_some_and(|(id, key, kind)| {
-                id == request && key.key == barrier.key && kind == CpuCommandKind::Stop
-            })
-            && let Err(error) =
-                self.control
-                    .cpus
-                    .begin(request, barrier, CpuCommandKind::Stop, &self.vcpus_handles)
-        {
-            return Poll::Ready(Err(error.to_string()));
+        match self.mmio_device_manager.quiescence.poll_stop(barrier) {
+            Ok(Poll::Pending) => return Poll::Pending,
+            Err(error) => return Poll::Ready(Err(error.to_string())),
+            Ok(Poll::Ready(())) => {}
         }
-        self.control
-            .cpus
-            .poll(&mut self.vcpus_handles)
-            .map(|result| result.map_err(|error| error.to_string()))
+        if !self.mmio_device_manager.poll_irq_cleanup() {
+            return Poll::Pending;
+        }
+        if Instant::now() >= barrier.deadline {
+            return Poll::Ready(Err("terminal cleanup completed after deadline".into()));
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -661,6 +785,13 @@ impl Vmm {
     }
     pub(crate) fn poll_execution_cut(&mut self) -> Poll<Result<(), String>> {
         Poll::Ready(Err("execution state excluded for this build/backend".into()))
+    }
+    pub(crate) fn poll_execution_cut_for_rollback(
+        &mut self,
+        _fenced: BarrierKey,
+        _rollback: BarrierRequest,
+    ) -> Poll<Result<(), String>> {
+        self.poll_execution_cut()
     }
     pub(crate) fn begin_execution_refence(
         &mut self,
@@ -723,5 +854,38 @@ mod tests {
             key,
             deadline: expired.deadline
         }));
+    }
+
+    #[test]
+    fn execution_prefence_vm_refusal_retires_only_unmodified_pre_dispatch_bookkeeping() {
+        use crate::vmm::execution::runtime::{ExecutionOwner, PendingCut};
+        let key = BarrierKey {
+            operation: OperationId(11),
+            generation: BarrierGeneration(7),
+        };
+        let pending = |cpu_dispatched| PendingCut {
+            key,
+            vm: None,
+            legacy: Vec::new(),
+            cpu_dispatched,
+        };
+        let mut owner = ExecutionOwner {
+            pending: Some(pending(false)),
+            ..ExecutionOwner::default()
+        };
+        assert!(!owner.retire_unmodified_vm_refusal(key, true));
+        assert!(owner.pending.is_some());
+        let foreign = BarrierKey {
+            operation: OperationId(12),
+            ..key
+        };
+        assert!(!owner.retire_unmodified_vm_refusal(foreign, false));
+        assert!(owner.pending.is_some());
+        owner.pending = Some(pending(true));
+        assert!(!owner.retire_unmodified_vm_refusal(key, false));
+        assert!(owner.pending.is_some());
+        owner.pending = Some(pending(false));
+        assert!(owner.retire_unmodified_vm_refusal(key, false));
+        assert!(!owner.has_cut_work());
     }
 }

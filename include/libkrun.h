@@ -527,6 +527,12 @@ typedef KrunNetDevice (*krun_net_device_new_unixgram_path_fn)(KrunStr id, KrunSt
  */
 KrunNetDevice krun_net_device_new_unixgram_fd(KrunStr id, int fd, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 typedef KrunNetDevice (*krun_net_device_new_unixgram_fd_fn)(KrunStr id, int fd, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
+/**
+ * Binds a connected datagram endpoint whose reservation is owned by the
+ * caller's managed network service, including its activation ingress fence.
+ */
+KrunNetDevice krun_net_device_new_managed_unixgram_fd(KrunStr id, int fd, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
+typedef KrunNetDevice (*krun_net_device_new_managed_unixgram_fd_fn)(KrunStr id, int fd, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 /** Create a net device backed by a Unix stream socket path. */
 KrunNetDevice krun_net_device_new_unixstream_path(KrunStr id, KrunStr path, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);
 typedef KrunNetDevice (*krun_net_device_new_unixstream_path_fn)(KrunStr id, KrunStr path, KrunBytes mac, uint32_t features, uint32_t flags, KrunError* err_out);

@@ -9,7 +9,6 @@ use windows_sys::Win32::Networking::WinSock::{
     send, sendto, socket,
 };
 
-use super::super::super::Queue as VirtQueue;
 use super::super::super::linux_errno::wsa_errno_to_linux;
 use super::super::defs;
 use super::super::defs::uapi;
@@ -23,6 +22,7 @@ use super::super::windows::sockaddr_storage::{
     SockaddrStorage, storage_to_winsock, winsock_to_storage,
 };
 use crate::virtio::RuntimeGuestMemory;
+use crate::virtio::vsock::packet::PacketQueue as VirtQueue;
 use utils::epoll::EventSet;
 
 pub type SendtoAddr = SockaddrStorage;

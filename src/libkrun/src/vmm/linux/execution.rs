@@ -62,6 +62,8 @@ pub(crate) fn fence_cpu_timer(fd: &VcpuFd, state: &KvmCpuState) -> Result<(), St
     native::fence_cpu_timer(fd, state)
 }
 
+#[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+pub(crate) use native::initialize_device_witness;
 #[cfg(target_arch = "x86_64")]
 pub(crate) use native::{KvmCaptureProfile, capture_vm, install_vm, prepare_vm_time};
 

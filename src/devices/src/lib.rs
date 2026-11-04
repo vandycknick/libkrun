@@ -18,7 +18,7 @@ extern crate log;
 use std::fmt;
 use std::io;
 
-mod bus;
+pub mod bus;
 pub mod display;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub mod fdt;

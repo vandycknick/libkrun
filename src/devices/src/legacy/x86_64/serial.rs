@@ -75,14 +75,19 @@ pub struct Serial {
 }
 
 impl Serial {
-    pub fn capture_state(&self) -> Result<crate::legacy::state::UartState, utils::state::Error> {
-        use crate::legacy::state::{MAX_SERIAL_INPUT, UartState};
+    pub fn preflight_state(&self) -> Result<(), utils::state::Error> {
         if self.state_fault {
             return Err(utils::state::Error::Invalid("UART terminality fault"));
         }
-        if self.in_buffer.len() > MAX_SERIAL_INPUT {
+        if self.in_buffer.len() > crate::legacy::state::MAX_SERIAL_INPUT {
             return Err(utils::state::Error::Limit);
         }
+        Ok(())
+    }
+
+    pub fn capture_state(&self) -> Result<crate::legacy::state::UartState, utils::state::Error> {
+        use crate::legacy::state::UartState;
+        self.preflight_state()?;
         Ok(UartState {
             interrupt_enable: self.interrupt_enable,
             interrupt_identification: self.interrupt_identification,

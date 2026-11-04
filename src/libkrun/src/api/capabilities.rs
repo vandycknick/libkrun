@@ -284,6 +284,7 @@ impl NativeBuildFacts {
                                 | "CARGO_FEATURE_AWS_NITRO"
                                 | "CARGO_FEATURE_NATIVE_CONTROL_PROBE"
                                 | "CARGO_FEATURE_NATIVE_EXECUTION_PROBE"
+                                | "CARGO_FEATURE_NATIVE_DEVICE_PROBE"
                         )
                     })
                 })
@@ -299,6 +300,65 @@ impl NativeBuildFacts {
     }
 }
 
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    any(feature = "native-execution-probe", feature = "native-device-probe")
+))]
+fn diagnostic_execution_producer() -> Result<String, String> {
+    let mut value = String::from("diagnostic-only;");
+    let build = compiled_live_build();
+    write!(
+        value,
+        "{};{:?};{:?};{:?};",
+        build.query_abi, build.control_abi, build.backend, build.architecture
+    )
+    .map_err(|e| e.to_string())?;
+    for package in build.packages {
+        package
+            .write_canonical(&mut value)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(value)
+}
+
+#[cfg(any(
+    all(
+        not(feature = "tee"),
+        any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            all(target_os = "macos", target_arch = "aarch64")
+        )
+    ),
+    all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        any(feature = "native-execution-probe", feature = "native-device-probe")
+    )
+))]
+pub(crate) fn execution_state_producer() -> Result<String, String> {
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        any(feature = "native-execution-probe", feature = "native-device-probe")
+    ))]
+    {
+        diagnostic_execution_producer()
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        any(feature = "native-execution-probe", feature = "native-device-probe")
+    )))]
+    {
+        compiled_live_build()
+            .execution_producer()
+            .map_err(str::to_owned)
+    }
+}
 macro_rules! package {
     ($module:path) => {{
         use $module as facts;
@@ -724,7 +784,6 @@ impl HvfHostFacts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeUnsupportedReason {
     BuildExcluded,
-    DeviceProvidersNotImplemented,
     NotImplemented,
 }
 
@@ -740,6 +799,7 @@ impl NativeOperationSupport {
     }
 }
 
+/// Implemented native primitives, not host/VM admission or lane qualification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeLiveOperations {
     pub pause: NativeOperationSupport,
@@ -758,11 +818,11 @@ impl NativeLiveOperations {
             NativeUnsupportedReason::NotImplemented
         });
         Self {
-            pause: NativeOperationSupport::Unsupported(if excluded {
-                NativeUnsupportedReason::BuildExcluded
+            pause: if excluded {
+                NativeOperationSupport::Unsupported(NativeUnsupportedReason::BuildExcluded)
             } else {
-                NativeUnsupportedReason::DeviceProvidersNotImplemented
-            }),
+                NativeOperationSupport::Supported
+            },
             capture: not_implemented,
             restore: not_implemented,
             fork: not_implemented,
@@ -899,11 +959,27 @@ mod tests {
     use crate::api::capabilities::{
         KVM_CAPABILITIES, KvmCapability, KvmCapabilityFact, KvmHostFacts, KvmPrerequisites,
         LIVE_QUERY_ABI, NativeArchitecture, NativeBackend, NativeBuildFacts, NativeLane,
-        NativeLiveOperations, NativeOperationSupport, NativeQueryError, Observation,
-        PackageBuildFacts, QueryOperation, SourceProvenance, WorktreeState, compiled_live_build,
-        reduce_kvm_prerequisites,
+        NativeLiveOperations, NativeOperationSupport, NativeQueryError, NativeUnsupportedReason,
+        Observation, PackageBuildFacts, QueryOperation, SourceProvenance, WorktreeState,
+        compiled_live_build, reduce_kvm_prerequisites,
     };
     use std::io::ErrorKind;
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        any(feature = "native-execution-probe", feature = "native-device-probe")
+    ))]
+    #[test]
+    fn native_diagnostic_producer_preserves_facts_without_qualification() {
+        use crate::api::capabilities::execution_state_producer;
+        let build = compiled_live_build();
+        let producer = execution_state_producer().expect("actual diagnostic build observations");
+        assert!(producer.starts_with("diagnostic-only;"));
+        assert!(build.execution_producer().is_err());
+        assert!(!build.binding_complete());
+        assert_eq!(NativeLane::from_build(build), NativeLane::Unsupported);
+    }
 
     const REVISION: &str = "58253c00580bda34f5ea9fc4e0fccaf1e09a83d4";
     const SOURCE: SourceProvenance = SourceProvenance {
@@ -1183,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn native_live_operations_remain_false_for_every_lane_and_host_outcome() {
+    fn native_live_operations_expose_only_implemented_pause_for_recognized_lanes() {
         for lane in [
             NativeLane::KvmX86_64,
             NativeLane::KvmArm64GicV3,
@@ -1191,14 +1267,30 @@ mod tests {
             NativeLane::Unsupported,
         ] {
             let operations = NativeLiveOperations::for_lane(lane);
-            for operation in [
+            let excluded = lane == NativeLane::Unsupported;
+            assert_eq!(
                 operations.pause,
+                if excluded {
+                    NativeOperationSupport::Unsupported(NativeUnsupportedReason::BuildExcluded)
+                } else {
+                    NativeOperationSupport::Supported
+                }
+            );
+            assert_eq!(operations.pause.is_supported(), !excluded);
+            for operation in [
                 operations.capture,
                 operations.restore,
                 operations.fork,
                 operations.incremental,
             ] {
-                assert!(matches!(operation, NativeOperationSupport::Unsupported(_)));
+                assert_eq!(
+                    operation,
+                    NativeOperationSupport::Unsupported(if excluded {
+                        NativeUnsupportedReason::BuildExcluded
+                    } else {
+                        NativeUnsupportedReason::NotImplemented
+                    })
+                );
                 assert!(!operation.is_supported());
             }
         }
@@ -1241,6 +1333,7 @@ mod tests {
             profile_packages!(Some(&["CARGO_FEATURE_AWS_NITRO"])),
             profile_packages!(Some(&["CARGO_FEATURE_NATIVE_CONTROL_PROBE"])),
             profile_packages!(Some(&["CARGO_FEATURE_NATIVE_EXECUTION_PROBE"])),
+            profile_packages!(Some(&["CARGO_FEATURE_NATIVE_DEVICE_PROBE"])),
             profile_packages!(None),
         ];
         for packages in PROFILES {
@@ -1269,6 +1362,10 @@ mod tests {
                     operations.fork,
                     operations.incremental,
                 ] {
+                    assert_eq!(
+                        operation,
+                        NativeOperationSupport::Unsupported(NativeUnsupportedReason::BuildExcluded)
+                    );
                     assert!(!operation.is_supported());
                 }
             }
@@ -1492,7 +1589,10 @@ mod tests {
                                 expected
                             );
                             let operations = NativeLiveOperations::for_lane(lane);
-                            assert!(!operations.pause.is_supported());
+                            assert_eq!(
+                                operations.pause.is_supported(),
+                                lane != NativeLane::Unsupported
+                            );
                             assert!(!operations.capture.is_supported());
                             assert!(!operations.restore.is_supported());
                             assert!(!operations.fork.is_supported());

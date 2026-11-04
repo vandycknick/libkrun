@@ -164,6 +164,8 @@ pub trait VirtioDevice: AsAny + Send {
 
     /// Optionally deactivates this device. The device should drop its queues.
     /// After reset, the transport will recreate queues from queue_config().
+    /// `true` acknowledges deactivation; `false` is unsupported or failed cleanup
+    /// and does not authorize terminal callers to release device ownership.
     fn reset(&mut self) -> bool {
         false
     }

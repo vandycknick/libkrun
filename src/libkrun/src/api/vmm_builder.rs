@@ -1,3 +1,13 @@
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "blk",
+    feature = "net",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
+#[doc(hidden)]
+pub mod native_device_probe;
+
 use std::marker::PhantomData;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd};

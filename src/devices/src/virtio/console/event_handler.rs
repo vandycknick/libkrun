@@ -6,7 +6,7 @@ use utils::windows::AsRawFd;
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 
-use super::device::Console;
+use crate::virtio::console::device::Console;
 use crate::virtio::console::device::{CONTROL_RXQ_INDEX, CONTROL_TXQ_INDEX};
 use crate::virtio::console::port_queue_mapping::{QueueDirection, queue_idx_to_port_id};
 use crate::virtio::device::VirtioDevice;
@@ -43,7 +43,7 @@ impl Console {
         }
     }
 
-    fn handle_activate_event(&self, event_manager: &mut EventManager) {
+    fn handle_activate_event(&mut self, event_manager: &mut EventManager) {
         debug!("console: activate event");
         if let Err(e) = self.activate_evt.read() {
             error!("Failed to consume console activate event: {e:?}");
@@ -51,9 +51,15 @@ impl Console {
 
         // The subscriber must exist as we previously registered activate_evt via
         // `interest_list()`.
-        let self_subscriber = event_manager
-            .subscriber(self.activate_evt.as_raw_fd())
-            .unwrap();
+        let self_subscriber = match event_manager.subscriber(self.activate_evt.as_raw_fd()) {
+            Ok(subscriber) => subscriber,
+            Err(error) => {
+                self.fault
+                    .get_or_insert(crate::virtio::lifecycle::ProviderFault::DeviceState);
+                log::error!("Failed to resolve console activation subscriber: {error:?}");
+                return;
+            }
+        };
 
         for queue_index in 0..self.queues.len() {
             event_manager
@@ -113,6 +119,9 @@ impl Console {
 
 impl Subscriber for Console {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
+        if !self.ingress_open() {
+            return;
+        }
         let source = event.fd();
 
         let activate_evt = self.activate_evt.as_raw_fd();
@@ -137,7 +146,9 @@ impl Subscriber for Console {
                 self.read_control_queue_event(event);
                 raise_irq |= self.process_control_rx();
             } else if source == control_rxq {
-                raise_irq |= self.read_queue_event(CONTROL_RXQ_INDEX, event)
+                if self.read_queue_event(CONTROL_RXQ_INDEX, event) {
+                    self.process_control_rx();
+                }
             }
             /* Guest signaled input/output on port */
             else if let Some(queue_index) = self

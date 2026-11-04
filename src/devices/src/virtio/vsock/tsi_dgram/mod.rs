@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::num::Wrapping;
 use std::sync::{Arc, Mutex};
 
-use super::super::Queue as VirtQueue;
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
+use crate::virtio::vsock::packet::PacketQueue as VirtQueue;
 #[cfg(unix)]
 use nix::sys::socket::AddressFamily;
 #[cfg(unix)]
@@ -28,7 +28,7 @@ mod windows;
 #[cfg(windows)]
 use windows as sys;
 
-pub struct TsiDgramProxy {
+pub(crate) struct TsiDgramProxy {
     pub(crate) id: u64,
     pub(crate) cid: u64,
     pub(crate) local_port: u32,
@@ -71,7 +71,7 @@ impl TsiDgramProxy {
         let mut queue = self.queue.lock().unwrap();
 
         while let Some(head) = queue.pop(&self.mem) {
-            let len = match VsockPacket::from_rx_virtq_head(&head) {
+            let len = match VsockPacket::from_rx_virtq_head(&head, &mut queue.snapshot) {
                 Ok(mut pkt) => match sys::recv_to_pkt(self, &mut pkt) {
                     RecvPkt::WaitForCredit => {
                         wait_credit = true;
@@ -91,7 +91,9 @@ impl TsiDgramProxy {
                 },
                 Err(e) => {
                     debug!("recv_pkt: RX queue error: {e:?}");
-                    0
+                    queue.record_processing_failure();
+                    have_used |= queue.add_used(&self.mem, head.index, 0).is_ok();
+                    break;
                 }
             };
 
@@ -105,6 +107,7 @@ impl TsiDgramProxy {
                 debug!("recv_pkt: pushing packet with {len} bytes");
                 if let Err(e) = queue.add_used(&self.mem, head.index, len as u32) {
                     error!("failed to add used elements to the queue: {e:?}");
+                    break;
                 }
             }
         }
@@ -115,6 +118,15 @@ impl TsiDgramProxy {
 }
 
 impl Proxy for TsiDgramProxy {
+    fn kind(&self) -> crate::virtio::vsock::proxy::ProxyKind {
+        crate::virtio::vsock::proxy::ProxyKind::TsiDatagram
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    fn pending_credit_count(&self) -> usize {
+        self.deferred_credit.pending_count()
+    }
+
     fn id(&self) -> u64 {
         self.id
     }

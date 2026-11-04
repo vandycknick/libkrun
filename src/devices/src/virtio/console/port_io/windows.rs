@@ -15,7 +15,9 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{PortInput, PortInputEmpty, PortOutput, PortTerminalProperties};
+use crate::virtio::console::port_io::{
+    PortInput, PortInputEmpty, PortOutput, PortTerminalProperties,
+};
 
 pub fn input_to_handle_dup(
     handle: *mut core::ffi::c_void,
@@ -91,12 +93,12 @@ impl PortInput for PortInputHandle {
         }
     }
 
-    fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
-        let mut handles = vec![self.as_raw_handle()];
-        if let Some(s) = stopfd {
-            handles.push(s.as_raw_fd());
-        }
-        wait_for_handles(&handles);
+    fn wait_until_readable(&self, stopfd: Option<&EventFd>) -> io::Result<()> {
+        let handles = [
+            self.as_raw_handle(),
+            stopfd.map_or(self.as_raw_handle(), AsRawFd::as_raw_fd),
+        ];
+        wait_for_handles(&handles)
     }
 }
 
@@ -105,9 +107,14 @@ impl PortInput for PortInputEmpty {
         Ok(0)
     }
 
-    fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
-        let handles: Vec<_> = stopfd.iter().map(|s| s.as_raw_fd()).collect();
-        wait_for_handles(&handles);
+    fn wait_until_readable(&self, stopfd: Option<&EventFd>) -> io::Result<()> {
+        let stop = stopfd.ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "empty console input needs a wake endpoint",
+            )
+        })?;
+        wait_for_handles(&[stop.as_raw_fd()])
     }
 }
 
@@ -141,10 +148,8 @@ impl PortOutput for PortOutputHandle {
         }
     }
 
-    fn wait_until_writable(&self) {
-        // Because WriteFile is blocking, `write_volatile` will natively pause the
-        // thread until space is available. It will never return io::ErrorKind::WouldBlock.
-        // Therefore, `process_tx` will never invoke this function on Windows.
+    fn wait_until_writable(&self, _terminal_stopfd: &EventFd) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -175,14 +180,16 @@ fn dup_handle(raw: *mut core::ffi::c_void) -> Result<OwnedHandle, io::Error> {
 }
 
 /// Block until at least one of the given Windows HANDLEs becomes signaled.
-fn wait_for_handles(handles: &[*mut core::ffi::c_void]) {
-    match handles.len() {
-        0 => std::thread::sleep(std::time::Duration::MAX),
-        1 => unsafe {
-            WaitForSingleObject(handles[0], INFINITE);
+fn wait_for_handles(handles: &[*mut core::ffi::c_void]) -> io::Result<()> {
+    let result = match handles {
+        [handle] => unsafe { WaitForSingleObject(*handle, INFINITE) },
+        _ => unsafe {
+            WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), FALSE, INFINITE)
         },
-        n => unsafe {
-            WaitForMultipleObjects(n as u32, handles.as_ptr(), FALSE, INFINITE);
-        },
+    };
+    if result == u32::MAX {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }

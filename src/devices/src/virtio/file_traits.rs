@@ -432,7 +432,10 @@ impl FileReadWriteAtVolatile for DiskProperties {
             .len()
             .try_into()
             .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        self.file.lock().unwrap().readv(iovec, offset)?;
+        self.file
+            .lock()
+            .map_err(|_| Error::other("block backend lock poisoned"))?
+            .readv(iovec, offset)?;
         Ok(full_length)
     }
 
@@ -450,7 +453,10 @@ impl FileReadWriteAtVolatile for DiskProperties {
             .len()
             .try_into()
             .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        self.file.lock().unwrap().writev(iovec, offset)?;
+        self.file
+            .lock()
+            .map_err(|_| Error::other("block backend lock poisoned"))?
+            .writev(iovec, offset)?;
         Ok(full_length)
     }
 }

@@ -733,7 +733,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use nix::sys::socket::{
-        AddressFamily, MsgFlags, Shutdown, SockFlag, SockType, recv, send, shutdown, socketpair,
+        AddressFamily, MsgFlags, Shutdown, SockFlag, SockType, recv, send, socketpair,
     };
     use vm_memory::{Address, GuestAddress, GuestMemoryMmap};
 
@@ -773,22 +773,6 @@ mod tests {
     }
 
     #[test]
-    fn socket_shutdown_accepts_disconnected_socket() {
-        let fd = socket(
-            AddressFamily::Unix,
-            SockType::Stream,
-            SockFlag::empty(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            shutdown(fd.as_raw_fd(), Shutdown::Both),
-            Err(Errno::ENOTCONN)
-        );
-        shutdown_socket(fd.as_raw_fd(), Shutdown::Both).unwrap();
-    }
-
-    #[test]
     fn socket_shutdown_preserves_unexpected_errors() {
         let file = std::fs::File::open("/dev/null").unwrap();
         assert_eq!(
@@ -801,7 +785,7 @@ mod tests {
     const CREDIT_PACKET_DESC: GuestAddress = GuestAddress(0x3000);
     const CREDIT_PACKET_HDR: GuestAddress = GuestAddress(0x3100);
 
-    fn credit_packet(mem: &RuntimeGuestMemory, buf_alloc: u32, fwd_cnt: u32) -> VsockPacket {
+    fn credit_packet(mem: &RuntimeGuestMemory, buf_alloc: u32, fwd_cnt: u32) -> VsockPacket<'_> {
         mem.write_obj(
             Descriptor {
                 addr: CREDIT_PACKET_HDR.raw_value(),
@@ -815,7 +799,12 @@ mod tests {
         mem.write_slice(&[0; VSOCK_PKT_HDR_SIZE], CREDIT_PACKET_HDR)
             .unwrap();
         let chain = DescriptorChain::checked_new(mem, CREDIT_PACKET_DESC, 1, 0).unwrap();
-        let mut packet = VsockPacket::from_tx_virtq_head(&chain).unwrap();
+        let mut packet = VsockPacket::from_tx_virtq_head(
+            &chain,
+            &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(1),
+            None,
+        )
+        .unwrap();
         packet.set_buf_alloc(buf_alloc).set_fwd_cnt(fwd_cnt);
         packet
     }
@@ -859,7 +848,9 @@ mod tests {
             data_addresses.push(data_address);
         }
         virt_queue.avail.idx.set(buffer_count as u16);
-        let queue = Arc::new(Mutex::new(virt_queue.create_queue()));
+        let queue = Arc::new(Mutex::new(
+            crate::virtio::vsock::packet::PacketQueue::from_queue(virt_queue.create_queue()),
+        ));
         let rxq = Arc::new(Mutex::new(MuxerRxQ::new()));
         let mut proxy = crate::virtio::vsock::unix_proxy::UnixProxy::new_waiting_on_host(
             (7u64 << 32) | 9,
@@ -912,10 +903,37 @@ mod tests {
             7,
             fd,
             memory,
-            Arc::new(Mutex::new(Queue::new(256))),
+            Arc::new(Mutex::new(
+                crate::virtio::vsock::packet::PacketQueue::from_queue(Queue::new(256)),
+            )),
             rxq.clone(),
         );
         (proxy, peer, rxq)
+    }
+
+    fn buffered_response_op(rxq: &Arc<Mutex<MuxerRxQ>>, memory: &RuntimeGuestMemory) -> u16 {
+        memory
+            .write_obj(
+                Descriptor {
+                    addr: 0x3900,
+                    len: VSOCK_PKT_HDR_SIZE as u32,
+                    flags: 2,
+                    next: 0,
+                },
+                GuestAddress(0x3800),
+            )
+            .unwrap();
+        let head = DescriptorChain::checked_new(memory, GuestAddress(0x3800), 1, 0).unwrap();
+        let mut packet = VsockPacket::from_rx_virtq_head(
+            &head,
+            &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(1),
+        )
+        .unwrap();
+        rxq.lock()
+            .expect("bounded response queue")
+            .fill_packet(3, &mut packet)
+            .unwrap();
+        packet.op()
     }
 
     #[test]
@@ -932,10 +950,10 @@ mod tests {
         let update = admit_mux(&mut proxy).unwrap();
         assert_eq!(proxy.status, ProxyStatus::Connected);
         assert!(update.signal_queue);
-        assert!(matches!(
-            rxq.lock().unwrap().pop(),
-            Some(MuxerRx::OpResponse { .. })
-        ));
+        assert_eq!(
+            buffered_response_op(&rxq, &proxy.mem),
+            uapi::VSOCK_OP_RESPONSE
+        );
         let mut payload = [0u8; 7];
         assert_eq!(
             recv(proxy.fd.as_raw_fd(), &mut payload, MsgFlags::MSG_DONTWAIT).unwrap(),
@@ -957,10 +975,7 @@ mod tests {
                 fail_waiting_on_host(&mut proxy)
             };
             assert!(matches!(update.remove_proxy, ProxyRemoval::Immediate));
-            assert!(matches!(
-                rxq.lock().unwrap().pop(),
-                Some(MuxerRx::Reset { .. })
-            ));
+            assert_eq!(buffered_response_op(&rxq, &proxy.mem), uapi::VSOCK_OP_RST);
             let mut byte = [0u8; 1];
             assert_eq!(
                 recv(peer.as_raw_fd(), &mut byte, MsgFlags::empty()).unwrap(),
@@ -1019,7 +1034,11 @@ mod tests {
             (packet_count * 2) as u16,
         )
         .unwrap();
-        let shutdown_packet = VsockPacket::from_rx_virtq_head(&shutdown_chain).unwrap();
+        let shutdown_packet = VsockPacket::from_rx_virtq_head(
+            &shutdown_chain,
+            &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(QUEUE_SIZE),
+        )
+        .unwrap();
         assert_eq!(shutdown_packet.op(), uapi::VSOCK_OP_SHUTDOWN);
         assert_eq!(shutdown_packet.flags(), uapi::VSOCK_FLAGS_SHUTDOWN_SEND);
 
@@ -1108,7 +1127,12 @@ mod tests {
         mem.write_obj((payload.len() as u32).to_le(), GuestAddress(0x3318))
             .unwrap();
         let head = DescriptorChain::checked_new(&mem, GuestAddress(0x3200), 2, 0).unwrap();
-        let packet = VsockPacket::from_tx_virtq_head(&head).unwrap();
+        let packet = VsockPacket::from_tx_virtq_head(
+            &head,
+            &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(2),
+            None,
+        )
+        .unwrap();
 
         let update = sendmsg_mux(&mut proxy, &packet);
         let mut received = [0; 64];

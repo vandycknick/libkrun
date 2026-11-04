@@ -10,13 +10,13 @@ use std::mem::{MaybeUninit, size_of};
 use std::ptr::copy_nonoverlapping;
 use std::result;
 
-use crate::virtio::queue::DescriptorChain;
+use crate::virtio::queue::{Descriptor, DescriptorChain};
 use vm_memory::{
     Address, ByteValued, GuestAddress, GuestMemoryError, Le16, Le32, Le64, VolatileMemoryError,
     VolatileSlice,
 };
 
-use super::file_traits::{FileReadWriteAtVolatile, FileReadWriteVolatile};
+use crate::virtio::file_traits::{FileReadWriteAtVolatile, FileReadWriteVolatile};
 use crate::virtio::{LeasedVolatileSlice, RuntimeGuestMemory};
 
 #[derive(Debug)]
@@ -52,6 +52,113 @@ impl Display for Error {
 pub type Result<T> = result::Result<T, Error>;
 
 impl std::error::Error for Error {}
+
+fn walk_descriptor_chain(
+    memory: &RuntimeGuestMemory,
+    mut current: DescriptorChain<'_>,
+    mut visit: impl FnMut(u16, Descriptor) -> Result<()>,
+) -> Result<()> {
+    let mut writable = false;
+    loop {
+        if current.flags & !(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE) != 0 {
+            return Err(Error::InvalidChain);
+        }
+        if current.is_write_only() {
+            writable = true;
+        } else if writable {
+            return Err(Error::InvalidChain);
+        }
+        memory
+            .try_access(current.len as usize, current.addr, |_, length, _, _| {
+                Ok(length)
+            })
+            .map_err(Error::GuestMemoryError)?;
+        visit(current.index, current.descriptor())?;
+        if current.flags & VIRTQ_DESC_F_NEXT == 0 {
+            return Ok(());
+        }
+        // has_next() hides TTL exhaustion; a raw NEXT is never a valid end.
+        current = current.next_descriptor().ok_or(Error::InvalidChain)?;
+    }
+}
+
+pub(crate) struct DescriptorChainSnapshot {
+    descriptors: Vec<Descriptor>,
+    seen: Vec<u64>,
+    limit: usize,
+}
+
+pub(crate) struct ValidatedDescriptorChain<'a> {
+    descriptors: &'a [Descriptor],
+}
+
+impl DescriptorChainSnapshot {
+    pub(crate) fn new(max_size: u16) -> Self {
+        let limit = usize::from(max_size);
+        Self {
+            descriptors: Vec::with_capacity(limit),
+            seen: vec![0; limit.div_ceil(u64::BITS as usize)],
+            limit,
+        }
+    }
+
+    pub(crate) fn read(
+        &mut self,
+        head: DescriptorChain<'_>,
+    ) -> Result<ValidatedDescriptorChain<'_>> {
+        self.descriptors.clear();
+        self.seen.fill(0);
+        walk_descriptor_chain(head.mem, head, |index, descriptor| {
+            let index = usize::from(index);
+            if index >= self.limit || self.descriptors.len() >= self.limit {
+                return Err(Error::InvalidChain);
+            }
+            let bit = 1_u64 << (index % u64::BITS as usize);
+            let word = self
+                .seen
+                .get_mut(index / u64::BITS as usize)
+                .ok_or(Error::InvalidChain)?;
+            if *word & bit != 0 {
+                return Err(Error::InvalidChain);
+            }
+            *word |= bit;
+            self.descriptors.push(descriptor);
+            Ok(())
+        })?;
+        Ok(ValidatedDescriptorChain {
+            descriptors: &self.descriptors,
+        })
+    }
+}
+
+impl ValidatedDescriptorChain<'_> {
+    pub(crate) fn descriptors(&self) -> &[Descriptor] {
+        self.descriptors
+    }
+}
+
+fn append_descriptor_buffers<'a>(
+    memory: &'a RuntimeGuestMemory,
+    descriptor: Descriptor,
+    buffers: &mut VecDeque<LeasedVolatileSlice<'a>>,
+) -> Result<()> {
+    let length = descriptor.len as usize;
+    let mut completed = 0_usize;
+    while completed < length {
+        let address = GuestAddress(descriptor.addr)
+            .checked_add(completed as u64)
+            .ok_or(Error::InvalidChain)?;
+        let slice = memory
+            .get_slice_at_most(address, length - completed)
+            .map_err(Error::GuestMemoryError)?
+            .ok_or(Error::InvalidChain)?;
+        completed = completed
+            .checked_add(slice.len())
+            .ok_or(Error::DescriptorChainOverflow)?;
+        buffers.push_back(slice);
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 struct DescriptorChainConsumer<'a> {
@@ -153,11 +260,9 @@ impl<'a> DescriptorChainConsumer<'a> {
             let mut other = self.buffers.split_off(at);
 
             if rem > 0 {
-                // There must be at least one element in `other` because we checked
-                // its `size` value in the call to `position` above.
-                let front = other.pop_front().expect("empty VecDeque after split");
+                let front = other.pop_front().ok_or(Error::InvalidChain)?;
                 self.buffers
-                    .push_back(front.offset(rem).map_err(Error::VolatileMemoryError)?);
+                    .push_back(front.subslice(0, rem).map_err(Error::VolatileMemoryError)?);
                 other.push_front(front.offset(rem).map_err(Error::VolatileMemoryError)?);
             }
 
@@ -181,8 +286,7 @@ impl<'a> DescriptorChainConsumer<'a> {
 ///
 /// Note that virtio spec requires driver to place any device-writable
 /// descriptors after any device-readable descriptors (2.6.4.2 in Virtio Spec v1.1).
-/// Reader will skip iterating over descriptor chain when first writable
-/// descriptor is encountered.
+/// Reader exposes the readable prefix only after validating the complete chain.
 #[derive(Clone)]
 pub struct Reader<'a> {
     buffer: DescriptorChainConsumer<'a>,
@@ -191,23 +295,43 @@ pub struct Reader<'a> {
 impl<'a> Reader<'a> {
     /// Construct a new Reader wrapper over `desc_chain`.
     pub fn new(mem: &'a RuntimeGuestMemory, chain: DescriptorChain<'a>) -> Result<Reader<'a>> {
-        let mut total_len: usize = 0;
-        let buffers = chain
-            .into_iter()
-            .readable()
-            .map(|desc| {
-                // Verify that summing the descriptor sizes does not overflow.
-                // This can happen if a driver tricks a device into reading more data than
-                // fits in a `usize`.
+        let mut total_len = 0_usize;
+        let mut buffers = VecDeque::new();
+        walk_descriptor_chain(mem, chain, |_, descriptor| {
+            if descriptor.flags & VIRTQ_DESC_F_WRITE == 0 {
                 total_len = total_len
-                    .checked_add(desc.len as usize)
+                    .checked_add(descriptor.len as usize)
                     .ok_or(Error::DescriptorChainOverflow)?;
-
-                mem.get_slice(desc.addr, desc.len as usize)
-                    .map_err(Error::GuestMemoryError)
-            })
-            .collect::<Result<VecDeque<LeasedVolatileSlice<'a>>>>()?;
+                append_descriptor_buffers(mem, descriptor, &mut buffers)?;
+            }
+            Ok(())
+        })?;
         Ok(Reader {
+            buffer: DescriptorChainConsumer {
+                buffers,
+                bytes_consumed: 0,
+            },
+        })
+    }
+
+    #[cfg(any(feature = "blk", test))]
+    pub(crate) fn from_validated(
+        mem: &'a RuntimeGuestMemory,
+        chain: &ValidatedDescriptorChain<'_>,
+    ) -> Result<Self> {
+        let mut total_len = 0_usize;
+        let mut buffers = VecDeque::new();
+        for descriptor in chain
+            .descriptors()
+            .iter()
+            .take_while(|descriptor| descriptor.flags & VIRTQ_DESC_F_WRITE == 0)
+        {
+            total_len = total_len
+                .checked_add(descriptor.len as usize)
+                .ok_or(Error::DescriptorChainOverflow)?;
+            append_descriptor_buffers(mem, *descriptor, &mut buffers)?;
+        }
+        Ok(Self {
             buffer: DescriptorChainConsumer {
                 buffers,
                 bytes_consumed: 0,
@@ -326,8 +450,7 @@ impl io::Read for Reader<'_> {
 ///
 /// Note that virtio spec requires driver to place any device-writable
 /// descriptors after any device-readable descriptors (2.6.4.2 in Virtio Spec v1.1).
-/// Writer will start iterating the descriptors from the first writable one and will
-/// assume that all following descriptors are writable.
+/// Writer exposes the writable suffix only after validating the complete chain.
 #[derive(Clone)]
 pub struct Writer<'a> {
     buffer: DescriptorChainConsumer<'a>,
@@ -336,24 +459,44 @@ pub struct Writer<'a> {
 impl<'a> Writer<'a> {
     /// Construct a new Writer wrapper over `desc_chain`.
     pub fn new(mem: &'a RuntimeGuestMemory, chain: DescriptorChain<'a>) -> Result<Writer<'a>> {
-        let mut total_len: usize = 0;
-        let buffers = chain
-            .into_iter()
-            .writable()
-            .map(|desc| {
-                // Verify that summing the descriptor sizes does not overflow.
-                // This can happen if a driver tricks a device into writing more data than
-                // fits in a `usize`.
+        let mut total_len = 0_usize;
+        let mut buffers = VecDeque::new();
+        walk_descriptor_chain(mem, chain, |_, descriptor| {
+            if descriptor.flags & VIRTQ_DESC_F_WRITE != 0 {
                 total_len = total_len
-                    .checked_add(desc.len as usize)
+                    .checked_add(descriptor.len as usize)
                     .ok_or(Error::DescriptorChainOverflow)?;
-
-                mem.get_slice(desc.addr, desc.len as usize)
-                    .map_err(Error::GuestMemoryError)
-            })
-            .collect::<Result<VecDeque<LeasedVolatileSlice<'a>>>>()?;
+                append_descriptor_buffers(mem, descriptor, &mut buffers)?;
+            }
+            Ok(())
+        })?;
 
         Ok(Writer {
+            buffer: DescriptorChainConsumer {
+                buffers,
+                bytes_consumed: 0,
+            },
+        })
+    }
+
+    #[cfg(any(feature = "blk", test))]
+    pub(crate) fn from_validated(
+        mem: &'a RuntimeGuestMemory,
+        chain: &ValidatedDescriptorChain<'_>,
+    ) -> Result<Self> {
+        let mut total_len = 0_usize;
+        let mut buffers = VecDeque::new();
+        for descriptor in chain
+            .descriptors()
+            .iter()
+            .skip_while(|descriptor| descriptor.flags & VIRTQ_DESC_F_WRITE == 0)
+        {
+            total_len = total_len
+                .checked_add(descriptor.len as usize)
+                .ok_or(Error::DescriptorChainOverflow)?;
+            append_descriptor_buffers(mem, *descriptor, &mut buffers)?;
+        }
+        Ok(Self {
             buffer: DescriptorChainConsumer {
                 buffers,
                 bytes_consumed: 0,
@@ -525,8 +668,8 @@ pub fn create_descriptor_chain(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::virtio::RuntimeGuestMemory as GuestMemoryMmap;
+    use crate::virtio::descriptor_utils::*;
 
     #[test]
     fn reader_test_simple_chain() {
@@ -967,5 +1110,265 @@ mod tests {
             writer.write(&buf[..]).expect("failed to write from buffer"),
             48
         );
+    }
+
+    fn snapshot_head(memory: &GuestMemoryMmap) -> DescriptorChain<'_> {
+        for (index, descriptor) in [
+            Descriptor {
+                addr: 0x1000,
+                len: 4,
+                flags: 1,
+                next: 1,
+            },
+            Descriptor {
+                addr: 0x1100,
+                len: 4,
+                flags: 2,
+                next: 0,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            memory
+                .write_obj(descriptor, GuestAddress(index as u64 * 16))
+                .unwrap();
+        }
+        DescriptorChain::checked_new(memory, GuestAddress(0), 8, 0).unwrap()
+    }
+
+    #[test]
+    fn descriptor_snapshot_retains_one_metadata_cut_for_reader_and_writer() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let head = snapshot_head(&memory);
+        memory
+            .write_slice(&[1, 2, 3, 4], GuestAddress(0x1000))
+            .unwrap();
+        let mut scratch = DescriptorChainSnapshot::new(8);
+        let allocation = scratch.descriptors.as_ptr();
+        {
+            let validated = scratch.read(head).unwrap();
+            assert_eq!(validated.descriptors().len(), 2);
+            memory
+                .write_obj(
+                    Descriptor {
+                        addr: 0x1400,
+                        len: 4,
+                        flags: 5,
+                        next: 7,
+                    },
+                    GuestAddress(0),
+                )
+                .unwrap();
+            memory
+                .write_obj(
+                    Descriptor {
+                        addr: 0x1500,
+                        len: 4,
+                        flags: 0,
+                        next: 0,
+                    },
+                    GuestAddress(16),
+                )
+                .unwrap();
+            let mut reader = Reader::from_validated(&memory, &validated).unwrap();
+            let mut writer = Writer::from_validated(&memory, &validated).unwrap();
+            let mut bytes = [0; 4];
+            reader.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes, [1, 2, 3, 4]);
+            writer.write_all(&[5, 6, 7, 8]).unwrap();
+            memory.read_slice(&mut bytes, GuestAddress(0x1100)).unwrap();
+            assert_eq!(bytes, [5, 6, 7, 8]);
+            memory.read_slice(&mut bytes, GuestAddress(0x1500)).unwrap();
+            assert_eq!(bytes, [0; 4]);
+        }
+        let head = snapshot_head(&memory);
+        assert_eq!(scratch.read(head).unwrap().descriptors().len(), 2);
+        assert_eq!(scratch.descriptors.as_ptr(), allocation);
+    }
+
+    #[test]
+    fn descriptor_snapshot_rejects_complete_malformed_tails_in_all_constructors() {
+        for malformed in 0..5 {
+            let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+            let _ = snapshot_head(&memory);
+            memory
+                .write_obj(
+                    Descriptor {
+                        addr: 0x1100,
+                        len: 4,
+                        flags: 3,
+                        next: 2,
+                    },
+                    GuestAddress(16),
+                )
+                .unwrap();
+            let tail = match malformed {
+                0 => Descriptor {
+                    addr: 0x1200,
+                    len: 0,
+                    flags: 3,
+                    next: 8,
+                },
+                1 => Descriptor {
+                    addr: 0x1200,
+                    len: 0,
+                    flags: 3,
+                    next: 2,
+                },
+                2 => Descriptor {
+                    addr: 0x1200,
+                    len: 0,
+                    flags: 6,
+                    next: 0,
+                },
+                3 => Descriptor {
+                    addr: 0x1200,
+                    len: 0,
+                    flags: 0,
+                    next: 0,
+                },
+                4 => Descriptor {
+                    addr: 0x6000,
+                    len: 1,
+                    flags: 2,
+                    next: 0,
+                },
+                _ => unreachable!("bounded malformed cases"),
+            };
+            memory.write_obj(tail, GuestAddress(32)).unwrap();
+            let head = DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 0).unwrap();
+            let mut scratch = DescriptorChainSnapshot::new(8);
+            assert!(
+                scratch.read(head.clone()).is_err(),
+                "snapshot case {malformed}"
+            );
+            assert!(
+                Reader::new(&memory, head.clone()).is_err(),
+                "reader case {malformed}"
+            );
+            assert!(
+                Writer::new(&memory, head).is_err(),
+                "writer case {malformed}"
+            );
+            let mut untouched = [0; 4];
+            memory
+                .read_slice(&mut untouched, GuestAddress(0x1100))
+                .unwrap();
+            assert_eq!(untouched, [0; 4], "case {malformed}");
+            let valid = snapshot_head(&memory);
+            assert_eq!(scratch.read(valid).unwrap().descriptors().len(), 2);
+        }
+    }
+
+    #[test]
+    fn descriptor_snapshot_accepts_adjacent_regions_and_zero_length_unmapped_tail() {
+        let memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 0x2000),
+            (GuestAddress(0x2000), 0x2000),
+        ])
+        .unwrap();
+        let _ = snapshot_head(&memory);
+        memory
+            .write_obj(
+                Descriptor {
+                    addr: 0x1ff0,
+                    len: 32,
+                    flags: 1,
+                    next: 1,
+                },
+                GuestAddress(0),
+            )
+            .unwrap();
+        memory
+            .write_obj(
+                Descriptor {
+                    addr: u64::MAX,
+                    len: 0,
+                    flags: 2,
+                    next: 0,
+                },
+                GuestAddress(16),
+            )
+            .unwrap();
+        let head = DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 0).unwrap();
+        let mut scratch = DescriptorChainSnapshot::new(8);
+        let validated = scratch.read(head).unwrap();
+        assert_eq!(validated.descriptors().len(), 2);
+        assert_eq!(validated.descriptors()[0].len, 32);
+        assert_eq!(validated.descriptors()[1].addr, u64::MAX);
+        let mut reader = Reader::from_validated(&memory, &validated).unwrap();
+        let mut bytes = [1; 32];
+        reader.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [0; 32]);
+        assert_eq!(
+            Writer::from_validated(&memory, &validated)
+                .unwrap()
+                .available_bytes(),
+            0
+        );
+    }
+
+    #[test]
+    fn descriptor_snapshot_rejects_a_hole_and_too_small_trusted_capacity() {
+        let memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 0x2000),
+            (GuestAddress(0x3000), 0x1000),
+        ])
+        .unwrap();
+        let head = snapshot_head(&memory);
+        assert!(DescriptorChainSnapshot::new(1).read(head).is_err());
+        let _ = snapshot_head(&memory);
+        memory
+            .write_obj(
+                Descriptor {
+                    addr: 0x1ff0,
+                    len: 0x1020,
+                    flags: 1,
+                    next: 1,
+                },
+                GuestAddress(0),
+            )
+            .unwrap();
+        let head = DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 0).unwrap();
+        assert!(DescriptorChainSnapshot::new(8).read(head).is_err());
+    }
+
+    #[test]
+    fn descriptor_snapshot_writer_maps_adjacent_regions_and_split_prefix_is_disjoint() {
+        let memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 0x2000),
+            (GuestAddress(0x2000), 0x1000),
+        ])
+        .unwrap();
+        memory
+            .write_obj(
+                Descriptor {
+                    addr: 0x1ff0,
+                    len: 33,
+                    flags: 2,
+                    next: 0,
+                },
+                GuestAddress(0),
+            )
+            .unwrap();
+        let head = DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 0).unwrap();
+        let mut scratch = DescriptorChainSnapshot::new(8);
+        let validated = scratch.read(head).unwrap();
+        let mut writer = Writer::from_validated(&memory, &validated).unwrap();
+        let mut status = writer.split_at(32).unwrap();
+        assert_eq!(writer.available_bytes(), 32);
+        assert_eq!(status.available_bytes(), 1);
+        writer.write_all(&[0x41; 32]).unwrap();
+        status.write_all(&[0x7e]).unwrap();
+        let mut first = [0; 16];
+        let mut second = [0; 17];
+        memory.read_slice(&mut first, GuestAddress(0x1ff0)).unwrap();
+        memory
+            .read_slice(&mut second, GuestAddress(0x2000))
+            .unwrap();
+        assert_eq!(first, [0x41; 16]);
+        assert_eq!(&second[..16], &[0x41; 16]);
+        assert_eq!(second[16], 0x7e);
     }
 }

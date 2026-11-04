@@ -157,6 +157,35 @@ impl RuntimeGuestMemory {
         Ok(LeasedVolatileSlice { slice, lease })
     }
 
+    pub(crate) fn get_slice_at_most(
+        &self,
+        address: GuestAddress,
+        len: usize,
+    ) -> Result<Option<LeasedVolatileSlice<'_>>, GuestMemoryError> {
+        if len == 0 {
+            return Ok(None);
+        }
+        let region = self
+            .memory
+            .find_region(address)
+            .ok_or(GuestMemoryError::InvalidGuestAddress(address))?;
+        let offset = address
+            .raw_value()
+            .checked_sub(region.start_addr().raw_value())
+            .ok_or(GuestMemoryError::InvalidBackendAddress)?;
+        let remaining = region
+            .len()
+            .checked_sub(offset)
+            .ok_or(GuestMemoryError::InvalidBackendAddress)?;
+        let remaining =
+            usize::try_from(remaining).map_err(|_| GuestMemoryError::InvalidBackendAddress)?;
+        let count = len.min(remaining);
+        if count == 0 {
+            return Err(GuestMemoryError::InvalidBackendAddress);
+        }
+        self.get_slice(address, count).map(Some)
+    }
+
     pub fn get_host_address(
         &self,
         address: GuestAddress,
@@ -247,6 +276,13 @@ impl<'a> LeasedVolatileSlice<'a> {
     pub fn offset(&self, count: usize) -> Result<Self, VolatileMemoryError> {
         Ok(Self {
             slice: self.slice.offset(count)?,
+            lease: self.lease.clone(),
+        })
+    }
+
+    pub(crate) fn subslice(&self, offset: usize, len: usize) -> Result<Self, VolatileMemoryError> {
+        Ok(Self {
+            slice: self.slice.subslice(offset, len)?,
             lease: self.lease.clone(),
         })
     }
@@ -461,7 +497,11 @@ mod tests {
             0,
         )
         .unwrap();
-        let packet = VsockPacket::from_rx_virtq_head(&packet_chain).unwrap();
+        let packet = VsockPacket::from_rx_virtq_head(
+            &packet_chain,
+            &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(256),
+        )
+        .unwrap();
         assert!(packet.buf().unwrap().is_empty());
         assert_eq!(access.active.load(Ordering::Acquire), 1);
         drop(packet);
@@ -611,7 +651,13 @@ mod tests {
                 0,
             )
             .unwrap();
-            assert!(VsockPacket::from_rx_virtq_head(&chain).is_err());
+            assert!(
+                VsockPacket::from_rx_virtq_head(
+                    &chain,
+                    &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(256)
+                )
+                .is_err()
+            );
         }
     }
 
@@ -624,5 +670,38 @@ mod tests {
         };
 
         assert_eq!(unsafe { raw.as_ptr().read() }, 0x5a);
+    }
+
+    #[test]
+    fn memory_slice_at_most_preserves_region_boundaries_zero_length_and_holes() {
+        let memory = crate::virtio::RuntimeGuestMemory::from_ranges(&[
+            (GuestAddress(0), 0x2000),
+            (GuestAddress(0x2000), 0x1000),
+        ])
+        .unwrap();
+        assert_eq!(
+            memory
+                .get_slice_at_most(GuestAddress(0x1ff0), 32)
+                .unwrap()
+                .unwrap()
+                .len(),
+            16
+        );
+        assert_eq!(
+            memory
+                .get_slice_at_most(GuestAddress(0x2000), 16)
+                .unwrap()
+                .unwrap()
+                .len(),
+            16
+        );
+        assert!(
+            memory
+                .get_slice_at_most(GuestAddress(u64::MAX), 0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(memory.get_slice_at_most(GuestAddress(0x3000), 1).is_err());
+        assert!(memory.get_slice_at_most(GuestAddress(u64::MAX), 1).is_err());
     }
 }

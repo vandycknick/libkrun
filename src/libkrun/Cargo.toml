@@ -23,6 +23,7 @@ timesync = ["devices/timesync"]
 ffi = ["serde_json", "dep:ffier", "dep:ffier-builtins", "devices/ffi"]
 native-control-probe = []
 native-execution-probe = []
+native-device-probe = ["native-execution-probe", "devices/native-device-probe"]
 
 [dependencies]
 bitfield = { version = "0.19.4", optional = true }
@@ -96,5 +97,12 @@ bench = false
 name = "native-execution-probe"
 path = "examples/native_execution_probe.rs"
 required-features = ["native-execution-probe"]
+test = false
+bench = false
+
+[[example]]
+name = "native-device-probe"
+path = "examples/native_device_probe.rs"
+required-features = ["blk", "net"]
 test = false
 bench = false

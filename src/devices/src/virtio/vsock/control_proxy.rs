@@ -332,6 +332,7 @@ pub(crate) struct ControlProxy {
     protected_identities: HashSet<UnixSocketIdentity>,
     line_deadline: Option<Instant>,
     ancillary: Vec<u8>,
+    admission: Option<Arc<crate::virtio::vsock::worker_control::WorkerControl>>,
 }
 
 impl ControlProxy {
@@ -360,6 +361,7 @@ impl ControlProxy {
                         ) as usize
                     }
                 ],
+                admission: None,
             },
             handle,
         ))
@@ -367,6 +369,13 @@ impl ControlProxy {
 
     pub(crate) fn as_raw_fd(&self) -> Option<RawFd> {
         self.fd.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
+    pub(crate) fn bind_admission(
+        &mut self,
+        control: Arc<crate::virtio::vsock::worker_control::WorkerControl>,
+    ) {
+        self.admission = Some(control);
     }
 
     pub(crate) fn add_protected_identity(&mut self, identity: UnixSocketIdentity) {
@@ -437,7 +446,14 @@ impl ControlProxy {
         let flags = libc::MSG_DONTWAIT;
         // nix refuses to expose cmsgs after MSG_CTRUNC, which would leak every
         // descriptor the kernel installed. Raw recvmsg is required for cleanup.
-        let result = unsafe { libc::recvmsg(fd.as_raw_fd(), &mut header, flags) };
+        let mut receive = || unsafe { libc::recvmsg(fd.as_raw_fd(), &mut header, flags) };
+        let result = match &self.admission {
+            Some(control) => match control.admit(receive) {
+                Some(result) => result,
+                None => return Ok(None),
+            },
+            None => receive(),
+        };
         if result < 0 {
             let error = Errno::last();
             return match error {
@@ -500,14 +516,20 @@ impl ControlProxy {
                 &frame.bytes[frame.offset..frame.offset + send_len],
             )];
             let raw_fds = frame.fd.as_ref().map(|fd| [fd.as_raw_fd()]);
-            let cmsgs = raw_fds
-                .as_ref()
-                .map_or_else(Vec::new, |fds| vec![ControlMessage::ScmRights(fds)]);
+            let cmsgs = raw_fds.as_ref().map(|fds| ControlMessage::ScmRights(fds));
             #[cfg(target_os = "linux")]
             let flags = MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL;
             #[cfg(target_os = "macos")]
             let flags = MsgFlags::MSG_DONTWAIT;
-            match sendmsg::<()>(fd.as_raw_fd(), &iov, &cmsgs, flags, None) {
+            let send = || sendmsg::<()>(fd.as_raw_fd(), &iov, cmsgs.as_slice(), flags, None);
+            let result = match &self.admission {
+                Some(control) => match control.admit(send) {
+                    Some(result) => result,
+                    None => return Ok(false),
+                },
+                None => send(),
+            };
+            match result {
                 Ok(0) => return Err("sendmsg made no progress".into()),
                 Ok(written) => {
                     byte_budget -= written;

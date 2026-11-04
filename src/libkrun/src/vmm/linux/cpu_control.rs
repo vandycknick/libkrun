@@ -66,6 +66,8 @@ impl CpuMailbox {
             CpuCommandKind::CaptureExecution => CpuAckKind::Captured,
             CpuCommandKind::InstallExecution => CpuAckKind::Installed,
             CpuCommandKind::PrepareExecutionTime => CpuAckKind::TimePrepared,
+            #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+            CpuCommandKind::InitializeDeviceWitness => CpuAckKind::DeviceWitnessInitialized,
         };
         let result = match command.kind {
             CpuCommandKind::Stop => {
@@ -87,6 +89,14 @@ impl CpuMailbox {
                     Ok(())
                 } else {
                     Err("stale or foreign vCPU park".to_owned())
+                }
+            }
+            #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+            CpuCommandKind::InitializeDeviceWitness => {
+                if cpu_id == 2 && key == self.key && self.disposition == CpuDisposition::Parked {
+                    Ok(())
+                } else {
+                    Err("source witness requires its exact parked AP2".into())
                 }
             }
             CpuCommandKind::CaptureExecution
@@ -429,5 +439,36 @@ mod tests {
                 .result
                 .is_err()
         );
+    }
+
+    #[cfg(all(feature = "native-device-probe", target_arch = "x86_64"))]
+    #[test]
+    fn kvm_device_witness_mailbox_requires_exact_parked_ap2() {
+        let mut mailbox = CpuMailbox::new();
+        let kind = CpuCommandKind::InitializeDeviceWitness;
+        assert!(mailbox.apply(0, command(1, 0, kind)).result.is_err());
+        assert!(mailbox.apply(3, command(1, 0, kind)).result.is_err());
+        let mut foreign = command(1, 0, kind);
+        foreign.barrier.key.operation = OperationId(1);
+        assert!(mailbox.apply(2, foreign).result.is_err());
+        assert!(mailbox.apply(2, command(1, 0, kind)).result.is_ok());
+        assert_eq!(mailbox.disposition(), CpuDisposition::Parked);
+        assert!(
+            mailbox
+                .apply(
+                    2,
+                    command(2, 0, CpuCommandKind::PrepareResume { paused_ticks: 0 })
+                )
+                .result
+                .is_ok()
+        );
+        assert!(mailbox.apply(2, command(3, 0, kind)).result.is_err());
+        assert!(
+            mailbox
+                .apply(2, command(4, 0, CpuCommandKind::Release))
+                .result
+                .is_ok()
+        );
+        assert!(mailbox.apply(2, command(5, 0, kind)).result.is_err());
     }
 }

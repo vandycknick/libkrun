@@ -3,12 +3,12 @@ use std::num::Wrapping;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use super::super::Queue as VirtQueue;
 use super::defs;
 use super::defs::uapi;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
+use crate::virtio::vsock::packet::PacketQueue as VirtQueue;
 
 #[cfg(unix)]
 use nix::sys::socket::AddressFamily;
@@ -33,7 +33,7 @@ mod windows;
 #[cfg(windows)]
 use windows as sys;
 
-pub struct TsiStreamProxy {
+pub(crate) struct TsiStreamProxy {
     pub(crate) id: u64,
     pub(crate) cid: u64,
     pub(crate) parent_id: u64,
@@ -161,7 +161,7 @@ impl TsiStreamProxy {
         let mut queue = self.queue.lock().unwrap();
 
         while let Some(head) = queue.pop(&self.mem) {
-            let len = match VsockPacket::from_rx_virtq_head(&head) {
+            let len = match VsockPacket::from_rx_virtq_head(&head, &mut queue.snapshot) {
                 Ok(mut pkt) => match sys::recv_to_pkt(self, &mut pkt) {
                     RecvPkt::WaitForCredit => {
                         wait_credit = true;
@@ -181,7 +181,9 @@ impl TsiStreamProxy {
                 },
                 Err(e) => {
                     debug!("recv_pkt: RX queue error: {e:?}");
-                    0
+                    queue.record_processing_failure();
+                    have_used |= queue.add_used(&self.mem, head.index, 0).is_ok();
+                    break;
                 }
             };
 
@@ -199,6 +201,7 @@ impl TsiStreamProxy {
                 );
                 if let Err(e) = queue.add_used(&self.mem, head.index, len as u32) {
                     error!("failed to add used elements to the queue: {e:?}");
+                    break;
                 }
             }
         }
@@ -238,6 +241,15 @@ impl TsiStreamProxy {
 }
 
 impl Proxy for TsiStreamProxy {
+    fn kind(&self) -> crate::virtio::vsock::proxy::ProxyKind {
+        crate::virtio::vsock::proxy::ProxyKind::TsiStream
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    fn pending_credit_count(&self) -> usize {
+        self.deferred_credit.pending_count()
+    }
+
     fn id(&self) -> u64 {
         self.id
     }

@@ -126,6 +126,14 @@ live-capabilities:
 native-execution-probe:
 	cargo build --locked -p libkrun $(FEATURE_FLAGS) --features native-execution-probe --example native-execution-probe
 
+.PHONY: native-device-probe
+native-device-probe:
+	cargo build --locked -p libkrun $(FEATURE_FLAGS) --features blk,net --example native-device-probe
+
+.PHONY: native-device-witness-probe
+native-device-witness-probe:
+	cargo build --locked -p libkrun $(FEATURE_FLAGS) --features blk,net,native-device-probe --example native-device-probe
+
 # Regenerate ffier bindings for libkrun.
 # The Rust client is generated at compile time from the committed JSON
 # (see src/libkrun-via-cdylib-weak/build.rs). Run this after changing the

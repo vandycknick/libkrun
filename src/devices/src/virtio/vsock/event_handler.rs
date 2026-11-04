@@ -13,8 +13,8 @@ use utils::windows::AsRawFd;
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 
-use super::device::{EVQ_INDEX, RXQ_INDEX, TXQ_INDEX, Vsock};
 use crate::virtio::VirtioDevice;
+use crate::virtio::vsock::device::{EVQ_INDEX, RXQ_INDEX, TXQ_INDEX, Vsock};
 
 impl Vsock {
     pub(crate) fn handle_rxq_event(&mut self, event: &EpollEvent) -> bool {
@@ -71,57 +71,51 @@ impl Vsock {
         if let Err(e) = self.queue_events[EVQ_INDEX].read() {
             error!("Failed to consume vsock evq event: {e:?}");
         }
-        false
+        self.process_transport_reset()
     }
 
-    fn handle_activate_event(&self, event_manager: &mut EventManager) {
-        debug!("activate event");
-        if let Err(e) = self.activate_evt.read() {
-            error!("Failed to consume vsock activate event: {e:?}");
+    fn handle_activate_event(&mut self, event_manager: &mut EventManager) {
+        if let Err(error) = self.activate_evt.read()
+            && error.kind() != std::io::ErrorKind::WouldBlock
+        {
+            self.provider
+                .retain_fault(crate::virtio::lifecycle::ProviderFault::Notification);
+            return;
         }
-
-        // The subscriber must exist as we previously registered activate_evt via
-        // `interest_list()`.
-        let self_subscriber = event_manager
-            .subscriber(self.activate_evt.as_raw_fd())
-            .unwrap();
-
-        event_manager
-            .register(
-                self.queue_events[RXQ_INDEX].as_raw_fd(),
-                EpollEvent::new(
-                    EventSet::IN,
-                    self.queue_events[RXQ_INDEX].as_raw_fd() as u64,
-                ),
-                self_subscriber.clone(),
-            )
-            .unwrap_or_else(|e| {
-                error!("Failed to register vsock rxq with event manager: {e:?}");
-            });
-
-        event_manager
-            .register(
-                self.queue_events[TXQ_INDEX].as_raw_fd(),
-                EpollEvent::new(
-                    EventSet::IN,
-                    self.queue_events[TXQ_INDEX].as_raw_fd() as u64,
-                ),
-                self_subscriber.clone(),
-            )
-            .unwrap_or_else(|e| {
-                error!("Failed to register vsock txq with event manager: {e:?}");
-            });
-
-        event_manager
-            .unregister(self.activate_evt.as_raw_fd())
-            .unwrap_or_else(|e| {
-                error!("Failed to unregister vsock activate evt: {e:?}");
-            })
+        let Ok(subscriber) = event_manager.subscriber(self.activate_evt.as_raw_fd()) else {
+            self.provider
+                .retain_fault(crate::virtio::lifecycle::ProviderFault::Notification);
+            return;
+        };
+        for event in &self.queue_events {
+            if let Err(error) = event_manager.register(
+                event.as_raw_fd(),
+                EpollEvent::new(EventSet::IN, event.as_raw_fd() as u64),
+                subscriber.clone(),
+            ) {
+                log::error!("failed to register vsock queue callback: {error:?}");
+                self.provider
+                    .retain_fault(crate::virtio::lifecycle::ProviderFault::Notification);
+            }
+        }
+        if let Err(error) = event_manager.unregister(self.activate_evt.as_raw_fd()) {
+            log::error!("failed to unregister vsock activation callback: {error:?}");
+            self.provider
+                .retain_fault(crate::virtio::lifecycle::ProviderFault::Notification);
+        }
+        let used =
+            self.process_transport_reset() | self.process_stream_tx() | self.process_stream_rx();
+        if used {
+            self.signal_used_queue();
+        }
     }
 }
 
 impl Subscriber for Vsock {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
+        if !self.is_activated() || !self.provider.callback_allowed() {
+            return;
+        }
         let source = event.fd();
         let rxq = self.queue_events[RXQ_INDEX].as_raw_fd();
         let txq = self.queue_events[TXQ_INDEX].as_raw_fd();
@@ -147,7 +141,7 @@ impl Subscriber for Vsock {
             }
             if raise_irq {
                 debug!("raising IRQ");
-                self.device_state.signal_used_queue();
+                self.signal_used_queue();
             }
         } else {
             warn!("The device is not yet activated. Spurious event received: {source:?}");

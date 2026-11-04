@@ -5,7 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
 use std::time::Duration;
 
@@ -148,17 +148,8 @@ impl EpollEvent {
 
 #[derive(Debug)]
 pub struct Epoll {
-    queue: RawFd,
+    queue: OwnedFd,
     kevs: Vec<Kevent>,
-}
-
-impl Clone for Epoll {
-    fn clone(&self) -> Self {
-        Epoll {
-            queue: self.queue,
-            kevs: Vec::new(),
-        }
-    }
 }
 
 impl Epoll {
@@ -168,10 +159,20 @@ impl Epoll {
             Err(io::Error::last_os_error())
         } else {
             Ok(Epoll {
-                queue,
+                // SAFETY: kqueue returned a new, valid descriptor owned here.
+                queue: unsafe { OwnedFd::from_raw_fd(queue) },
                 kevs: Vec::new(),
             })
         }
+    }
+
+    /// Duplicate the polling descriptor while retaining independent event storage.
+    /// Failure leaves the source owner and its registered interests intact.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            queue: self.queue.try_clone()?,
+            kevs: Vec::new(),
+        })
     }
 
     /// Register, modify, or remove interest in events for a file descriptor.
@@ -215,7 +216,7 @@ impl Epoll {
                 }
                 let ret = unsafe {
                     libc::kevent(
-                        self.queue,
+                        self.queue.as_raw_fd(),
                         kevs.as_ptr() as *const libc::kevent,
                         kevs.len() as i32,
                         ptr::null_mut(),
@@ -263,7 +264,7 @@ impl Epoll {
                 }
                 let _ = unsafe {
                     libc::kevent(
-                        self.queue,
+                        self.queue.as_raw_fd(),
                         kevs.as_ptr() as *const libc::kevent,
                         kevs.len() as i32,
                         ptr::null_mut(),
@@ -296,7 +297,7 @@ impl Epoll {
         debug_assert!(spare.len() >= max_events);
         let ret = unsafe {
             libc::kevent(
-                self.queue,
+                self.queue.as_raw_fd(),
                 ptr::null(),
                 0,
                 spare.as_mut_ptr().cast::<libc::kevent>(),
@@ -355,14 +356,23 @@ impl Epoll {
             data: delay_us as isize,
             udata: udata as *mut libc::c_void,
         };
-        let ret = unsafe { libc::kevent(self.queue, &kev, 1, ptr::null_mut(), 0, ptr::null()) };
+        let ret = unsafe {
+            libc::kevent(
+                self.queue.as_raw_fd(),
+                &kev,
+                1,
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+            )
+        };
         assert_eq!(ret, 0);
     }
 }
 
 impl AsRawFd for Epoll {
     fn as_raw_fd(&self) -> RawFd {
-        self.queue
+        self.queue.as_raw_fd()
     }
 }
 
@@ -399,7 +409,7 @@ mod tests {
         const MAX_EVENTS: usize = 10;
 
         let mut epoll = Epoll::new().unwrap();
-        assert_eq!(epoll.queue, epoll.as_raw_fd());
+        assert_eq!(epoll.queue.as_raw_fd(), epoll.as_raw_fd());
 
         // Let's test different scenarios for `epoll_ctl()` and `epoll_wait()` functionality.
 

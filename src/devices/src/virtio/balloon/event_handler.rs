@@ -3,194 +3,115 @@ use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
 use utils::windows::AsRawFd;
 
-use polly::event_manager::{EventManager, Subscriber};
+use polly::event_manager::{Error as EventManagerError, EventManager, Subscriber};
+use std::sync::Arc;
 use utils::epoll::{EpollEvent, EventSet};
 
-use super::device::{Balloon, DFQ_INDEX, FRQ_INDEX, IFQ_INDEX, PHQ_INDEX, STQ_INDEX};
+use crate::virtio::balloon::device::{
+    Balloon, DFQ_INDEX, FRQ_INDEX, IFQ_INDEX, PHQ_INDEX, STQ_INDEX,
+};
 use crate::virtio::device::VirtioDevice;
+use crate::virtio::lifecycle::ProviderFault;
 
 impl Balloon {
-    fn queue_event(&self, idx: usize) -> &std::sync::Arc<utils::eventfd::EventFd> {
-        &self.queues.as_ref().expect("queues should exist")[idx].event
-    }
-
-    pub(crate) fn handle_ifq_event(&mut self, event: &EpollEvent) {
-        error!("balloon: unsupported inflate queue event");
-
-        let event_set = event.event_set();
-        if event_set != EventSet::IN {
-            warn!("balloon: inflate unexpected event {event_set:?}");
+    fn handle_queue_event(&mut self, index: usize, event: &EpollEvent) {
+        if !self.callbacks.admission_open() || event.event_set() != EventSet::IN {
             return;
         }
-
-        if let Err(e) = self.queue_event(IFQ_INDEX).read() {
-            error!("Failed to read balloon inflate queue event: {e:?}");
-        }
-    }
-
-    pub(crate) fn handle_dfq_event(&mut self, event: &EpollEvent) {
-        error!("balloon: unsupported deflate queue event");
-
-        let event_set = event.event_set();
-        if event_set != EventSet::IN {
-            warn!("balloon: deflate unexpected event {event_set:?}");
+        let Some(queue) = self.queues.as_ref().and_then(|queues| queues.get(index)) else {
+            self.callbacks.retain_fault(ProviderFault::QueueCount);
+            return;
+        };
+        if let Err(error) = queue.event.read() {
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                self.callbacks.retain_fault(ProviderFault::Notification);
+            }
             return;
         }
-
-        if let Err(e) = self.queue_event(DFQ_INDEX).read() {
-            error!("Failed to read balloon inflate queue event: {e:?}");
+        match index {
+            FRQ_INDEX => self.process_and_notify(),
+            STQ_INDEX => debug!("balloon: stats queue event (ignored)"),
+            IFQ_INDEX | DFQ_INDEX | PHQ_INDEX => {
+                error!("balloon: unsupported queue event: {index}")
+            }
+            _ => self.callbacks.retain_fault(ProviderFault::QueueCount),
         }
     }
 
-    pub(crate) fn handle_stq_event(&mut self, event: &EpollEvent) {
-        debug!("balloon: stats queue event (ignored)");
-
-        let event_set = event.event_set();
-        if event_set != EventSet::IN {
-            warn!("balloon: stats unexpected event {event_set:?}");
+    fn handle_activate_event(&mut self, event_manager: &mut EventManager) {
+        if let Err(error) = self.activate_evt.read()
+            && error.kind() != std::io::ErrorKind::WouldBlock
+        {
+            self.callbacks.retain_fault(ProviderFault::Notification);
             return;
         }
-
-        if let Err(e) = self.queue_event(STQ_INDEX).read() {
-            error!("Failed to read balloon stats queue event: {e:?}");
-        }
-    }
-
-    pub(crate) fn handle_phq_event(&mut self, event: &EpollEvent) {
-        error!("balloon: unsupported page-hinting queue event");
-
-        let event_set = event.event_set();
-        if event_set != EventSet::IN {
-            warn!("balloon: page-hinting unexpected event {event_set:?}");
+        let Ok(subscriber) = event_manager.subscriber(self.activate_evt.as_raw_fd()) else {
+            self.callbacks.retain_fault(ProviderFault::Notification);
             return;
-        }
-
-        if let Err(e) = self.queue_event(PHQ_INDEX).read() {
-            error!("Failed to read balloon page-hinting queue event: {e:?}");
-        }
-    }
-
-    pub(crate) fn handle_frq_event(&mut self, event: &EpollEvent) {
-        debug!("balloon: free-page reporting queue event");
-
-        let event_set = event.event_set();
-        if event_set != EventSet::IN {
-            warn!("balloon: free-page reporting unexpected event {event_set:?}");
+        };
+        let Some(queues) = &self.queues else {
+            self.callbacks.retain_fault(ProviderFault::QueueCount);
             return;
-        }
-
-        if let Err(e) = self.queue_event(FRQ_INDEX).read() {
-            error!("Failed to read balloon free-page reporting queue event: {e:?}");
-        } else {
-            match self.process_frq() {
-                Ok(true) => self.device_state.signal_used_queue(),
-                Ok(false) => {}
-                Err(error) => self.fail_vm(&error),
+        };
+        for queue in queues {
+            let fd = queue.event.as_raw_fd();
+            let registration = match event_manager.subscriber(fd) {
+                Ok(existing) if Arc::ptr_eq(&existing, &subscriber) => Ok(()),
+                Ok(_) => Err(EventManagerError::AlreadyExists(fd)),
+                Err(EventManagerError::NotFound(missing)) if missing == fd => event_manager
+                    .register(
+                        fd,
+                        EpollEvent::new(EventSet::IN, fd as u64),
+                        subscriber.clone(),
+                    ),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = registration {
+                error!("balloon: failed queue callback registration: {error:?}");
+                self.callbacks.retain_fault(ProviderFault::Notification);
+                return;
             }
         }
-    }
-
-    fn handle_activate_event(&self, event_manager: &mut EventManager) {
-        debug!("balloon: activate event");
-        if let Err(e) = self.activate_evt.read() {
-            error!("Failed to consume balloon activate event: {e:?}");
-        }
-
-        // The subscriber must exist as we previously registered activate_evt via
-        // `interest_list()`.
-        let self_subscriber = event_manager
-            .subscriber(self.activate_evt.as_raw_fd())
-            .unwrap();
-
-        event_manager
-            .register(
-                self.queue_event(IFQ_INDEX).as_raw_fd(),
-                EpollEvent::new(EventSet::IN, self.queue_event(IFQ_INDEX).as_raw_fd() as u64),
-                self_subscriber.clone(),
-            )
-            .unwrap_or_else(|e| {
-                error!("Failed to register balloon ifq with event manager: {e:?}");
-            });
-
-        event_manager
-            .register(
-                self.queue_event(DFQ_INDEX).as_raw_fd(),
-                EpollEvent::new(EventSet::IN, self.queue_event(DFQ_INDEX).as_raw_fd() as u64),
-                self_subscriber.clone(),
-            )
-            .unwrap_or_else(|e| {
-                error!("Failed to register balloon dfq with event manager: {e:?}");
-            });
-
-        event_manager
-            .register(
-                self.queue_event(STQ_INDEX).as_raw_fd(),
-                EpollEvent::new(EventSet::IN, self.queue_event(STQ_INDEX).as_raw_fd() as u64),
-                self_subscriber.clone(),
-            )
-            .unwrap_or_else(|e| {
-                error!("Failed to register balloon stq with event manager: {e:?}");
-            });
-
-        event_manager
-            .register(
-                self.queue_event(PHQ_INDEX).as_raw_fd(),
-                EpollEvent::new(EventSet::IN, self.queue_event(PHQ_INDEX).as_raw_fd() as u64),
-                self_subscriber.clone(),
-            )
-            .unwrap_or_else(|e| {
-                error!("Failed to register balloon dfq with event manager: {e:?}");
-            });
-
-        event_manager
-            .register(
-                self.queue_event(FRQ_INDEX).as_raw_fd(),
-                EpollEvent::new(EventSet::IN, self.queue_event(FRQ_INDEX).as_raw_fd() as u64),
-                self_subscriber.clone(),
-            )
-            .unwrap_or_else(|e| {
-                error!("Failed to register balloon frq with event manager: {e:?}");
-            });
-
-        event_manager
+        if event_manager
             .unregister(self.activate_evt.as_raw_fd())
-            .unwrap_or_else(|e| {
-                error!("Failed to unregister balloon activate evt: {e:?}");
-            })
+            .is_err()
+        {
+            self.callbacks.retain_fault(ProviderFault::Notification);
+        }
     }
 }
 
 impl Subscriber for Balloon {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
-        let source = event.fd();
-        let ifq = self.queue_event(IFQ_INDEX).as_raw_fd();
-        let dfq = self.queue_event(DFQ_INDEX).as_raw_fd();
-        let stq = self.queue_event(STQ_INDEX).as_raw_fd();
-        let phq = self.queue_event(PHQ_INDEX).as_raw_fd();
-        let frq = self.queue_event(FRQ_INDEX).as_raw_fd();
-        let activate_evt = self.activate_evt.as_raw_fd();
-
-        if self.is_activated() {
-            match source {
-                _ if source == ifq => self.handle_ifq_event(event),
-                _ if source == dfq => self.handle_dfq_event(event),
-                _ if source == stq => self.handle_stq_event(event),
-                _ if source == phq => self.handle_phq_event(event),
-                _ if source == frq => self.handle_frq_event(event),
-                _ if source == activate_evt => {
-                    self.handle_activate_event(event_manager);
-                }
-                _ => warn!("Unexpected balloon event received: {source:?}"),
-            }
-        } else {
-            warn!("balloon: The device is not yet activated. Spurious event received: {source:?}");
+        if !self.callbacks.admission_open() {
+            return;
+        }
+        if event.fd() == self.activate_evt.as_raw_fd() {
+            self.handle_activate_event(event_manager);
+            return;
+        }
+        if self.is_activated()
+            && let Some(index) = self.queues.as_ref().and_then(|queues| {
+                queues
+                    .iter()
+                    .position(|queue| queue.event.as_raw_fd() == event.fd())
+            })
+        {
+            self.handle_queue_event(index, event);
         }
     }
 
     fn interest_list(&self) -> Vec<EpollEvent> {
-        vec![EpollEvent::new(
-            EventSet::IN,
-            self.activate_evt.as_raw_fd() as u64,
-        )]
+        if let Some(queues) = &self.queues {
+            queues
+                .iter()
+                .map(|queue| EpollEvent::new(EventSet::IN, queue.event.as_raw_fd() as u64))
+                .collect()
+        } else {
+            vec![EpollEvent::new(
+                EventSet::IN,
+                self.activate_evt.as_raw_fd() as u64,
+            )]
+        }
     }
 }

@@ -277,21 +277,20 @@ pub struct Epoll {
     entries: Vec<OVERLAPPED_ENTRY>,
 }
 
-impl Clone for Epoll {
-    fn clone(&self) -> Self {
-        Epoll {
-            iocp: self.iocp.clone(),
-            entries: Vec::new(),
-        }
-    }
-}
-
 // SAFETY: `Epoll` is safe to send across threads. The `Vec<OVERLAPPED_ENTRY>` entries
 // buffer is only accessed from the thread that owns the `Epoll`, and the underlying
 // `CompletionPort` (Arc) already implements `Send + Sync`.
 unsafe impl Send for Epoll {}
 
 impl Epoll {
+    /// Retain the shared completion-port owner with independent waiter storage.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            iocp: self.iocp.clone(),
+            entries: Vec::new(),
+        })
+    }
+
     /// Create a new polling instance backed by a fresh I/O Completion Port.
     pub fn new() -> io::Result<Self> {
         let mut data: WSADATA = unsafe { std::mem::zeroed() };
@@ -707,9 +706,9 @@ mod tests {
     }
 
     #[test]
-    fn test_clone_shares_state() {
+    fn test_try_clone_shares_state() {
         let epoll = Epoll::new().unwrap();
-        let epoll2 = epoll.clone();
+        let epoll2 = epoll.try_clone().unwrap();
         let ev = create_event();
         let event = EpollEvent::new(EventSet::IN, ev as u64);
 

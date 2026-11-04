@@ -22,6 +22,7 @@ test_utils = []
 timesync = []
 vhost-user = ["vhost", "vmm-sys-util", "krun_display"]
 ffi = ["dep:ffier"]
+native-device-probe = []
 
 [dependencies]
 bitflags = "1.2.0"

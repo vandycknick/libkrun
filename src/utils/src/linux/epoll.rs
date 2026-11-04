@@ -3,7 +3,7 @@
 
 use std::io;
 use std::ops::Deref;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use bitflags::bitflags;
 use libc::{
@@ -131,16 +131,27 @@ impl EpollEvent {
 }
 
 /// Wrapper over epoll functionality.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Epoll {
-    epoll_fd: RawFd,
+    epoll_fd: OwnedFd,
 }
 
 impl Epoll {
     /// Create a new epoll file descriptor.
     pub fn new() -> io::Result<Self> {
         let epoll_fd = SyscallReturnCode(unsafe { epoll_create1(EPOLL_CLOEXEC) }).into_result()?;
-        Ok(Epoll { epoll_fd })
+        // SAFETY: epoll_create1 returned a new, valid descriptor owned here.
+        Ok(Epoll {
+            epoll_fd: unsafe { OwnedFd::from_raw_fd(epoll_fd) },
+        })
+    }
+
+    /// Duplicate the descriptor for the same polling instance.
+    /// Each waiter owns its descriptor; duplication failure leaves this owner intact.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            epoll_fd: self.epoll_fd.try_clone()?,
+        })
     }
 
     /// Wrapper for `libc::epoll_ctl`.
@@ -163,7 +174,7 @@ impl Epoll {
         // as well as a valid epoll_event structure. We also check the return value.
         SyscallReturnCode(unsafe {
             epoll_ctl(
-                self.epoll_fd,
+                self.epoll_fd.as_raw_fd(),
                 operation as i32,
                 fd,
                 event as *const EpollEvent as *mut epoll_event,
@@ -195,7 +206,7 @@ impl Epoll {
         // descriptors in the interest list. We also check the return value.
         let events_count = SyscallReturnCode(unsafe {
             epoll_wait(
-                self.epoll_fd,
+                self.epoll_fd.as_raw_fd(),
                 events.as_mut_ptr() as *mut epoll_event,
                 max_events as i32,
                 timeout,
@@ -209,17 +220,7 @@ impl Epoll {
 
 impl AsRawFd for Epoll {
     fn as_raw_fd(&self) -> RawFd {
-        self.epoll_fd
-    }
-}
-
-impl std::ops::Drop for Epoll {
-    fn drop(&mut self) {
-        // Safe because this fd is opened with `epoll_create` and we trust
-        // the kernel to give us a valid fd.
-        unsafe {
-            libc::close(self.epoll_fd);
-        }
+        self.epoll_fd.as_raw_fd()
     }
 }
 
@@ -228,6 +229,28 @@ mod tests {
     use super::*;
 
     use crate::eventfd::EventFd;
+
+    #[test]
+    fn provider_epoll_owned_duplicate_keeps_real_waiter_alive_after_original_drop() {
+        let original = Epoll::new().unwrap();
+        let mut waiter = original.try_clone().unwrap();
+        assert_ne!(original.as_raw_fd(), waiter.as_raw_fd());
+        let event = EventFd::new(crate::eventfd::EFD_NONBLOCK).unwrap();
+        original
+            .ctl(
+                ControlOperation::Add,
+                event.as_raw_fd(),
+                &EpollEvent::new(EventSet::IN, 41),
+            )
+            .unwrap();
+        drop(original);
+        event.write(1).unwrap();
+        let mut events = [EpollEvent::default(); 1];
+        assert_eq!(waiter.wait(1, 1000, &mut events).unwrap(), 1);
+        assert_eq!(events[0].data(), 41);
+        drop(waiter);
+        assert_eq!(event.read().unwrap(), 1);
+    }
 
     #[test]
     fn test_event_ops() {
@@ -250,7 +273,7 @@ mod tests {
         const MAX_EVENTS: usize = 10;
 
         let mut epoll = Epoll::new().unwrap();
-        assert_eq!(epoll.epoll_fd, epoll.as_raw_fd());
+        assert_eq!(epoll.epoll_fd.as_raw_fd(), epoll.as_raw_fd());
 
         // Let's test different scenarios for `epoll_ctl()` and `epoll_wait()` functionality.
 

@@ -82,6 +82,23 @@ pub enum CpuTimePlan {
 pub enum CpuExecutionInput {
     Install(CpuExecutionState),
     PrepareTime(CpuTimePlan),
+    #[cfg(all(
+        feature = "native-device-probe",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    InitializeDeviceWitness(SourceWitnessBootstrap),
+}
+
+#[cfg(all(
+    feature = "native-device-probe",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceWitnessBootstrap {
+    pub regs: [u64; 18],
+    pub special: kvm::X86Special,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -9,10 +9,10 @@ use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
-use super::write_virtio_net_hdr;
+use crate::virtio::net::backend::{ConnectError, NetBackend, ReadError, WriteError};
+use crate::virtio::net::write_virtio_net_hdr;
 #[cfg(target_os = "macos")]
-use super::{MAX_BUFFER_SIZE, VNET_HDR_LEN};
+use crate::virtio::net::{MAX_BUFFER_SIZE, VNET_HDR_LEN};
 
 const VFKIT_MAGIC: [u8; 4] = *b"VFKT";
 
@@ -43,6 +43,28 @@ pub struct Unixgram {
 }
 
 impl Unixgram {
+    fn validate_endpoint(fd: &OwnedFd) -> Result<(), nix::Error> {
+        if getsockopt(fd, sockopt::SockType)? != SockType::Datagram {
+            return Err(nix::Error::EPROTOTYPE);
+        }
+        let _: UnixAddr = nix::sys::socket::getpeername(fd.as_raw_fd())?;
+        Ok(())
+    }
+
+    pub fn validate_managed(fd: &OwnedFd) -> Result<(), nix::Error> {
+        Self::validate_endpoint(fd)?;
+        let flags = OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL)?);
+        if !flags.contains(OFlag::O_NONBLOCK) {
+            return Err(nix::Error::EINVAL);
+        }
+        Ok(())
+    }
+    pub fn prepare_managed(fd: &OwnedFd) -> Result<(), nix::Error> {
+        Self::validate_endpoint(fd)?;
+        let flags = OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL)?);
+        fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        Ok(())
+    }
     /// Create the backend with a pre-established connection to the userspace network proxy.
     pub fn new(fd: OwnedFd) -> Self {
         // Ensure the socket is in non-blocking mode.
@@ -129,7 +151,11 @@ impl NetBackend for Unixgram {
     /// Try to read a frame the proxy. If no bytes are available reports ReadError::NothingRead
     fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
         let hdr_len = write_virtio_net_hdr(buf);
-        let frame_length = match recv(self.fd.as_raw_fd(), &mut buf[hdr_len..], MsgFlags::empty()) {
+        let frame_length = match recv(
+            self.fd.as_raw_fd(),
+            &mut buf[hdr_len..],
+            MsgFlags::MSG_DONTWAIT,
+        ) {
             Ok(f) => f,
             #[allow(unreachable_patterns)]
             Err(nix::Error::EAGAIN | nix::Error::EWOULDBLOCK) => {
@@ -145,11 +171,14 @@ impl NetBackend for Unixgram {
 
     /// Try to write a frame to the proxy.
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
-        let ret = match send(self.fd.as_raw_fd(), &buf[hdr_len..], MsgFlags::empty()) {
+        if buf.len() < hdr_len {
+            return Err(WriteError::Internal(nix::Error::EINVAL));
+        }
+        let ret = match send(self.fd.as_raw_fd(), &buf[hdr_len..], MsgFlags::MSG_DONTWAIT) {
             Ok(ret) => ret,
             // macOS returns ENOBUFS when the kernel socket buffer is full,
             // rather than blocking or returning EAGAIN on non-blocking sockets.
-            Err(nix::Error::ENOBUFS) => {
+            Err(nix::Error::ENOBUFS | nix::Error::EAGAIN) => {
                 if self.retries == 0 {
                     info!("write_frame: ENOBUFS");
                 }
@@ -158,6 +187,9 @@ impl NetBackend for Unixgram {
             }
             Err(e) => return Err(WriteError::Internal(e)),
         };
+        if ret != buf.len() - hdr_len {
+            return Err(WriteError::Internal(nix::Error::EIO));
+        }
         if self.retries > 0 {
             info!(
                 "write_frame: ENOBUFS resolved after {} retries",

@@ -97,16 +97,21 @@ pub struct Serial {
 }
 
 impl Serial {
-    pub fn capture_state(
-        &self,
-    ) -> std::result::Result<crate::legacy::state::Pl011State, utils::state::Error> {
-        use crate::legacy::state::{MAX_SERIAL_INPUT, Pl011State};
+    pub fn preflight_state(&self) -> Result<(), utils::state::Error> {
         if self.state_fault {
             return Err(utils::state::Error::Invalid("PL011 terminality fault"));
         }
-        if self.read_fifo.len() > MAX_SERIAL_INPUT {
+        if self.read_fifo.len() > crate::legacy::state::MAX_SERIAL_INPUT {
             return Err(utils::state::Error::Limit);
         }
+        Ok(())
+    }
+
+    pub fn capture_state(
+        &self,
+    ) -> std::result::Result<crate::legacy::state::Pl011State, utils::state::Error> {
+        use crate::legacy::state::Pl011State;
+        self.preflight_state()?;
         Ok(Pl011State {
             flags: self.flags,
             lcr: self.lcr,

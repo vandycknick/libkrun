@@ -115,12 +115,40 @@ commands. No thread is detached and no guest RAM/VM ownership is released while
 an owner can still execute. Normal controller polling and reap are nonblocking;
 the standalone coordinator sleeps between polls, not inside the VMM owner loop.
 
+Console terminal stop is not a reversible pause. The transport dispatches an
+explicit `Stopping`/`Stopped` provider contract before capture preflight, closes
+the direction owners, wakes blocked TX on its separate terminal EventFd and
+joins only finished workers. It never drains the host reader or publishes an
+abandoned TX head as used. Direction queues and errors remain owner-retained;
+terminal stages cannot be captured or resumed. Pause and cancellation still
+finish accepted output through the original reversible quiescence path.
+
+Cold-only network backends have a corresponding bounded terminal owner handoff,
+independent of their refusal of live capture. Stop closes the existing packet
+admission boundary, wakes and reaps the worker, and retains its returned backend,
+queues and any partial frame in the original owner slot. Managed network and
+block providers retain their existing accepted-work drain contracts. Legacy
+devices without a terminal contract still use their existing reset interface;
+an active reset returning `false` is a failure, not a cleanup acknowledgement.
+Those legacy resets are not newly certified as bounded. Empty-vCPU execution
+attempts still reconcile device and IRQ owners before acknowledging stop.
+
+A new stop journals its own key and deadline while retaining the failed pause as
+history. Reconciliation polls the original accepted drain without another begin,
+wake attempt or reset. A failed block wake is historical only after the provider
+independently proves its worker was reaped and backend retained without a current
+effects/backend fault, and the transport revalidates retained queue escrow and
+IRQ notification health. A fresh worker error is a stop failure even if it has
+the same error kind as the old wake failure. Pending ownership and an expired
+current stop never become successful cleanup acknowledgements.
+
 The short fault deadline is 40 ms and the ordinary observation/operation budget
 is two seconds. Preparation and release share one absolute deadline; explicit
 cancellation shares its new deadline across reconciliation, preparation and
-release. Expiry never discards accepted work. If terminal cleanup exceeds its
-deadline, the coordinator keeps ownership
-and polling until reap, then reports failure rather than a backdated success.
+release. Expiry itself never discards accepted work; abandonment requires the
+explicit terminal ownership contract above. If terminal cleanup exceeds its
+deadline, ownership remains retained and any late reap reports failure rather
+than a backdated success.
 For a genuinely stuck native syscall the outer runner may terminate and reap the
 entire standalone process; never reinterpret runner timeout as successful native
 cleanup or qualification.

@@ -18,10 +18,18 @@ pub struct RequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CpuCommandKind {
     Park,
-    PrepareResume { paused_ticks: u64 },
+    PrepareResume {
+        paused_ticks: u64,
+    },
     CaptureExecution,
     InstallExecution,
     PrepareExecutionTime,
+    #[cfg(all(
+        feature = "native-device-probe",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    InitializeDeviceWitness,
     Release,
     Stop,
 }
@@ -41,6 +49,12 @@ pub enum CpuAckKind {
     Captured,
     Installed,
     TimePrepared,
+    #[cfg(all(
+        feature = "native-device-probe",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    DeviceWitnessInitialized,
     Released,
     Stopped,
 }
@@ -53,6 +67,12 @@ impl CpuCommandKind {
             Self::CaptureExecution => CpuAckKind::Captured,
             Self::InstallExecution => CpuAckKind::Installed,
             Self::PrepareExecutionTime => CpuAckKind::TimePrepared,
+            #[cfg(all(
+                feature = "native-device-probe",
+                target_os = "linux",
+                target_arch = "x86_64"
+            ))]
+            Self::InitializeDeviceWitness => CpuAckKind::DeviceWitnessInitialized,
             Self::Release => CpuAckKind::Released,
             Self::Stop => CpuAckKind::Stopped,
         }
@@ -144,6 +164,7 @@ pub enum ControlReply {
 pub(crate) enum RequestKind {
     Pause(PauseOwner),
     Resume(PauseToken),
+    ReleaseRestore,
     CancelPause(OperationId),
     Status,
     Stop,
@@ -234,15 +255,6 @@ pub(crate) struct CpuController {
 }
 
 impl CpuController {
-    #[cfg(any(
-        test,
-        all(
-            feature = "native-execution-probe",
-            target_os = "linux",
-            target_arch = "x86_64",
-            not(feature = "tee")
-        )
-    ))]
     pub fn release_may_have_run(&self) -> bool {
         self.released_any
     }
@@ -313,6 +325,12 @@ impl CpuController {
             kind,
             CpuCommandKind::InstallExecution | CpuCommandKind::PrepareExecutionTime
         );
+        #[cfg(all(
+            feature = "native-device-probe",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        let typed = typed || kind == CpuCommandKind::InitializeDeviceWitness;
         if (typed && inputs.len() != self.count)
             || (!typed && !inputs.is_empty())
             || inputs
@@ -326,6 +344,23 @@ impl CpuController {
                         CpuCommandKind::PrepareExecutionTime,
                         Some(CpuExecutionInput::PrepareTime(_)),
                     ) => false,
+                    #[cfg(all(
+                        feature = "native-device-probe",
+                        target_os = "linux",
+                        target_arch = "x86_64"
+                    ))]
+                    (
+                        CpuCommandKind::InitializeDeviceWitness,
+                        Some(CpuExecutionInput::InitializeDeviceWitness(_)),
+                    ) => self.count != 4 || index != 2,
+                    #[cfg(all(
+                        feature = "native-device-probe",
+                        target_os = "linux",
+                        target_arch = "x86_64"
+                    ))]
+                    (CpuCommandKind::InitializeDeviceWitness, None) => {
+                        self.count != 4 || index == 2
+                    }
                     _ => true,
                 })
         {
@@ -359,6 +394,14 @@ impl CpuController {
         };
         let mut failure = None;
         for (index, handle) in handles.iter().enumerate() {
+            #[cfg(all(
+                feature = "native-device-probe",
+                target_os = "linux",
+                target_arch = "x86_64"
+            ))]
+            if kind == CpuCommandKind::InitializeDeviceWitness && index != 2 {
+                continue;
+            }
             let mut command = command.clone();
             command.execution = inputs.get(index).cloned().flatten();
             match handle.send_control(command) {
@@ -446,7 +489,23 @@ impl CpuController {
                 return Poll::Ready(Ok(()));
             }
         } else {
-            for slot in &batch.slots {
+            #[cfg(all(
+                feature = "native-device-probe",
+                target_os = "linux",
+                target_arch = "x86_64"
+            ))]
+            let slots = if batch.command.kind == CpuCommandKind::InitializeDeviceWitness {
+                &batch.slots[2..3]
+            } else {
+                &batch.slots[..]
+            };
+            #[cfg(not(all(
+                feature = "native-device-probe",
+                target_os = "linux",
+                target_arch = "x86_64"
+            )))]
+            let slots = &batch.slots;
+            for slot in slots {
                 if !slot.accepted {
                     return Poll::Ready(Err(ControlFailure::Participant(
                         "CPU command was not accepted".into(),
@@ -499,10 +558,41 @@ impl CpuController {
                     .all(|slot| slot.accepted && matches!(slot.acknowledgement, Some(Ok(()))))
         })
     }
+
+    pub(crate) fn capture_owned(&self, key: BarrierKey) -> bool {
+        self.batches.last().is_some_and(|batch| {
+            batch.command.kind == CpuCommandKind::CaptureExecution
+                && batch.command.barrier.key == key
+                && batch.slots.iter().any(|slot| slot.accepted)
+        })
+    }
+
+    pub(crate) fn poll_capture_for_rollback(
+        &mut self,
+        handles: &mut [VcpuHandle],
+        fenced: BarrierKey,
+        rollback: BarrierRequest,
+    ) -> Poll<Result<(), ControlFailure>> {
+        if rollback.key.generation != fenced.generation
+            || rollback.key.operation == fenced.operation
+            || !self.capture_owned(fenced)
+        {
+            return Poll::Ready(Err(ControlFailure::InvalidOperation));
+        }
+        if Instant::now() >= rollback.deadline {
+            return Poll::Ready(Err(ControlFailure::Deadline));
+        }
+        match self.poll(handles) {
+            Poll::Ready(Err(ControlFailure::Deadline)) if !self.reconciled() => Poll::Pending,
+            result => result,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Phase {
+    /// At a poll boundary, no ingress fence or CPU command has been accepted.
+    Admission,
     Park,
     Devices,
     Maintenance,
@@ -513,6 +603,7 @@ pub(crate) enum Phase {
     CpuRefence,
     CpuPrepare,
     Prepared,
+    CancelCapture,
     CancelPark,
     CancelDevices,
     Rearm,
@@ -533,6 +624,27 @@ pub(crate) struct ActiveControl {
     pub routes_begun: bool,
     pub maintenance_closed: bool,
     pub cpu_parked_at: Option<u64>,
+}
+
+impl ActiveControl {
+    fn begin_ingress(
+        &mut self,
+        events: &mut polly::event_manager::EventManager,
+    ) -> Result<(), ControlFailure> {
+        if self.phase != Phase::Admission {
+            return Err(ControlFailure::FailedFenced);
+        }
+        let result = events.begin_ingress_fence(self.barrier);
+        // A deadline can reject before installation, or fail after installation.
+        // Only the actual fence distinguishes those cases; no CPU was sent yet.
+        if result.is_ok() || events.dispatch_fence().is_some() {
+            self.phase = Phase::Park;
+        }
+        result.map_err(|error| match error {
+            polly::event_manager::Error::Deadline(_) => ControlFailure::Deadline,
+            error => ControlFailure::Participant(format!("{error:?}")),
+        })
+    }
 }
 
 pub(crate) struct ControlOwner {
@@ -591,6 +703,18 @@ impl ControlOwner {
     pub fn validate_token(&self, token: &PauseToken) -> bool {
         matches!(&self.state, ControlState::Paused(current) if current == token)
     }
+
+    fn retire_admission(&mut self, failure: ControlFailure) -> Result<(), ControlFailure> {
+        let Some(active) = self
+            .active
+            .take_if(|active| active.phase == Phase::Admission)
+        else {
+            return Err(failure);
+        };
+        self.state = ControlState::Running;
+        let _ = active.request.reply.try_send(Err(failure));
+        Ok(())
+    }
 }
 
 impl crate::vmm::Vmm {
@@ -616,6 +740,66 @@ impl crate::vmm::Vmm {
             }
         }
         self.poll_control(events);
+    }
+
+    fn pause_admission(&self) -> Result<Poll<()>, ControlFailure> {
+        use crate::vmm::device_manager::quiescence::ManagerFault;
+        use std::sync::TryLockError;
+
+        if self.vcpus_handles.is_empty() {
+            return Err(ControlFailure::Unsupported("empty CPU topology".into()));
+        }
+        if cfg!(feature = "tee") {
+            return Err(ControlFailure::Unsupported(
+                "execution controller profile".into(),
+            ));
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if self.execution.profile.is_none() {
+            return Err(ControlFailure::Unsupported(
+                "execution clock/PIT profile not admitted".into(),
+            ));
+        }
+        let mut pending = false;
+        match self.mmio_device_manager.preflight_quiesce() {
+            Ok(()) => {}
+            Err(error) if matches!(error.fault, ManagerFault::LockBusy) => pending = true,
+            Err(error) => return Err(ControlFailure::Unsupported(error.to_string())),
+        }
+        match self.execution_controller.try_lock() {
+            Ok(controller) => {
+                if !controller.execution_state_supported() {
+                    return Err(ControlFailure::Unsupported(
+                        "execution controller profile".into(),
+                    ));
+                }
+            }
+            Err(TryLockError::WouldBlock) => pending = true,
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(ControlFailure::Unsupported(
+                    "interrupt controller lock poisoned".into(),
+                ));
+            }
+        }
+        Ok(if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        })
+    }
+
+    fn begin_pause_parking(
+        &mut self,
+        active: &mut ActiveControl,
+        events: &mut polly::event_manager::EventManager,
+    ) -> Result<(), ControlFailure> {
+        active.begin_ingress(events)?;
+        self.control.cpus.begin(
+            active.request.id,
+            active.barrier,
+            CpuCommandKind::Park,
+            &self.vcpus_handles,
+        )
     }
 
     fn accept_control(
@@ -679,30 +863,9 @@ impl crate::vmm::Vmm {
                 if self.control.state != ControlState::Running {
                     return Err(ControlFailure::Busy);
                 }
-                if self.vcpus_handles.is_empty() {
-                    return Err(ControlFailure::Unsupported("empty CPU topology".into()));
-                }
-                self.mmio_device_manager
-                    .preflight_quiesce()
-                    .map_err(|error| ControlFailure::Unsupported(error.to_string()))?;
-                if cfg!(feature = "tee")
-                    || !self
-                        .execution_controller
-                        .try_lock()
-                        .map_err(|_| {
-                            ControlFailure::Unsupported("interrupt controller lock".into())
-                        })?
-                        .execution_state_supported()
-                {
-                    return Err(ControlFailure::Unsupported(
-                        "execution controller profile".into(),
-                    ));
-                }
-                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-                if self.execution.profile.is_none() {
-                    return Err(ControlFailure::Unsupported(
-                        "execution clock/PIT profile not admitted".into(),
-                    ));
+                let admission = self.pause_admission()?;
+                if Instant::now() >= request.deadline {
+                    return Err(ControlFailure::Deadline);
                 }
                 self.control.reserve(request.operation)?;
                 let barrier = BarrierRequest {
@@ -714,36 +877,24 @@ impl crate::vmm::Vmm {
                     key: barrier.key,
                     failed: false,
                 };
-                self.control.active = Some(ActiveControl {
+                let mut active = ActiveControl {
                     request,
                     barrier,
                     original: barrier.key,
                     owner,
-                    phase: Phase::Park,
+                    phase: Phase::Admission,
                     failed: false,
                     devices_begun: false,
                     routes_begun: false,
                     maintenance_closed: false,
                     cpu_parked_at: None,
-                });
-                // A partially installed ingress fence remains journal-owned on error.
-                let result = events
-                    .begin_ingress_fence(barrier)
-                    .map_err(|error| ControlFailure::Participant(format!("{error:?}")))
-                    .and_then(|()| {
-                        let id = self
-                            .control
-                            .active
-                            .as_ref()
-                            .map(|active| active.request.id)
-                            .ok_or(ControlFailure::FailedFenced)?;
-                        self.control.cpus.begin(
-                            id,
-                            barrier,
-                            CpuCommandKind::Park,
-                            &self.vcpus_handles,
-                        )
-                    });
+                };
+                if admission.is_pending() {
+                    self.control.active = Some(active);
+                    return Ok(());
+                }
+                let result = self.begin_pause_parking(&mut active, events);
+                self.control.active = Some(active);
                 if let Err(error) = result {
                     self.fail_control(error);
                 }
@@ -775,12 +926,57 @@ impl crate::vmm::Vmm {
                 self.control.active = Some(active);
                 Ok(())
             }
+            RequestKind::ReleaseRestore => {
+                let ControlState::RestorePrepared { key: original } = self.control.state else {
+                    return Err(ControlFailure::Busy);
+                };
+                if self.execution.failed_install || self.control.cpus.release_may_have_run() {
+                    return Err(ControlFailure::FailedFenced);
+                }
+                self.control.reserve(request.operation)?;
+                let barrier = BarrierRequest {
+                    key: BarrierKey {
+                        operation: request.operation,
+                        generation: original.generation,
+                    },
+                    deadline: request.deadline,
+                };
+                self.control.state = ControlState::Resuming { key: barrier.key };
+                self.control.active = Some(ActiveControl {
+                    request,
+                    barrier,
+                    original,
+                    owner: PauseOwner::Capture,
+                    phase: Phase::PrepareTime,
+                    failed: false,
+                    devices_begun: true,
+                    routes_begun: true,
+                    maintenance_closed: false,
+                    cpu_parked_at: None,
+                });
+                Ok(())
+            }
             RequestKind::CancelPause(original) => {
                 if !matches!(self.control.state, ControlState::Pausing { key, .. } if key.operation == *original)
                 {
                     return Err(ControlFailure::InvalidOperation);
                 }
                 self.control.reserve(request.operation)?;
+                if self
+                    .control
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.phase == Phase::Admission)
+                    && self
+                        .control
+                        .retire_admission(ControlFailure::Participant(
+                            "pause explicitly cancelled before admission".into(),
+                        ))
+                        .is_ok()
+                {
+                    let _ = request.reply.try_send(Ok(ControlReply::Complete));
+                    return Ok(());
+                }
                 let mut active = self
                     .control
                     .active
@@ -800,7 +996,12 @@ impl crate::vmm::Vmm {
                     deadline: request.deadline,
                 };
                 active.request = request;
-                active.phase = Phase::CancelPark;
+                let capture_owned = self.control.cpus.capture_owned(active.original);
+                active.phase = if capture_owned {
+                    Phase::CancelCapture
+                } else {
+                    Phase::CancelPark
+                };
                 active.failed = false;
                 self.control.state = ControlState::RollingBack {
                     key: active.barrier.key,
@@ -811,6 +1012,9 @@ impl crate::vmm::Vmm {
                 };
                 let id = active.request.id;
                 self.control.active = Some(active);
+                if capture_owned {
+                    return Ok(());
+                }
                 if let Err(error) = self.control.cpus.begin(
                     id,
                     reconcile,
@@ -826,6 +1030,10 @@ impl crate::vmm::Vmm {
     }
 
     fn fail_control(&mut self, error: ControlFailure) {
+        let error = match self.control.retire_admission(error) {
+            Ok(()) => return,
+            Err(error) => error,
+        };
         if let Some(active) = &mut self.control.active {
             active.failed = true;
             self.control.state = match active.phase {
@@ -903,6 +1111,15 @@ impl crate::vmm::Vmm {
             return Err(ControlFailure::Deadline);
         }
         match active.phase {
+            Phase::Admission => {
+                if self.pause_admission()?.is_pending() {
+                    return Ok(false);
+                }
+                if Instant::now() >= active.barrier.deadline {
+                    return Err(ControlFailure::Deadline);
+                }
+                self.begin_pause_parking(active, events)?;
+            }
             Phase::Park | Phase::CancelPark => {
                 match self.control.cpus.poll(&mut self.vcpus_handles) {
                     Poll::Pending => return Ok(false),
@@ -923,8 +1140,10 @@ impl crate::vmm::Vmm {
                         .quiescence
                         .request()
                         .is_some_and(|request| request.key == active.original);
-                    result.map_err(|error| ControlFailure::Participant(error.to_string()))?;
-                    active.phase = Phase::Devices;
+                    match result.map_err(|error| ControlFailure::Participant(error.to_string()))? {
+                        Poll::Pending => return Ok(false),
+                        Poll::Ready(()) => active.phase = Phase::Devices,
+                    }
                 }
             }
             Phase::Devices => {
@@ -996,6 +1215,15 @@ impl crate::vmm::Vmm {
                     .reply
                     .try_send(Ok(ControlReply::Paused(token)));
                 return Ok(true);
+            }
+            Phase::CancelCapture => {
+                match self.poll_execution_cut_for_rollback(active.original, active.barrier) {
+                    Poll::Pending => return Ok(false),
+                    Poll::Ready(result) => result.map_err(ControlFailure::Participant)?,
+                }
+                // Capture owners were already parked. Retain every actual
+                // captured payload before any later command retires that batch.
+                active.phase = Phase::PrepareTime;
             }
             Phase::CancelDevices => {
                 if active.devices_begun {
@@ -1081,6 +1309,18 @@ impl crate::vmm::Vmm {
                 active.phase = Phase::Prepared;
             }
             Phase::Prepared => {
+                match self.mmio_device_manager.quiescence.preflight_legacy() {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.fault,
+                            crate::vmm::device_manager::quiescence::ManagerFault::LockBusy
+                        ) =>
+                    {
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(ControlFailure::Participant(error.to_string())),
+                }
                 match self.control.cpus.poll(&mut self.vcpus_handles) {
                     Poll::Pending => return Ok(false),
                     Poll::Ready(result) => result?,
@@ -1114,10 +1354,15 @@ impl crate::vmm::Vmm {
             }
             Phase::ResumeDevices => {
                 if active.devices_begun {
-                    self.mmio_device_manager
+                    match self
+                        .mmio_device_manager
                         .quiescence
                         .begin_resume(active.original, active.barrier)
-                        .map_err(|error| ControlFailure::Participant(error.to_string()))?;
+                        .map_err(|error| ControlFailure::Participant(error.to_string()))?
+                    {
+                        Poll::Pending => return Ok(false),
+                        Poll::Ready(()) => {}
+                    }
                 }
                 active.phase = Phase::Prepare;
             }
@@ -1169,6 +1414,15 @@ impl crate::vmm::Vmm {
                     }
                     Poll::Ready(result) => result?,
                 }
+                match self
+                    .mmio_device_manager
+                    .quiescence
+                    .poll_stop(active.barrier)
+                    .map_err(|error| ControlFailure::Participant(error.to_string()))?
+                {
+                    Poll::Pending => return Ok(false),
+                    Poll::Ready(()) => {}
+                }
                 // IRQ workers retain their own VM fd and route owners. Reclaim
                 // them before allowing the outer VM resources to be dropped.
                 if !self.mmio_device_manager.poll_irq_cleanup() {
@@ -1206,6 +1460,147 @@ mod tests {
         BarrierKey {
             operation: OperationId(1),
             generation: BarrierGeneration(1),
+        }
+    }
+
+    #[test]
+    fn pause_admission_retirement_preserves_operation_and_fence_accounting() {
+        use crate::vmm::control::{
+            ActiveControl, ControlFailure, ControlRequest, Phase, RequestKind,
+        };
+        for phase in [Phase::Admission, Phase::Park] {
+            for failure in [
+                ControlFailure::Deadline,
+                ControlFailure::Participant("explicit cancellation".into()),
+                ControlFailure::Unsupported("real unsupported provider".into()),
+            ] {
+                let mut owner = ControlOwner::new(BarrierGeneration(1)).unwrap();
+                let operation = OperationId(2);
+                owner.reserve(operation).unwrap();
+                let barrier = BarrierRequest {
+                    key: owner.next_key(operation).unwrap(),
+                    deadline: Instant::now() + Duration::from_secs(1),
+                };
+                let (reply, waiting) = crossbeam_channel::bounded(1);
+                owner.state = ControlState::Pausing {
+                    key: barrier.key,
+                    failed: false,
+                };
+                owner.active = Some(ActiveControl {
+                    request: ControlRequest {
+                        id: RequestId(1),
+                        operation,
+                        deadline: barrier.deadline,
+                        kind: RequestKind::Pause(PauseOwner::User),
+                        reply,
+                    },
+                    barrier,
+                    original: barrier.key,
+                    owner: PauseOwner::User,
+                    phase,
+                    failed: false,
+                    devices_begun: false,
+                    routes_begun: false,
+                    maintenance_closed: false,
+                    cpu_parked_at: None,
+                });
+                let retired = owner.retire_admission(failure.clone()).is_ok();
+                assert_eq!(retired, phase == Phase::Admission);
+                assert!(owner.cpus.batches.is_empty());
+                assert_eq!(
+                    owner.reserve(operation),
+                    Err(ControlFailure::InvalidOperation)
+                );
+                if retired {
+                    assert!(owner.active.is_none());
+                    assert_eq!(owner.state, ControlState::Running);
+                    assert!(matches!(waiting.try_recv(), Ok(Err(error)) if error == failure));
+                    assert!(owner.retire_admission(ControlFailure::Deadline).is_err());
+                    assert!(waiting.try_recv().is_err());
+                    owner.reserve(OperationId(3)).unwrap();
+                } else {
+                    let active = owner.active.as_ref().unwrap();
+                    assert_eq!(active.original, barrier.key);
+                    assert_eq!(active.barrier, barrier);
+                    assert_eq!(active.phase, Phase::Park);
+                    assert!(matches!(owner.state, ControlState::Pausing { .. }));
+                    assert!(waiting.try_recv().is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pause_admission_actual_fence_rejection_retires_only_unfenced_request() {
+        use crate::vmm::control::{
+            ActiveControl, ControlFailure, ControlRequest, Phase, RequestKind,
+        };
+        for already_fenced in [false, true] {
+            let mut owner = ControlOwner::new(BarrierGeneration(1)).unwrap();
+            let operation = OperationId(2);
+            owner.reserve(operation).unwrap();
+            let barrier = BarrierRequest {
+                key: owner.next_key(operation).unwrap(),
+                deadline: Instant::now(),
+            };
+            let (reply, waiting) = crossbeam_channel::bounded(1);
+            owner.state = ControlState::Pausing {
+                key: barrier.key,
+                failed: false,
+            };
+            owner.active = Some(ActiveControl {
+                request: ControlRequest {
+                    id: RequestId(1),
+                    operation,
+                    deadline: barrier.deadline,
+                    kind: RequestKind::Pause(PauseOwner::User),
+                    reply,
+                },
+                barrier,
+                original: barrier.key,
+                owner: PauseOwner::User,
+                phase: Phase::Admission,
+                failed: false,
+                devices_begun: false,
+                routes_begun: false,
+                maintenance_closed: false,
+                cpu_parked_at: None,
+            });
+            let mut events = polly::event_manager::EventManager::new().unwrap();
+            if already_fenced {
+                events
+                    .begin_ingress_fence(BarrierRequest {
+                        deadline: Instant::now() + Duration::from_secs(10),
+                        ..barrier
+                    })
+                    .unwrap();
+            }
+            let failure = owner
+                .active
+                .as_mut()
+                .unwrap()
+                .begin_ingress(&mut events)
+                .unwrap_err();
+            assert!(owner.cpus.batches.is_empty());
+            assert_eq!(events.dispatch_fence().is_some(), already_fenced);
+            assert_eq!(
+                owner.retire_admission(failure.clone()).is_ok(),
+                !already_fenced
+            );
+            if already_fenced {
+                assert!(matches!(failure, ControlFailure::Participant(_)));
+                assert_eq!(owner.active.as_ref().unwrap().phase, Phase::Park);
+                assert!(waiting.try_recv().is_err());
+            } else {
+                assert_eq!(failure, ControlFailure::Deadline);
+                assert_eq!(owner.state, ControlState::Running);
+                assert!(owner.active.is_none());
+                assert!(matches!(
+                    waiting.try_recv(),
+                    Ok(Err(ControlFailure::Deadline))
+                ));
+                assert!(waiting.try_recv().is_err());
+            }
         }
     }
 
@@ -1391,5 +1786,96 @@ mod tests {
             exhausted.next_key(OperationId(1)),
             Err(crate::vmm::control::ControlFailure::Exhausted)
         ));
+    }
+
+    #[test]
+    fn cpu_capture_rollback_keeps_original_batch_and_bounds_only_late_ack_wait() {
+        use crate::vmm::control::ControlFailure;
+        let mut cpus = journal();
+        cpus.batches[0].command.kind = CpuCommandKind::CaptureExecution;
+        cpus.batches[0].command.barrier.deadline = Instant::now();
+        let original = cpus.batches[0].command.clone();
+        let rollback = BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(2),
+                ..key()
+            },
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        assert!(cpus.capture_owned(key()));
+        assert!(
+            cpus.poll_capture_for_rollback(&mut [], key(), rollback)
+                .is_pending()
+        );
+        assert_eq!(cpus.batches.len(), 1);
+        assert_eq!(cpus.batches[0].command.request, original.request);
+        assert_eq!(cpus.batches[0].command.barrier, original.barrier);
+        assert!(
+            cpus.batches[0]
+                .slots
+                .iter()
+                .all(|slot| slot.accepted && slot.acknowledgement.is_none())
+        );
+        let expired = BarrierRequest {
+            deadline: Instant::now(),
+            ..rollback
+        };
+        assert!(matches!(
+            cpus.poll_capture_for_rollback(&mut [], key(), expired),
+            std::task::Poll::Ready(Err(ControlFailure::Deadline))
+        ));
+        let foreign = BarrierRequest {
+            key: BarrierKey {
+                generation: BarrierGeneration(99),
+                ..rollback.key
+            },
+            ..rollback
+        };
+        assert!(matches!(
+            cpus.poll_capture_for_rollback(&mut [], key(), foreign),
+            std::task::Poll::Ready(Err(ControlFailure::InvalidOperation))
+        ));
+        // A terminal owner-error acknowledgement is not the old deadline.
+        let mut failed = ack(0);
+        failed.kind = CpuAckKind::Captured;
+        failed.result = Err("captured owner fault".into());
+        cpus.acknowledge(0, failed);
+        assert!(
+            matches!(cpus.poll_capture_for_rollback(&mut [], key(), rollback),
+            std::task::Poll::Ready(Err(ControlFailure::Participant(error)))
+                if error == "captured owner fault")
+        );
+        assert!(!cpus.reconciled());
+        assert_eq!(cpus.batches.len(), 1);
+        assert_eq!(cpus.batches[0].command.request, original.request);
+    }
+
+    #[test]
+    fn cpu_capture_rollback_partial_submission_keeps_accepted_original_owner() {
+        use crate::vmm::control::ControlFailure;
+        let mut cpus = journal();
+        cpus.batches[0].command.kind = CpuCommandKind::CaptureExecution;
+        cpus.batches[0].slots[1].accepted = false;
+        let rollback = BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(2),
+                ..key()
+            },
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        assert!(cpus.capture_owned(key()));
+        assert!(matches!(
+            cpus.poll_capture_for_rollback(&mut [], key(), rollback),
+            std::task::Poll::Ready(Err(ControlFailure::Participant(_)))
+        ));
+        assert!(cpus.batches[0].slots[0].accepted);
+        assert!(cpus.batches[0].slots[0].acknowledgement.is_none());
+        assert_eq!(
+            cpus.batches[0].command.kind,
+            CpuCommandKind::CaptureExecution
+        );
+        assert_eq!(cpus.batches[0].command.request, RequestId(7));
+        assert!(!cpus.reconciled());
+        assert!(!cpus.capture_owned(rollback.key));
     }
 }

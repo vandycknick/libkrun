@@ -8,6 +8,7 @@ pub enum ConnectError {
     CreateSocket(nix::Error),
     Binding(nix::Error),
     SendingMagic(nix::Error),
+    Configure(nix::Error),
     // Tap backend errors.
     OpenNetTun(nix::Error),
     TunSetIff(io::Error),

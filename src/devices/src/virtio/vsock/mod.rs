@@ -16,13 +16,17 @@ mod muxer_rxq;
 mod muxer_thread;
 #[allow(dead_code)]
 pub(crate) mod packet;
+#[cfg(feature = "native-device-probe")]
+pub mod pressure;
 mod proxy;
 mod reaper;
+mod state;
 #[cfg(target_os = "macos")]
 mod timesync;
 mod tsi_dgram;
 mod tsi_stream;
 mod unix_proxy;
+mod worker_control;
 
 #[cfg(target_os = "windows")]
 mod windows;
@@ -171,6 +175,8 @@ pub enum VsockError {
     HdrDescTooSmall(u32),
     /// The vsock header `len` field holds an invalid value.
     InvalidPktLen(u32),
+    InvalidDescriptorChain,
+    LockPoisoned,
     /// A data fetch was attempted when no data was available.
     NoData,
     /// A data buffer was expected for the provided packet, but it is missing.

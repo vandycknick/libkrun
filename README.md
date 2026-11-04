@@ -267,18 +267,27 @@ do not prevent cold boot or change its existing userspace-GIC fallback.
 prerequisite reducer: it refuses unknown facts, missing symbols, userspace
 GICs, nested profiles and incomplete providers. Even
 `HvfGicAdmission::PrerequisitesAvailable` grants no live operation or host
-qualification. Providers remain incomplete through Phase 8.
+qualification. Provider completeness remains a per-VM admission predicate,
+independent of whether the native pause primitive is implemented.
 Actual macOS compile/link/optional-import checks and older-host cold boot
 remain unverified, owner Phase 25 (`pending-lane:hvf`).
 No query creates a VM/vCPU/GIC, installs signals, allocates guest RAM,
 executes guest code, or performs capture/restore/reclaim probes.
 
 `NativeLiveOperations` has `pause`, `capture`, `restore`, `fork` and
-`incremental`, each `NativeOperationSupport`. Every returned value is
-`Unsupported(reason)`, with `BuildExcluded`,
-`DeviceProvidersNotImplemented`, or `NotImplemented` as appropriate.
-API presence, a clean source revision and accessible host APIs grant no
-native operation and no public Silo operation.
+`incremental`, each `NativeOperationSupport`. For the recognized
+`KvmX86_64`, `KvmArm64GicV3` and `HvfArm64GicV3` lanes, `pause` is
+`Supported`: the native whole-machine pause primitive is implemented.
+The other four operations remain `Unsupported(NotImplemented)`.
+The `Unsupported` lane returns `Unsupported(BuildExcluded)` for all five
+operations, including diagnostic probe builds excluded by lane selection.
+Native support describes implementation, not host/VM admission, runtime
+qualification or delivery of public Silo live operations. Pause still requires
+the actual host APIs, admitted execution/controller profile and complete
+providers for every attached device. KVM arm64 and HVF runtime qualification
+remain pending; public qualification remains false and all public Silo live
+operations remain not delivered. API presence, a clean source revision and
+accessible host APIs alone grant neither VM admission nor public operations.
 
 Run the standalone query explicitly (not as a Cargo test):
 
@@ -301,10 +310,12 @@ tests construct real VMs.
 
 ### Internal device/callback quiescence contracts
 
-The transport/provider contracts are internal Rust APIs, not delivered live
-operations. Real devices still refuse quiescence unless they explicitly supply
-`VirtioStateProvider`; an inactive device or an empty queue is not a provider.
-No native or public live-operation bit is enabled by these contracts.
+The transport/provider contracts are internal Rust APIs supporting the native
+pause primitive, not delivered public live operations. Real devices still
+refuse quiescence unless they explicitly supply `VirtioStateProvider`; an
+inactive device or an empty queue is not a provider. These contracts alone
+grant neither per-VM admission nor native lane qualification, and enable no
+public live-operation bit.
 
 All participants use `polly::event_manager::BarrierRequest { key, deadline }`,
 where `BarrierKey { operation: OperationId, generation: BarrierGeneration }`
@@ -391,6 +402,38 @@ TSI for AF_INET and AF_INET6 is automatically enabled when no network interface 
 - It's limited to SOCK_DGRAM and SOCK_STREAM sockets and AF_INET, AF_INET6 and AF_UNIX address families (for instance, raw sockets aren't supported).
 - Listening on SOCK_DGRAM sockets from the guest is not supported.
 - When TSI is enabled for AF_UNIX sockets, only absolute path are supported as addresses.
+
+#### Native mux state provider
+
+The native Silo Unix control mux has an internal state provider, separate from
+TSI. Its reversible source barrier parks the actual mux, deferred reaper and
+macOS timesync owners and retains their thread handles, sessions, credits,
+partial SCM_RIGHTS frames and original operation deadlines. RX, TX and the
+event queue transfer to transport escrow exactly once. Protocol-failure
+`ControlHandle::fence` is destructive and is not this barrier.
+
+Frontend and worker pollers independently own their descriptors to the same
+polling instance. `Epoll::try_clone` performs fallible descriptor duplication
+before worker startup; dropping either owner cannot close the other's descriptor
+or an unrelated descriptor subsequently reused by the process.
+
+Restore requires a fresh constructor-supplied control endpoint and listener
+bindings, plus `Vsock::bind_restore_control_service` with the trusted guest
+agent service port. The device payload contains no host path or descriptor.
+Prepared installation starts no worker, scans no queue and writes no guest
+memory. At release it discards old queued TX, retains a real pending
+`VIRTIO_VSOCK_EVENT_TRANSPORT_RESET` until an event buffer can receive it, and
+admits only the bound agent control service after reset delivery. Other
+sessions remain fenced until the generation-correlated activation release.
+Source cancellation instead resumes the same owners and resources without a
+virtio reset. TSI and other non-native-mux profiles remain explicitly refused.
+
+Hypervisor-free `provider_vsock_` regressions exercise actual queues and Unix
+SCM_RIGHTS streams. They do not qualify a runtime lane. Busy guest traffic,
+credit exhaustion, deferred expiry, reset/reconnect, fresh-process restore and
+shared native IRQ delivery still require the production device gates; macOS
+timesync execution remains pending its actual host lane.
+
 
 ### **virtio-net + passt/gvproxy**
 

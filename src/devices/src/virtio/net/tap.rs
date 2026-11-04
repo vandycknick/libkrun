@@ -13,7 +13,7 @@ use virtio_bindings::virtio_net::{
     VIRTIO_NET_F_GUEST_UFO,
 };
 
-use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
+use crate::virtio::net::backend::{ConnectError, NetBackend, ReadError, WriteError};
 
 ioctl_write_ptr!(tunsetiff, b'T', 202, c_int);
 ioctl_write_int!(tunsetoffload, b'T', 208);
@@ -72,17 +72,12 @@ impl Tap {
             }
         }
 
-        match fcntl(&fd, FcntlArg::F_GETFL) {
-            Ok(flags) => {
-                if let Err(e) = fcntl(
-                    &fd,
-                    FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
-                ) {
-                    warn!("error switching to non-blocking: id={fd:?}, err={e}");
-                }
-            }
-            Err(e) => error!("couldn't obtain fd flags id={fd:?}, err={e}"),
-        };
+        let flags = fcntl(&fd, FcntlArg::F_GETFL).map_err(ConnectError::Configure)?;
+        fcntl(
+            &fd,
+            FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK),
+        )
+        .map_err(ConnectError::Configure)?;
 
         Ok(Self { fd })
     }
@@ -108,7 +103,12 @@ impl NetBackend for Tap {
 
     /// Try to write a frame to the tap device.
     fn write_frame(&mut self, _hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
-        let ret = write(&self.fd, buf).map_err(WriteError::Internal)?;
+        let ret = match write(&self.fd, buf) {
+            Ok(count) if count == buf.len() => count,
+            Ok(_) => return Err(WriteError::Internal(nix::Error::EIO)),
+            Err(nix::Error::EAGAIN) => return Err(WriteError::NothingWritten),
+            Err(error) => return Err(WriteError::Internal(error)),
+        };
         debug!("Written frame size={}, written={}", buf.len(), ret);
         Ok(())
     }
@@ -124,5 +124,58 @@ impl NetBackend for Tap {
 
     fn raw_socket_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::virtio::net::backend::{NetBackend, WriteError};
+    use crate::virtio::net::tap::Tap;
+    use std::os::unix::net::UnixDatagram;
+
+    #[test]
+    fn net_provider_tap_nonblocking_write_backpressure_has_no_effect() {
+        let (socket, peer) = UnixDatagram::pair().expect("real packet socket");
+        socket
+            .set_nonblocking(true)
+            .expect("TAP nonblocking contract");
+        peer.set_nonblocking(true).expect("nonblocking observation");
+        let mut backend = Tap { fd: socket.into() };
+        let mut frame = [0x33; 1024];
+        let mut accepted = 0;
+        loop {
+            match backend.write_frame(0, &mut frame) {
+                Ok(()) => {
+                    accepted += 1;
+                    assert!(accepted < 10000, "real socket must reach backpressure");
+                }
+                Err(WriteError::NothingWritten) => break,
+                Err(error) => panic!("legitimate TAP backpressure became terminal: {error:?}"),
+            }
+        }
+        assert!(matches!(
+            backend.write_frame(0, &mut frame),
+            Err(WriteError::NothingWritten)
+        ));
+        let mut received = [0; 2048];
+        for _ in 0..accepted {
+            assert_eq!(
+                peer.recv(&mut received).expect("accepted packet"),
+                frame.len()
+            );
+            assert_eq!(&received[..frame.len()], &frame);
+        }
+        assert_eq!(
+            peer.recv(&mut received)
+                .expect_err("no effect from refused packet")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let mut retry = [0x55; 17];
+        backend
+            .write_frame(0, &mut retry)
+            .expect("retry after writable");
+        assert_eq!(peer.recv(&mut received).expect("one retry"), retry.len());
+        assert_eq!(&received[..retry.len()], &retry);
     }
 }

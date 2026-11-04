@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use crate::virtio::Queue;
+use crate::virtio::descriptor_utils::DescriptorChainSnapshot;
+use crate::virtio::queue::VIRTQ_DESC_F_WRITE;
+use crate::virtio::vsock::worker_control::WorkerControl;
 /// `VsockPacket` provides a thin wrapper over the buffers exchanged via virtio queues.
 /// There are two components to a vsock packet, each using its own descriptor in a
 /// virtio queue:
@@ -20,8 +24,10 @@ use std::ffi::CStr;
 use std::net::{Ipv4Addr, SocketAddrV4};
 #[cfg(target_os = "macos")]
 use std::net::{Ipv6Addr, SocketAddrV6};
+use std::ops::{Deref, DerefMut};
 use std::os::raw::c_char;
 use std::result;
+use std::sync::Arc;
 
 #[cfg(windows)]
 use crate::virtio::vsock::windows::sockaddr_storage::SockaddrStorage;
@@ -187,15 +193,69 @@ pub struct TsiReleaseReq {
     pub local_port: u32,
 }
 
+pub(crate) struct PacketQueue {
+    pub queue: Queue,
+    pub snapshot: DescriptorChainSnapshot,
+    admission: Option<Arc<WorkerControl>>,
+}
+
+impl PacketQueue {
+    pub fn from_queue(queue: Queue) -> Self {
+        let snapshot = DescriptorChainSnapshot::new(queue.get_max_size());
+        Self {
+            queue,
+            snapshot,
+            admission: None,
+        }
+    }
+
+    pub fn bind_admission(&mut self, control: Arc<WorkerControl>) {
+        self.admission = Some(control);
+    }
+
+    pub fn pop<'m>(&mut self, memory: &'m RuntimeGuestMemory) -> Option<DescriptorChain<'m>> {
+        let queue = &mut self.queue;
+        match &self.admission {
+            Some(control) => control.admit(|| queue.pop(memory)).flatten(),
+            None => queue.pop(memory),
+        }
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    pub fn record_counter(&self, counter: crate::virtio::vsock::worker_control::WorkerCounter) {
+        if let Some(control) = &self.admission {
+            control.record(counter);
+        }
+    }
+}
+
+impl Deref for PacketQueue {
+    type Target = Queue;
+    fn deref(&self) -> &Queue {
+        &self.queue
+    }
+}
+
+impl DerefMut for PacketQueue {
+    fn deref_mut(&mut self) -> &mut Queue {
+        &mut self.queue
+    }
+}
+
+enum PacketHeader {
+    Captured([u8; VSOCK_PKT_HDR_SIZE]),
+    Guest(LeasedHostAddress),
+}
+
 /// The vsock packet, implemented as a wrapper over a virtq descriptor chain:
 /// - the chain head, holding the packet header; and
 /// - (an optional) data/buffer descriptor, only present for data packets (VSOCK_OP_RW).
-pub struct VsockPacket {
-    hdr: *mut u8,
+pub struct VsockPacket<'a> {
+    header: PacketHeader,
     buf: Option<*mut u8>,
     buf_size: usize,
-    owned_buf: Option<Vec<u8>>,
-    leases: Vec<LeasedHostAddress>,
+    owned_buf: Option<&'a mut [u8]>,
+    _buffer_lease: Option<LeasedHostAddress>,
 }
 
 fn get_host_address(
@@ -206,200 +266,165 @@ fn get_host_address(
     mem.get_host_address(guest_addr, size)
 }
 
-impl VsockPacket {
-    /// Create the packet wrapper from a TX virtq chain head.
-    ///
-    /// The chain head is expected to hold valid packet header data. A following packet buffer
-    /// descriptor can optionally end the chain. Bounds and pointer checks are performed when
-    /// creating the wrapper.
-    pub fn from_tx_virtq_head(head: &DescriptorChain) -> Result<Self> {
-        // All buffers in the TX queue must be readable.
-        //
-        if head.is_write_only() {
+impl<'a> VsockPacket<'a> {
+    pub(crate) fn from_tx_virtq_head(
+        head: &DescriptorChain,
+        snapshot: &mut DescriptorChainSnapshot,
+        scratch: Option<&'a mut [u8]>,
+    ) -> Result<Self> {
+        let chain = snapshot
+            .read(head.clone())
+            .map_err(|_| VsockError::InvalidDescriptorChain)?;
+        let descriptors = chain.descriptors();
+        if descriptors
+            .iter()
+            .any(|descriptor| descriptor.flags & VIRTQ_DESC_F_WRITE != 0)
+        {
             return Err(VsockError::UnreadableDescriptor);
         }
-
-        // The packet header should fit inside the head descriptor.
-        if head.len < VSOCK_PKT_HDR_SIZE as u32 {
-            return Err(VsockError::HdrDescTooSmall(head.len));
+        let header = descriptors.first().ok_or(VsockError::BufDescMissing)?;
+        if header.len < VSOCK_PKT_HDR_SIZE as u32 {
+            return Err(VsockError::HdrDescTooSmall(header.len));
         }
-
-        let header = get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
+        let mut captured = [0u8; VSOCK_PKT_HDR_SIZE];
+        head.mem
+            .read_slice(&mut captured, GuestAddress(header.addr))
             .map_err(VsockError::GuestMemoryMmap)?;
-        let mut pkt = Self {
-            hdr: header.as_ptr(),
+        let mut packet = Self {
+            header: PacketHeader::Captured(captured),
             buf: None,
             buf_size: 0,
             owned_buf: None,
-            leases: vec![header],
+            _buffer_lease: None,
         };
-        let pkt_len = pkt.len();
-
-        // No point looking for a data/buffer descriptor, if the packet is zero-lengthed.
-        if pkt_len == 0 {
-            return Ok(pkt);
+        let length = packet.len() as usize;
+        if length > defs::MAX_PKT_BUF_SIZE {
+            return Err(VsockError::InvalidPktLen(packet.len()));
         }
-
-        // Reject weirdly-sized packets.
-        //
-        if pkt_len > defs::MAX_PKT_BUF_SIZE as u32 {
-            return Err(VsockError::InvalidPktLen(pkt_len));
+        if length == 0 {
+            return Ok(packet);
         }
-
-        let head_data_size = head.len as usize - VSOCK_PKT_HDR_SIZE;
-
-        // Single combined descriptor: header + data with no next descriptor.
-        if !head.has_next() {
-            if head_data_size == 0 {
-                return Err(VsockError::BufDescMissing);
-            }
-            let buf_addr = head
-                .addr
-                .checked_add(VSOCK_PKT_HDR_SIZE as u64)
-                .ok_or(VsockError::GuestMemoryBounds)?;
-            pkt.buf_size = head_data_size;
-            let buffer = get_host_address(head.mem, buf_addr, pkt.buf_size)
-                .map_err(VsockError::GuestMemoryMmap)?;
-            pkt.buf = Some(buffer.as_ptr());
-            pkt.leases.push(buffer);
-            if pkt.buf_size < pkt_len as usize {
-                return Err(VsockError::BufDescTooSmall);
-            }
-            return Ok(pkt);
+        let inline = header.len as usize - VSOCK_PKT_HDR_SIZE;
+        let direct = if descriptors.len() == 1 && inline >= length {
+            Some(
+                GuestAddress(header.addr)
+                    .checked_add(VSOCK_PKT_HDR_SIZE as u64)
+                    .ok_or(VsockError::GuestMemoryBounds)?,
+            )
+        } else if descriptors.len() == 2 && inline == 0 && descriptors[1].len as usize >= length {
+            Some(GuestAddress(descriptors[1].addr))
+        } else {
+            None
+        };
+        if let Some(address) = direct {
+            let lease =
+                get_host_address(head.mem, address, length).map_err(VsockError::GuestMemoryMmap)?;
+            packet.buf = Some(lease.as_ptr());
+            packet.buf_size = length;
+            packet._buffer_lease = Some(lease);
+            return Ok(packet);
         }
-
-        let buf_desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
-        if buf_desc.is_write_only() {
-            return Err(VsockError::UnreadableDescriptor);
-        }
-
-        // Classic two-descriptor case: header in first, all data in second. Zero-copy.
-        if head_data_size == 0 && !buf_desc.has_next() {
-            if buf_desc.len < pkt_len {
-                return Err(VsockError::BufDescTooSmall);
-            }
-            pkt.buf_size = buf_desc.len as usize;
-            let buffer = get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
-                .map_err(VsockError::GuestMemoryMmap)?;
-            pkt.buf = Some(buffer.as_ptr());
-            pkt.leases.push(buffer);
-            return Ok(pkt);
-        }
-
-        // Multiple data regions: inline data after header and/or multiple data descriptors.
-        // Copy into a contiguous owned buffer.
-        let mut owned_buf: Vec<u8> = Vec::with_capacity(pkt_len as usize);
-
-        if head_data_size > 0 {
-            let buf_addr = head
-                .addr
-                .checked_add(VSOCK_PKT_HDR_SIZE as u64)
-                .ok_or(VsockError::GuestMemoryBounds)?;
-            let src = get_host_address(head.mem, buf_addr, head_data_size)
-                .map_err(VsockError::GuestMemoryMmap)?;
-            owned_buf.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(src.as_ptr() as *const u8, head_data_size)
-            });
-        }
-
-        // First data descriptor (already validated as readable above).
-        if buf_desc.len > 0 {
-            let src = get_host_address(buf_desc.mem, buf_desc.addr, buf_desc.len as usize)
-                .map_err(VsockError::GuestMemoryMmap)?;
-            owned_buf.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(src.as_ptr() as *const u8, buf_desc.len as usize)
-            });
-        }
-
-        let mut next = buf_desc.next_descriptor();
-        while let Some(desc) = next {
-            if desc.is_write_only() {
-                return Err(VsockError::UnreadableDescriptor);
-            }
-            if desc.len > 0 {
-                let src = get_host_address(desc.mem, desc.addr, desc.len as usize)
+        let buffer = scratch
+            .and_then(|buffer| buffer.get_mut(..length))
+            .ok_or(VsockError::BufDescTooSmall)?;
+        let mut written = 0;
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            let skip = if index == 0 { VSOCK_PKT_HDR_SIZE } else { 0 };
+            let count = (descriptor.len as usize - skip).min(length - written);
+            if count != 0 {
+                let address = GuestAddress(descriptor.addr)
+                    .checked_add(skip as u64)
+                    .ok_or(VsockError::GuestMemoryBounds)?;
+                head.mem
+                    .read_slice(&mut buffer[written..written + count], address)
                     .map_err(VsockError::GuestMemoryMmap)?;
-                owned_buf.extend_from_slice(unsafe {
-                    std::slice::from_raw_parts(src.as_ptr() as *const u8, desc.len as usize)
-                });
+                written += count;
             }
-            next = desc.next_descriptor();
+            if written == length {
+                break;
+            }
         }
-
-        if owned_buf.len() < (pkt_len as usize) {
+        if written != length {
             return Err(VsockError::BufDescTooSmall);
         }
-
-        pkt.buf_size = owned_buf.len();
-        pkt.owned_buf = Some(owned_buf);
-
-        Ok(pkt)
+        packet.buf_size = length;
+        packet.owned_buf = Some(buffer);
+        Ok(packet)
     }
 
-    /// Create the packet wrapper from an RX virtq chain head.
-    ///
-    /// There must be two descriptors in the chain, both writable: a header descriptor and a data
-    /// descriptor. Bounds and pointer checks are performed when creating the wrapper.
-    pub fn from_rx_virtq_head(head: &DescriptorChain) -> Result<Self> {
-        // All RX buffers must be writable.
-        //
-        if !head.is_write_only() {
+    pub(crate) fn from_rx_virtq_head(
+        head: &DescriptorChain,
+        snapshot: &mut DescriptorChainSnapshot,
+    ) -> Result<Self> {
+        let chain = snapshot
+            .read(head.clone())
+            .map_err(|_| VsockError::InvalidDescriptorChain)?;
+        let descriptors = chain.descriptors();
+        if descriptors
+            .iter()
+            .any(|descriptor| descriptor.flags & VIRTQ_DESC_F_WRITE == 0)
+        {
             return Err(VsockError::UnwritableDescriptor);
         }
-
-        // The packet header should fit inside the head descriptor.
-        if head.len < VSOCK_PKT_HDR_SIZE as u32 {
-            return Err(VsockError::HdrDescTooSmall(head.len));
+        let first = descriptors.first().ok_or(VsockError::BufDescMissing)?;
+        if first.len < VSOCK_PKT_HDR_SIZE as u32 {
+            return Err(VsockError::HdrDescTooSmall(first.len));
         }
-
-        let header = get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
+        let header = get_host_address(head.mem, GuestAddress(first.addr), VSOCK_PKT_HDR_SIZE)
             .map_err(VsockError::GuestMemoryMmap)?;
-        let mut pkt = Self {
-            hdr: header.as_ptr(),
+        let mut packet = Self {
+            header: PacketHeader::Guest(header),
             buf: None,
             buf_size: 0,
             owned_buf: None,
-            leases: vec![header],
+            _buffer_lease: None,
         };
-
-        // Starting from Linux 6.2 the virtio-vsock driver can use a single descriptor for both
-        // header and data.
-        if !head.has_next() && head.len > VSOCK_PKT_HDR_SIZE as u32 {
-            let buf_addr = head
-                .addr
-                .checked_add(VSOCK_PKT_HDR_SIZE as u64)
-                .ok_or(VsockError::GuestMemoryBounds)?;
-
-            pkt.buf_size = head.len as usize - VSOCK_PKT_HDR_SIZE;
-            let buffer = get_host_address(head.mem, buf_addr, pkt.buf_size)
-                .map_err(VsockError::GuestMemoryMmap)?;
-            pkt.buf = Some(buffer.as_ptr());
-            pkt.leases.push(buffer);
+        let inline = first.len as usize - VSOCK_PKT_HDR_SIZE;
+        let body = if inline != 0 {
+            Some((
+                GuestAddress(first.addr)
+                    .checked_add(VSOCK_PKT_HDR_SIZE as u64)
+                    .ok_or(VsockError::GuestMemoryBounds)?,
+                inline,
+            ))
         } else {
-            let buf_desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
-
-            pkt.buf_size = buf_desc.len as usize;
-            let buffer = get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
+            descriptors[1..]
+                .iter()
+                .find(|descriptor| descriptor.len != 0)
+                .map(|descriptor| (GuestAddress(descriptor.addr), descriptor.len as usize))
+        };
+        if let Some((address, capacity)) = body {
+            packet.buf_size = capacity.min(defs::MAX_PKT_BUF_SIZE);
+            let lease = get_host_address(head.mem, address, packet.buf_size)
                 .map_err(VsockError::GuestMemoryMmap)?;
-            pkt.buf = Some(buffer.as_ptr());
-            pkt.leases.push(buffer);
+            packet.buf = Some(lease.as_ptr());
+            packet._buffer_lease = Some(lease);
+        } else if descriptors.len() > 1 {
+            // An explicit zero-length body remains present without leasing its
+            // arbitrary guest address; a header-only control packet has none.
+            packet.buf = Some(std::ptr::NonNull::<u8>::dangling().as_ptr());
         }
-
-        Ok(pkt)
+        Ok(packet)
     }
 
     /// Provides in-place, byte-slice, access to the vsock packet header.
     pub fn hdr(&self) -> &[u8] {
-        // This is safe since bound checks have already been performed when creating the packet
-        // from the virtq descriptor.
-        unsafe { std::slice::from_raw_parts(self.hdr as *const u8, VSOCK_PKT_HDR_SIZE) }
+        match &self.header {
+            PacketHeader::Captured(header) => header,
+            PacketHeader::Guest(header) => unsafe {
+                std::slice::from_raw_parts(header.as_ptr(), VSOCK_PKT_HDR_SIZE)
+            },
+        }
     }
 
     /// Provides in-place, byte-slice, mutable access to the vsock packet header.
     pub fn hdr_mut(&mut self) -> &mut [u8] {
-        // This is safe since bound checks have already been performed when creating the packet
-        // from the virtq descriptor.
-        unsafe { std::slice::from_raw_parts_mut(self.hdr, VSOCK_PKT_HDR_SIZE) }
+        match &mut self.header {
+            PacketHeader::Captured(header) => header,
+            PacketHeader::Guest(header) => unsafe {
+                std::slice::from_raw_parts_mut(header.as_ptr(), VSOCK_PKT_HDR_SIZE)
+            },
+        }
     }
 
     /// Provides in-place, byte-slice access to the vsock packet data buffer.
@@ -411,7 +436,7 @@ impl VsockPacket {
     ///            is stored in the packet header, and accessible via `VsockPacket::len()`.
     pub fn buf(&self) -> Option<&[u8]> {
         if let Some(ref owned) = self.owned_buf {
-            Some(owned.as_slice())
+            Some(owned)
         } else {
             self.buf.map(|ptr| {
                 // This is safe since bound checks have already been performed when creating the
@@ -430,7 +455,7 @@ impl VsockPacket {
     ///            is stored in the packet header, and accessible via `VsockPacket::len()`.
     pub fn buf_mut(&mut self) -> Option<&mut [u8]> {
         if let Some(ref mut owned) = self.owned_buf {
-            Some(owned.as_mut_slice())
+            Some(owned)
         } else {
             self.buf.map(|ptr| {
                 // This is safe since bound checks have already been performed when creating the
@@ -796,5 +821,95 @@ impl VsockPacket {
         {
             byte_order::write_le_u64(&mut buf[0..], time);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vm_memory::GuestAddress;
+
+    use crate::virtio::descriptor_utils::DescriptorChainSnapshot;
+    use crate::virtio::queue::tests::VirtQueue;
+    use crate::virtio::vsock::packet::{VSOCK_PKT_HDR_SIZE, VsockPacket};
+    use crate::virtio::{DescriptorChain, RuntimeGuestMemory};
+
+    #[test]
+    fn provider_vsock_packet_full_tail_rejects_ttl_and_direction_before_dma() {
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0), &memory, 8);
+        ring.dtable[0].set(0x4000, VSOCK_PKT_HDR_SIZE as u32, 3, 1);
+        ring.dtable[1].set(0x5000, 8, 3, 1);
+        memory
+            .write_slice(&[0x5a; VSOCK_PKT_HDR_SIZE], GuestAddress(0x4000))
+            .unwrap();
+        let mut snapshot = DescriptorChainSnapshot::new(8);
+        let head = DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 0).unwrap();
+        assert!(VsockPacket::from_rx_virtq_head(&head, &mut snapshot).is_err());
+        let mut header = [0u8; VSOCK_PKT_HDR_SIZE];
+        memory
+            .read_slice(&mut header, GuestAddress(0x4000))
+            .unwrap();
+        assert_eq!(header, [0x5a; VSOCK_PKT_HDR_SIZE]);
+        ring.dtable[1].set(0x5000, 8, 1, 2);
+        ring.dtable[2].set(0x6000, 8, 2, 0);
+        assert!(VsockPacket::from_rx_virtq_head(&head, &mut snapshot).is_err());
+        ring.dtable[1].set(0x5000, 8, 2, 0);
+        assert!(VsockPacket::from_rx_virtq_head(&head, &mut snapshot).is_ok());
+    }
+
+    #[test]
+    fn provider_vsock_packet_tx_metadata_is_frozen_and_scatter_copy_is_bounded() {
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0), &memory, 8);
+        ring.dtable[0].set(0x4000, VSOCK_PKT_HDR_SIZE as u32, 1, 1);
+        ring.dtable[1].set(0x5000, 3, 1, 2);
+        ring.dtable[2].set(0x6000, 128, 0, 0);
+        memory.write_obj(4u32, GuestAddress(0x4018)).unwrap();
+        memory.write_obj(1027u32, GuestAddress(0x4014)).unwrap();
+        memory.write_slice(b"abc", GuestAddress(0x5000)).unwrap();
+        memory.write_slice(b"defgh", GuestAddress(0x6000)).unwrap();
+        let head = DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 0).unwrap();
+        let mut snapshot = DescriptorChainSnapshot::new(8);
+        let mut scratch = [0xa5; 64];
+        let packet =
+            VsockPacket::from_tx_virtq_head(&head, &mut snapshot, Some(&mut scratch)).unwrap();
+        memory.write_obj(42u32, GuestAddress(0x4014)).unwrap();
+        assert_eq!(packet.dst_port(), 1027);
+        assert_eq!(packet.buf().unwrap(), b"abcd");
+        drop(packet);
+        assert_eq!(scratch[4..], [0xa5; 60]);
+    }
+
+    #[test]
+    fn provider_vsock_packet_zero_length_tx_still_validates_complete_tail() {
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0), &memory, 8);
+        ring.dtable[0].set(0x4000, VSOCK_PKT_HDR_SIZE as u32, 1, 1);
+        ring.dtable[1].set(0x5000, 8, 1, 1);
+        let head = DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 0).unwrap();
+        let mut snapshot = DescriptorChainSnapshot::new(8);
+        assert!(VsockPacket::from_tx_virtq_head(&head, &mut snapshot, None).is_err());
+    }
+
+    #[test]
+    fn provider_vsock_packet_admission_closes_between_real_owned_heads() {
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0), &memory, 8);
+        ring.dtable[0].set(0x4000, 44, 2, 0);
+        ring.dtable[1].set(0x5000, 44, 2, 0);
+        ring.avail.ring[0].set(0);
+        ring.avail.ring[1].set(1);
+        ring.avail.idx.set(2);
+        let control = crate::virtio::vsock::worker_control::WorkerControl::new().unwrap();
+        let mut queue = crate::virtio::vsock::packet::PacketQueue::from_queue(ring.create_queue());
+        queue.bind_admission(control.clone());
+        let first = queue.pop(&memory).unwrap();
+        control.pause().unwrap();
+        assert!(queue.pop(&memory).is_none());
+        queue.add_used(&memory, first.index, 0).unwrap();
+        assert_eq!(queue.capture_state().unwrap().next_avail, 1);
+        assert_eq!(queue.capture_state().unwrap().next_used, 1);
+        control.resume().unwrap();
+        assert_eq!(queue.pop(&memory).unwrap().index, 1);
     }
 }

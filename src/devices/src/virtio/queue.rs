@@ -574,6 +574,9 @@ impl Queue {
     /// Returns the number of yet-to-be-popped descriptor chains in the avail ring.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self, mem: &RuntimeGuestMemory) -> u16 {
+        if !self.ready {
+            return 0;
+        }
         self.avail_idx(mem, Ordering::Acquire)
             .map_or(0, |index| (index - self.next_avail).0)
     }
@@ -585,7 +588,7 @@ impl Queue {
 
     /// Pop the first available descriptor chain from the avail ring.
     pub fn pop<'b>(&mut self, mem: &'b RuntimeGuestMemory) -> Option<DescriptorChain<'b>> {
-        if self.admission.is_some() || self.actual_size() == 0 {
+        if !self.ready || self.admission.is_some() || self.actual_size() == 0 {
             return None;
         }
         let available = match self.avail_idx(mem, Ordering::Acquire) {
@@ -847,6 +850,9 @@ impl Queue {
     //     }
     // }
     pub fn enable_notification(&mut self, mem: &RuntimeGuestMemory) -> Result<bool, Error> {
+        if !self.ready {
+            return Ok(false);
+        }
         self.set_notification(mem, true)?;
         // Ensures the following read is not reordered before any previous write operation.
         fence(Ordering::SeqCst);
@@ -861,11 +867,29 @@ impl Queue {
             .map(|idx| idx != self.next_avail)
     }
 
+    pub(crate) fn arm_available_notification(
+        &mut self,
+        mem: &RuntimeGuestMemory,
+        index: u16,
+    ) -> Result<(), Error> {
+        if self.event_idx_enabled {
+            self.set_avail_event(mem, index, Ordering::Release)
+        } else {
+            self.set_used_flags(mem, 0, Ordering::Release)
+        }
+    }
+
     pub fn disable_notification(&mut self, mem: &RuntimeGuestMemory) -> Result<(), Error> {
+        if !self.ready {
+            return Ok(());
+        }
         self.set_notification(mem, false)
     }
 
     pub fn needs_notification(&mut self, mem: &RuntimeGuestMemory) -> Result<bool, Error> {
+        if !self.ready {
+            return Ok(false);
+        }
         let used_idx = self.next_used;
 
         // Complete all the writes in add_used() before reading the event.
@@ -907,7 +931,11 @@ impl Queue {
     /// Fetch the available ring index (`virtq_avail->idx`) from guest memory.
     /// This is written by the driver, to indicate the next slot that will be filled in the avail
     /// ring.
-    fn avail_idx(&self, mem: &RuntimeGuestMemory, order: Ordering) -> Result<Wrapping<u16>, Error> {
+    pub(crate) fn avail_idx(
+        &self,
+        mem: &RuntimeGuestMemory,
+        order: Ordering,
+    ) -> Result<Wrapping<u16>, Error> {
         let addr = self
             .avail_ring
             .checked_add(2)
@@ -1486,5 +1514,27 @@ pub(crate) mod tests {
         assert_eq!(queue.next_used.0, 1);
         assert!(queue.owned[0].is_some());
         assert!(queue.capture_state().is_err());
+    }
+
+    #[test]
+    fn lifecycle_queue_unready_partial_geometry_has_no_acquisition_or_notification_effects() {
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let mut queue = Queue::new(8);
+        let mut saved = queue.capture_state().unwrap();
+        saved.size = 3;
+        saved.desc_table = u64::MAX;
+        saved.avail_ring = u64::MAX;
+        saved.used_ring = u64::MAX;
+        saved.next_avail = u16::MAX;
+        saved.next_used = u16::MAX;
+        saved.num_added = 7;
+        queue.validate_state(&memory, &saved).unwrap();
+        queue.apply_state(&saved);
+        assert_eq!(queue.len(&memory), 0);
+        assert!(queue.pop(&memory).is_none());
+        assert!(!queue.enable_notification(&memory).unwrap());
+        queue.disable_notification(&memory).unwrap();
+        assert!(!queue.needs_notification(&memory).unwrap());
+        assert_eq!(queue.capture_state().unwrap(), saved);
     }
 }

@@ -1369,6 +1369,24 @@ impl NetDevice {
         )
     }
 
+    /// Binds a connected datagram endpoint whose reservation is owned by the
+    /// caller's managed network service, including its activation ingress fence.
+    pub fn new_managed_unixgram_fd(
+        id: &str,
+        fd: OwnedFd,
+        mac: &[u8],
+        features: u32,
+        flags: NetFlags,
+    ) -> Result<Self, VmmError> {
+        let _ = flags;
+        let mac: [u8; 6] = mac.try_into().map_err(|_| VmmError::InvalidParam())?;
+        let net = devices::virtio::Net::new_managed(id.to_string(), fd, mac, features)
+            .map_err(|error| VmmError::Internal(format!("net: {error:?}")))?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(net)),
+        })
+    }
+
     /// Create a net device backed by a Unix stream socket path.
     pub fn new_unixstream_path(
         id: &str,

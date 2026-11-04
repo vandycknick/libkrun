@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import signal
 import subprocess
 import time
 
@@ -45,22 +46,53 @@ def save(path: Path, value: object) -> None:
         output.write("\n")
 
 
-def invoke(command: list[str], evidence: Path, name: str) -> dict:
+def invoke(command: list[str], evidence: Path, name: str, *, timeout: float) -> dict:
     started = time.monotonic_ns()
     with (evidence / f"{name}.stdout").open("xb") as stdout, (evidence / f"{name}.stderr").open("xb") as stderr:
         os.chmod(stdout.name, 0o600)
         os.chmod(stderr.name, 0o600)
-        process = subprocess.Popen(command, stdout=stdout, stderr=stderr)
+        process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
         try:
-            status = process.wait(timeout=120)
+            status = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+            cleanup = {"process_group": process.pid, "grace_seconds": 120,
+                       "forced_reap_seconds": 10, "controller_exited_during_grace": False,
+                       "group_kill_sent": False, "controller_reaped": False, "errors": []}
+            try:
+                os.kill(process.pid, signal.SIGINT)
+                deadline = time.monotonic() + cleanup["grace_seconds"]
+                # WNOWAIT reserves the session leader's PID/PGID until the final
+                # group signal. Popen.poll/wait here could reap and release it.
+                while os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(.05, remaining))
+                else:
+                    cleanup["controller_exited_during_grace"] = True
+            except OSError as error:
+                cleanup["errors"].append(f"controller interruption: {error}")
+            try:
+                # Native and netd children inherit this dedicated group. Signal
+                # survivors even when the controller already finished unwinding.
+                os.killpg(process.pid, signal.SIGKILL)
+                cleanup["group_kill_sent"] = True
+            except ProcessLookupError:
+                cleanup["group_absent_before_kill"] = True
+            except OSError as error:
+                cleanup["errors"].append(f"owned group kill: {error}")
+            try:
+                cleanup["controller_exit_status"] = process.wait(timeout=cleanup["forced_reap_seconds"])
+                cleanup["controller_reaped"] = True
+            except (OSError, subprocess.TimeoutExpired) as error:
+                cleanup["errors"].append(f"controller reap: {error}")
             save(evidence / f"{name}.invocation.json", {"command": command, "pid": process.pid, "timeout": True,
-                "native_cleanup_acknowledged": False, "duration_ns": time.monotonic_ns() - started})
+                "native_cleanup_acknowledged": False, "duration_ns": time.monotonic_ns() - started,
+                "timeout_seconds": timeout, "cleanup": cleanup})
             raise RuntimeError(f"{name}: process timeout, NOT a successful native cleanup") from None
     save(evidence / f"{name}.invocation.json", {"command": command, "pid": process.pid, "exit_status": status,
-        "started_monotonic_ns": started, "duration_ns": time.monotonic_ns() - started})
+        "started_monotonic_ns": started, "duration_ns": time.monotonic_ns() - started,
+        "timeout_seconds": timeout})
     if status:
         raise RuntimeError(f"{name}: native process exited {status}; retain {evidence}")
     if (evidence / f"{name}.stdout").stat().st_size > 16 * 1024 * 1024:
@@ -84,7 +116,7 @@ def production_extension(driver: Path, evidence: Path, kernel: Path, linux_fixtu
     """
     command = [str(driver), "--evidence", str(evidence / "production"), "--kernel", str(kernel),
                "--register-fixture", str(linux_fixture), "--execution-completeness", "--busy-devices"]
-    result = invoke(command, evidence, "production-driver")
+    result = invoke(command, evidence, "production-driver", timeout=600)
     if result.get("scope") != "whole-machine-production":
         raise RuntimeError("CPU-only evidence cannot satisfy production busy-device proof")
     required = ("normal_kernel_profile", "native_pit_predicate", "source_resume", "three_fresh_generations",
@@ -92,7 +124,8 @@ def production_extension(driver: Path, evidence: Path, kernel: Path, linux_fixtu
                 "in_service_eoi", "offline_start", "halted_wake", "live_xstate", "io_mmio_exact_once",
                 "long_prepared_dwell", "contemporary_clock_bracket", "partial_install_reaped",
                 "unsupported_participant_named", "busy_block", "busy_net", "busy_vsock", "busy_console",
-                "balloon_rng_legacy", "shared_irq", "no_post_release_controller_rewrite")
+                "balloon_rng_legacy", "shared_irq", "no_post_release_controller_rewrite",
+                "absolute_timer_delivery")
     witnesses = result.get("witnesses")
     if not isinstance(witnesses, dict) or set(witnesses) != set(required):
         raise RuntimeError("production driver omitted/added an unrecognized witness")
@@ -100,7 +133,8 @@ def production_extension(driver: Path, evidence: Path, kernel: Path, linux_fixtu
     objects = {}
     for name in required:
         witness = witnesses[name]
-        if not isinstance(witness, dict) or set(witness) != {"status", "observations"} or witness["status"] != "passed":
+        expected_status = "observed-not-gating" if name == "absolute_timer_delivery" else "passed"
+        if not isinstance(witness, dict) or set(witness) != {"status", "observations"} or witness["status"] != expected_status:
             raise RuntimeError(f"production witness {name} has invalid fields/status")
         observations = witness["observations"]
         if not isinstance(observations, list) or not 1 <= len(observations) <= 64:
@@ -175,13 +209,13 @@ def main() -> None:
             symbols_arg = ":".join(f"{symbols[key]:x}" for key in ("interrupt", "io_complete", "mmio_complete"))
             source = lane / "generation-0"
             if case in ("active-pit", "count-lapic"):
-                invoke([str(args.probe), "negative", str(source), str(binding), str(args.fixture), symbols_arg, str(cpus), case], lane, "negative")
+                invoke([str(args.probe), "negative", str(source), str(binding), str(args.fixture), symbols_arg, str(cpus), case], lane, "negative", timeout=120)
                 cases.append({"cpus": cpus, "case": case, "native_refusal": True, "status": "passed"})
                 continue
-            invoke([str(args.probe), "source", str(source), str(binding), str(args.fixture), symbols_arg, str(cpus), case], lane, "source")
+            invoke([str(args.probe), "source", str(source), str(binding), str(args.fixture), symbols_arg, str(cpus), case], lane, "source", timeout=120)
             manifest = capture_manifest(source)
             save(lane / "generation-0.manifest.json", manifest)
-            invoke([str(args.probe), "partial", str(source), str(binding), str(cpus), "2"], lane, "partial-install")
+            invoke([str(args.probe), "partial", str(source), str(binding), str(cpus), "2"], lane, "partial-install", timeout=120)
             if capture_manifest(source) != manifest:
                 raise RuntimeError("failed destination installation modified the source checkpoint")
             previous = source
@@ -189,21 +223,24 @@ def main() -> None:
             for generation in range(3):
                 child = lane / f"generation-{generation + 1}"
                 invoke([str(args.probe), "restore", str(previous), str(child), str(binding), str(cpus), generation_case,
-                       str(generation + 2), str(args.dwell_ms)], lane, f"restore-{generation + 1}")
+                       str(generation + 2), str(args.dwell_ms)], lane, f"restore-{generation + 1}", timeout=120)
                 save(lane / f"generation-{generation + 1}.manifest.json", capture_manifest(child))
                 previous = child
                 if generation_case == "offline":
                     generation_case = "future"  # actual guest started AP; recapture is now a live two-CPU cut
-            cases.append({"cpus": cpus, "case": case, "fresh_generations": 3, "status": "passed"})
+            cases.append({"cpus": cpus, "case": case, "fresh_generations": 3, "status": "passed",
+                          "absolute_no_early_requirement": "not-measured"})
     production = {"status": "pending", "reason": "actual production kernel native PIT predicate and commit6 provider-complete driver required"}
     if args.production_driver:
         if not args.linux_fixture:
             parser.error("--production-driver requires --linux-fixture")
         production = production_extension(args.production_driver, args.evidence, args.kernel, args.linux_fixture)
     save(args.evidence / "result.json", {"schema": 1, "scope": "cpu-execution-only", "cpu_cases": cases,
-        "production": production, "pending_lanes": ["kvm-arm64", "hvf-arm64"], "qualification_eligible": False})
+        "production": production, "pending_lanes": ["kvm-arm64", "hvf-arm64"], "qualification_eligible": False,
+        "absolute_no_early_requirement": "not-measured"})
     print(json.dumps({"status": "passed", "scope": "cpu-execution-only", "production": production["status"],
-                      "qualification_eligible": False, "evidence": str(args.evidence)}))
+                      "qualification_eligible": False, "evidence": str(args.evidence),
+                      "absolute_no_early_requirement": "not-measured"}))
 
 
 if __name__ == "__main__":

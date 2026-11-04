@@ -16,13 +16,15 @@ pub use windows::*;
 pub trait PortInput {
     fn read_volatile(&mut self, buf: &mut VolatileSlice) -> Result<usize, io::Error>;
 
-    fn wait_until_readable(&self, stopfd: Option<&EventFd>);
+    fn wait_until_readable(&self, stopfd: Option<&EventFd>) -> io::Result<()>;
 }
 
 pub trait PortOutput {
     fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error>;
 
-    fn wait_until_writable(&self);
+    /// Wake for output readiness or destructive shutdown, never reversible quiesce.
+    /// The caller must inspect terminal intent before retrying a write.
+    fn wait_until_writable(&self, terminal_stopfd: &EventFd) -> io::Result<()>;
 }
 
 /// Terminal properties associated with this port
@@ -84,7 +86,9 @@ impl PortOutput for PortOutputLog {
         Ok(buf.len())
     }
 
-    fn wait_until_writable(&self) {}
+    fn wait_until_writable(&self, _terminal_stopfd: &EventFd) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub struct PortInputEmpty {}

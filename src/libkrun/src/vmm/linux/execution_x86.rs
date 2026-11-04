@@ -579,45 +579,8 @@ fn native_cpuid(entries: &[CpuidEntry]) -> Result<CpuId, String> {
         .collect();
     CpuId::from_entries(&native).map_err(|e| format!("kvm/cpuid/allocation: {e:?}"))
 }
-pub(crate) fn install_cpu(
-    fd: &VcpuFd,
-    state: &KvmCpuState,
-    config: &CpuCaptureConfig,
-) -> Result<(), String> {
-    let KvmCpuState::X86(s) = state else {
-        return Err("kvm/x86/backend".into());
-    };
-    if s.xsave.len() != config.xsave_size || s.xstate != xstate_layout() {
-        return Err("kvm/xsave2/destination-layout".into());
-    }
-    let cpuid = native_cpuid(&s.cpuid)?;
-    admit_cpuid(&cpuid, config)?;
-    if classify(&config.raw_msrs, &cpuid)? != s.inventory {
-        return Err("kvm/msr/destination-inventory".into());
-    }
-    let current_cap = one_msr(fd, s.id, 0x179)?;
-    if s.mce_cap & !255 != current_cap & !255 || s.mce_cap & 255 > current_cap & 255 {
-        return Err("kvm/mce/destination-capability".into());
-    }
-    let model_indices: Vec<_> = s.model_msrs.iter().map(|e| e.index).collect();
-    if get_msrs(fd, s.id, &model_indices)? != s.model_msrs {
-        return Err("kvm/msr/destination-model-values".into());
-    }
-    native_events(s.events)?;
-    fd.set_cpuid2(&cpuid)
-        .map_err(|e| native_error("SET_CPUID2", e))?;
-    ioctl_result(
-        unsafe { ioctl_with_ref(fd, setup_mce(), &s.mce_cap) },
-        "SETUP_MCE",
-    )?;
-    if fd
-        .get_tsc_khz()
-        .map_err(|e| native_error("GET_TSC_KHZ", e))?
-        != s.tsc_khz
-    {
-        return Err("kvm/clock/unscaled-rate-mismatch".into());
-    }
-    let r = s.regs;
+fn set_execution_registers(fd: &VcpuFd, s: &X86CpuState) -> Result<(), String> {
+    let r = &s.regs;
     fd.set_regs(&kvm_regs {
         rax: r[0],
         rbx: r[1],
@@ -674,6 +637,55 @@ pub(crate) fn install_cpu(
         unsafe { ioctl_with_ref(fd, set_sregs2(), &special) },
         "SET_SREGS2",
     )?;
+    Ok(())
+}
+
+#[cfg(feature = "native-device-probe")]
+pub(crate) fn initialize_device_witness(fd: &VcpuFd, state: &X86CpuState) -> Result<(), String> {
+    set_execution_registers(fd, state)?;
+    fd.set_mp_state(kvm_mp_state { mp_state: 0 })
+        .map_err(|e| native_error("SET_MP_STATE", e))
+}
+
+pub(crate) fn install_cpu(
+    fd: &VcpuFd,
+    state: &KvmCpuState,
+    config: &CpuCaptureConfig,
+) -> Result<(), String> {
+    let KvmCpuState::X86(s) = state else {
+        return Err("kvm/x86/backend".into());
+    };
+    if s.xsave.len() != config.xsave_size || s.xstate != xstate_layout() {
+        return Err("kvm/xsave2/destination-layout".into());
+    }
+    let cpuid = native_cpuid(&s.cpuid)?;
+    admit_cpuid(&cpuid, config)?;
+    if classify(&config.raw_msrs, &cpuid)? != s.inventory {
+        return Err("kvm/msr/destination-inventory".into());
+    }
+    let current_cap = one_msr(fd, s.id, 0x179)?;
+    if s.mce_cap & !255 != current_cap & !255 || s.mce_cap & 255 > current_cap & 255 {
+        return Err("kvm/mce/destination-capability".into());
+    }
+    let model_indices: Vec<_> = s.model_msrs.iter().map(|e| e.index).collect();
+    if get_msrs(fd, s.id, &model_indices)? != s.model_msrs {
+        return Err("kvm/msr/destination-model-values".into());
+    }
+    native_events(s.events)?;
+    fd.set_cpuid2(&cpuid)
+        .map_err(|e| native_error("SET_CPUID2", e))?;
+    ioctl_result(
+        unsafe { ioctl_with_ref(fd, setup_mce(), &s.mce_cap) },
+        "SETUP_MCE",
+    )?;
+    if fd
+        .get_tsc_khz()
+        .map_err(|e| native_error("GET_TSC_KHZ", e))?
+        != s.tsc_khz
+    {
+        return Err("kvm/clock/unscaled-rate-mismatch".into());
+    }
+    set_execution_registers(fd, s)?;
     let mut xcr = kvm_xcrs {
         nr_xcrs: s.xcrs.len() as u32,
         ..Default::default()
@@ -914,10 +926,19 @@ fn native_pit(s: &X86VmState) -> kvm_pit_state2 {
         ..Default::default()
     }
 }
+#[cfg(feature = "native-device-probe")]
+pub(crate) type ControllerWrites = [std::sync::atomic::AtomicU64; 5];
+
+#[cfg(feature = "native-device-probe")]
+fn observed_write(writes: &ControllerWrites, index: usize) {
+    writes[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn capture_vm(
     fd: &VmFd,
     profile: &KvmCaptureProfile,
     retained: &mut Option<kvm_pit_state2>,
+    #[cfg(feature = "native-device-probe")] writes: &ControllerWrites,
 ) -> Result<KvmVmState, String> {
     let (host_kernel, host_mode) = host_clock_profile()?;
     let pit = match retained {
@@ -980,6 +1001,8 @@ pub(crate) fn capture_vm(
     inhibited.flags |= KVM_PIT_FLAGS_HPET_LEGACY;
     fd.set_pit2(&inhibited)
         .map_err(|e| native_error("SET_PIT2/passive-fence", e))?;
+    #[cfg(feature = "native-device-probe")]
+    observed_write(writes, 3);
     let m = irqchip(fd, KVM_IRQCHIP_PIC_MASTER)?;
     let s = irqchip(fd, KVM_IRQCHIP_PIC_SLAVE)?;
     let io = irqchip(fd, KVM_IRQCHIP_IOAPIC)?;
@@ -1005,7 +1028,11 @@ pub(crate) fn capture_vm(
     state.validate()?;
     Ok(state)
 }
-fn install_controllers(fd: &VmFd, s: &X86VmState) -> Result<(), String> {
+fn install_controllers(
+    fd: &VmFd,
+    s: &X86VmState,
+    #[cfg(feature = "native-device-probe")] writes: &ControllerWrites,
+) -> Result<(), String> {
     for (index, chip_id) in [KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE]
         .into_iter()
         .enumerate()
@@ -1017,6 +1044,8 @@ fn install_controllers(fd: &VmFd, s: &X86VmState) -> Result<(), String> {
         chip.chip.pic = native_pic(s.pic[index]);
         fd.set_irqchip(&chip)
             .map_err(|e| native_error("SET_IRQCHIP/PIC", e))?;
+        #[cfg(feature = "native-device-probe")]
+        observed_write(writes, index);
     }
     let mut chip = kvm_irqchip {
         chip_id: KVM_IRQCHIP_IOAPIC,
@@ -1033,9 +1062,16 @@ fn install_controllers(fd: &VmFd, s: &X86VmState) -> Result<(), String> {
             .map(|bits| kvm_ioapic_state__bindgen_ty_1 { bits }),
     };
     fd.set_irqchip(&chip)
-        .map_err(|e| native_error("SET_IRQCHIP/IOAPIC", e))
+        .map_err(|e| native_error("SET_IRQCHIP/IOAPIC", e))?;
+    #[cfg(feature = "native-device-probe")]
+    observed_write(writes, 2);
+    Ok(())
 }
-pub(crate) fn install_vm(fd: &VmFd, state: &KvmVmState) -> Result<(), String> {
+pub(crate) fn install_vm(
+    fd: &VmFd,
+    state: &KvmVmState,
+    #[cfg(feature = "native-device-probe")] writes: &ControllerWrites,
+) -> Result<(), String> {
     state.validate()?;
     let KvmVmState::X86(s) = state else {
         return Err("kvm/vm/backend".into());
@@ -1045,13 +1081,21 @@ pub(crate) fn install_vm(fd: &VmFd, state: &KvmVmState) -> Result<(), String> {
     pit.flags |= KVM_PIT_FLAGS_HPET_LEGACY;
     fd.set_pit2(&pit)
         .map_err(|e| native_error("SET_PIT2/install-fence", e))?;
-    install_controllers(fd, s)
+    #[cfg(feature = "native-device-probe")]
+    observed_write(writes, 3);
+    install_controllers(
+        fd,
+        s,
+        #[cfg(feature = "native-device-probe")]
+        writes,
+    )
 }
 pub(crate) fn prepare_vm_time(
     fd: &VmFd,
     state: &KvmVmState,
     cpus: &[KvmCpuState],
     observation: &mut Option<crate::vmm::linux::execution::KvmClockObservation>,
+    #[cfg(feature = "native-device-probe")] writes: &ControllerWrites,
 ) -> Result<Vec<KvmCpuTimePlan>, String> {
     let KvmVmState::X86(s) = state else {
         return Err("kvm/clock/backend".into());
@@ -1073,13 +1117,22 @@ pub(crate) fn prepare_vm_time(
     }
     fd.set_pit2(&native_pit(s))
         .map_err(|e| native_error("SET_PIT2/passive-release", e))?;
-    install_controllers(fd, s)?;
+    #[cfg(feature = "native-device-probe")]
+    observed_write(writes, 3);
+    install_controllers(
+        fd,
+        s,
+        #[cfg(feature = "native-device-probe")]
+        writes,
+    )?;
     fd.set_clock(&kvm_clock_data {
         clock: s.clock,
         flags: 0,
         ..Default::default()
     })
     .map_err(|e| native_error("SET_CLOCK/final", e))?;
+    #[cfg(feature = "native-device-probe")]
+    observed_write(writes, 4);
     let destination = fd
         .get_clock()
         .map_err(|e| native_error("GET_CLOCK/final", e))?;
