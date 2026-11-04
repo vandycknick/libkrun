@@ -1211,6 +1211,22 @@ impl crate::vmm::Vmm {
                 if active.phase == Phase::CancelPark {
                     active.phase = Phase::CancelDevices;
                 } else {
+                    #[cfg(all(feature = "native-device-probe", not(feature = "tee")))]
+                    {
+                        if !self.balloon_bindings.is_empty()
+                            && (!self.control.cpus.parked(active.barrier.key)
+                                || self.vcpus_handles.is_empty())
+                        {
+                            return Err(ControlFailure::Participant(
+                                "report witness requires reconciled all-CPU Park".into(),
+                            ));
+                        }
+                        for binding in &self.balloon_bindings {
+                            binding
+                                .report_parked(active.barrier.key, self.vcpus_handles.len())
+                                .map_err(ControlFailure::Participant)?;
+                        }
+                    }
                     let result = self
                         .mmio_device_manager
                         .quiescence

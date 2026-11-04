@@ -10,7 +10,6 @@ use std;
 use std::any::Any;
 use std::io::Error as IOError;
 
-#[cfg(not(feature = "tee"))]
 pub mod balloon;
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]

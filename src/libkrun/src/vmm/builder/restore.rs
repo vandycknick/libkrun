@@ -78,6 +78,7 @@ fn assemble(
         memory_domain,
         memory: memory_coordinator,
         balloon_bindings: Vec::new(),
+        reclaim_observer: None,
         arch_memory_info: info,
         vm,
         execution_controller: controller,
@@ -336,10 +337,17 @@ pub(crate) fn build_restore_prepared(
         // before owners take their buses; install device payloads only after CPU state.
         attach_device_resources(&mut attempt, &devices)?;
         attempt.balloon_bindings = std::mem::take(&mut devices.balloon_bindings);
+        let observer = devices::virtio::balloon::ReclaimObserver::for_domain(
+            &attempt.memory_domain,
+            #[cfg(target_os = "macos")]
+            attempt.vm.reclaim_state(),
+        );
         for binding in &attempt.balloon_bindings {
             binding
                 .finalize(
                     devices::virtio::balloon::BalloonMemoryPolicy::RestoredPrivate,
+                    observer.clone(),
+                    &attempt.memory_domain,
                     #[cfg(target_os = "macos")]
                     attempt.vm.reclaim_state(),
                     #[cfg(target_os = "macos")]
@@ -347,6 +355,7 @@ pub(crate) fn build_restore_prepared(
                 )
                 .map_err(|error| error.to_string())?;
         }
+        attempt.reclaim_observer = Some(observer);
         attempt
             .start_vcpus_parked(cpus)
             .map_err(|error| error.to_string())?;
@@ -749,6 +758,9 @@ pub(crate) fn build_execution_fixture(
     attempt
         .finalize_source_memory(true)
         .map_err(|error| error.to_string())?;
+    attempt.reclaim_observer = Some(devices::virtio::balloon::ReclaimObserver::for_domain(
+        &attempt.memory_domain,
+    ));
     attempt
         .start_vcpus_parked(cpus)
         .map_err(|error| error.to_string())?;

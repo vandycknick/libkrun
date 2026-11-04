@@ -834,6 +834,232 @@ static int sharing_observation(struct sharing_memory *memory, const char *token,
         token, write_slot, checksum, memory->baseline_checksum, first_gpa);
 }
 
+enum {
+    RECLAIM_PREPARE = SHARING_WRITE_LAST + 1,
+    RECLAIM_DONATE,
+    RECLAIM_REUSE,
+    RECLAIM_VERIFY,
+    RECLAIM_PAGE = 4096,
+};
+struct reclaim_status {
+    char state[9], operation[8], token[33], checksum[17];
+    uint64_t gpa, mismatches;
+    unsigned abi, bytes, submitted, used_seen, verified_bytes, error;
+};
+static int reclaim_now(uint64_t *now) {
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value)) return -1;
+    *now = (uint64_t)value.tv_sec * UINT64_C(1000000000) + (uint64_t)value.tv_nsec;
+    return 0;
+}
+static int reclaim_attribute(char *path, size_t capacity) {
+    const char *root = "/sys/bus/virtio/devices";
+    DIR *directory = opendir(root);
+    if (!directory) return -1;
+    unsigned found = 0;
+    int error = 0;
+    struct dirent *entry;
+    errno = 0;
+    while ((entry = readdir(directory))) {
+        if (entry->d_name[0] == '.') continue;
+        char candidate[PATH_MAX], device[PATH_MAX], identity[32] = {0};
+        if (snprintf(candidate, sizeof(candidate), "%s/%s/silo_reclaim", root, entry->d_name) >= (int)sizeof(candidate) ||
+            snprintf(device, sizeof(device), "%s/%s/device", root, entry->d_name) >= (int)sizeof(device)) {
+            error = ENAMETOOLONG; break;
+        }
+        struct stat metadata;
+        if (stat(candidate, &metadata)) {
+            if (errno == ENOENT) { errno = 0; continue; }
+            error = errno; break;
+        }
+        int fd = open(device, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) { error = errno; break; }
+        ssize_t count = read(fd, identity, sizeof(identity) - 1);
+        error = count < 0 ? errno : 0;
+        if (close(fd) && !error) error = errno;
+        if (error) break;
+        if (strcmp(identity, "0x0005\n") || !S_ISREG(metadata.st_mode) ||
+            (metadata.st_mode & 0777) != 0600 || metadata.st_uid != 0) {
+            error = ENOTSUP; break;
+        }
+        if (++found != 1) { error = EEXIST; break; }
+        if (strlen(candidate) >= capacity) { error = ENAMETOOLONG; break; }
+        strcpy(path, candidate);
+        errno = 0;
+    }
+    if (!error && errno) error = errno;
+    if (closedir(directory) && !error) error = errno;
+    if (!error && found != 1) error = ENODEV;
+    if (error) { errno = error; return -1; }
+    return 0;
+}
+static int reclaim_status_read(const char *path, struct reclaim_status *status) {
+    char line[512] = {0}, canonical[512];
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t count = read(fd, line, sizeof(line) - 1);
+    int error = count < 0 ? errno : 0;
+    if (close(fd) && !error) error = errno;
+    if (error) { errno = error; return -1; }
+    int consumed = 0;
+    int fields = sscanf(line,
+        "abi=%u state=%8[a-z-] operation=%7[a-z] token=%32[0-9a-f] gpa=%" SCNu64
+        " bytes=%u submitted=%u used_seen=%u verified_bytes=%u mismatches=%" SCNu64
+        " checksum=%16[0-9a-f] error=%u%n",
+        &status->abi, status->state, status->operation, status->token, &status->gpa,
+        &status->bytes, &status->submitted, &status->used_seen, &status->verified_bytes,
+        &status->mismatches, status->checksum, &status->error, &consumed);
+    if (fields != 12 || count <= 0 || count >= (ssize_t)sizeof(line) - 1 ||
+        consumed != count - 1 || line[consumed] != '\n' ||
+        strlen(status->token) != 32 || strlen(status->checksum) != 16) {
+        errno = EPROTO; return -1;
+    }
+    int length = snprintf(canonical, sizeof(canonical),
+        "abi=%u state=%s operation=%s token=%s gpa=%" PRIu64
+        " bytes=%u submitted=%u used_seen=%u verified_bytes=%u mismatches=%" PRIu64
+        " checksum=%s error=%u\n",
+        status->abi, status->state, status->operation, status->token, status->gpa,
+        status->bytes, status->submitted, status->used_seen, status->verified_bytes,
+        status->mismatches, status->checksum, status->error);
+    if (length != count || strcmp(line, canonical) || status->abi != 1 ||
+        status->bytes != RECLAIM_PAGE || status->submitted > 1 || status->used_seen > 1 ||
+        (strcmp(status->state, "empty") && strcmp(status->state, "owned") &&
+         strcmp(status->state, "inflight") && strcmp(status->state, "acked") &&
+         strcmp(status->state, "c-ready") && strcmp(status->state, "failed")) ||
+        (strcmp(status->operation, "none") && strcmp(status->operation, "prepare") &&
+         strcmp(status->operation, "donate") && strcmp(status->operation, "reuse") &&
+         strcmp(status->operation, "verify")) ||
+        (status->verified_bytes != 0 && status->verified_bytes != RECLAIM_PAGE)) {
+        errno = EPROTO; return -1;
+    }
+    if (status->error || !strcmp(status->state, "failed")) {
+        errno = status->error && status->error <= INT_MAX ? (int)status->error : EIO;
+        return -1;
+    }
+    return 0;
+}
+static int reclaim_write(const char *path, const char *request, size_t length) {
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t count = write(fd, request, length);
+    int error = count < 0 ? errno : count != (ssize_t)length ? EIO : 0;
+    if (close(fd) && !error) error = errno;
+    if (error) { errno = error; return -1; }
+    return 0;
+}
+static int reclaim_request(const char *request, size_t length, int complete,
+    int command, uint64_t deadline) {
+    char token[33] = {0}, path[PATH_MAX] = {0}, line[128];
+    uint64_t target = 0;
+    struct reclaim_status before = {0}, after = {0};
+    int error;
+    const char *stage = "request";
+    const char *operation = command == RECLAIM_PREPARE ? "prepare" :
+        command == RECLAIM_DONATE ? "donate" : command == RECLAIM_REUSE ? "reuse" : "verify";
+    if (length < 32 || strlen(request) != length) { errno = EINVAL; goto failed; }
+    for (unsigned index = 0; index < 32; ++index) {
+        char byte = request[index];
+        if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f'))) {
+            errno = EINVAL; goto failed;
+        }
+    }
+    memcpy(token, request, 32);
+    if (command == RECLAIM_PREPARE) {
+        if (length != 32) { errno = EINVAL; goto failed; }
+    } else {
+        if (length < 34 || request[32] != ' ') { errno = EINVAL; goto failed; }
+        for (const char *digit = request + 33; *digit; ++digit) {
+            if (*digit < '0' || *digit > '9') { errno = EINVAL; goto failed; }
+        }
+        errno = 0;
+        char *end;
+        target = strtoull(request + 33, &end, 10);
+        if (errno || *end || !target || target % RECLAIM_PAGE) {
+            if (!errno) errno = EINVAL;
+            goto failed;
+        }
+    }
+    stage = "request-deadline";
+    if (sharing_time_left(deadline)) goto failed;
+    if (!complete) { errno = EINVAL; stage = "incomplete-request"; goto failed; }
+    stage = "required-diagnostic-balloon-attribute";
+    if (reclaim_attribute(path, sizeof(path))) goto failed;
+    stage = "kernel-status-before";
+    if (reclaim_status_read(path, &before)) goto failed;
+    stage = "kernel-ownership-before";
+    int valid_state = 0;
+    if (command == RECLAIM_PREPARE) {
+        valid_state = !strcmp(before.state, "empty") && !strcmp(before.operation, "none") &&
+            !before.gpa && !before.submitted && !before.used_seen;
+    } else if (before.gpa == target) {
+        if (command == RECLAIM_DONATE) {
+            valid_state = !strcmp(before.state, "owned") && !strcmp(before.operation, "prepare") &&
+                !before.submitted && !before.used_seen;
+        } else if (command == RECLAIM_REUSE) {
+            valid_state = (!strcmp(before.state, "inflight") || !strcmp(before.state, "acked")) &&
+                !strcmp(before.operation, "donate") && before.submitted == 1 &&
+                (!strcmp(before.state, "acked") == (before.used_seen == 1));
+        } else {
+            valid_state = !strcmp(before.state, "c-ready") && before.submitted == 1 &&
+                before.used_seen == 1 &&
+                (!strcmp(before.operation, "reuse") || !strcmp(before.operation, "verify"));
+        }
+    }
+    if (!valid_state || !strcmp(before.token, token)) { errno = ESTALE; goto failed; }
+    int line_length = command == RECLAIM_PREPARE ?
+        snprintf(line, sizeof(line), "%s %s\n", operation, token) :
+        snprintf(line, sizeof(line), "%s %s %" PRIu64 "\n", operation, token, target);
+    if (line_length < 0 || line_length >= (int)sizeof(line)) { errno = EOVERFLOW; goto failed; }
+    stage = "kernel-command";
+    for (;;) {
+        if (sharing_time_left(deadline)) goto failed;
+        if (!reclaim_write(path, line, (size_t)line_length)) break;
+        if (command != RECLAIM_REUSE || errno != EAGAIN) goto failed;
+        delay();
+    }
+    stage = "kernel-status-after";
+    if (reclaim_status_read(path, &after)) goto failed;
+    stage = "kernel-transition";
+    if (strcmp(after.token, token) || strcmp(after.operation, operation) ||
+        !after.gpa || after.gpa % RECLAIM_PAGE ||
+        (command != RECLAIM_PREPARE && after.gpa != target) ||
+        (command == RECLAIM_PREPARE ?
+            (strcmp(after.state, "owned") || after.submitted || after.used_seen) :
+         command == RECLAIM_DONATE ?
+            ((strcmp(after.state, "inflight") && strcmp(after.state, "acked")) ||
+             after.submitted != 1 || (!strcmp(after.state, "acked") != (after.used_seen == 1))) :
+            (strcmp(after.state, "c-ready") || after.submitted != 1 || after.used_seen != 1 ||
+             after.verified_bytes != RECLAIM_PAGE || after.mismatches)) ||
+        (command <= RECLAIM_DONATE &&
+            (after.verified_bytes || after.mismatches || strcmp(after.checksum, "0000000000000000")))) {
+        errno = EPROTO; goto failed;
+    }
+    stage = "request-deadline";
+    if (sharing_time_left(deadline)) goto failed;
+    return emit_record(output,
+        "OBS-BEGIN memory-reclaim\n"
+        "{\"schema\":1,\"ownership\":\"kernel-order0-retained\",\"request_token\":\"%s\","
+        "\"operation\":\"%s\",\"success\":true,\"target_gpa\":%" PRIu64
+        ",\"gpa_before\":%" PRIu64 ",\"gpa_after\":%" PRIu64
+        ",\"sysfs_attribute\":\"%s\",\"kernel\":{\"abi\":%u,\"state\":\"%s\","
+        "\"operation\":\"%s\",\"token\":\"%s\",\"gpa\":%" PRIu64
+        ",\"bytes\":%u,\"submitted\":%u,\"used_seen\":%u,\"verified_bytes\":%u,"
+        "\"mismatches\":%" PRIu64 ",\"checksum\":\"%s\",\"error\":%u}}\nOBS-END memory-reclaim\n",
+        token, operation, after.gpa, before.gpa, after.gpa, path, after.abi, after.state,
+        after.operation, after.token, after.gpa, after.bytes, after.submitted, after.used_seen,
+        after.verified_bytes, after.mismatches, after.checksum, after.error);
+failed:
+    error = errno;
+    emit_record(output,
+        "OBS-BEGIN memory-reclaim\n"
+        "{\"schema\":1,\"ownership\":\"kernel-order0-retained\",\"request_token\":\"%s\","
+        "\"operation\":\"%s\",\"success\":false,\"target_gpa\":%" PRIu64
+        ",\"error\":\"%s\",\"errno\":%d}\nOBS-END memory-reclaim\n",
+        token, operation, target, stage, error);
+    errno = error;
+    return -1;
+}
+
 int main(void) {
     if (getpid() != 1) return 2;
     signal(SIGPIPE, SIG_IGN);
@@ -877,12 +1103,20 @@ int main(void) {
     uint64_t sequence = 0;
     char pressure_command[1024]; size_t pressure_length = 0; int pressure_forward = 0;
     struct sharing_memory sharing = {.write_slot = -1};
+    uint64_t reclaim_deadline = 0;
     uint64_t sharing_deadline = 0;
     for (;;) {
         int status;
         if (waitpid(registers, &status, WNOHANG) == registers) { fail("live-register-fixture-exited"); return 9; }
         if (pressure > 0 && waitpid(pressure, &status, WNOHANG) == pressure) { fail("pressure-fixture-exited"); return 13; }
-        if (pressure_forward >= SHARING_INITIALIZE && sharing_time_left(sharing_deadline)) {
+        if (pressure_forward >= RECLAIM_PREPARE && sharing_time_left(reclaim_deadline)) {
+            pressure_command[pressure_length] = '\0';
+            reclaim_request(pressure_command, pressure_length, 0,
+                pressure_forward, reclaim_deadline);
+            fail("memory-reclaim"); return 19;
+        }
+        if (pressure_forward >= SHARING_INITIALIZE &&
+            pressure_forward <= SHARING_WRITE_LAST && sharing_time_left(sharing_deadline)) {
             fail("memory-sharing-request"); return 18;
         }
         char input[64]; ssize_t count = read(control_input, input, sizeof(input));
@@ -892,6 +1126,12 @@ int main(void) {
                     if (pressure_forward == 1) {
                         pressure_command[pressure_length++] = '\n';
                         if (write(pressure_pipe[1], pressure_command, pressure_length) != (ssize_t)pressure_length) fail("pressure-command-write");
+                    } else if (pressure_forward >= RECLAIM_PREPARE) {
+                        pressure_command[pressure_length] = '\0';
+                        if (reclaim_request(pressure_command, pressure_length, 1,
+                            pressure_forward, reclaim_deadline)) {
+                            fail("memory-reclaim"); return 19;
+                        }
                     } else {
                         if (pressure_length != 32) {
                             errno = EINVAL;
@@ -917,7 +1157,13 @@ int main(void) {
                         }
                     }
                     pressure_length = 0; pressure_forward = 0;
-                } else if (pressure_forward >= SHARING_INITIALIZE && pressure_length >= 32) {
+                } else if (pressure_forward >= RECLAIM_PREPARE && pressure_length >= 53) {
+                    pressure_command[pressure_length] = '\0';
+                    reclaim_request(pressure_command, pressure_length, 0,
+                        pressure_forward, reclaim_deadline);
+                    fail("memory-reclaim"); return 19;
+                } else if (pressure_forward >= SHARING_INITIALIZE &&
+                    pressure_forward <= SHARING_WRITE_LAST && pressure_length >= 32) {
                     errno = EINVAL; fail("memory-sharing-request"); return 18;
                 } else if (pressure_length + 1 < sizeof(pressure_command)) pressure_command[pressure_length++] = input[i];
                 else { fail("pressure-command-bound"); return 14; }
@@ -935,6 +1181,14 @@ int main(void) {
                 sharing_deadline = (uint64_t)now.tv_sec * UINT64_C(1000000000) +
                     (uint64_t)now.tv_nsec + UINT64_C(15000000000);
                 pressure_forward = sharing_command;
+                continue;
+            }
+            if (input[i] == 'Q' || input[i] == 'T' || input[i] == 'R' || input[i] == 'V') {
+                uint64_t now;
+                if (reclaim_now(&now)) { fail("memory-reclaim-clock"); return 19; }
+                reclaim_deadline = now + UINT64_C(10000000000);
+                pressure_forward = input[i] == 'Q' ? RECLAIM_PREPARE :
+                    input[i] == 'T' ? RECLAIM_DONATE : input[i] == 'R' ? RECLAIM_REUSE : RECLAIM_VERIFY;
                 continue;
             }
             if (input[i] == 'P' && pressure > 0) { pressure_forward = 1; continue; }

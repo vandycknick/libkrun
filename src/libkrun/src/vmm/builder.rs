@@ -1246,6 +1246,7 @@ pub fn build_microvm(
         memory,
         #[cfg(not(feature = "tee"))]
         balloon_bindings: Vec::new(),
+        reclaim_observer: None,
         arch_memory_info,
         kernel_cmdline,
         vcpus_handles: Vec::new(),
@@ -1315,6 +1316,11 @@ pub fn build_microvm(
         .map_err(StartMicrovmError::Internal)?;
     #[cfg(not(feature = "tee"))]
     {
+        let observer = devices::virtio::balloon::ReclaimObserver::for_domain(
+            &vmm.memory_domain,
+            #[cfg(target_os = "macos")]
+            vmm.vm.reclaim_state(),
+        );
         let policy = if vmm.memory_domain.tracking_mode()
             == Some(arch::guest_memory::TrackingMode::Capture)
         {
@@ -1326,6 +1332,8 @@ pub fn build_microvm(
             binding
                 .finalize(
                     policy,
+                    observer.clone(),
+                    &vmm.memory_domain,
                     #[cfg(target_os = "macos")]
                     vmm.vm.reclaim_state(),
                     #[cfg(target_os = "macos")]
@@ -1333,6 +1341,7 @@ pub fn build_microvm(
                 )
                 .map_err(|error| StartMicrovmError::AttachDevice(format!("{error:?}")))?;
         }
+        vmm.reclaim_observer = Some(observer);
     }
 
     #[cfg(feature = "tee")]
@@ -1371,6 +1380,14 @@ pub fn build_microvm(
     #[cfg(feature = "tee")]
     vmm.finalize_source_memory(false)
         .map_err(StartMicrovmError::Internal)?;
+    #[cfg(feature = "tee")]
+    {
+        vmm.reclaim_observer = Some(devices::virtio::balloon::ReclaimObserver::for_domain(
+            &vmm.memory_domain,
+            #[cfg(target_os = "macos")]
+            vmm.vm.reclaim_state(),
+        ));
+    }
 
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;

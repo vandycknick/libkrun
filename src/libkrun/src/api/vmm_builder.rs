@@ -169,69 +169,15 @@ pub struct VmmHandle {
     control: ControlClient,
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     shutdown_efd: Option<Arc<EventFd>>,
-    #[cfg(target_os = "macos")]
-    reclaim_state: std::sync::Arc<hvf::reclaim::ReclaimState>,
+    reclaim_observer: devices::virtio::balloon::ReclaimObserver,
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     hvf_vm_facts: crate::api::capabilities::HvfVmFacts,
 }
 
-/// Outcome of the per-VM host reclaim qualification probe.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HostReclaimQualification {
-    NotRun,
-    Passed,
-    Failed,
-    Inconclusive,
-}
-
-/// Host memory reclaim state of a running VMM on macOS.
-///
-/// `effective` means reports are advised free: reclaim was requested, the
-/// page-state qualification probe passed, and no release failure disabled it.
-/// Discard is lazy. The counters are cumulative operations, not measured
-/// reductions in resident or compressed memory.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostReclaimStatus {
-    pub requested: bool,
-    pub qualification: HostReclaimQualification,
-    pub effective: bool,
-    /// Cumulative successfully advised bytes, including repeat reports.
-    pub released_bytes: u64,
-    /// Successfully advised coalesced ranges, not unique physical extents.
-    pub released_extents: u64,
-    pub retried_faults: u64,
-    pub skipped_reports: u64,
-    pub failed_operations: u64,
-}
-
-#[cfg(target_os = "macos")]
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 impl VmmHandle {
-    #[cfg(target_arch = "aarch64")]
     pub fn hvf_vm_facts(&self) -> crate::api::capabilities::HvfVmFacts {
         self.hvf_vm_facts
-    }
-
-    /// Snapshot of host memory reclaim for this VM.
-    pub fn host_reclaim_status(&self) -> HostReclaimStatus {
-        use hvf::reclaim::ReclaimQualification;
-        let stats = self.reclaim_state.stats();
-        HostReclaimStatus {
-            requested: self.reclaim_state.policy_enabled(),
-            qualification: match self.reclaim_state.qualification() {
-                ReclaimQualification::NotRun => HostReclaimQualification::NotRun,
-                ReclaimQualification::Passed => HostReclaimQualification::Passed,
-                ReclaimQualification::Failed => HostReclaimQualification::Failed,
-                ReclaimQualification::Inconclusive => HostReclaimQualification::Inconclusive,
-            },
-            effective: self.reclaim_state.is_effective(),
-            released_bytes: stats.released_bytes,
-            released_extents: stats.released_extents,
-            retried_faults: stats.retried_faults,
-            skipped_reports: stats.skipped_reports,
-            failed_operations: stats.failed_operations,
-        }
     }
 }
 
@@ -239,8 +185,7 @@ impl Clone for VmmHandle {
     fn clone(&self) -> Self {
         Self {
             control: self.control.clone(),
-            #[cfg(target_os = "macos")]
-            reclaim_state: std::sync::Arc::clone(&self.reclaim_state),
+            reclaim_observer: self.reclaim_observer.clone(),
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             hvf_vm_facts: self.hvf_vm_facts,
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -250,6 +195,11 @@ impl Clone for VmmHandle {
 }
 
 impl VmmHandle {
+    /// Observe finalized backing, policy and process-local advice operations.
+    pub fn host_reclaim_status(&self) -> devices::virtio::balloon::ReclaimStatus {
+        self.reclaim_observer.status()
+    }
+
     /// Wait for the complete machine barrier. Caller timeout/drop is not cancellation.
     pub fn pause(
         &self,
@@ -359,8 +309,9 @@ impl<'a> Vmm<'a> {
                     .map_err(|error| VmmError::Internal(error.to_string()))?;
                 Ok(VmmHandle {
                     control: inner.control.client.clone(),
-                    #[cfg(target_os = "macos")]
-                    reclaim_state: inner.vm.reclaim_state(),
+                    reclaim_observer: inner.reclaim_observer.clone().ok_or_else(|| {
+                        VmmError::Internal("reclaim observation not finalized".into())
+                    })?,
                     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
                     hvf_vm_facts: inner.vm.live_facts(),
                     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]

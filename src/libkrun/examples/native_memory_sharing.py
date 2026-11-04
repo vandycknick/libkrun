@@ -48,6 +48,7 @@ import time
 
 from native_device_controller import Session, digest, save, seal_cut
 from native_memory_controller import image_record, prepared_observation, source_identity, unique_fields
+from native_device_pressure import inhibited_reclaim
 from native_ram_image import authenticate_image, validate_layout
 
 MIB = 1024 * 1024
@@ -279,8 +280,9 @@ def snapshot(session: Session, label: str, timeout: float = 30) -> dict:
     path = session.directory / f"sharing-{label}.native.json"
     session.command(f"pressure snapshot {path}", timeout=timeout)
     record = json.loads(bounded_text(path, 2 * MIB), object_pairs_hook=unique_fields)
-    if record["pid"] != session.process.pid or record["balloon"]["host_reclaim_enabled"] is not False:
-        raise ValueError("actual tracked/restored balloon admitted destructive reclaim")
+    if record["pid"] != session.process.pid:
+        raise ValueError("actual tracked/restored native owner identity")
+    inhibited_reclaim(record["balloon"]["reclaim"])
     balloons = [device for device in record["devices"] if device["id"] == "balloon0"]
     if len(balloons) != 1 or len(balloons[0]["queues"]) != 5:
         raise ValueError("actual reporting queue absent")
@@ -289,15 +291,15 @@ def snapshot(session: Session, label: str, timeout: float = 30) -> dict:
 
 
 def reporting_advanced(record: dict, native_pid: int, baseline_used: int) -> bool:
-    fields = {"schema", "native_pid", "reporting_negotiated", "host_reclaim_enabled",
+    fields = {"schema", "native_pid", "reporting_negotiated", "reclaim",
               "ready", "next_used", "used_idx", "used_ring"}
     if (not isinstance(record, dict) or set(record) != fields
             or type(record["schema"]) is not int or record["schema"] != 1
             or type(record["native_pid"]) is not int or record["native_pid"] != native_pid
             or type(record["reporting_negotiated"]) is not bool or type(record["ready"]) is not bool
-            or record["host_reclaim_enabled"] is not False
             or type(baseline_used) is not int or not 0 <= baseline_used <= 0xffff):
         raise ValueError("actual reporting readiness schema/identity/policy")
+    inhibited_reclaim(record["reclaim"], "restored-private")
     if not record["ready"]:
         if any(record[field] is not None for field in ("next_used", "used_idx", "used_ring")):
             raise ValueError("unready reporting queue exposed completion state")

@@ -3,6 +3,12 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::Instant;
 
+use devices::virtio::balloon::{
+    ReclaimBacking, ReclaimQualification, ReclaimReason, ReclaimStatus,
+};
+use devices::virtio::balloon::{
+    ReportDescriptor, ReportIdentity, ReportWitness, ReportWitnessState,
+};
 use devices::virtio::block::Block;
 use devices::virtio::lifecycle::ProviderFault;
 use devices::virtio::{Balloon, Console, Vsock};
@@ -82,6 +88,217 @@ fn quoted(value: &str) -> String {
     }
     result.push('"');
     result
+}
+
+pub(in crate::api::vmm_builder::native_device_probe) fn reclaim_status_json(
+    status: ReclaimStatus,
+) -> String {
+    let backing = match status.backing {
+        ReclaimBacking::Boot => "boot",
+        ReclaimBacking::RestoredPrivate => "restored-private",
+    };
+    let reason = match status.reason {
+        ReclaimReason::None => "none",
+        ReclaimReason::TrackedCapture => "tracked-capture",
+        ReclaimReason::RestoredPrivateMapping => "restored-private-mapping",
+    };
+    let qualification = match status.qualification {
+        ReclaimQualification::NotRun => "not-run",
+        ReclaimQualification::Passed => "passed",
+        ReclaimQualification::Failed => "failed",
+        ReclaimQualification::Inconclusive => "inconclusive",
+    };
+    format!(
+        concat!(
+            "{{\"backing\":\"{}\",\"reason\":\"{}\",\"requested\":{},\"qualification\":\"{}\",\"effective\":{},",
+            "\"released_bytes\":{},\"released_extents\":{},\"retried_faults\":{},\"skipped_reports\":{},\"failed_operations\":{}}}"
+        ),
+        backing,
+        reason,
+        status.requested,
+        qualification,
+        status.effective,
+        status.released_bytes,
+        status.released_extents,
+        status.retried_faults,
+        status.skipped_reports,
+        status.failed_operations,
+    )
+}
+
+fn reclaim_field<T: std::str::FromStr>(
+    fields: &mut std::str::SplitWhitespace<'_>,
+    name: &str,
+) -> Result<T, String> {
+    fields
+        .next()
+        .ok_or_else(|| format!("reclaim command missing {name}"))?
+        .parse()
+        .map_err(|_| format!("reclaim command invalid {name}"))
+}
+
+fn child_report(operand: &str) -> Result<(u8, u8, ReportIdentity), String> {
+    let mut fields = operand.split_whitespace();
+    let source = reclaim_field(&mut fields, "source seed")?;
+    let child = reclaim_field(&mut fields, "child seed")?;
+    let mut report = ReportIdentity {
+        head: reclaim_field(&mut fields, "head")?,
+        next_avail: reclaim_field(&mut fields, "next_avail")?,
+        next_used: reclaim_field(&mut fields, "next_used")?,
+        avail_idx: reclaim_field(&mut fields, "avail_idx")?,
+        used_idx: reclaim_field(&mut fields, "used_idx")?,
+        gpa: reclaim_field(&mut fields, "gpa")?,
+        desc_table: reclaim_field(&mut fields, "desc_table")?,
+        avail_ring: reclaim_field(&mut fields, "avail_ring")?,
+        used_ring: reclaim_field(&mut fields, "used_ring")?,
+        descriptors: Vec::new(),
+    };
+    let count: usize = reclaim_field(&mut fields, "descriptor count")?;
+    if !(1..=256).contains(&count) {
+        return Err("reclaim descriptor count outside reporting queue capacity".into());
+    }
+    report.descriptors.reserve_exact(count);
+    for _ in 0..count {
+        report.descriptors.push(ReportDescriptor {
+            addr: reclaim_field(&mut fields, "descriptor addr")?,
+            len: reclaim_field(&mut fields, "descriptor len")?,
+            flags: reclaim_field(&mut fields, "descriptor flags")?,
+            next: reclaim_field(&mut fields, "descriptor next")?,
+        });
+    }
+    if fields.next().is_some() || source == 0 || child == 0 || source == child {
+        return Err("reclaim child requires exact identity and distinct nonzero seeds".into());
+    }
+    Ok((source, child, report))
+}
+
+fn report_witness_json(witness: &ReportWitness) -> String {
+    let state = match witness.state {
+        ReportWitnessState::Idle => "idle",
+        ReportWitnessState::Holding => "holding",
+        ReportWitnessState::SourceSeeded => "source-seeded",
+        ReportWitnessState::ChildCompleted => "child-completed",
+        ReportWitnessState::Failed => "failed",
+    };
+    let report = witness.report.as_ref().map_or_else(|| "null".into(), |report| {
+        let descriptors = report.descriptors.iter().map(|descriptor| format!(
+            "{{\"addr\":{},\"len\":{},\"flags\":{},\"next\":{}}}",
+            descriptor.addr, descriptor.len, descriptor.flags, descriptor.next,
+        )).collect::<Vec<_>>().join(",");
+        format!(
+            concat!(
+                "{{\"head\":{},\"next_avail\":{},\"next_used\":{},\"avail_idx\":{},\"used_idx\":{},",
+                "\"gpa\":{},\"desc_table\":{},\"avail_ring\":{},\"used_ring\":{},\"descriptors\":[{}]}}"
+            ),
+            report.head, report.next_avail, report.next_used, report.avail_idx, report.used_idx,
+            report.gpa, report.desc_table, report.avail_ring, report.used_ring, descriptors,
+        )
+    });
+    let barrier = witness.barrier.map_or_else(
+        || "null".into(),
+        |key| {
+            format!(
+                "{{\"operation\":{},\"generation\":{}}}",
+                key.operation.0, key.generation.0,
+            )
+        },
+    );
+    format!(
+        concat!(
+            "\"state\":\"{}\",\"report\":{},\"seed\":{},\"verified_bytes\":{},\"used_after\":{},",
+            "\"barrier\":{},\"parked_cpus\":{},\"failure\":{}"
+        ),
+        state,
+        report,
+        witness
+            .seed
+            .map_or_else(|| "null".into(), |seed| seed.to_string()),
+        witness.verified_bytes,
+        witness
+            .used_after
+            .map_or_else(|| "null".into(), |index| index.to_string()),
+        barrier,
+        witness.parked_cpus,
+        witness
+            .failure
+            .as_ref()
+            .map_or_else(|| "null".into(), |failure| quoted(failure)),
+    )
+}
+
+pub(in crate::api::vmm_builder::native_device_probe) fn reclaim_command(
+    driver: &mut Driver,
+    resources: &[Resource],
+    operation: &str,
+    operand: &str,
+) -> Result<(), String> {
+    let source_seed = if operation == "reclaim-hold-source" {
+        let seed = operand.parse::<u8>().map_err(|_| "reclaim source seed")?;
+        if seed == 0 {
+            return Err("reclaim source seed must be nonzero".into());
+        }
+        Some(seed)
+    } else {
+        None
+    };
+    let child = if operation == "reclaim-complete-child" {
+        Some(child_report(operand)?)
+    } else {
+        None
+    };
+    if operation == "reclaim-release-hold" && !operand.is_empty() {
+        return Err("reclaim-release-hold takes no operands".into());
+    }
+    let vmm = driver
+        .vmm
+        .try_lock()
+        .map_err(|_| "reclaim VMM lock unavailable")?;
+    if source_seed.is_some() && !matches!(vmm.control.state, ControlState::Running) {
+        return Err("source reclaim hold requires a running source".into());
+    }
+    if child.is_some() && !matches!(vmm.control.state, ControlState::RestorePrepared { .. }) {
+        return Err("child reclaim completion must arm before restore release".into());
+    }
+    let mut balloons = resources
+        .iter()
+        .filter(|resource| resource.id == "balloon0");
+    let resource = balloons.next().ok_or("reclaim actual balloon absent")?;
+    if balloons.next().is_some() {
+        return Err("reclaim actual balloon is not unique".into());
+    }
+    let mut device = resource
+        .device
+        .try_lock()
+        .map_err(|_| "reclaim balloon lock unavailable")?;
+    let balloon = (*device)
+        .as_mut_any()
+        .downcast_mut::<Balloon>()
+        .ok_or("reclaim requires actual Balloon")?;
+    match operation {
+        "reclaim-hold-source" => {
+            let seed = source_seed.ok_or("reclaim source seed absent")?;
+            balloon.pressure_hold_reports()?;
+            balloon.pressure_arm_source(seed)
+        }
+        "reclaim-complete-child" => {
+            let (source, child, report) = child.ok_or("reclaim child identity absent")?;
+            balloon.pressure_hold_reports()?;
+            balloon.pressure_arm_child(report, source, child)
+        }
+        "reclaim-release-hold" => balloon.pressure_release_reports(),
+        "reclaim-witness" => {
+            let witness = balloon.pressure_report_witness();
+            let output = format!(
+                "{{\"schema\":1,\"native_pid\":{},{},\"reclaim\":{},\"remapper_present\":{}}}\n",
+                std::process::id(),
+                report_witness_json(&witness),
+                reclaim_status_json(balloon.reclaim_status()),
+                balloon.pressure_remapper_present(),
+            );
+            write_new(Path::new(operand), output.as_bytes())
+        }
+        _ => Err("unknown reclaim operation".into()),
+    }
 }
 
 pub(in crate::api::vmm_builder::native_device_probe) fn command(
@@ -356,7 +573,7 @@ fn snapshot_observation(
             ));
         }
         if let Some(balloon) = (*device).as_any().downcast_ref::<Balloon>() {
-            balloon_reclaim = Some(balloon.pressure_reclaim_enabled());
+            balloon_reclaim = Some(reclaim_status_json(balloon.reclaim_status()));
         }
         if let Some(device) = (*device).as_any().downcast_ref::<Vsock>() {
             let observation = device
@@ -479,7 +696,7 @@ fn snapshot_observation(
     let result = format!(
         concat!(
             "{{\"pid\":{},\"controller\":{{\"state\":{},\"release_may_have_run\":{},\"time\":{},\"writes\":{:?},\"clock_pairs\":{}}},",
-            "\"devices\":[{}],\"irq_routes\":[{}],\"irq_members\":[{}],\"legacy\":[{}],\"vsock\":{},\"block\":[{}],\"consoles\":[{}],\"balloon\":{{\"host_reclaim_enabled\":{}}},\"retained_native_controller\":{}}}\n"
+            "\"devices\":[{}],\"irq_routes\":[{}],\"irq_members\":[{}],\"legacy\":[{}],\"vsock\":{},\"block\":[{}],\"consoles\":[{}],\"balloon\":{{\"reclaim\":{}}},\"retained_native_controller\":{}}}\n"
         ),
         std::process::id(),
         quoted(&format!("{:?}", vmm.control.state)),

@@ -1740,6 +1740,16 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
                         "pressure" => {
                             pressure::command(&mut driver, &activation_resources, operand)?
                         }
+                        #[cfg(feature = "native-device-probe")]
+                        "reclaim-hold-source"
+                        | "reclaim-complete-child"
+                        | "reclaim-witness"
+                        | "reclaim-release-hold" => pressure::reclaim_command(
+                            &mut driver,
+                            &activation_resources,
+                            command,
+                            operand,
+                        )?,
                         "profile" => {
                             let profile = observed_profile(Path::new(operand))?;
                             driver
@@ -1967,10 +1977,10 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
                                 .used_ring
                                 .map_or("null".into(), |value| value.to_string());
                             let output = format!(
-                                "{{\"schema\":1,\"native_pid\":{},\"reporting_negotiated\":{},\"host_reclaim_enabled\":{},\"ready\":{},\"next_used\":{next_used},\"used_idx\":{used_idx},\"used_ring\":{used_ring}}}\n",
+                                "{{\"schema\":1,\"native_pid\":{},\"reporting_negotiated\":{},\"reclaim\":{},\"ready\":{},\"next_used\":{next_used},\"used_idx\":{used_idx},\"used_ring\":{used_ring}}}\n",
                                 std::process::id(),
                                 queue.reporting_negotiated,
-                                balloon.pressure_reclaim_enabled(),
+                                pressure::reclaim_status_json(balloon.reclaim_status()),
                                 queue.ready,
                             );
                             write_new(Path::new(operand), output.as_bytes())?;

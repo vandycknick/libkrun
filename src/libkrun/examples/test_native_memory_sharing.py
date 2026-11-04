@@ -221,8 +221,11 @@ class ReportingPublicationTests(unittest.TestCase):
     @staticmethod
     def observation():
         return {"schema": 1, "native_pid": 17, "reporting_negotiated": True,
-                "host_reclaim_enabled": False, "ready": True, "next_used": 0,
-                "used_idx": 0, "used_ring": 0x4000}
+                "reclaim": {"backing": "restored-private", "reason": "restored-private-mapping",
+                            "requested": False, "qualification": "not-run", "effective": False,
+                            "released_bytes": 0, "released_extents": 0, "retried_faults": 0,
+                            "skipped_reports": 0, "failed_operations": 0},
+                "ready": True, "next_used": 0, "used_idx": 0, "used_ring": 0x4000}
 
     def test_actual_used_publication_not_attempt_or_guest_churn_is_required(self):
         zero = self.observation()
@@ -244,7 +247,7 @@ class ReportingPublicationTests(unittest.TestCase):
         zero = self.observation()
         unready = {**zero, "ready": False, "next_used": None, "used_idx": None, "used_ring": None}
         self.assertFalse(reporting_advanced(unready, 17, 0))
-        for changed in ({"native_pid": 18}, {"schema": True}, {"host_reclaim_enabled": True},
+        for changed in ({"native_pid": 18}, {"schema": True}, {"reclaim": {}},
                         {"ready": 1}, {"reporting_negotiated": 1}, {"next_used": 65536},
                         {"used_idx": -1}, {"used_ring": 0x4001}, {"extra": 0}):
             with self.subTest(changed=changed):
@@ -254,6 +257,18 @@ class ReportingPublicationTests(unittest.TestCase):
             reporting_advanced({**unready, "next_used": 1}, 17, 0)
         with self.assertRaises(ValueError):
             reporting_advanced(zero, 17, True)
+
+    def test_inhibited_reporting_rejects_advice_and_contradictory_policy(self):
+        zero = self.observation()
+        for changed in ({"released_bytes": 4096}, {"released_extents": 1},
+                        {"requested": True}, {"effective": True}, {"qualification": "passed"},
+                        {"reason": "none"}, {"backing": "boot"}, {"skipped_reports": -1},
+                        {"failed_operations": True}):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                reporting_advanced({**zero, "reclaim": {**zero["reclaim"], **changed}}, 17, 0)
+        published = {**zero, "next_used": 1, "used_idx": 1,
+                     "reclaim": {**zero["reclaim"], "skipped_reports": 3}}
+        self.assertTrue(reporting_advanced(published, 17, 0))
 
 
 class PressureUnitOwnershipTests(unittest.TestCase):

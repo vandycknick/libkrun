@@ -1,0 +1,559 @@
+Subject: [DIAGNOSTIC ONLY] virtio_balloon: retain one disposable reporting page
+
+Linux 7.2.2; apply after the existing Silo live and x86_64 patches.
+Default-off, built-in x86_64 diagnostic, not production allocator reacquisition
+or destructive-reclaim qualification. No ordinary page_reporting supplier is
+registered in this build. The single page stays allocated through the exact
+used completion, guest C reuse, capture, and fresh-restore verification.
+
+diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -132,6 +132,19 @@
+ 
+ 	 If unsure, say M.
+ 
++config VIRTIO_BALLOON_SILO_RECLAIM_DIAG
++	bool "Silo owned disposable page reporting diagnostic"
++	depends on VIRTIO_BALLOON=y && X86_64 && SYSFS
++	default n
++	help
++	  Reserve the balloon reporting queue exclusively for a root-only,
++	  one-page retained-allocation diagnostic via the device's silo_reclaim
++	  sysfs attribute. Ordinary page_reporting is not registered.
++
++	  This is not production allocator reacquisition or destructive reclaim
++	  qualification. Select only in a separately identified diagnostic image.
++	  If unsure, say N.
++
+ config VIRTIO_MEM
+ 	tristate "Virtio mem driver"
+ 	depends on X86_64 || ARM64 || RISCV || S390
+diff --git a/drivers/virtio/virtio_balloon.c b/drivers/virtio/virtio_balloon.c
+--- a/drivers/virtio/virtio_balloon.c
++++ b/drivers/virtio/virtio_balloon.c
+@@ -18,6 +18,9 @@
+ #include <linux/wait.h>
+ #include <linux/mm.h>
+ #include <linux/page_reporting.h>
++#ifdef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
++#include <linux/sysfs.h>
++#endif
+ 
+ /*
+  * Balloon device works in 4K page units.  So each page is pointed to by
+@@ -52,6 +55,42 @@
+ 	VIRTIO_BALLOON_CONFIG_READ_CMD_ID = 0,
+ };
+ 
++#ifdef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
++enum silo_reclaim_state {
++	SILO_RECLAIM_EMPTY,
++	SILO_RECLAIM_OWNED,
++	SILO_RECLAIM_INFLIGHT,
++	SILO_RECLAIM_ACKED,
++	SILO_RECLAIM_C_READY,
++	SILO_RECLAIM_FAILED,
++};
++
++enum silo_reclaim_operation {
++	SILO_RECLAIM_NONE,
++	SILO_RECLAIM_PREPARE,
++	SILO_RECLAIM_DONATE,
++	SILO_RECLAIM_REUSE,
++	SILO_RECLAIM_VERIFY,
++};
++
++struct silo_reclaim_diag {
++	struct mutex lock;
++	struct page *page;
++	struct scatterlist sg;
++	enum silo_reclaim_state state;
++	enum silo_reclaim_operation operation;
++	char token[33];
++	u64 gpa;
++	u64 checksum;
++	u64 mismatches;
++	unsigned int verified_bytes;
++	int error;
++	bool submitted;
++	bool used_seen;
++	bool stopping;
++};
++#endif
++
+ struct virtio_balloon {
+ 	struct virtio_device *vdev;
+ 	struct virtqueue *inflate_vq, *deflate_vq, *stats_vq, *free_page_vq;
+@@ -118,7 +157,11 @@
+ 
+ 	/* Free page reporting device */
+ 	struct virtqueue *reporting_vq;
++#ifdef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
++	struct silo_reclaim_diag diag;
++#else
+ 	struct page_reporting_dev_info pr_dev_info;
++#endif
+ 
+ 	/* State for keeping the wakeup_source active while adjusting the balloon */
+ 	spinlock_t wakeup_lock;
+@@ -196,6 +239,7 @@
+ 
+ }
+ 
++#ifndef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
+ static int virtballoon_free_page_report(struct page_reporting_dev_info *pr_dev_info,
+ 				   struct scatterlist *sg, unsigned int nents)
+ {
+@@ -222,6 +266,296 @@
+ 
+ 	return 0;
+ }
++#else
++static int silo_reclaim_fail(struct silo_reclaim_diag *diag, int error)
++{
++	diag->state = SILO_RECLAIM_FAILED;
++	diag->error = -error;
++	return error;
++}
++
++/* Only metadata outside the disposable payload may be inspected in flight. */
++static int silo_reclaim_check_page(struct silo_reclaim_diag *diag)
++{
++	if (!diag->page || page_count(diag->page) != 1 ||
++	    PageCompound(diag->page) || PageReserved(diag->page) ||
++	    ((u64)page_to_pfn(diag->page) << PAGE_SHIFT) != diag->gpa)
++		return silo_reclaim_fail(diag, -EIO);
++	return 0;
++}
++
++/* The only reporting_vq consumer in this build; balloon_ack only wakes. */
++static int silo_reclaim_try_complete_locked(struct virtio_balloon *vb)
++{
++	struct silo_reclaim_diag *diag = &vb->diag;
++	unsigned int unused;
++	void *cookie;
++	int err;
++
++	if (diag->state == SILO_RECLAIM_FAILED)
++		return -diag->error;
++	if (diag->state != SILO_RECLAIM_INFLIGHT)
++		return 0;
++	if (!diag->submitted || diag->used_seen)
++		return silo_reclaim_fail(diag, -EIO);
++	err = silo_reclaim_check_page(diag);
++	if (err)
++		return err;
++	if (virtqueue_is_broken(vb->reporting_vq))
++		return silo_reclaim_fail(diag, -EIO);
++	cookie = virtqueue_get_buf(vb->reporting_vq, &unused);
++	if (virtqueue_is_broken(vb->reporting_vq))
++		return silo_reclaim_fail(diag, -EIO);
++	if (!cookie)
++		return 0;
++	if (cookie != diag)
++		return silo_reclaim_fail(diag, -EIO);
++	diag->used_seen = true;
++	diag->state = SILO_RECLAIM_ACKED;
++	return 0;
++}
++
++struct silo_reclaim_command {
++	enum silo_reclaim_operation operation;
++	char token[33];
++	u64 gpa;
++};
++
++static int silo_reclaim_parse(const char *buf, size_t count,
++			      struct silo_reclaim_command *command)
++{
++	size_t pos, i;
++	u64 gpa = 0;
++
++	/* Longest line: "donate " + token + " " + 20 GPA digits + LF. */
++	if (!count || count > 61 || buf[count - 1] != '\n')
++		return -EINVAL;
++	if (count >= 8 && !memcmp(buf, "prepare ", 8)) {
++		command->operation = SILO_RECLAIM_PREPARE;
++		pos = 8;
++	} else if (count >= 7 && !memcmp(buf, "donate ", 7)) {
++		command->operation = SILO_RECLAIM_DONATE;
++		pos = 7;
++	} else if (count >= 6 && !memcmp(buf, "reuse ", 6)) {
++		command->operation = SILO_RECLAIM_REUSE;
++		pos = 6;
++	} else if (count >= 7 && !memcmp(buf, "verify ", 7)) {
++		command->operation = SILO_RECLAIM_VERIFY;
++		pos = 7;
++	} else {
++		return -EINVAL;
++	}
++	if (count < pos + 33)
++		return -EINVAL;
++	for (i = 0; i < 32; i++) {
++		char c = buf[pos + i];
++
++		if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
++			return -EINVAL;
++		command->token[i] = c;
++	}
++	command->token[32] = '\0';
++	pos += 32;
++	if (command->operation == SILO_RECLAIM_PREPARE)
++		return pos + 1 == count ? 0 : -EINVAL;
++	if (buf[pos++] != ' ' || pos >= count - 1 ||
++	    count - 1 - pos > 20)
++		return -EINVAL;
++	for (; pos < count - 1; pos++) {
++		unsigned int digit;
++
++		if (buf[pos] < '0' || buf[pos] > '9')
++			return -EINVAL;
++		digit = buf[pos] - '0';
++		if (gpa > (U64_MAX - digit) / 10)
++			return -ERANGE;
++		gpa = gpa * 10 + digit;
++	}
++	if (gpa & (PAGE_SIZE - 1))
++		return -EINVAL;
++	command->gpa = gpa;
++	return 0;
++}
++
++static void silo_reclaim_record(struct silo_reclaim_diag *diag,
++				const struct silo_reclaim_command *command)
++{
++	diag->operation = command->operation;
++	memcpy(diag->token, command->token, sizeof(diag->token));
++}
++
++static u8 silo_reclaim_c_byte(unsigned int i)
++{
++	return 1 + ((i * 29 + 67) % 255);
++}
++
++static int silo_reclaim_read_c(struct silo_reclaim_diag *diag)
++{
++	const u8 *payload = page_address(diag->page);
++	u64 checksum = 14695981039346656037ULL;
++	u64 mismatches = 0;
++	unsigned int i;
++
++	/* Actual independent loads, including on a fresh restored guest. */
++	for (i = 0; i < PAGE_SIZE; i++) {
++		u8 byte = READ_ONCE(payload[i]);
++
++		if (byte != silo_reclaim_c_byte(i))
++			mismatches++;
++		checksum = (checksum ^ byte) * 1099511628211ULL;
++	}
++	diag->verified_bytes = PAGE_SIZE;
++	diag->mismatches = mismatches;
++	diag->checksum = checksum;
++	if (mismatches)
++		return silo_reclaim_fail(diag, -EIO);
++	return 0;
++}
++
++static int silo_reclaim_execute_locked(struct virtio_balloon *vb,
++				       const struct silo_reclaim_command *command)
++{
++	struct silo_reclaim_diag *diag = &vb->diag;
++	unsigned int i;
++	u8 *payload;
++	int err;
++
++	if (diag->stopping)
++		return -EBUSY;
++	if (diag->state == SILO_RECLAIM_FAILED)
++		return -diag->error;
++	if (command->operation == SILO_RECLAIM_PREPARE) {
++		if (diag->state != SILO_RECLAIM_EMPTY || diag->page)
++			return -EBUSY;
++		/* No direct reclaim or allocator wait in the sysfs command. */
++		diag->page = alloc_page(GFP_NOWAIT | __GFP_NOWARN);
++		if (!diag->page)
++			return -ENOMEM;
++		diag->gpa = (u64)page_to_pfn(diag->page) << PAGE_SHIFT;
++		err = silo_reclaim_check_page(diag);
++		if (err)
++			return err;
++		sg_init_table(&diag->sg, 1);
++		sg_set_page(&diag->sg, diag->page, PAGE_SIZE, 0);
++		diag->state = SILO_RECLAIM_OWNED;
++		silo_reclaim_record(diag, command);
++		return 0;
++	}
++	if (!diag->page || command->gpa != diag->gpa)
++		return -EINVAL;
++	err = silo_reclaim_check_page(diag);
++	if (err)
++		return err;
++	switch (command->operation) {
++	case SILO_RECLAIM_DONATE:
++		if (diag->state != SILO_RECLAIM_OWNED || diag->submitted ||
++		    diag->used_seen)
++			return -EBUSY;
++		if (virtqueue_is_broken(vb->reporting_vq))
++			return silo_reclaim_fail(diag, -EIO);
++		err = virtqueue_add_inbuf(vb->reporting_vq, &diag->sg, 1,
++					 diag, GFP_NOWAIT);
++		if (err)
++			return silo_reclaim_fail(diag, err);
++		diag->submitted = true;
++		diag->state = SILO_RECLAIM_INFLIGHT;
++		silo_reclaim_record(diag, command);
++		virtqueue_kick(vb->reporting_vq);
++		if (virtqueue_is_broken(vb->reporting_vq))
++			return silo_reclaim_fail(diag, -EIO);
++		return 0;
++	case SILO_RECLAIM_REUSE:
++		if (diag->state != SILO_RECLAIM_INFLIGHT &&
++		    diag->state != SILO_RECLAIM_ACKED)
++			return -EBUSY;
++		err = silo_reclaim_try_complete_locked(vb);
++		if (err)
++			return err;
++		if (diag->state == SILO_RECLAIM_INFLIGHT)
++			return -EAGAIN;
++		if (!diag->submitted || !diag->used_seen)
++			return silo_reclaim_fail(diag, -EIO);
++		err = silo_reclaim_check_page(diag);
++		if (err)
++			return err;
++		silo_reclaim_record(diag, command);
++		payload = page_address(diag->page);
++		/* The first post-ack payload operation overwrites every byte. */
++		for (i = 0; i < PAGE_SIZE; i++)
++			WRITE_ONCE(payload[i], silo_reclaim_c_byte(i));
++		err = silo_reclaim_read_c(diag);
++		if (!err)
++			diag->state = SILO_RECLAIM_C_READY;
++		return err;
++	case SILO_RECLAIM_VERIFY:
++		if (diag->state != SILO_RECLAIM_C_READY)
++			return -EBUSY;
++		if (!diag->submitted || !diag->used_seen)
++			return silo_reclaim_fail(diag, -EIO);
++		silo_reclaim_record(diag, command);
++		return silo_reclaim_read_c(diag);
++	default:
++		return -EINVAL;
++	}
++}
++
++static ssize_t silo_reclaim_show(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	static const char * const states[] = {
++		"empty", "owned", "inflight", "acked", "c-ready", "failed",
++	};
++	static const char * const operations[] = {
++		"none", "prepare", "donate", "reuse", "verify",
++	};
++	struct virtio_balloon *vb = dev_to_virtio(dev)->priv;
++	struct silo_reclaim_diag *diag = &vb->diag;
++	ssize_t count;
++
++	if (!mutex_trylock(&diag->lock))
++		return -EBUSY;
++	if (diag->stopping) {
++		mutex_unlock(&diag->lock);
++		return -EBUSY;
++	}
++	/* Status can harvest a used entry, but must never inspect payload. */
++	silo_reclaim_try_complete_locked(vb);
++	count = sysfs_emit(buf,
++		"abi=1 state=%s operation=%s token=%s gpa=%llu bytes=4096 "
++		"submitted=%u used_seen=%u verified_bytes=%u mismatches=%llu "
++		"checksum=%016llx error=%d\n",
++		states[diag->state], operations[diag->operation], diag->token,
++		(unsigned long long)diag->gpa, diag->submitted, diag->used_seen,
++		diag->verified_bytes, (unsigned long long)diag->mismatches,
++		(unsigned long long)diag->checksum, diag->error);
++	mutex_unlock(&diag->lock);
++	return count;
++}
++
++static ssize_t silo_reclaim_store(struct device *dev,
++				 struct device_attribute *attr,
++				 const char *buf, size_t count)
++{
++	struct virtio_balloon *vb = dev_to_virtio(dev)->priv;
++	struct silo_reclaim_command command = {};
++	int err;
++
++	err = silo_reclaim_parse(buf, count, &command);
++	if (err)
++		return err;
++	if (!mutex_trylock(&vb->diag.lock))
++		return -EBUSY;
++	err = silo_reclaim_execute_locked(vb, &command);
++	mutex_unlock(&vb->diag.lock);
++	if (err)
++		return err;
++	return count;
++}
++
++static DEVICE_ATTR(silo_reclaim, 0600, silo_reclaim_show, silo_reclaim_store);
++
++static void virtballoon_remove(struct virtio_device *vdev);
++#endif
+ 
+ static void set_page_pfns(struct virtio_balloon *vb,
+ 			  __virtio32 pfns[], struct page *page)
+@@ -926,6 +1260,15 @@
+ 			__func__);
+ 		return -EINVAL;
+ 	}
++#ifdef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
++	BUILD_BUG_ON(PAGE_SIZE != 4096);
++	if (!virtio_has_feature(vdev, VIRTIO_BALLOON_F_REPORTING) ||
++	    virtio_has_feature(vdev, VIRTIO_BALLOON_F_PAGE_POISON) ||
++	    want_init_on_free() || page_poisoning_enabled_static()) {
++		dev_err(&vdev->dev, "owned-report diagnostic requires unpoisoned reporting\n");
++		return -EOPNOTSUPP;
++	}
++#endif
+ 
+ 	vdev->priv = vb = kzalloc_obj(*vb);
+ 	if (!vb) {
+@@ -937,6 +1280,10 @@
+ 	INIT_WORK(&vb->update_balloon_size_work, update_balloon_size_func);
+ 	spin_lock_init(&vb->stop_update_lock);
+ 	mutex_init(&vb->balloon_lock);
++#ifdef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
++	mutex_init(&vb->diag.lock);
++	memset(vb->diag.token, '0', 32);
++#endif
+ 	init_waitqueue_head(&vb->acked);
+ 	vb->vdev = vdev;
+ 
+@@ -1012,6 +1359,7 @@
+ 				 poison_val, &poison_val);
+ 	}
+ 
++#ifndef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
+ 	vb->pr_dev_info.report = virtballoon_free_page_report;
+ 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_REPORTING)) {
+ 		unsigned int capacity;
+@@ -1042,6 +1390,7 @@
+ 		if (err)
+ 			goto out_unregister_oom;
+ 	}
++#endif
+ 
+ 	spin_lock_init(&vb->wakeup_lock);
+ 
+@@ -1055,14 +1404,23 @@
+ 	device_set_wakeup_capable(&vb->vdev->dev, true);
+ 
+ 	virtio_device_ready(vdev);
++#ifdef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
++	err = device_create_file(&vdev->dev, &dev_attr_silo_reclaim);
++	if (err) {
++		virtballoon_remove(vdev);
++		return err;
++	}
++#endif
+ 
+ 	if (towards_target(vb))
+ 		virtballoon_changed(vdev);
+ 	return 0;
+ 
++#ifndef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
+ out_unregister_oom:
+ 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_DEFLATE_ON_OOM))
+ 		unregister_oom_notifier(&vb->oom_nb);
++#endif
+ out_unregister_shrinker:
+ 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_FREE_PAGE_HINT))
+ 		virtio_balloon_unregister_shrinker(vb);
+@@ -1072,6 +1430,9 @@
+ out_del_vqs:
+ 	vdev->config->del_vqs(vdev);
+ out_free_vb:
++#ifdef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
++	mutex_destroy(&vb->diag.lock);
++#endif
+ 	mutex_destroy(&vb->balloon_lock);
+ 	kfree(vb);
+ out:
+@@ -1080,6 +1441,10 @@
+ 
+ static void remove_common(struct virtio_balloon *vb)
+ {
++#ifdef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
++	mutex_lock(&vb->diag.lock);
++	vb->diag.stopping = true;
++#endif
+ 	/* There might be pages left in the balloon: free them. */
+ 	while (vb->num_pages)
+ 		leak_balloon(vb, vb->num_pages);
+@@ -1093,14 +1458,27 @@
+ 	virtio_reset_device(vb->vdev);
+ 
+ 	vb->vdev->config->del_vqs(vb->vdev);
++#ifdef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
++	/* Only completed reset/queue deletion revokes a pending donation. */
++	if (vb->diag.page) {
++		__free_page(vb->diag.page);
++		vb->diag.page = NULL;
++	}
++	mutex_unlock(&vb->diag.lock);
++#endif
+ }
+ 
+ static void virtballoon_remove(struct virtio_device *vdev)
+ {
+ 	struct virtio_balloon *vb = vdev->priv;
+ 
++#ifdef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
++	/* Drain active sysfs users before taking their mutex or deleting queues. */
++	device_remove_file(&vdev->dev, &dev_attr_silo_reclaim);
++#else
+ 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_REPORTING))
+ 		page_reporting_unregister(&vb->pr_dev_info);
++#endif
+ 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_DEFLATE_ON_OOM))
+ 		unregister_oom_notifier(&vb->oom_nb);
+ 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_FREE_PAGE_HINT))
+@@ -1117,6 +1495,9 @@
+ 	}
+ 
+ 	remove_common(vb);
++#ifdef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
++	mutex_destroy(&vb->diag.lock);
++#endif
+ 	mutex_destroy(&vb->balloon_lock);
+ 	kfree(vb);
+ }
+@@ -1126,6 +1507,16 @@
+ {
+ 	struct virtio_balloon *vb = vdev->priv;
+ 
++#ifdef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
++	mutex_lock(&vb->diag.lock);
++	if (vb->diag.page) {
++		mutex_unlock(&vb->diag.lock);
++		return -EBUSY;
++	}
++	/* Block new allocations until restore has made the new queues ready. */
++	vb->diag.stopping = true;
++	mutex_unlock(&vb->diag.lock);
++#endif
+ 	/*
+ 	 * The workqueue is already frozen by the PM core before this
+ 	 * function is called.
+@@ -1144,6 +1535,11 @@
+ 		return ret;
+ 
+ 	virtio_device_ready(vdev);
++#ifdef CONFIG_VIRTIO_BALLOON_SILO_RECLAIM_DIAG
++	mutex_lock(&vb->diag.lock);
++	vb->diag.stopping = false;
++	mutex_unlock(&vb->diag.lock);
++#endif
+ 
+ 	if (towards_target(vb))
+ 		virtballoon_changed(vdev);

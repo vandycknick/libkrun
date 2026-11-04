@@ -1589,3 +1589,36 @@ owner reaping, preserve text, identities and exact shared inputs before
 removing generated RAM/disk payloads. The deliberately unlinked baseline and
 removed payloads are not replayable. This diagnostic grants no public
 live-operation capability and does not qualify restored-private discard.
+
+### Restored-private reporting safety
+
+The native reclaim observer reports backing, inhibition reason, qualification
+and process-local advice counters. Tracked source RAM and restored file-private
+RAM remain inhibited. A real reporting completion with no destructive advice
+is not a zero-after-discard qualification.
+
+The `--memory-reclaim` diagnostic requires the separately built kernel fixture
+in `src/libkrun/examples/reclaim_kernel/`. Its exclusive real reporting queue
+retains one disposable order-0 page; ordinary allocator reporting is not
+registered in this diagnostic build. Production kernel configuration is unchanged.
+The guest prepares that page before capture. The native witness seeds source
+bytes A, then writes distinct B through the restored host-writer domain while
+every vCPU is parked. It processes the actual report and checks B after
+used-ring publication, before guest reuse. The controller verifies immutable
+baseline/sibling isolation and bounded memory pressure. Guest kernel CPU code
+writes C to the same retained PFN only after actual used completion; complete
+recapture and a fresh restore must verify C without rewriting it.
+
+This proves owned-page reporting safety, not production allocator reacquisition
+or private discard-to-zero. The earlier bounded allocator campaign failed to
+obtain its target PFN; its failed evidence remains intact. No fallback page,
+larger allocation campaign, destructive advice, or public capability grant is
+substituted. Diagnostic reports identify this narrower ownership scope explicitly.
+
+Shutdown pumps only the owner being stopped. A peer guest failure cannot
+interrupt another owner's bounded native stop. An owner's own pump failures
+are retained in `native-stop.json` and rethrown after actual stop/reap; they
+do not become successful workload results. Deadline, nonzero exit and forced
+reaping remain failures. Real-subprocess controller regressions exercise this
+cleanup contract but do not substitute for native VM stop acknowledgements.
+

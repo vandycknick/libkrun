@@ -158,6 +158,8 @@ pub struct ReclaimStats {
     /// Cumulative successfully advised bytes, not measured host-memory savings.
     pub released_bytes: u64,
     pub retried_faults: u64,
+    /// Backend range skips. Device-level skipped chains are observed separately
+    /// only after used publication; neither counter measures physical pages.
     pub skipped_reports: u64,
     pub failed_operations: u64,
 }

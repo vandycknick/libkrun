@@ -1065,6 +1065,8 @@ impl BalloonBinding {
     pub(crate) fn finalize(
         &self,
         policy: devices::virtio::balloon::BalloonMemoryPolicy,
+        observer: devices::virtio::balloon::ReclaimObserver,
+        domain: &arch::guest_memory::MemoryDomain,
         #[cfg(target_os = "macos")] state: Arc<hvf::reclaim::ReclaimState>,
         #[cfg(target_os = "macos")] remapper: Option<Arc<hvf::remap::HostMemoryRemapper>>,
     ) -> Result<(), VmmError> {
@@ -1072,6 +1074,9 @@ impl BalloonBinding {
             .balloon
             .lock()
             .map_err(|_| VmmError::Internal("balloon lock poisoned".to_string()))?;
+        balloon.set_reclaim_observer(observer).map_err(|error| {
+            VmmError::Internal(format!("balloon reclaim observation: {error:?}"))
+        })?;
         #[cfg(target_os = "macos")]
         balloon.set_reclaim_state(state);
         balloon
@@ -1079,7 +1084,20 @@ impl BalloonBinding {
             .map_err(|error| VmmError::Internal(format!("balloon memory policy: {error:?}")))?;
         #[cfg(target_os = "macos")]
         balloon.set_host_memory_remapper(remapper);
+        balloon.bind_reclaim_domain(domain);
         Ok(())
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    pub(crate) fn report_parked(
+        &self,
+        key: polly::event_manager::BarrierKey,
+        cpu_count: usize,
+    ) -> Result<(), String> {
+        self.balloon
+            .try_lock()
+            .map_err(|_| "report witness balloon lock unavailable")?
+            .pressure_report_parked(key, cpu_count)
     }
 }
 
@@ -1954,9 +1972,13 @@ mod tests {
     #[test]
     fn late_balloon_binding_preserves_saved_offer_and_rejects_second_policy() {
         use crate::api::device_builders::BalloonBinding;
+        use arch::guest_memory::{BackingKind, MemoryDomain};
         use devices::virtio::VirtioDevice;
-        use devices::virtio::balloon::BalloonMemoryPolicy;
+        use devices::virtio::balloon::{
+            BalloonMemoryPolicy, ReclaimBacking, ReclaimObserver, ReclaimReason,
+        };
         use std::sync::{Arc, Mutex};
+        use vm_memory::{GuestAddress, GuestMemoryMmap};
 
         let base = devices::virtio::Balloon::new().unwrap().avail_features() & !(1 << 5);
         for (offer, policy) in [
@@ -1967,15 +1989,33 @@ mod tests {
                 devices::virtio::Balloon::new_restore_binding(offer).unwrap(),
             ));
             let binding = BalloonBinding::new(balloon.clone());
+            let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+            let (domain, authority, mut control) =
+                MemoryDomain::construct(memory, 4096, BackingKind::RestoredPrivate).unwrap();
+            let epoch = authority.issue_epoch(1).unwrap();
+            control.finish_tracked(authority, epoch).unwrap();
+            #[cfg(target_os = "macos")]
+            let state = Arc::new(hvf::reclaim::ReclaimState::new());
+            let observer = ReclaimObserver::for_domain(
+                &domain,
+                #[cfg(target_os = "macos")]
+                state.clone(),
+            );
             binding
                 .finalize(
                     policy,
+                    observer.clone(),
+                    &domain,
                     #[cfg(target_os = "macos")]
-                    Arc::new(hvf::reclaim::ReclaimState::new()),
+                    state.clone(),
                     #[cfg(target_os = "macos")]
                     None,
                 )
                 .unwrap();
+            let status = observer.status();
+            assert_eq!(status.backing, ReclaimBacking::RestoredPrivate);
+            assert_eq!(status.reason, ReclaimReason::RestoredPrivateMapping);
+            assert!(!status.requested && !status.effective);
             match balloon.lock() {
                 Ok(device) => assert_eq!(device.avail_features(), offer),
                 Err(error) => panic!("balloon lock poisoned: {error}"),
@@ -1984,13 +2024,16 @@ mod tests {
                 binding
                     .finalize(
                         BalloonMemoryPolicy::Untracked,
+                        observer.clone(),
+                        &domain,
                         #[cfg(target_os = "macos")]
-                        Arc::new(hvf::reclaim::ReclaimState::new()),
+                        state.clone(),
                         #[cfg(target_os = "macos")]
                         None,
                     )
                     .is_err()
             );
+            assert_eq!(observer.status(), status);
             match balloon.lock() {
                 Ok(device) => assert_eq!(device.avail_features(), offer),
                 Err(error) => panic!("balloon lock poisoned: {error}"),

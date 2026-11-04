@@ -142,6 +142,7 @@ pub struct Vmm {
     pub(crate) memory: memory::MemoryCoordinator,
     #[cfg(not(feature = "tee"))]
     pub(crate) balloon_bindings: Vec<crate::api::device_builders::BalloonBinding>,
+    pub(crate) reclaim_observer: Option<devices::virtio::balloon::ReclaimObserver>,
     pub(crate) arch_memory_info: ArchMemoryInfo,
 
     pub(crate) kernel_cmdline: KernelCmdline,

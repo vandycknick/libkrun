@@ -176,6 +176,20 @@ The public `released_bytes` and `released_extents` counters retain their API nam
 but count cumulative successfully advised bytes and coalesced ranges, including
 repeats. They are not current memory savings or counts of unique physical pages.
 
+`VmmHandle::host_reclaim_status()` observes finalized backing and policy,
+not just the balloon's requested setting. Capture-tracked boot memory reports
+`tracked-capture`; restored file-private memory reports
+`restored-private-mapping`. Both are inhibited, ineffective and `not-run`,
+even if anonymous boot-memory qualification succeeded elsewhere. Reporting
+queue completion does not change that qualification.
+
+Counters are process-local observations and are not checkpoint payload.
+Fresh restored children start at zero. Inhibited operations do not increment
+successfully advised bytes or ranges; skipped operations are counted only
+after successful used-ring publication. Malformed reports and failed
+publication do not become completed skips. The skipped-operation count is
+not a portable count of physical pages or queue heads.
+
 ## Approaches tested and rejected
 
 - **Guarding every device access with leases:** the early implementation took a

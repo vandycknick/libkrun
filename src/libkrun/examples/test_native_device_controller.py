@@ -1,4 +1,17 @@
-"""Pure bounded native-mux framing and console-owner readiness regressions."""
+"""Bounded framing, readiness and real subprocess/socket pump regressions.
+
+The subprocess cases exercise controller cleanup, not native-owner acknowledgement.
+"""
+import json
+import os
+from pathlib import Path
+import select
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from types import SimpleNamespace
 import unittest
 
 from native_device_controller import Session
@@ -120,6 +133,147 @@ class ConsoleOwnerReadinessTests(unittest.TestCase):
             with self.subTest(consoles=consoles):
                 with self.assertRaisesRegex(RuntimeError, "unique actual console"):
                     Session.blocked_console_owner({"consoles": consoles})
+
+
+class StopIsolationTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="native-stop-unit-")
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.args = SimpleNamespace(sessions=[])
+
+    def session(self, name, exit_status=0):
+        session = Session.__new__(Session)
+        session.directory = self.directory / name
+        session.directory.mkdir()
+        session.args = self.args
+        session.native_reaped = False
+        session.cleanup_failures = []
+        session.stopping = False
+        session.partial = False
+        session.drain_output = True
+        session.last_send = time.monotonic()
+        session.mux_data = None
+        session.netd = None
+        session.process = None
+        session.sockets = []
+        session.fds = []
+        self.addCleanup(session.close)
+        for name in ("log", "guest_log", "output_log"):
+            setattr(session, name, (session.directory / name).open("wb"))
+        session.control_buffer = bytearray()
+        session.guest_buffer = bytearray()
+        session.replies = []
+        console, guest = socket.socketpair()
+        session.console = console.fileno()
+        session.sockets.extend((console, guest))
+        session.input_host, input_guest = socket.socketpair()
+        session.output_host, output_guest = socket.socketpair()
+        session.sockets.extend((session.input_host, input_guest, session.output_host, output_guest))
+        session.echo = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        session.echo.bind(("127.0.0.1", 0))
+        session.sockets.append(session.echo)
+        session.network_peers = set()
+        for endpoint in session.sockets:
+            endpoint.setblocking(False)
+        child = """
+import os
+from pathlib import Path
+import sys
+
+print("ready", flush=True)
+Path(sys.argv[1]).write_bytes(sys.stdin.buffer.readline())
+# Exceed pipe capacity so stop must pump real descriptors before this exits.
+remaining = b"draining\\n" * 32768
+while remaining:
+    remaining = remaining[os.write(sys.stdout.fileno(), remaining):]
+if sys.argv[2] == "stall":
+    sys.stdin.buffer.read()
+sys.exit(int(sys.argv[2]))
+"""
+        process = subprocess.Popen(
+            [sys.executable, "-c", child, str(session.directory / "received-stop"), str(exit_status)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        session.process = process
+        self.addCleanup(process.stdin.close)
+        self.addCleanup(process.stdout.close)
+        # Reap before closing the pipes, including if an assertion fails.
+        self.addCleanup(session.close)
+        ready, _, _ = select.select([process.stdout], [], [], 5)
+        self.assertTrue(ready, "subprocess readiness deadline")
+        self.assertEqual(process.stdout.readline(), b"ready\n")
+        os.set_blocking(process.stdout.fileno(), False)
+        self.args.sessions.append(session)
+        return session, process, guest
+
+    def test_peer_guest_failure_cannot_interrupt_another_owner_stop(self):
+        primary, primary_process, primary_console = self.session("primary")
+        sibling, sibling_process, _ = self.session("sibling")
+        primary_console.sendall(b"FAIL memory-reclaim errno=2\n")
+
+        sibling.stop()
+        self.assertTrue(sibling.native_reaped)
+        self.assertEqual(sibling_process.returncode, 0)
+        self.assertEqual((sibling.directory / "received-stop").read_bytes(), b"stop\n")
+        self.assertEqual((sibling.directory / "guest_log").read_bytes(), b"")
+        self.assertIsNone(primary_process.poll())
+        self.assertEqual(primary.guest_buffer, b"")
+
+        with self.assertRaisesRegex(RuntimeError, "FAIL memory-reclaim errno=2"):
+            primary.stop()
+        self.assertTrue(primary.native_reaped)
+        self.assertEqual(primary_process.returncode, 0)
+        self.assertEqual((primary.directory / "received-stop").read_bytes(), b"stop\n")
+        proof = json.loads((primary.directory / "native-stop.json").read_text())
+        self.assertEqual(proof["pump_failures"], ["FAIL memory-reclaim errno=2"])
+        self.assertTrue(proof["native_driver_stop_completed"])
+        self.assertIn(b"FAIL memory-reclaim errno=2\n", (primary.directory / "guest_log").read_bytes())
+        self.assertEqual(primary.close(), [])
+        self.assertEqual(sibling.close(), [])
+
+    def test_ordinary_pump_still_propagates_peer_guest_failure(self):
+        primary, _, primary_console = self.session("primary")
+        sibling, _, _ = self.session("sibling")
+        primary_console.sendall(b"FAIL memory-reclaim errno=2\n")
+        with self.assertRaisesRegex(RuntimeError, "FAIL memory-reclaim errno=2"):
+            sibling.pump(.1)
+        self.assertFalse(primary.stopping)
+        self.assertFalse(sibling.stopping)
+        primary.stop()
+        sibling.stop()
+
+    def test_nonzero_exit_cannot_become_acknowledged_stop(self):
+        session, process, console = self.session("nonzero", exit_status=7)
+        console.sendall(b"FAIL memory-reclaim errno=2\n")
+        with self.assertRaises(RuntimeError) as raised:
+            session.stop()
+        self.assertEqual(str(raised.exception.__cause__), "FAIL memory-reclaim errno=2")
+        self.assertFalse(session.native_reaped)
+        self.assertEqual(process.returncode, 7)
+        self.assertFalse((session.directory / "native-stop.json").exists())
+        self.assertIn(b"FAIL memory-reclaim errno=2\n", (session.directory / "guest_log").read_bytes())
+
+    def test_unacknowledged_stop_keeps_deadline_and_original_guest_failure(self):
+        session, process, console = self.session("deadline", exit_status="stall")
+        console.sendall(b"FAIL memory-reclaim errno=2\n")
+        started = time.monotonic()
+        with self.assertRaises(RuntimeError) as raised:
+            session.stop()
+        self.assertGreaterEqual(time.monotonic() - started, 10)
+        self.assertEqual(str(raised.exception.__cause__), "FAIL memory-reclaim errno=2")
+        self.assertIsNone(process.poll())
+        self.assertFalse(session.native_reaped)
+        self.assertFalse((session.directory / "native-stop.json").exists())
+        self.assertEqual(session.close(), [
+            "native driver required forced process reap, no native stop acknowledgement"])
+
+    def test_forced_reap_remains_a_cleanup_failure(self):
+        session, process, _ = self.session("forced")
+        self.assertEqual(session.close(), [
+            "native driver required forced process reap, no native stop acknowledgement"])
+        self.assertIsNotNone(process.returncode)
+        self.assertFalse(session.native_reaped)
+        self.assertFalse((session.directory / "native-stop.json").exists())
 
 
 if __name__ == "__main__":

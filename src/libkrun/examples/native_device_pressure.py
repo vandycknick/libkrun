@@ -49,6 +49,28 @@ def integer(value: object, label: str) -> int:
     return value
 
 
+def inhibited_reclaim(record: dict, backing: str | None = None) -> dict:
+    fields = {"backing", "reason", "requested", "qualification", "effective",
+              "released_bytes", "released_extents", "retried_faults", "skipped_reports",
+              "failed_operations"}
+    if not isinstance(record, dict) or set(record) != fields:
+        raise ValueError("actual reclaim status fields")
+    reasons = {"boot": "tracked-capture", "restored-private": "restored-private-mapping"}
+    if (type(record["backing"]) is not str or record["backing"] not in reasons
+            or backing is not None and record["backing"] != backing
+            or record["reason"] != reasons[record["backing"]]
+            or record["requested"] is not False or record["effective"] is not False
+            or record["qualification"] != "not-run"):
+        raise ValueError("actual tracked/restored reclaim policy")
+    for field in ("released_bytes", "released_extents", "retried_faults",
+                  "skipped_reports", "failed_operations"):
+        if type(record[field]) is not int or not 0 <= record[field] < 1 << 64:
+            raise ValueError(f"actual reclaim counter {field}")
+    if any(record[field] != 0 for field in ("released_bytes", "released_extents", "retried_faults")):
+        raise ValueError("inhibited reclaim reported successful advice/fault retry")
+    return record
+
+
 @contextmanager
 def stopped_child(child: Session, root: Path):
     primary = None
@@ -365,8 +387,7 @@ class Pressure:
                     for device in state["devices"]), "a real participant remained unsettled/faulted")
         devices = {device["id"]: device for device in state["devices"]}
         self.source_devices = devices
-        require(state["balloon"]["host_reclaim_enabled"] is False,
-                "capture-tracked source admitted destructive balloon reclaim")
+        inhibited_reclaim(state["balloon"]["reclaim"], "boot")
         for name in ("disk0", "disk1", "net0", "vsock0", "balloon0", "rng0", "hvc0"):
             require(name in devices and devices[name].get("queues"), f"missing actual retained queues for {name}")
         require(len(devices["vsock0"]["queues"]) == 3, "EVQ was lost at source closure")
@@ -562,8 +583,7 @@ class Pressure:
             prepared, prepared_path = self.native("destination-prepared")
             require(prepared["vsock"]["pending_reset"] and prepared["vsock"]["reset_deliveries"] == 0,
                     "destination did not retain actual undelivered transport reset")
-            require(prepared["balloon"]["host_reclaim_enabled"] is False,
-                    "restored private RAM admitted destructive balloon reclaim")
+            inhibited_reclaim(prepared["balloon"]["reclaim"], "restored-private")
             require({device["id"] for device in prepared["devices"]} == set(self.source_devices),
                     "fresh destination attachment inventory differs from actual source")
             for device in prepared["devices"]:
@@ -684,8 +704,7 @@ class Pressure:
                 require(any((new["next_used"] - old["next_used"]) & 0xffff
                             for old, new in zip(self.source_devices[name]["queues"], recaptured_devices[name]["queues"])),
                         f"fresh destination did not publish actual new used entries for {name}")
-            require(recaptured["balloon"]["host_reclaim_enabled"] is False,
-                    "fresh reporting changed restored reclaim policy")
+            inhibited_reclaim(recaptured["balloon"]["reclaim"], "restored-private")
             recapture_directory = self.root / "fresh-child-recapture"
             self.session.command(f"capture {recapture_directory}")
             self.attach(("busy_block", "busy_net", "busy_vsock", "busy_console", "balloon_rng_legacy"),

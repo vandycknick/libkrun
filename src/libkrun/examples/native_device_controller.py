@@ -832,17 +832,28 @@ class Session:
         self.stopping = True
         self.process.stdin.write(b"stop\n"); self.process.stdin.flush()
         deadline = time.monotonic() + 10
+        pump_failures = []
         while self.process.poll() is None:
             if time.monotonic() >= deadline:
-                raise RuntimeError("native stop/reap deadline, actual owners not acknowledged")
-            self.pump()
+                raise RuntimeError("native stop/reap deadline, actual owners not acknowledged") from (
+                    pump_failures[0] if pump_failures else None)
+            try:
+                # A peer's workload must not interrupt this owner's stop, and an
+                # already-failing guest must not prevent its own acknowledgement.
+                self.pump(peers=False)
+            except RuntimeError as error:
+                pump_failures.append(error)
         result = self.process.wait(timeout=1)
         if result:
-            raise RuntimeError(f"native stop/reap failed: {result}")
+            raise RuntimeError(f"native stop/reap failed: {result}") from (
+                pump_failures[0] if pump_failures else None)
         save(self.directory / "native-stop.json", {"native_pid": self.process.pid, "exit_status": result,
-             "explicit_stop_requested": True, "native_driver_stop_completed": True})
+             "explicit_stop_requested": True, "native_driver_stop_completed": True,
+             "pump_failures": [str(error) for error in pump_failures]})
         self.process = None
         self.native_reaped = True
+        if pump_failures:
+            raise pump_failures[0]
 
     def close(self):
         failures = []
@@ -1021,6 +1032,8 @@ def main():
                         help="accepted-generation native RAM image and private restore proof")
     parser.add_argument("--memory-sharing", type=int, choices=(1, 2, 4),
                         help="one fresh KVM sharing/lifetime cohort, N=1 before N=2/4")
+    parser.add_argument("--memory-reclaim", action="store_true",
+                        help="real-report acknowledge-only restored-private safety, not discard qualification")
     parser.add_argument("--sharing-unit",
                         help="this invocation's isolated silo-phase10-sharing-*.service user unit")
     parser.add_argument("--sharing-control", type=Path,
@@ -1030,13 +1043,16 @@ def main():
     args = parser.parse_args()
     if args.execution_completeness != args.busy_devices:
         parser.error("closed production extension requires both --execution-completeness and --busy-devices")
-    memory_modes = int(args.memory_dirty) + int(args.memory_incremental) + int(args.memory_sharing is not None)
+    memory_modes = (int(args.memory_dirty) + int(args.memory_incremental)
+                    + int(args.memory_sharing is not None) + int(args.memory_reclaim))
     if memory_modes > 1 or (memory_modes and args.execution_completeness):
         parser.error("memory proof modes are mutually exclusive with each other and execution-completeness")
-    if args.memory_sharing is not None and not args.sharing_unit:
-        parser.error("--memory-sharing requires --sharing-unit for this isolated user unit")
-    if args.memory_sharing is None and (args.sharing_unit is not None or args.sharing_control is not None):
-        parser.error("--sharing-unit/--sharing-control require --memory-sharing")
+    if (args.memory_sharing is not None or args.memory_reclaim) and not args.sharing_unit:
+        parser.error("--memory-sharing/--memory-reclaim require --sharing-unit for this isolated user unit")
+    if args.memory_sharing is None and not args.memory_reclaim and args.sharing_unit is not None:
+        parser.error("--sharing-unit requires --memory-sharing or --memory-reclaim")
+    if args.memory_sharing is None and args.sharing_control is not None:
+        parser.error("--sharing-control requires --memory-sharing")
     if args.netd is None:
         parser.error("supply actual netd with NETD_BIN or --netd")
     args.guest_init = args.guest_init or args.register_fixture.parent / "native-device-linux"
@@ -1103,7 +1119,11 @@ def main():
     report = {"schema": 1, "scope": "whole-machine-production", "native_pause": False, "pid": os.getpid(),
               "qualification_granted": False, "qualification_eligible": False}
     try:
-        if args.memory_sharing is not None:
+        if args.memory_reclaim:
+            from native_memory_reclaim import run
+            report["scope"] = "commit9-real-report-restored-private"
+            report["memory"] = run(args, echo)
+        elif args.memory_sharing is not None:
             from native_memory_sharing import run
             report["scope"] = "commit8-native-kvm-sharing-lifetime"
             report["memory"] = run(args, echo)
