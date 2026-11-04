@@ -894,6 +894,15 @@ mismatches retain the ACK, expected prefix and received bytes in
 native disconnect/reaping without draining them, and the activation-fence
 rejection probe still requires EOF/reset, not a successful ACK.
 
+A host mux endpoint that writes its final bytes and immediately closes leaves
+them queued on the native socketpair end, while Linux already reports
+`EPOLLHUP` for the closed peer. The native proxy delivers those queued bytes to
+the guest first, waiting for guest credit when required, and sends the reset
+only after reading EOF. Resetting on the hangup alone lost a host `send(); close()`
+reply whenever the muxer observed the close before the bytes. The real-epoll
+socketpair regressions are `mux_hangup_delivers_reply_queued_before_host_close`
+and `mux_hangup_waits_for_credit_before_reset` in `devices`.
+
 The separate numbered output-only console is a byte stream, not a record-atomic
 endpoint. Once the native source is paused and all owners are quiesced, the
 pressure controller drains its actual output socket to EAGAIN before fixing the

@@ -570,10 +570,62 @@ pub(crate) fn release(proxy: &mut super::UnixProxy) -> ProxyUpdate {
     }
 }
 
+/// Finishes a mux stream whose host end hung up.
+///
+/// A Unix stream hangup only means both directions are shut down: Linux
+/// reports `EPOLLHUP` as soon as the peer closes, while every byte it wrote
+/// before `close()` is still queued on this end. Resetting at that point
+/// discards a reply sent as `send(); close()`. Deliver the queued bytes first,
+/// as credit and guest buffers allow, and reset only once EOF is reached.
+fn drain_after_hangup(proxy: &mut crate::virtio::vsock::unix_proxy::UnixProxy) -> ProxyUpdate {
+    let mut update = ProxyUpdate::default();
+    if proxy.status == ProxyStatus::Connected {
+        let (signal_queue, wait_credit) = proxy.recv_pkt();
+        update.signal_queue = signal_queue;
+        if wait_credit {
+            proxy.status = ProxyStatus::WaitingCreditUpdate;
+            update.push_credit_req = Some(MuxerRx::CreditRequest {
+                local_port: proxy.local_port,
+                peer_port: proxy.peer_port,
+                fwd_cnt: proxy.tx_cnt.0,
+            });
+        }
+    }
+    match proxy.status {
+        ProxyStatus::PeerHalfClosed => {
+            debug!(
+                "process_event: hung-up endpoint drained, sending reset: id={}",
+                proxy.id
+            );
+            proxy.push_reset();
+            proxy.status = ProxyStatus::Closed;
+            update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
+            update.signal_queue = true;
+            update.remove_proxy = ProxyRemoval::Deferred;
+        }
+        // The hangup stays level-triggered and nothing can be written to a
+        // closed peer, so stop polling until a credit update re-arms reads.
+        ProxyStatus::WaitingCreditUpdate => {
+            update.polling = Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty()));
+        }
+        // Connected: the guest posted no RX buffer yet; the hangup refires.
+        _ => {}
+    }
+    update
+}
+
 pub(crate) fn process_event(proxy: &mut super::UnixProxy, evset: EventSet) -> ProxyUpdate {
     let mut update = ProxyUpdate::default();
 
     if evset.contains(EventSet::HANG_UP) {
+        if proxy.mux_transport
+            && matches!(
+                proxy.status,
+                ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+            )
+        {
+            return drain_after_hangup(proxy);
+        }
         debug!("process_event: HANG_UP");
 
         if proxy.status == ProxyStatus::Connecting {
@@ -735,6 +787,7 @@ mod tests {
     use nix::sys::socket::{
         AddressFamily, MsgFlags, Shutdown, SockFlag, SockType, recv, send, socketpair,
     };
+    use utils::epoll::{ControlOperation, Epoll, EpollEvent};
     use vm_memory::{Address, GuestAddress};
 
     use crate::virtio::queue::tests::VirtQueue;
@@ -1156,5 +1209,119 @@ mod tests {
         assert_eq!(proxy.peer_avail_credit(), 16);
         assert_eq!(proxy.status, ProxyStatus::Connected);
         assert_eq!(event_set(&update), Some(EventSet::IN));
+    }
+
+    /// Reads the op and payload length the device published in RX head `head`.
+    fn published_packet(mem: &RuntimeGuestMemory, head: usize) -> (u16, u32) {
+        let chain =
+            DescriptorChain::checked_new(mem, GuestAddress(0), QUEUE_SIZE, (head * 2) as u16)
+                .unwrap();
+        let packet = RxPacket::from_rx_virtq_head(
+            &chain,
+            &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(QUEUE_SIZE),
+        )
+        .unwrap();
+        (packet.op(), packet.len())
+    }
+
+    /// Waits for the kernel's own readiness on the proxy end, as the muxer does.
+    fn kernel_events(epoll: &mut Epoll) -> EventSet {
+        let mut events = [EpollEvent::default(); 1];
+        assert_eq!(epoll.wait(1, 1000, &mut events).unwrap(), 1);
+        events[0].event_set()
+    }
+
+    #[test]
+    fn mux_hangup_delivers_reply_queued_before_host_close() {
+        const REPLY: &[u8] = b"ECHO cff50b4af6fc600f\n";
+        let (mut proxy, peer, mem, data_addresses) = socketpair_proxy_with_rx_buffers(2, 64);
+        proxy.peer_buf_alloc = 64;
+        // The guest relay half-closed after forwarding its request.
+        shutdown_socket(proxy.fd.as_raw_fd(), Shutdown::Write).unwrap();
+        let mut epoll = Epoll::new().unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                proxy.fd.as_raw_fd(),
+                &EpollEvent::new(EventSet::IN, proxy.id),
+            )
+            .unwrap();
+
+        // The host replies and closes before the muxer observes readiness.
+        send_all(peer.as_raw_fd(), REPLY);
+        drop(peer);
+        let events = kernel_events(&mut epoll);
+        assert!(events.contains(EventSet::IN | EventSet::HANG_UP));
+
+        let update = process_event(&mut proxy, events);
+        assert!(update.signal_queue);
+        assert_eq!(proxy.status, ProxyStatus::Closed);
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Deferred));
+        assert_eq!(event_set(&update), Some(EventSet::empty()));
+        assert_eq!(
+            published_packet(&mem, 0),
+            (uapi::VSOCK_OP_RW, REPLY.len() as u32)
+        );
+        let mut received = [0; REPLY.len()];
+        mem.read_slice(&mut received, data_addresses[0]).unwrap();
+        assert_eq!(&received, REPLY);
+        assert_eq!(published_packet(&mem, 1).0, uapi::VSOCK_OP_RST);
+        assert_eq!(proxy.rx_cnt, Wrapping(REPLY.len() as u32));
+        assert_eq!(proxy.queue.lock().unwrap().next_used.0, 2);
+    }
+
+    #[test]
+    fn mux_hangup_waits_for_credit_before_reset() {
+        const WINDOW: u32 = 8;
+        const REPLY: &[u8] = b"ECHO cff50b4af6fc600f\n";
+        let (mut proxy, peer, mem, data_addresses) = socketpair_proxy_with_rx_buffers(4, 64);
+        proxy.peer_buf_alloc = WINDOW;
+        let mut epoll = Epoll::new().unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                proxy.fd.as_raw_fd(),
+                &EpollEvent::new(EventSet::IN, proxy.id),
+            )
+            .unwrap();
+        send_all(peer.as_raw_fd(), REPLY);
+        drop(peer);
+
+        for window in 1..=2 {
+            let events = kernel_events(&mut epoll);
+            assert!(events.contains(EventSet::IN | EventSet::HANG_UP));
+            let update = process_event(&mut proxy, events);
+            assert!(update.signal_queue);
+            assert_eq!(proxy.status, ProxyStatus::WaitingCreditUpdate);
+            assert!(matches!(update.remove_proxy, ProxyRemoval::Keep));
+            assert!(matches!(
+                update.push_credit_req,
+                Some(MuxerRx::CreditRequest { .. })
+            ));
+            assert_eq!(event_set(&update), Some(EventSet::empty()));
+            assert_eq!(proxy.queue.lock().unwrap().next_used.0, window);
+
+            let update = update_peer_credit(
+                &mut proxy,
+                &credit_packet(&mem, WINDOW, u32::from(window) * WINDOW),
+            );
+            assert_eq!(proxy.status, ProxyStatus::Connected);
+            assert_eq!(event_set(&update), Some(EventSet::IN));
+        }
+
+        let update = process_event(&mut proxy, kernel_events(&mut epoll));
+        assert_eq!(proxy.status, ProxyStatus::Closed);
+        assert!(matches!(update.remove_proxy, ProxyRemoval::Deferred));
+        let mut received = Vec::with_capacity(REPLY.len());
+        for (head, address) in data_addresses.iter().take(3).enumerate() {
+            let (op, len) = published_packet(&mem, head);
+            assert_eq!(op, uapi::VSOCK_OP_RW);
+            let mut chunk = vec![0; len as usize];
+            mem.read_slice(&mut chunk, *address).unwrap();
+            received.extend_from_slice(&chunk);
+        }
+        assert_eq!(received, REPLY);
+        assert_eq!(published_packet(&mem, 3).0, uapi::VSOCK_OP_RST);
+        assert_eq!(proxy.queue.lock().unwrap().next_used.0, 4);
     }
 }
