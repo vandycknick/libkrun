@@ -21,6 +21,7 @@ pub mod device;
 pub mod file_traits;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub mod fs;
+pub mod generation;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 #[cfg(feature = "input")]

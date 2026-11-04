@@ -1622,3 +1622,124 @@ do not become successful workload results. Deadline, nonzero exit and forced
 reaping remain failures. Real-subprocess controller regressions exercise this
 cleanup contract but do not substitute for native VM stop acknowledgements.
 
+### Acknowledged generation driver (commit 10, explicit standalone proof)
+
+`src/libkrun/examples/native_generation_controller.py` invokes the existing
+ordinary-kernel `native-device-probe` with `--generation on`. Generation is
+registered after the existing providers, retains the exact typed resource,
+and binds its already assigned MMIO interrupt. Preparation and continuation
+use the same native control owner as ordinary pause/resume. The owner samples
+the existing devices-crate `SysRng` only after stopped-authority admission;
+there is no additional RNG dependency, caller-supplied ID, register-writing
+controller, alternate IRQ or guest userspace ACK.
+
+The final notification is in control `Phase::Prepare`: execution/controller
+restoration and provider resume have completed, but ingress and vCPUs have not
+been released. Publication while stopped advances configuration generation
+once; this later notification and exact-ticket continuation do not allocate
+another sequence or renew the original deadline. Stop and fatal release
+failure invalidate the shared attempt. Owner servicing expires it even when
+no caller polls. Unresolved memory attempts still prevent every resume path.
+
+Once a generation has been published, guest reset is terminal: the backend
+refuses reset, the transport stays failed, and original provider ownership
+remains available for native stop. Repeated reset/reprobe cannot allocate
+new generation authority. Failed-reset state cannot be captured as portable
+continuation. Before the first publication, normal reset/reprobe remains
+supported, including the unused queue handshake.
+
+Build the standalone executable and its ordinary guest inputs explicitly,
+outside Cargo tests, from this native checkout:
+
+```sh
+make BLK=1 NET=1 native-device-witness-probe
+cc -O2 -pthread -static -o "$INPUTS/native-device-linux" \
+  src/libkrun/examples/native_device_linux.c
+cc -O2 -pthread -static -o "$INPUTS/native-execution-linux" \
+  src/libkrun/examples/native_execution_linux.c
+python3 -m unittest discover -s src/libkrun/examples -p 'test_native_generation_controller.py'
+```
+
+The positive case uses the unchanged production generation patch and kernel.
+For the Phase-10 retained kernel, Main supplied SHA256
+`ec6fee8b1885a71e78306fea384f4f6687fd151b6f279c23117785027748f33`;
+the controller records the actual input hash rather than assuming this value.
+No production kernel rebuild is required for that case. `$NETD_BIN` is the
+actual Silo netd executable. All networking remains private/local; there is
+no image pull or external network prerequisite. Required inputs are an ELF
+ordinary Linux kernel, its exact emitted `.config`, the unchanged production
+generation patch, the two separately built static guest executables, and
+the newly built native probe. Every evidence directory must be fresh.
+
+```sh
+python3 src/libkrun/examples/native_generation_controller.py \
+  --case positive --probe target/debug/examples/native-device-probe \
+  --netd "$NETD_BIN" --guest-init "$INPUTS/native-device-linux" \
+  --register-fixture "$INPUTS/native-execution-linux" \
+  --kernel "$PRODUCTION_KERNEL" --kernel-config "$PRODUCTION_CONFIG" \
+  --production-patch "$SILO/resources/kernels/patches/live/0001-virtio-silo-vmgenid.patch" \
+  --evidence "$EVIDENCE/positive"
+```
+
+Negative instrumentation is isolated in `native_generation_fault.patch`
+and `native_generation_fault.h`, neither of which belongs to the production
+kernel patch set. In a separately owned copy of the already production-patched
+kernel source, copy the header to `drivers/virtio/native_generation_fault.h`,
+then apply the patch with `patch --fuzz=0 -p1`. Build into a separate `O=`
+directory with the exact production config and retain source/config/patch
+identities. Do not edit, overwrite or rebuild the retained production kernel.
+The diagnostic kernel keeps the real RNG, clock and ordered low-last helper.
+Its boot-only `virtio_silo_vmgenid.proof_mode` chooses rejected ACK gates,
+a cancellable six-second late ACK, or driver absence. Only this isolated
+kernel exposes the `generation_proof` gate; the controller never writes
+generation registers. Run the four bounded negative cases sequentially:
+
+```sh
+for case in faults late absent expiry; do
+  python3 src/libkrun/examples/native_generation_controller.py \
+    --case "$case" --probe target/debug/examples/native-device-probe \
+    --netd "$NETD_BIN" --guest-init "$INPUTS/native-device-linux" \
+    --register-fixture "$INPUTS/native-execution-linux" \
+    --kernel "$DIAGNOSTIC_KERNEL" --kernel-config "$DIAGNOSTIC_CONFIG" \
+    --production-patch "$SILO/resources/kernels/patches/live/0001-virtio-silo-vmgenid.patch" \
+    --evidence "$EVIDENCE/$case" || exit
+done
+```
+
+Each controller has a 180-second outer bound, the shared device-progress
+readiness gate (up to 60 seconds), a five-second immutable generation
+deadline, two vCPUs and 512 MiB RAM. Profile collection follows complete
+device progress, not the first counter sample, so initial disk mounting
+finishes before the profile records are read. The controller creates private
+sparse disks and a minimal shared immutable initramfs.
+Cleanup kills/reaps only the directly owned native/netd processes; forced
+native cleanup is a failed proof. It never deletes retained evidence/payloads.
+
+The positive oracle correlates the native timely low-write receipt with the
+real driver's coherent `generation_state`: exact sequence/ID, initialized RNG
+before the real reseed, reseed and clock completion before ACK, and accessor
+return. It covers initial zero-identity CLOCK_ONLY, fresh identity, resident
+CLOCK_ONLY without another reseed, and duplicate notification without renewal.
+Live native snapshots read configuration generation from the generation
+device's retained interrupt binding while holding its device lock. They
+never re-lock the MMIO transport to observe that counter. An unbound device
+records `None`, not a manufactured zero; the standalone command refuses
+such a snapshot because its registered device must already have a binding.
+The fault oracle checks changed sequence, changed ID at the exact sequence,
+and the prior tuple against one immutable pending attempt. A real native
+pause captures its bounded provider payload. The oracle compares every
+serialized configuration word, prior committed tuple and protocol history
+against independent native observations, and checks the captured transport
+counter/IRQ against stopped before/after samples. Only the later exact guest
+low-write commits. A separate expiry case consumes the original deadline
+while paused and rejects continuation; this proves release refusal, not the
+time at which the owner's independent expiry service ran. Late exact writes
+and an absent driver cannot manufacture a receipt.
+
+`generation-report.json`, input hashes, native source hashes/revision,
+native/guest JSONL snapshots, raw serial/controller logs, actual command,
+captured pending payload and native stop acknowledgement are evidence, not
+capability grants. No fresh-process restore/generation activation proof is
+claimed here: that additionally requires commit 11's exported restore path.
+The guest production patch remains unchanged.
+

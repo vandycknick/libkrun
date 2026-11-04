@@ -6,6 +6,10 @@ use std::task::Poll;
 use std::time::Instant;
 
 use crossbeam_channel::{Sender, bounded};
+use devices::virtio::generation::{
+    GenerationAttempt, GenerationFailure, GenerationObservation, GenerationRequest,
+    GenerationSnapshot,
+};
 pub use polly::event_manager::{BarrierGeneration, BarrierKey, BarrierRequest, OperationId};
 use utils::pollable_channel::{PollableChannelReciever, PollableChannelSender, pollable_channel};
 
@@ -143,6 +147,34 @@ impl PartialEq for PauseToken {
 }
 impl Eq for PauseToken {}
 
+#[derive(Clone, Debug)]
+pub struct GenerationTicket {
+    run: Arc<()>,
+    stopped: BarrierKey,
+    attempt: GenerationAttempt,
+}
+
+impl GenerationTicket {
+    pub(crate) fn observe(&self, now: Instant) -> GenerationObservation {
+        self.attempt.observe(now)
+    }
+    pub(crate) fn deadline(&self) -> Instant {
+        self.attempt.deadline()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum GenerationAuthority {
+    Pause(PauseToken),
+    Restore(BarrierKey),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GenerationMode {
+    Fresh,
+    ClockOnly,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlState {
     Running,
@@ -161,6 +193,8 @@ pub enum ControlReply {
     Paused(PauseToken),
     State(ControlState),
     Complete,
+    Generation(GenerationTicket),
+    GenerationSnapshot(GenerationSnapshot),
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +205,14 @@ pub(crate) enum RequestKind {
     CancelPause(OperationId),
     Status,
     Stop,
+    PrepareGeneration {
+        authority: GenerationAuthority,
+        mode: GenerationMode,
+        deadline: Instant,
+    },
+    ResumeGeneration(PauseToken, GenerationTicket),
+    ReleaseRestoreGeneration(GenerationTicket),
+    GenerationSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -704,6 +746,8 @@ pub(crate) struct ControlOwner {
     run: Arc<()>,
     generation: u64,
     last_operation: u64,
+    generation_ticket: Option<GenerationTicket>,
+    release_generation: Option<GenerationTicket>,
 }
 
 impl ControlOwner {
@@ -718,6 +762,8 @@ impl ControlOwner {
             run: Arc::new(()),
             generation: generation.0,
             last_operation: 0,
+            generation_ticket: None,
+            release_generation: None,
         })
     }
 
@@ -777,6 +823,27 @@ impl ControlOwner {
         Ok(key)
     }
 
+    fn generation_authority(
+        &self,
+        authority: &GenerationAuthority,
+        unresolved_memory: bool,
+    ) -> Result<BarrierKey, ControlFailure> {
+        if unresolved_memory {
+            return Err(ControlFailure::Busy);
+        }
+        match authority {
+            GenerationAuthority::Pause(token) if self.validate_token(token) => self
+                .active
+                .as_ref()
+                .map(|active| active.original)
+                .ok_or(ControlFailure::InvalidToken),
+            GenerationAuthority::Restore(key) if matches!(self.state, ControlState::RestorePrepared { key: current } if current == *key) => {
+                Ok(*key)
+            }
+            _ => Err(ControlFailure::InvalidToken),
+        }
+    }
+
     fn retire_admission(&mut self, failure: ControlFailure) -> Result<(), ControlFailure> {
         let Some(active) = self
             .active
@@ -791,6 +858,91 @@ impl ControlOwner {
 }
 
 impl crate::vmm::Vmm {
+    fn generation_authority(
+        &self,
+        authority: &GenerationAuthority,
+    ) -> Result<BarrierKey, ControlFailure> {
+        self.control
+            .generation_authority(authority, self.memory.has_attempt())
+    }
+
+    fn prepare_generation_at(
+        &mut self,
+        key: BarrierKey,
+        mode: GenerationMode,
+        deadline: Instant,
+    ) -> Result<GenerationTicket, ControlFailure> {
+        if Instant::now() >= deadline {
+            return Err(ControlFailure::Deadline);
+        }
+        let binding = self
+            .generation_binding
+            .as_ref()
+            .ok_or_else(|| ControlFailure::Unsupported("generation device absent".into()))?;
+        let request = match mode {
+            GenerationMode::Fresh => GenerationRequest::FreshIdentity(
+                devices::virtio::generation::fresh_identity().map_err(|error| {
+                    ControlFailure::Participant(format!("generation entropy: {error}"))
+                })?,
+            ),
+            GenerationMode::ClockOnly => GenerationRequest::ClockOnly,
+        };
+        let attempt = binding
+            .with(|device| {
+                device
+                    .prepare(key, request, deadline)
+                    .map_err(|error| format!("{error:?}"))
+            })
+            .map_err(ControlFailure::Participant)?;
+        let ticket = GenerationTicket {
+            run: self.control.run.clone(),
+            stopped: key,
+            attempt,
+        };
+        self.control.generation_ticket = Some(ticket.clone());
+        Ok(ticket)
+    }
+
+    fn validate_generation_ticket(&self, ticket: &GenerationTicket) -> Result<(), ControlFailure> {
+        if !Arc::ptr_eq(&ticket.run, &self.control.run)
+            || self
+                .control
+                .generation_ticket
+                .as_ref()
+                .is_none_or(|current| !current.attempt.same_attempt(&ticket.attempt))
+        {
+            return Err(ControlFailure::InvalidToken);
+        }
+        match ticket.observe(Instant::now()) {
+            GenerationObservation::Failed(error) => Err(ControlFailure::Participant(format!(
+                "generation: {error:?}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    fn notify_generation_before_release(&mut self) -> Result<(), ControlFailure> {
+        let Some(ticket) = self.control.release_generation.take() else {
+            return Ok(());
+        };
+        self.validate_generation_ticket(&ticket)?;
+        self.generation_binding
+            .as_ref()
+            .ok_or(ControlFailure::InvalidToken)?
+            .with(|device| {
+                device
+                    .notify(&ticket.attempt)
+                    .map_err(|error| format!("{error:?}"))
+            })
+            .map_err(ControlFailure::Participant)
+    }
+
+    pub(crate) fn fail_generation(&mut self, failure: GenerationFailure) {
+        if let Some(binding) = &self.generation_binding {
+            binding.fail(failure);
+        }
+        self.control.release_generation = None;
+    }
     pub(crate) fn register_control_roles(
         &self,
         events: &mut polly::event_manager::EventManager,
@@ -802,7 +954,17 @@ impl crate::vmm::Vmm {
     }
 
     pub(crate) fn control_pending(&self) -> bool {
-        self.control.active.is_some() && !matches!(self.control.state, ControlState::Paused(_))
+        (self.control.active.is_some() && !matches!(self.control.state, ControlState::Paused(_)))
+            || self
+                .control
+                .generation_ticket
+                .as_ref()
+                .is_some_and(|ticket| {
+                    matches!(
+                        ticket.observe(Instant::now()),
+                        GenerationObservation::Pending
+                    )
+                })
     }
 
     pub(crate) fn service_control(&mut self, events: &mut polly::event_manager::EventManager) {
@@ -813,6 +975,9 @@ impl crate::vmm::Vmm {
             }
         }
         self.poll_control(events);
+        if let Some(ticket) = &self.control.generation_ticket {
+            let _ = ticket.observe(Instant::now());
+        }
     }
 
     fn pause_admission(&self) -> Result<Poll<()>, ControlFailure> {
@@ -896,6 +1061,7 @@ impl crate::vmm::Vmm {
         }
         if matches!(request.kind, RequestKind::Stop) {
             self.control.reserve(request.operation)?;
+            self.fail_generation(GenerationFailure::Stopped);
             if let Some(previous) = self.control.active.take() {
                 let _ = previous
                     .request
@@ -937,6 +1103,29 @@ impl crate::vmm::Vmm {
             return Ok(());
         }
         match &request.kind {
+            RequestKind::PrepareGeneration {
+                authority,
+                mode,
+                deadline,
+            } => {
+                let key = self.generation_authority(authority)?;
+                self.control.reserve(request.operation)?;
+                let ticket = self.prepare_generation_at(key, *mode, *deadline)?;
+                let _ = request.reply.try_send(Ok(ControlReply::Generation(ticket)));
+                Ok(())
+            }
+            RequestKind::GenerationSnapshot => {
+                let snapshot = self
+                    .generation_binding
+                    .as_ref()
+                    .ok_or_else(|| ControlFailure::Unsupported("generation device absent".into()))?
+                    .with(|device| Ok(device.snapshot()))
+                    .map_err(ControlFailure::Participant)?;
+                let _ = request
+                    .reply
+                    .try_send(Ok(ControlReply::GenerationSnapshot(snapshot)));
+                Ok(())
+            }
             RequestKind::Pause(owner) => {
                 if self.control.state != ControlState::Running {
                     return Err(ControlFailure::Busy);
@@ -978,10 +1167,29 @@ impl crate::vmm::Vmm {
                 }
                 Ok(())
             }
-            RequestKind::Resume(token) => {
+            RequestKind::Resume(token) | RequestKind::ResumeGeneration(token, _) => {
                 self.control
                     .validate_memory_resume(token, self.memory.has_attempt())?;
                 self.control.reserve(request.operation)?;
+                let original = self
+                    .control
+                    .active
+                    .as_ref()
+                    .ok_or(ControlFailure::InvalidToken)?
+                    .original;
+                let ticket = if let RequestKind::ResumeGeneration(_, ticket) = &request.kind {
+                    self.validate_generation_ticket(ticket)?;
+                    Some(ticket.clone())
+                } else if self.generation_binding.is_some() {
+                    Some(self.prepare_generation_at(
+                        original,
+                        GenerationMode::ClockOnly,
+                        request.deadline,
+                    )?)
+                } else {
+                    None
+                };
+                self.control.release_generation = ticket;
                 let mut active = self
                     .control
                     .active
@@ -1003,14 +1211,30 @@ impl crate::vmm::Vmm {
                 self.control.active = Some(active);
                 Ok(())
             }
-            RequestKind::ReleaseRestore => {
+            RequestKind::ReleaseRestore | RequestKind::ReleaseRestoreGeneration(_) => {
                 let original = self
                     .control
                     .restore_release_key(self.memory.has_attempt())?;
                 if self.execution.failed_install || self.control.cpus.release_may_have_run() {
                     return Err(ControlFailure::FailedFenced);
                 }
+                let ticket = if self.generation_binding.is_some() {
+                    let RequestKind::ReleaseRestoreGeneration(ticket) = &request.kind else {
+                        return Err(ControlFailure::InvalidToken);
+                    };
+                    self.validate_generation_ticket(ticket)?;
+                    if ticket.stopped != original || ticket.attempt.request().flags != 1 {
+                        return Err(ControlFailure::InvalidToken);
+                    }
+                    Some(ticket.clone())
+                } else {
+                    if matches!(&request.kind, RequestKind::ReleaseRestoreGeneration(_)) {
+                        return Err(ControlFailure::InvalidToken);
+                    }
+                    None
+                };
                 self.control.reserve(request.operation)?;
+                self.control.release_generation = ticket;
                 let barrier = BarrierRequest {
                     key: BarrierKey {
                         operation: request.operation,
@@ -1130,6 +1354,9 @@ impl crate::vmm::Vmm {
                 self.execution.failed_install = true;
             }
             let _ = active.request.reply.try_send(Err(error));
+        }
+        if self.control.state == ControlState::FailedFenced {
+            self.fail_generation(GenerationFailure::Release);
         }
     }
 
@@ -1510,6 +1737,7 @@ impl crate::vmm::Vmm {
                         Poll::Ready(()) => {}
                     }
                 }
+                self.notify_generation_before_release()?;
                 #[cfg(target_os = "macos")]
                 if active.maintenance_closed {
                     if let Some(remapper) = self.vm.host_memory_remapper() {
@@ -1593,6 +1821,104 @@ mod tests {
             operation: OperationId(1),
             generation: BarrierGeneration(1),
         }
+    }
+
+    #[test]
+    fn generation_restore_authority_requires_exact_cut_and_resolved_memory() {
+        use crate::vmm::control::{ControlFailure, GenerationAuthority};
+        let mut owner = ControlOwner::new(BarrierGeneration(1)).unwrap();
+        let authority = GenerationAuthority::Restore(key());
+        assert_eq!(
+            owner.generation_authority(&authority, false),
+            Err(ControlFailure::InvalidToken)
+        );
+        owner.state = ControlState::RestorePrepared { key: key() };
+        assert_eq!(owner.generation_authority(&authority, false), Ok(key()));
+        assert_eq!(
+            owner.generation_authority(&authority, true),
+            Err(ControlFailure::Busy)
+        );
+        for foreign in [
+            BarrierKey {
+                operation: OperationId(99),
+                ..key()
+            },
+            BarrierKey {
+                generation: BarrierGeneration(99),
+                ..key()
+            },
+        ] {
+            assert_eq!(
+                owner.generation_authority(&GenerationAuthority::Restore(foreign), false),
+                Err(ControlFailure::InvalidToken)
+            );
+        }
+        owner.state = ControlState::Running;
+        assert_eq!(
+            owner.generation_authority(&authority, false),
+            Err(ControlFailure::InvalidToken)
+        );
+    }
+
+    #[test]
+    fn generation_pause_authority_is_run_owner_cut_and_memory_bound() {
+        use crate::vmm::control::{
+            ActiveControl, ControlFailure, ControlRequest, GenerationAuthority, Phase, RequestKind,
+        };
+        let mut owner = ControlOwner::new(BarrierGeneration(1)).unwrap();
+        let foreign = ControlOwner::new(BarrierGeneration(1)).unwrap();
+        let token = owner.token(key(), PauseOwner::User);
+        let barrier = BarrierRequest {
+            key: key(),
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        let (reply, _waiting) = crossbeam_channel::bounded(1);
+        owner.active = Some(ActiveControl {
+            request: ControlRequest {
+                id: RequestId(1),
+                operation: key().operation,
+                deadline: barrier.deadline,
+                kind: RequestKind::Pause(PauseOwner::User),
+                reply,
+            },
+            barrier,
+            original: key(),
+            owner: PauseOwner::User,
+            phase: Phase::Cut,
+            failed: false,
+            devices_begun: true,
+            routes_begun: true,
+            maintenance_closed: false,
+            cpu_parked_at: None,
+        });
+        owner.state = ControlState::Paused(token.clone());
+        let authority = GenerationAuthority::Pause(token);
+        assert_eq!(owner.generation_authority(&authority, false), Ok(key()));
+        assert_eq!(
+            owner.generation_authority(&authority, true),
+            Err(ControlFailure::Busy)
+        );
+        for token in [
+            foreign.token(key(), PauseOwner::User),
+            owner.token(key(), PauseOwner::Capture),
+            owner.token(
+                BarrierKey {
+                    generation: BarrierGeneration(9),
+                    ..key()
+                },
+                PauseOwner::User,
+            ),
+        ] {
+            assert_eq!(
+                owner.generation_authority(&GenerationAuthority::Pause(token), false),
+                Err(ControlFailure::InvalidToken)
+            );
+        }
+        owner.state = ControlState::Running;
+        assert_eq!(
+            owner.generation_authority(&authority, false),
+            Err(ControlFailure::InvalidToken)
+        );
     }
 
     #[test]

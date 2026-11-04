@@ -521,6 +521,47 @@ static void dump_file(const char *tag, const char *path) {
         emit_record(output, "OBS-BEGIN broadcast-clockevent-state\npath=/sys/devices/system/clockevents/broadcast/current_device\nread_complete=1\nbytes_read=%zu\nkind=%s\nOBS-END broadcast-clockevent-state\n", bytes_read, bytes_read == 0 ? "no-device" : "device");
     }
 }
+static void generation_observation(int advance) {
+    DIR *directory = opendir("/sys/bus/virtio/devices");
+    if (!directory) { fail("generation-discovery"); return; }
+    char selected[PATH_MAX] = {0};
+    unsigned matches = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory))) {
+        if (entry->d_name[0] == '.') continue;
+        char path[PATH_MAX], identity[32] = {0};
+        snprintf(path, sizeof(path), "/sys/bus/virtio/devices/%s/device", entry->d_name);
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        ssize_t count = read(fd, identity, sizeof(identity) - 1);
+        close(fd);
+        if (count <= 0 || strcmp(identity, "0x5347\n")) continue;
+        ++matches;
+        snprintf(selected, sizeof(selected), "/sys/bus/virtio/devices/%s", entry->d_name);
+    }
+    closedir(directory);
+    if (matches != 1) { fail("generation-exact-inventory"); return; }
+    char path[PATH_MAX + 32];
+    snprintf(path, sizeof(path), "%s/generation_state", selected);
+    if (access(path, R_OK)) {
+        if (errno != ENOENT) { fail("generation-driver-state"); return; }
+        emit_record(output, "OBS-BEGIN generation\nabsent=1 device_id=21319\nOBS-END generation\n");
+        return;
+    }
+    if (advance) {
+        snprintf(path, sizeof(path), "%s/generation_proof", selected);
+        int fd = open(path, O_WRONLY | O_CLOEXEC);
+        if (fd < 0) { fail("diagnostic-generation-gate"); return; }
+        ssize_t count = write(fd, "advance\n", 8);
+        int error = errno;
+        close(fd);
+        if (count != 8) { errno = error; fail("diagnostic-generation-gate"); return; }
+    }
+    snprintf(path, sizeof(path), "%s/generation_state", selected);
+    dump_file("generation", path);
+    snprintf(path, sizeof(path), "%s/generation_proof", selected);
+    if (!access(path, R_OK)) dump_file("generation-proof", path);
+}
 static void observations(void) {
     if (rng_observations()) fail("real-virtio-rng-identity");
     dump_file("kernel-identity", "/proc/version");
@@ -1198,6 +1239,8 @@ int main(void) {
             if (input[i] == 'Z') { pressure_forward = 5; continue; }
             if (input[i] == 'B') atomic_store(&console_burst, 1);
             if (input[i] == 'O') observations();
+            if (input[i] == 'G') generation_observation(0);
+            if (input[i] == 'F') generation_observation(1);
             if (input[i] == 'M' && network_mac(1)) fail("destination-mac");
         }
         emit_devices(++sequence, "");

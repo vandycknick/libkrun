@@ -18,6 +18,9 @@ fn payload_limit(device_type: u32) -> Result<usize, utils::state::Error> {
         3 => Ok(MAX_DEVICE_PAYLOAD),
         4 => Ok(22),
         19 => Ok(65536),
+        devices::virtio::generation::DEVICE_TYPE => {
+            Ok(devices::virtio::generation::STATE_LIMIT as usize)
+        }
         _ => Err(utils::state::Error::Invalid(
             "unsupported device provider kind",
         )),
@@ -94,8 +97,21 @@ impl DeviceEnvelope {
         }
         let mut previous = None;
         let mut total = 0usize;
+        let mut generation_seen = false;
         for record in &self.records {
             let state = &record.state;
+            if state.device_type == devices::virtio::generation::DEVICE_TYPE {
+                if generation_seen
+                    || record.identity.configured_id != devices::virtio::generation::DEVICE_ID
+                    || state.device_name != devices::virtio::generation::DEVICE_ID
+                    || state.avail_features != 1 << 32
+                    || state.queues.len() != 1
+                    || state.queues[0].max_size != 1
+                {
+                    return Err(Error::Invalid("generation attachment profile"));
+                }
+                generation_seen = true;
+            }
             if record.identity.device_type != devices::DeviceType::Virtio(state.device_type)
                 || record.identity.address != state.attachment_address
                 || Some(record.identity.irq) != state.irq_line
@@ -257,6 +273,7 @@ pub(crate) struct RestoreDeviceBinding {
     pub payload: Vec<u8>,
     pub resource: Arc<Mutex<dyn VirtioDevice>>,
     pub subscriber: Option<Arc<Mutex<dyn polly::event_manager::Subscriber + Send>>>,
+    pub generation_binding: Option<crate::api::device_builders::GenerationBinding>,
 }
 
 pub(crate) struct PreparedDeviceInstall {
@@ -264,6 +281,7 @@ pub(crate) struct PreparedDeviceInstall {
     pub devices: Vec<RestoreDeviceBinding>,
     #[cfg(not(feature = "tee"))]
     pub balloon_bindings: Vec<crate::api::device_builders::BalloonBinding>,
+    pub generation_binding: Option<crate::api::device_builders::GenerationBinding>,
     pub serial: Vec<(u64, Arc<Mutex<Serial>>)>,
     pub shutdown: Option<EventFd>,
     #[cfg(feature = "native-execution-probe")]
@@ -354,7 +372,22 @@ impl PreparedDeviceInstall {
             return Err("restore device count exceeds bound".into());
         }
         let mut previous = None;
+        let mut generation_binding = None;
         for entry in &devices {
+            if entry.state.device_type == devices::virtio::generation::DEVICE_TYPE {
+                if generation_binding.is_some()
+                    || entry.identity.configured_id != devices::virtio::generation::DEVICE_ID
+                    || entry
+                        .generation_binding
+                        .as_ref()
+                        .is_none_or(|binding| !binding.matches(&entry.resource))
+                {
+                    return Err("generation destination binding mismatch".into());
+                }
+                generation_binding = entry.generation_binding.clone();
+            } else if entry.generation_binding.is_some() {
+                return Err("generation binding on another device".into());
+            }
             if previous.is_some_and(|address| address >= entry.identity.address)
                 || entry.identity.configured_id.is_empty()
                 || entry.identity.configured_id.len() > 256
@@ -418,6 +451,7 @@ impl PreparedDeviceInstall {
             devices,
             #[cfg(not(feature = "tee"))]
             balloon_bindings: Vec::new(),
+            generation_binding,
             serial,
             shutdown,
             #[cfg(feature = "native-execution-probe")]
@@ -436,6 +470,7 @@ impl PreparedDeviceInstall {
             binding: binding.clone(),
             #[cfg(not(feature = "tee"))]
             balloon_bindings: Vec::new(),
+            generation_binding: None,
             devices: Vec::new(),
             serial: Vec::new(),
             shutdown: None,
@@ -555,8 +590,95 @@ mod tests {
                 payload,
                 resource: resource.clone(),
                 subscriber: Some(resource),
+                generation_binding: None,
             },
         )
+    }
+
+    fn generation_binding() -> (StateBinding, RestoreDeviceBinding) {
+        use crate::api::device_builders::GenerationBinding;
+        use devices::virtio::generation::{DEVICE_ID, DEVICE_TYPE, Generation};
+        use devices::virtio::lifecycle::VirtioStateProvider;
+        use polly::event_manager::{BarrierGeneration, BarrierKey, BarrierRequest, OperationId};
+        use std::time::{Duration, Instant};
+        let (binding, mut record) = rng_binding();
+        let request = BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(1),
+                generation: BarrierGeneration(1),
+            },
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        let mut generation = Generation::new();
+        generation.begin_quiesce(request).unwrap();
+        assert!(generation.poll_quiesce(request.key).unwrap().is_ready());
+        record.payload = generation.capture_payload(request.key).unwrap();
+        record.identity.device_type = devices::DeviceType::Virtio(DEVICE_TYPE);
+        record.identity.configured_id = DEVICE_ID.into();
+        record.state.device_type = DEVICE_TYPE;
+        record.state.device_name = DEVICE_ID.into();
+        record.state.avail_features = 1 << 32;
+        record.state.queues = vec![Queue::new(1).capture_state().unwrap()];
+        let resource = Arc::new(Mutex::new(Generation::new()));
+        record.generation_binding = Some(GenerationBinding::new(resource.clone()));
+        record.resource = resource;
+        record.subscriber = None;
+        (binding, record)
+    }
+
+    #[test]
+    fn generation_restore_retains_exact_typed_resource_without_callback() {
+        let (binding, device) = generation_binding();
+        let prepared =
+            PreparedDeviceInstall::validate(binding, vec![device], Vec::new(), None).unwrap();
+        assert!(
+            prepared
+                .generation_binding
+                .as_ref()
+                .unwrap()
+                .matches(&prepared.devices[0].resource)
+        );
+        assert!(prepared.devices[0].subscriber.is_none());
+    }
+
+    #[test]
+    fn generation_restore_rejects_foreign_typed_binding() {
+        use crate::api::device_builders::GenerationBinding;
+        use devices::virtio::generation::Generation;
+        let (binding, mut device) = generation_binding();
+        device.generation_binding = Some(GenerationBinding::new(Arc::new(Mutex::new(
+            Generation::new(),
+        ))));
+        assert!(PreparedDeviceInstall::validate(binding, vec![device], Vec::new(), None).is_err());
+    }
+
+    #[test]
+    fn generation_payload_whitelist_and_exact_singleton_profile_are_bounded() {
+        use crate::vmm::execution::device_restore::{DeviceEnvelope, DeviceRecord, payload_limit};
+        use devices::virtio::generation::{DEVICE_TYPE, STATE_LIMIT};
+        assert_eq!(payload_limit(DEVICE_TYPE).unwrap(), STATE_LIMIT as usize);
+        assert!(payload_limit(DEVICE_TYPE + 1).is_err());
+        let (binding, device) = generation_binding();
+        let mut envelope = DeviceEnvelope {
+            binding,
+            records: vec![DeviceRecord {
+                identity: device.identity,
+                state: device.state,
+                payload: device.payload,
+            }],
+        };
+        assert!(envelope.validate().is_ok());
+        let mut duplicate = envelope.records[0].clone();
+        duplicate.identity.address += 0x1000;
+        duplicate.state.attachment_address = duplicate.identity.address;
+        duplicate.identity.configured_id = "another-generation".into();
+        envelope.records.push(duplicate);
+        assert!(envelope.validate().is_err());
+        envelope.records.pop();
+        envelope.records[0]
+            .payload
+            .resize(STATE_LIMIT as usize + 1, 0);
+        assert!(envelope.validate().is_err());
     }
 
     #[test]

@@ -346,6 +346,35 @@ impl DeviceQuiescence {
             .collect()
     }
 
+    pub(crate) fn has_attachment_conflict(&self, device_type: u32, configured_id: &str) -> bool {
+        self.attachments.iter().any(|entry| {
+            entry.identity.device_type == DeviceType::Virtio(device_type)
+                || entry.identity.configured_id == configured_id
+        })
+    }
+
+    pub(crate) fn interrupt_binding(
+        &self,
+        device_type: u32,
+        configured_id: &str,
+    ) -> Result<devices::virtio::InterruptTransport, ManagerError> {
+        let mut matches = self.attachments.iter().enumerate().filter(|(_, entry)| {
+            entry.identity.device_type == DeviceType::Virtio(device_type)
+                && entry.identity.configured_id == configured_id
+        });
+        let (index, attachment) = matches
+            .next()
+            .ok_or_else(|| self.error(None, ManagerFault::InvalidTransition))?;
+        if matches.next().is_some() {
+            return Err(self.error(None, ManagerFault::InvalidTransition));
+        }
+        let transport = attachment
+            .transport
+            .try_lock()
+            .map_err(|error| self.lock_error(index, error))?;
+        Ok(transport.interrupt_transport().clone())
+    }
+
     pub fn lifecycle_snapshots(
         &self,
     ) -> Result<Vec<(AttachmentIdentity, LifecycleSnapshot)>, ManagerError> {
@@ -1016,6 +1045,21 @@ mod tests {
             irq: 5,
         };
         inventory.retain_transport(identity.clone(), Arc::new(Mutex::new(transport)));
+        let interrupt = inventory.interrupt_binding(4, "entropy0").unwrap();
+        if let Ok(transport) = inventory.attachments[0].transport.try_lock() {
+            assert!(interrupt.same_binding(transport.interrupt_transport()));
+        } else {
+            panic!("uncontended transport binding lock");
+        }
+        assert!(inventory.interrupt_binding(4, "foreign-id").is_err());
+        assert!(inventory.interrupt_binding(0x5347, "entropy0").is_err());
+        {
+            let Ok(_guard) = inventory.attachments[0].transport.try_lock() else {
+                panic!("uncontended transport binding lock");
+            };
+            assert!(matches!(inventory.interrupt_binding(4, "entropy0"),
+                Err(error) if matches!(error.fault, ManagerFault::LockBusy)));
+        }
         inventory.preflight_quiesce().unwrap();
         let request = BarrierRequest {
             key: BarrierKey {
@@ -1033,6 +1077,10 @@ mod tests {
         assert_eq!(records[0].identity, identity);
         assert!(!records[0].state.activated);
         assert_eq!(records[0].payload.len(), 22);
+        let transport = inventory.attachments[0].transport.clone();
+        inventory.retain_transport(identity, transport);
+        assert!(matches!(inventory.interrupt_binding(4, "entropy0"),
+            Err(error) if matches!(error.fault, ManagerFault::InvalidTransition)));
     }
 
     #[test]

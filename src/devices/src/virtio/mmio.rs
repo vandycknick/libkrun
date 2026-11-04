@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicU64;
 
 use std::fmt::{Display, Formatter};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::task::Poll;
 use std::time::Instant;
@@ -117,7 +117,6 @@ pub struct MmioTransport {
     pub(crate) acked_features_select: u32,
     pub(crate) queue_select: u32,
     pub(crate) device_status: u32,
-    pub(crate) config_generation: u32,
     mem: RuntimeGuestMemory,
     // Queues owned by the transport during negotiation.
     // These are moved to the device on activation.
@@ -155,6 +154,7 @@ enum InterruptEvent {
 struct InterruptTransportInner {
     log_target: String,
     status: AtomicUsize,
+    config_generation: AtomicU32,
     notification_failed: AtomicBool,
     event: InterruptEvent,
     intc: IrqChip,
@@ -232,6 +232,7 @@ impl InterruptTransport {
         Ok(Self(Arc::new(InterruptTransportInner {
             log_target,
             status: AtomicUsize::new(0),
+            config_generation: AtomicU32::new(0),
             notification_failed: AtomicBool::new(false),
             event: match shared_event {
                 Some(event) => InterruptEvent::Shared(event),
@@ -248,6 +249,14 @@ impl InterruptTransport {
 
     pub fn status(&self) -> &AtomicUsize {
         &self.0.status
+    }
+
+    pub fn config_generation(&self) -> u32 {
+        self.0.config_generation.load(Ordering::SeqCst)
+    }
+
+    pub fn same_binding(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     pub fn event(&self) -> &EventFd {
@@ -312,6 +321,12 @@ impl InterruptTransport {
         self.try_signal(VIRTIO_MMIO_INT_VRING)
     }
 
+    /// Publishes a logical change without issuing a native notification.
+    pub fn publish_config_change(&self) {
+        self.0.config_generation.fetch_add(1, Ordering::SeqCst);
+        self.publish_cause(VIRTIO_MMIO_INT_CONFIG);
+    }
+
     pub fn try_signal_config_change(&self) -> Result<(), crate::Error> {
         debug!(target: &self.0.log_target, "interrupt: signal_config_change");
         self.try_signal(VIRTIO_MMIO_INT_CONFIG)
@@ -361,7 +376,6 @@ impl MmioTransport {
             acked_features_select: 0,
             queue_select: 0,
             device_status: device_status::INIT,
-            config_generation: 0,
             mem,
             queues: Some(queues),
             queue_evts,
@@ -1116,7 +1130,7 @@ impl MmioTransport {
             acked_features_select: self.acked_features_select,
             queue_select: self.queue_select,
             device_status: self.device_status,
-            config_generation: self.config_generation,
+            config_generation: self.interrupt.config_generation(),
             shm_region_select: self.shm_region_select,
             interrupt_status: self.interrupt.status().load(Ordering::SeqCst) as u32,
             activated: self.quiesced_active,
@@ -1221,7 +1235,10 @@ impl MmioTransport {
         self.acked_features_select = state.acked_features_select;
         self.queue_select = state.queue_select;
         self.device_status = state.device_status;
-        self.config_generation = state.config_generation;
+        self.interrupt
+            .0
+            .config_generation
+            .store(state.config_generation, Ordering::SeqCst);
         self.shm_region_select = state.shm_region_select;
         self.interrupt
             .status()
@@ -1449,7 +1466,7 @@ impl MmioTransport {
             .notification_failed
             .store(false, Ordering::SeqCst);
         self.device_status = device_status::INIT;
-        // Do not reset config_generation and keep it monotonically increasing.
+        // ConfigGeneration survives reset, including its permitted u32 wrap.
         // Recreate queues from queue_config for the next negotiation cycle.
         // Keep queue_evts as is - they are reused across reset cycles.
         // TODO: consider resting the events when we refactor event handling
@@ -1463,7 +1480,6 @@ impl MmioTransport {
                 .map(|(queue, event)| QueueBinding::new(queue, event))
                 .collect(),
         );
-        // . Do not reset config_generation and keep it monotonically increasing
     }
 
     fn activate(&mut self) {
@@ -1521,7 +1537,7 @@ impl MmioTransport {
                 self.device_status |= FAILED;
             }
             _ if status == 0 => {
-                if self.locked_device().is_activated() && !self.locked_device().reset() {
+                if self.locked_device().reset_required() && !self.locked_device().reset() {
                     self.device_status |= FAILED;
                 }
 
@@ -1566,7 +1582,7 @@ impl BusDevice for MmioTransport {
                     0x44 => self.with_queue(0, |q| q.ready as u32),
                     0x60 => self.interrupt.status().load(Ordering::SeqCst) as u32,
                     0x70 => self.device_status,
-                    0xfc => self.config_generation,
+                    0xfc => self.interrupt.config_generation(),
                     0xb0..=0xbc => {
                         // For no SHM region or invalid region the kernel looks for length of -1
                         let (shm_base, shm_len) = if self.shm_region_select > 1 {
@@ -1900,7 +1916,7 @@ pub(crate) mod tests {
         d.read(0, 0x70, &mut buf[..]);
         assert_eq!(read_le_u32(&buf[..]), 0);
 
-        d.config_generation = 5;
+        d.interrupt.0.config_generation.store(5, Ordering::SeqCst);
         d.read(0, 0xfc, &mut buf[..]);
         assert_eq!(read_le_u32(&buf[..]), 5);
 
@@ -2056,13 +2072,13 @@ pub(crate) mod tests {
 
         // Write to an invalid address in generic register range.
         write_le_u32(&mut buf[..], 0xf);
-        d.config_generation = 0;
+        d.interrupt.0.config_generation.store(0, Ordering::SeqCst);
         d.write(0, 0xfb, &buf[..]);
-        assert_eq!(d.config_generation, 0);
+        assert_eq!(d.interrupt.config_generation(), 0);
 
         // Write to an invalid length in generic register range.
         d.write(0, 0xfc, &buf[..2]);
-        assert_eq!(d.config_generation, 0);
+        assert_eq!(d.interrupt.config_generation(), 0);
 
         // Here we test writes/read into/from the device specific configuration space.
         let buf1 = vec![1; 0xeff];
@@ -3217,5 +3233,390 @@ pub(crate) mod tests {
         assert!(vsock.lock().expect("retained vsock owner").is_activated());
         assert!(transport.capture_device_state(stop.key).is_err());
         assert!(transport.capture_transport(stop.key).is_err());
+    }
+
+    fn probe_generation_driver(transport: &mut MmioTransport) {
+        set_device_status(transport, device_status::ACKNOWLEDGE);
+        set_device_status(
+            transport,
+            device_status::ACKNOWLEDGE | device_status::DRIVER,
+        );
+        transport.write(0, 0x24, &1u32.to_le_bytes());
+        transport.write(0, 0x20, &1u32.to_le_bytes());
+        let negotiated =
+            device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK;
+        set_device_status(transport, negotiated);
+        for (offset, value) in [
+            (0x38, 1u32),
+            (0x80, 0x100),
+            (0x90, 0x200),
+            (0xa0, 0x300),
+            (0x44, 1),
+        ] {
+            transport.write(0, offset, &value.to_le_bytes());
+        }
+        set_device_status(transport, negotiated | device_status::DRIVER_OK);
+        transport.write(0, 0x104, &13u32.to_le_bytes());
+    }
+
+    #[test]
+    fn generation_guest_reset_reprobe_is_terminal_and_native_stop_settles() {
+        use crate::virtio::generation::{
+            Generation, GenerationError, GenerationFailure, GenerationObservation,
+            GenerationRequest,
+        };
+        use polly::event_manager::{BarrierGeneration, OperationId};
+        use std::time::Duration;
+
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let device = Arc::new(Mutex::new(Generation::new()));
+        let mut transport =
+            MmioTransport::new(memory, DummyIrqChip::new().into(), device.clone(), None).unwrap();
+        transport.set_irq_line(5);
+        transport.set_attachment_address(0xd000).unwrap();
+        probe_generation_driver(&mut transport);
+        let running_status = transport.device_status;
+        let event = transport.queue_evts()[0].clone();
+        let barrier = |operation| BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(operation),
+                generation: BarrierGeneration(1),
+            },
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        let pause = barrier(1);
+        transport.begin_quiesce(pause).unwrap();
+        assert!(transport.poll_quiesce(pause.key).unwrap().is_ready());
+        let attempt = device
+            .lock()
+            .expect("generation owner")
+            .prepare(
+                pause.key,
+                GenerationRequest::FreshIdentity([0x5a; 16]),
+                pause.deadline,
+            )
+            .unwrap();
+        let resume = barrier(2);
+        transport.begin_resume(resume).unwrap();
+        assert!(transport.poll_resume(resume.key).unwrap().is_ready());
+
+        set_device_status(&mut transport, 0);
+        // Exercise the actual guest reprobe before inspecting the failure so
+        // the regression also catches activation through a falsely reset bus.
+        probe_generation_driver(&mut transport);
+        assert_eq!(
+            transport.device_status,
+            running_status | device_status::FAILED
+        );
+        assert!(device.lock().expect("generation owner").is_activated());
+        assert!(transport.queues.is_none());
+        assert!(Arc::ptr_eq(&event, &transport.queue_evts()[0]));
+        assert_eq!(
+            attempt.observe(Instant::now()),
+            GenerationObservation::Failed(GenerationFailure::Reset)
+        );
+        assert_eq!(
+            device.lock().expect("generation owner").snapshot().request,
+            attempt.request()
+        );
+        assert_eq!(transport.interrupt_transport().config_generation(), 1);
+
+        for _ in 0..2 {
+            set_device_status(&mut transport, 0);
+            probe_generation_driver(&mut transport);
+            transport.write(0, 0x104, &13u32.to_le_bytes());
+            for index in 0..4 {
+                transport.write(0, 0x128 + index * 4, &0x5a5a5a5au32.to_le_bytes());
+            }
+            transport.write(0, 0x124, &0u32.to_le_bytes());
+            transport.write(0, 0x120, &(attempt.request().sequence as u32).to_le_bytes());
+            assert_eq!(
+                transport.device_status,
+                running_status | device_status::FAILED
+            );
+            assert_eq!(
+                attempt.observe(Instant::now()),
+                GenerationObservation::Failed(GenerationFailure::Reset)
+            );
+            assert_eq!(
+                device
+                    .lock()
+                    .expect("generation owner")
+                    .snapshot()
+                    .committed,
+                None
+            );
+        }
+
+        let failed_cut = barrier(3);
+        transport.begin_quiesce(failed_cut).unwrap();
+        assert!(transport.poll_quiesce(failed_cut.key).unwrap().is_ready());
+        assert_eq!(
+            transport
+                .capture_transport(failed_cut.key)
+                .unwrap()
+                .device_status,
+            running_status | device_status::FAILED
+        );
+        assert_eq!(
+            transport
+                .capture_device_state(failed_cut.key)
+                .unwrap_err()
+                .fault,
+            ProviderFault::InvalidTransition
+        );
+        assert!(matches!(
+            device.lock().expect("generation owner").prepare(
+                failed_cut.key,
+                GenerationRequest::ClockOnly,
+                failed_cut.deadline
+            ),
+            Err(GenerationError::Failed(GenerationFailure::Reset))
+        ));
+        let stop = barrier(4);
+        assert!(transport.poll_stop(stop).unwrap().is_ready());
+        assert!(transport.poll_stop(stop).unwrap().is_ready());
+        assert_eq!(transport.lifecycle_snapshot().stage, ProviderStage::Stopped);
+        assert!(transport.queues.is_none());
+        let returned = transport.escrow.returned.as_ref().unwrap();
+        assert_eq!(returned.len(), 1);
+        assert!(Arc::ptr_eq(&returned[0].event, &event));
+        assert!(transport.capture_transport(stop.key).is_err());
+    }
+
+    #[test]
+    fn generation_inactive_prepared_guest_reset_is_terminal_and_native_stop_settles() {
+        use crate::virtio::generation::{
+            Generation, GenerationError, GenerationFailure, GenerationObservation,
+            GenerationRequest,
+        };
+        use polly::event_manager::{BarrierGeneration, OperationId};
+        use std::time::Duration;
+
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let device = Arc::new(Mutex::new(Generation::new()));
+        let mut transport =
+            MmioTransport::new(memory, DummyIrqChip::new().into(), device.clone(), None).unwrap();
+        transport.set_irq_line(5);
+        transport.set_attachment_address(0xd000).unwrap();
+        device
+            .lock()
+            .expect("generation owner")
+            .bind_interrupt(transport.interrupt_transport().clone())
+            .unwrap();
+        let barrier = |operation| BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(operation),
+                generation: BarrierGeneration(1),
+            },
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        let pause = barrier(1);
+        transport.begin_quiesce(pause).unwrap();
+        assert!(transport.poll_quiesce(pause.key).unwrap().is_ready());
+        let attempt = device
+            .lock()
+            .expect("generation owner")
+            .prepare(
+                pause.key,
+                GenerationRequest::FreshIdentity([0x6b; 16]),
+                pause.deadline,
+            )
+            .unwrap();
+        let resume = barrier(2);
+        transport.begin_resume(resume).unwrap();
+        assert!(transport.poll_resume(resume.key).unwrap().is_ready());
+        assert!(!device.lock().expect("generation owner").is_activated());
+
+        for _ in 0..3 {
+            set_device_status(&mut transport, 0);
+            probe_generation_driver(&mut transport);
+            assert_eq!(transport.device_status, device_status::FAILED);
+            assert!(!device.lock().expect("generation owner").is_activated());
+            assert_eq!(transport.queues.as_ref().unwrap().len(), 1);
+            assert_eq!(
+                attempt.observe(Instant::now()),
+                GenerationObservation::Failed(GenerationFailure::Reset)
+            );
+            assert_eq!(
+                device.lock().expect("generation owner").snapshot().request,
+                attempt.request()
+            );
+        }
+        let failed_cut = barrier(3);
+        transport.begin_quiesce(failed_cut).unwrap();
+        assert!(transport.poll_quiesce(failed_cut.key).unwrap().is_ready());
+        assert_eq!(
+            transport
+                .capture_transport(failed_cut.key)
+                .unwrap()
+                .device_status,
+            device_status::FAILED
+        );
+        assert_eq!(
+            transport
+                .capture_device_state(failed_cut.key)
+                .unwrap_err()
+                .fault,
+            ProviderFault::InvalidTransition
+        );
+        assert!(matches!(
+            device.lock().expect("generation owner").prepare(
+                failed_cut.key,
+                GenerationRequest::FreshIdentity([0x7c; 16]),
+                failed_cut.deadline
+            ),
+            Err(GenerationError::Failed(GenerationFailure::Reset))
+        ));
+        let stop = barrier(4);
+        assert!(transport.poll_stop(stop).unwrap().is_ready());
+        assert!(transport.poll_stop(stop).unwrap().is_ready());
+        assert_eq!(transport.lifecycle_snapshot().stage, ProviderStage::Stopped);
+    }
+
+    #[test]
+    fn generation_prepublication_guest_reset_allows_clean_reprobe() {
+        use crate::virtio::generation::{Generation, GenerationTuple, ProcessedGeneration};
+
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let device = Arc::new(Mutex::new(Generation::new()));
+        let mut transport =
+            MmioTransport::new(memory, DummyIrqChip::new().into(), device.clone(), None).unwrap();
+        transport.set_irq_line(5);
+        probe_generation_driver(&mut transport);
+        let running_status = transport.device_status;
+        transport.write(0, 0x128, &0x5a5a5a5au32.to_le_bytes());
+        let interrupt = transport.interrupt_transport().clone();
+        interrupt.publish_config_change();
+        for _ in 0..3 {
+            set_device_status(&mut transport, 0);
+            assert_eq!(transport.device_status, device_status::INIT);
+            assert!(!device.lock().expect("generation owner").is_activated());
+            assert_eq!(device.lock().expect("generation owner").acked_features(), 0);
+            let snapshot = device.lock().expect("generation owner").snapshot();
+            assert_eq!(snapshot.request, GenerationTuple::default());
+            assert_eq!(snapshot.processed, ProcessedGeneration::default());
+            assert_eq!(snapshot.driver_status, 0);
+            assert_eq!(snapshot.attempt, None);
+            assert_eq!(interrupt.status().load(Ordering::SeqCst), 0);
+            assert_eq!(interrupt.config_generation(), 1);
+            assert!(!transport.queues.as_ref().unwrap()[0].ready);
+        }
+        probe_generation_driver(&mut transport);
+        assert_eq!(transport.device_status, running_status);
+        assert!(device.lock().expect("generation owner").is_activated());
+        assert_eq!(
+            device
+                .lock()
+                .expect("generation owner")
+                .snapshot()
+                .driver_status,
+            13
+        );
+    }
+
+    #[test]
+    fn config_publication_counter_is_shared_wraps_and_survives_reset() {
+        use crate::virtio::generation::Generation;
+
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let device = Arc::new(Mutex::new(Generation::new()));
+        let mut transport =
+            MmioTransport::new(memory, DummyIrqChip::new().into(), device, None).unwrap();
+        transport.set_irq_line(5);
+        set_device_status(&mut transport, device_status::ACKNOWLEDGE);
+        set_device_status(
+            &mut transport,
+            device_status::ACKNOWLEDGE | device_status::DRIVER,
+        );
+        transport.write(0, 0x24, &1u32.to_le_bytes());
+        transport.write(0, 0x20, &1u32.to_le_bytes());
+        let negotiated =
+            device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK;
+        set_device_status(&mut transport, negotiated);
+        for (offset, value) in [
+            (0x38, 1u32),
+            (0x80, 0x100),
+            (0x90, 0x200),
+            (0xa0, 0x300),
+            (0x44, 1),
+        ] {
+            transport.write(0, offset, &value.to_le_bytes());
+        }
+        set_device_status(&mut transport, negotiated | device_status::DRIVER_OK);
+        assert!(transport.locked_device().is_activated());
+        let interrupt = transport.interrupt_transport().clone();
+        assert!(interrupt.same_binding(transport.interrupt_transport()));
+        interrupt
+            .0
+            .config_generation
+            .store(u32::MAX, Ordering::SeqCst);
+        interrupt.publish_config_change();
+        assert_eq!(interrupt.config_generation(), 0);
+        assert_eq!(
+            interrupt.status().load(Ordering::SeqCst),
+            VIRTIO_MMIO_INT_CONFIG as usize
+        );
+        interrupt.publish_config_change();
+        interrupt.try_signal_config_change().unwrap();
+        interrupt.try_signal_config_change().unwrap();
+        let mut bytes = [0; 4];
+        transport.read(0, 0xfc, &mut bytes);
+        assert_eq!(u32::from_le_bytes(bytes), 1);
+        transport.write(0, 0x64, &VIRTIO_MMIO_INT_CONFIG.to_le_bytes());
+        assert_eq!(interrupt.status().load(Ordering::SeqCst), 0);
+        assert_eq!(interrupt.config_generation(), 1);
+        transport.reset();
+        transport.read(0, 0xfc, &mut bytes);
+        assert_eq!(u32::from_le_bytes(bytes), 1);
+    }
+
+    #[test]
+    fn config_counter_capture_apply_use_only_existing_serialized_field() {
+        use crate::virtio::generation::Generation;
+        use polly::event_manager::{BarrierGeneration, OperationId};
+        use std::time::Duration;
+
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let mut transport = MmioTransport::new(
+            memory,
+            DummyIrqChip::new().into(),
+            Arc::new(Mutex::new(Generation::new())),
+            None,
+        )
+        .unwrap();
+        transport.set_irq_line(5);
+        transport.set_attachment_address(0xd000).unwrap();
+        let interrupt = transport.interrupt_transport().clone();
+        interrupt.publish_config_change();
+        let request = BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(1),
+                generation: BarrierGeneration(1),
+            },
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        transport.begin_quiesce(request).unwrap();
+        assert!(transport.poll_quiesce(request.key).unwrap().is_ready());
+        let mut state = transport.capture_transport(request.key).unwrap();
+        assert_eq!(state.config_generation, 1);
+        state.config_generation = 42;
+        transport.apply_transport(&state).unwrap();
+        assert_eq!(interrupt.config_generation(), 42);
+        assert_eq!(
+            transport
+                .capture_transport(request.key)
+                .unwrap()
+                .config_generation,
+            42
+        );
+        interrupt.publish_config_change();
+        assert_eq!(
+            transport
+                .capture_transport(request.key)
+                .unwrap()
+                .config_generation,
+            43
+        );
     }
 }

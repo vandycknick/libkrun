@@ -162,6 +162,11 @@ pub trait VirtioDevice: AsAny + Send {
         None
     }
 
+    /// Whether guest reset must consult the backend before resetting transport state.
+    fn reset_required(&self) -> bool {
+        self.is_activated()
+    }
+
     /// Optionally deactivates this device. The device should drop its queues.
     /// After reset, the transport will recreate queues from queue_config().
     /// `true` acknowledges deactivation; `false` is unsupported or failed cleanup

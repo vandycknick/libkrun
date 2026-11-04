@@ -27,13 +27,16 @@ use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vm_memory::GuestAddress;
 
 use crate::api::capabilities::execution_state_producer;
-use crate::api::device_builders::{AttachContext, AttachDevice, BalloonBinding, MmioDeviceManager};
+use crate::api::device_builders::{
+    AttachContext, AttachDevice, BalloonBinding, GenerationBinding, MmioDeviceManager,
+};
 use crate::api::error::VmmError;
 use crate::api::payload::{KernelFormat, Payload};
 use crate::api::vmm_builder::{VmmBuilder, VmmInner};
 use crate::vmm::Vmm;
 use crate::vmm::builder::restore::build_restore_prepared;
 use crate::vmm::control::{ControlReply, PauseOwner, PauseToken, RequestId, RequestKind};
+use crate::vmm::control::{GenerationAuthority, GenerationMode, GenerationTicket};
 use crate::vmm::device_manager::quiescence::ManagerFault;
 use crate::vmm::execution::device_restore::{
     DeviceEnvelope, RestoreDeviceBinding, ValidatedDevices,
@@ -47,6 +50,9 @@ use crate::vmm::memory::image::{
 use crate::vmm::memory::{AttemptId, CompletedCandidate, DirtyCrossoverPercent, RamCaptureRequest};
 #[cfg(feature = "native-device-probe")]
 use crate::vmm::vstate::NativeRunObserver;
+use devices::virtio::generation::{
+    DEVICE_ID, Generation, GenerationFailure, GenerationObservation,
+};
 
 #[cfg(feature = "native-device-probe")]
 #[derive(Debug)]
@@ -189,6 +195,7 @@ struct Resource {
     device: Arc<Mutex<dyn VirtioDevice>>,
     subscriber: Option<Arc<Mutex<dyn Subscriber + Send>>>,
     balloon_binding: Option<BalloonBinding>,
+    generation_binding: Option<GenerationBinding>,
 }
 impl<'a> AttachDevice<'a> for Resource {
     fn attach(self: Box<Self>, context: &mut AttachContext) -> Result<(), VmmError> {
@@ -207,6 +214,9 @@ impl<'a> AttachDevice<'a> for Resource {
         if let Some(binding) = self.balloon_binding {
             context.retain_balloon_binding(binding);
         }
+        if let Some(binding) = self.generation_binding {
+            context.retain_generation_binding(binding)?;
+        }
         Ok(())
     }
 }
@@ -223,6 +233,7 @@ struct Driver {
     _worker: Option<crossbeam_channel::Sender<utils::worker_message::WorkerMessage>>,
     operation: u64,
     token: Option<PauseToken>,
+    generation_ticket: Option<GenerationTicket>,
     stopped: bool,
     prepared_layout: Option<Arc<ValidatedRamLayout>>,
     memory_attempt: Option<AttemptId>,
@@ -298,6 +309,10 @@ impl Driver {
         Err(format!("{reason}; cleanup={cleanup:?}"))
     }
     fn stop(&mut self) -> Result<(), String> {
+        self.vmm
+            .try_lock()
+            .map_err(|_| "driver VMM lock")?
+            .fail_generation(GenerationFailure::Stopped);
         #[cfg(feature = "native-device-probe")]
         self.witness.release();
         self.operation = self
@@ -994,6 +1009,7 @@ fn resource<T: VirtioDevice + Subscriber + 'static>(id: &str, device: T) -> Reso
         device: device.clone(),
         subscriber: Some(device),
         balloon_binding: None,
+        generation_binding: None,
     }
 }
 fn owned_fd(arguments: &BTreeMap<String, String>, key: &str) -> Result<OwnedFd, String> {
@@ -1097,6 +1113,7 @@ fn resources(
             device: Arc::new(Mutex::new(disk)),
             subscriber: None,
             balloon_binding: None,
+            generation_binding: None,
         });
     }
     let net_fd = owned_fd(arguments, "net-fd")?;
@@ -1123,6 +1140,7 @@ fn resources(
         device: Arc::new(Mutex::new(net)),
         subscriber: None,
         balloon_binding: None,
+        generation_binding: None,
     });
     let mut vsock = Vsock::new(3, None, None, TsiFlags::empty())
         .map_err(|error| format!("vsock: {error:?}"))?;
@@ -1154,11 +1172,38 @@ fn resources(
         device: balloon.clone(),
         subscriber: Some(balloon.clone()),
         balloon_binding: Some(BalloonBinding::new(balloon)),
+        generation_binding: None,
     });
     result.push(resource(
         "rng0",
         Rng::new().map_err(|error| format!("rng: {error:?}"))?,
     ));
+    if arguments
+        .get("generation")
+        .is_some_and(|value| value == "on")
+    {
+        if saved.is_some_and(|saved| {
+            saved
+                .records
+                .iter()
+                .filter(|record| {
+                    record.state.device_type == devices::virtio::generation::DEVICE_TYPE
+                        && record.identity.configured_id == DEVICE_ID
+                })
+                .count()
+                != 1
+        }) {
+            return Err("generation restore requires exact captured attachment".into());
+        }
+        let device = Arc::new(Mutex::new(Generation::new()));
+        result.push(Resource {
+            id: DEVICE_ID.into(),
+            device: device.clone(),
+            subscriber: None,
+            balloon_binding: None,
+            generation_binding: Some(GenerationBinding::new(device)),
+        });
+    }
     Ok(result)
 }
 
@@ -1173,13 +1218,19 @@ fn cold(arguments: &BTreeMap<String, String>, resources: Vec<Resource>) -> Resul
     if port == 0 {
         return Err("echo-port cannot be zero".into());
     }
-    let commandline = if arguments.contains_key("witness") {
+    let mut commandline = if arguments.contains_key("witness") {
         format!(
             "console=hvc0 rdinit=/init panic=-1 probe.echo_port={port} maxcpus=2 memmap=16M$448M memmap=64K$448K"
         )
     } else {
         format!("console=hvc0 rdinit=/init panic=-1 probe.echo_port={port}")
     };
+    if let Some(mode) = arguments.get("generation-proof-mode") {
+        if !matches!(mode.as_str(), "1" | "2" | "3") {
+            return Err("diagnostic generation proof mode must be 1, 2 or 3".into());
+        }
+        commandline.push_str(&format!(" virtio_silo_vmgenid.proof_mode={mode}"));
+    }
     let payload = Payload::load_external(
         argument(arguments, "kernel")?,
         KernelFormat::Elf,
@@ -1211,6 +1262,7 @@ fn cold(arguments: &BTreeMap<String, String>, resources: Vec<Resource>) -> Resul
         _worker: Some(_worker_sender),
         operation: 0,
         token: None,
+        generation_ticket: None,
         stopped: false,
         prepared_layout: None,
         memory_attempt: None,
@@ -1291,6 +1343,7 @@ fn restore(
             payload: record.payload.clone(),
             resource: resource.device.clone(),
             subscriber: resource.subscriber.clone(),
+            generation_binding: resource.generation_binding.clone(),
         });
     }
     let mut serial = Vec::new();
@@ -1407,6 +1460,7 @@ fn restore(
                     _worker: None,
                     operation: 0,
                     token: None,
+                    generation_ticket: None,
                     stopped: false,
                     prepared_layout: None,
                     memory_attempt: None,
@@ -1530,6 +1584,7 @@ fn restore(
             _worker: None,
             operation: 0,
             token: None,
+            generation_ticket: None,
             stopped: false,
             prepared_layout: None,
             memory_attempt: None,
@@ -1556,6 +1611,7 @@ fn restore(
         _worker: None,
         operation: 0,
         token: None,
+        generation_ticket: None,
         stopped: false,
         prepared_layout: None,
         memory_attempt: None,
@@ -1728,6 +1784,17 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
                     .map_err(|_| "controller UTF-8")?;
                 let (command, operand) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
                 let response: Result<bool, String> = (|| {
+                    if matches!(
+                        command,
+                        "generation-fresh"
+                            | "generation-clock"
+                            | "generation-resume"
+                            | "generation-snapshot"
+                            | "generation-wait"
+                    ) && !operand.is_empty()
+                    {
+                        return Err("generation command takes no operands".into());
+                    }
                     match command {
                         #[cfg(feature = "native-device-probe")]
                         command if command.starts_with("witness-") => {
@@ -1760,6 +1827,155 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
                                 .profile = Some(profile);
                         }
                         "pause" => driver.pause()?,
+                        "generation-fresh" | "generation-clock" => {
+                            let authority = if let Some(token) = &driver.token {
+                                GenerationAuthority::Pause(token.clone())
+                            } else {
+                                let vmm = driver.vmm.try_lock().map_err(|_| "driver lock")?;
+                                let crate::vmm::control::ControlState::RestorePrepared { key } =
+                                    vmm.control.state
+                                else {
+                                    return Err(
+                                        "generation preparation requires stopped authority".into(),
+                                    );
+                                };
+                                GenerationAuthority::Restore(key)
+                            };
+                            let mode = if command == "generation-fresh" {
+                                GenerationMode::Fresh
+                            } else {
+                                GenerationMode::ClockOnly
+                            };
+                            let deadline = Instant::now() + WAIT;
+                            let ControlReply::Generation(ticket) =
+                                driver.call(RequestKind::PrepareGeneration {
+                                    authority,
+                                    mode,
+                                    deadline,
+                                })?
+                            else {
+                                return Err("generation preparation reply".into());
+                            };
+                            driver.generation_ticket = Some(ticket);
+                        }
+                        "generation-resume" => {
+                            let ticket = driver
+                                .generation_ticket
+                                .clone()
+                                .ok_or("generation ticket absent")?;
+                            let request = if let Some(token) = &driver.token {
+                                RequestKind::ResumeGeneration(token.clone(), ticket)
+                            } else {
+                                RequestKind::ReleaseRestoreGeneration(ticket)
+                            };
+                            driver.call(request)?;
+                            driver.token = None;
+                        }
+                        "generation-capture" => {
+                            use std::sync::atomic::Ordering;
+
+                            if operand.is_empty() {
+                                return Err("generation-capture requires an output path".into());
+                            }
+                            let vmm = driver.vmm.try_lock().map_err(|_| "driver lock")?;
+                            let key = vmm
+                                .execution
+                                .retained
+                                .as_ref()
+                                .ok_or("generation capture requires actual cut")?
+                                .key;
+                            let interrupt = vmm
+                                .mmio_device_manager
+                                .quiescence
+                                .interrupt_binding(
+                                    devices::virtio::generation::DEVICE_TYPE,
+                                    DEVICE_ID,
+                                )
+                                .map_err(|error| error.to_string())?;
+                            let before_config_generation = interrupt.config_generation();
+                            let before_interrupt_status =
+                                interrupt.status().load(Ordering::SeqCst) as u32;
+                            let records = vmm
+                                .mmio_device_manager
+                                .quiescence
+                                .capture_devices(key)
+                                .map_err(|error| error.to_string())?;
+                            let mut records = records
+                                .iter()
+                                .filter(|record| record.identity.configured_id == DEVICE_ID);
+                            let record = records.next().ok_or("generation attachment absent")?;
+                            if records.next().is_some() {
+                                return Err("duplicate generation attachment".into());
+                            }
+                            record
+                                .state
+                                .validate_payload_binding(&record.payload)
+                                .map_err(|error| format!("{error:?}"))?;
+                            write_new(Path::new(operand), &record.payload)?;
+                            let after_config_generation = interrupt.config_generation();
+                            let after_interrupt_status =
+                                interrupt.status().load(Ordering::SeqCst) as u32;
+                            println!(
+                                "GENERATION_CAPTURE bytes={} config_generation={} interrupt_status={} avail_features={} acked_features={} before_config_generation={before_config_generation} before_interrupt_status={before_interrupt_status} after_config_generation={after_config_generation} after_interrupt_status={after_interrupt_status}",
+                                record.payload.len(),
+                                record.state.config_generation,
+                                record.state.interrupt_status,
+                                record.state.avail_features,
+                                record.state.acked_features
+                            );
+                        }
+                        "generation-snapshot" => {
+                            let ControlReply::GenerationSnapshot(snapshot) =
+                                driver.call(RequestKind::GenerationSnapshot)?
+                            else {
+                                return Err("generation snapshot reply".into());
+                            };
+                            let ticket = driver.generation_ticket.as_ref();
+                            let observed = ticket.map(|ticket| ticket.observe(Instant::now()));
+                            let outcome = match observed {
+                                None => "none",
+                                Some(GenerationObservation::Pending) => "pending",
+                                Some(GenerationObservation::Acknowledged(_)) => "acknowledged",
+                                Some(GenerationObservation::Failed(
+                                    GenerationFailure::Deadline,
+                                )) => "deadline",
+                                Some(GenerationObservation::Failed(_)) => "failed",
+                            };
+                            let timely = matches!(observed, Some(GenerationObservation::Acknowledged(receipt))
+                                if ticket.is_some_and(|ticket| receipt.completed_at < ticket.deadline()));
+                            let deadline = ticket
+                                .map(|ticket| format!("{:?}", ticket.deadline()))
+                                .unwrap_or_default();
+                            let committed = snapshot.committed.map_or(0, |tuple| tuple.sequence);
+                            let counter = snapshot
+                                .config_generation
+                                .ok_or("generation snapshot interrupt binding absent")?;
+                            println!(
+                                "GENERATION {{\"sequence\":{},\"id\":{:?},\"flags\":{},\"processed_sequence\":{},\"processed_id\":{:?},\"driver_status\":{},\"clock_latch\":{},\"config_generation\":{counter},\"committed_sequence\":{committed},\"outcome\":\"{outcome}\",\"deadline\":\"{deadline}\",\"timely\":{timely}}}",
+                                snapshot.request.sequence,
+                                snapshot.request.id,
+                                snapshot.request.flags,
+                                snapshot.processed.sequence,
+                                snapshot.processed.id,
+                                snapshot.driver_status,
+                                snapshot.clock_latch
+                            );
+                        }
+                        "generation-wait" => {
+                            let ticket = driver
+                                .generation_ticket
+                                .clone()
+                                .ok_or("generation ticket absent")?;
+                            loop {
+                                match ticket.observe(Instant::now()) {
+                                    GenerationObservation::Pending => driver.poll()?,
+                                    observation => {
+                                        println!("GENERATION_OUTCOME {observation:?}");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         #[cfg(feature = "native-device-probe")]
                         "memory-host-write" => diagnostic_host_write(&driver, operand)?,
                         #[cfg(feature = "native-device-probe")]

@@ -120,6 +120,18 @@ impl<'a> AttachContext<'a> {
         self.vmm.balloon_bindings.push(binding);
     }
 
+    pub(crate) fn retain_generation_binding(
+        &mut self,
+        binding: GenerationBinding,
+    ) -> Result<(), VmmError> {
+        if self.vmm.generation_binding.is_some() {
+            return Err(VmmError::Internal("duplicate generation binding".into()));
+        }
+        binding.bind(self.vmm).map_err(VmmError::Internal)?;
+        self.vmm.generation_binding = Some(binding);
+        Ok(())
+    }
+
     /// Subscribe a device to the event loop for epoll-based I/O.
     pub fn subscribe_events(
         &mut self,
@@ -1177,6 +1189,95 @@ impl<'a> AttachDevice<'a> for RngDevice {
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         ctx.subscribe_events(self.inner.clone())?;
         ctx.register("rng", self.inner)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct GenerationBinding {
+    inner: Arc<Mutex<devices::virtio::generation::Generation>>,
+}
+
+impl GenerationBinding {
+    pub(crate) fn new(inner: Arc<Mutex<devices::virtio::generation::Generation>>) -> Self {
+        Self { inner }
+    }
+
+    pub(crate) fn matches(&self, resource: &Arc<Mutex<dyn VirtioDevice>>) -> bool {
+        Arc::as_ptr(&self.inner) as *const () == Arc::as_ptr(resource) as *const ()
+    }
+
+    pub(crate) fn fail(&self, cause: devices::virtio::generation::GenerationFailure) {
+        let mut device = match self.inner.lock() {
+            Ok(device) => device,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        device.fail_attempt(cause);
+    }
+
+    pub(crate) fn with<T>(
+        &self,
+        action: impl FnOnce(&mut devices::virtio::generation::Generation) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut device = self
+            .inner
+            .try_lock()
+            .map_err(|_| "generation device lock unavailable")?;
+        action(&mut device)
+    }
+
+    pub(crate) fn bind(&self, vmm: &Vmm) -> Result<(), String> {
+        use devices::virtio::generation::{DEVICE_ID, DEVICE_TYPE};
+        let interrupt = vmm
+            .mmio_device_manager
+            .quiescence
+            .interrupt_binding(DEVICE_TYPE, DEVICE_ID)
+            .map_err(|error| error.to_string())?;
+        self.with(|device| {
+            device
+                .bind_interrupt(interrupt)
+                .map_err(|error| format!("{error:?}"))
+        })
+    }
+}
+
+/// The config-only generation device. It has no backend worker or host DMA path.
+#[cfg(not(feature = "tee"))]
+pub struct GenerationDevice {
+    inner: Arc<Mutex<devices::virtio::generation::Generation>>,
+}
+
+#[cfg(not(feature = "tee"))]
+impl GenerationDevice {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(devices::virtio::generation::Generation::new())),
+        }
+    }
+}
+
+#[cfg(not(feature = "tee"))]
+impl Default for GenerationDevice {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(not(feature = "tee"))]
+impl<'a> AttachDevice<'a> for GenerationDevice {
+    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+        use devices::virtio::generation::{DEVICE_ID, DEVICE_TYPE};
+        if ctx.vmm.generation_binding.is_some()
+            || ctx
+                .vmm
+                .mmio_device_manager
+                .quiescence
+                .has_attachment_conflict(DEVICE_TYPE, DEVICE_ID)
+        {
+            return Err(VmmError::Internal("duplicate generation attachment".into()));
+        }
+        let binding = GenerationBinding::new(self.inner.clone());
+        ctx.register(DEVICE_ID, self.inner)?;
+        ctx.retain_generation_binding(binding)
     }
 }
 

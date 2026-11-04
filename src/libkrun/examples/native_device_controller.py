@@ -241,6 +241,10 @@ class Session:
             command += ["--partial-install", str(directory / "partial-install.json")]
         if generic:
             command += ["--net-profile", "generic"]
+        if getattr(args, "generation", False):
+            command += ["--generation", "on"]
+            if getattr(args, "generation_proof_mode", 0):
+                command += ["--generation-proof-mode", str(args.generation_proof_mode)]
         save(directory / "command.json", command)
         inherited = (slave, input_guest.fileno(), output_guest.fileno(), self.net.fileno(), mux_guest.fileno(), *ram_fds)
         error = (directory / "driver.stderr").open("wb")

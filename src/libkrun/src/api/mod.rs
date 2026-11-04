@@ -44,6 +44,8 @@ pub use device_builders::BlockDevice;
 pub use device_builders::FsDevice;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use device_builders::FsOverlay;
+#[cfg(not(feature = "tee"))]
+pub use device_builders::GenerationDevice;
 #[cfg(feature = "input")]
 pub use device_builders::InputDevice;
 #[cfg(feature = "net")]

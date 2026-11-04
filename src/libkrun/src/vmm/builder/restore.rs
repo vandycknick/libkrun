@@ -78,6 +78,7 @@ fn assemble(
         memory_domain,
         memory: memory_coordinator,
         balloon_bindings: Vec::new(),
+        generation_binding: None,
         reclaim_observer: None,
         arch_memory_info: info,
         vm,
@@ -337,6 +338,10 @@ pub(crate) fn build_restore_prepared(
         // before owners take their buses; install device payloads only after CPU state.
         attach_device_resources(&mut attempt, &devices)?;
         attempt.balloon_bindings = std::mem::take(&mut devices.balloon_bindings);
+        attempt.generation_binding = devices.generation_binding.take();
+        if let Some(binding) = &attempt.generation_binding {
+            binding.bind(&attempt)?;
+        }
         let observer = devices::virtio::balloon::ReclaimObserver::for_domain(
             &attempt.memory_domain,
             #[cfg(target_os = "macos")]

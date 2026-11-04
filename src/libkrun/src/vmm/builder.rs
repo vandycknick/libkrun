@@ -1246,6 +1246,7 @@ pub fn build_microvm(
         memory,
         #[cfg(not(feature = "tee"))]
         balloon_bindings: Vec::new(),
+        generation_binding: None,
         reclaim_observer: None,
         arch_memory_info,
         kernel_cmdline,

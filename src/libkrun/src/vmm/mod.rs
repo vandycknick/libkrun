@@ -142,6 +142,7 @@ pub struct Vmm {
     pub(crate) memory: memory::MemoryCoordinator,
     #[cfg(not(feature = "tee"))]
     pub(crate) balloon_bindings: Vec<crate::api::device_builders::BalloonBinding>,
+    pub(crate) generation_binding: Option<crate::api::device_builders::GenerationBinding>,
     pub(crate) reclaim_observer: Option<devices::virtio::balloon::ReclaimObserver>,
     pub(crate) arch_memory_info: ArchMemoryInfo,
 
@@ -302,6 +303,7 @@ impl Vmm {
 
     /// Waits for all vCPUs to exit and terminates the Firecracker process.
     pub fn stop(&mut self, exit_code: i32) {
+        self.fail_generation(devices::virtio::generation::GenerationFailure::Stopped);
         info!("Vmm is stopping.");
 
         for observer in &self.exit_observers {
