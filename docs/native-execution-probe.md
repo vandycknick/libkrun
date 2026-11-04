@@ -1759,6 +1759,10 @@ production capture merely because it compiles. Rebuild after establishing
 the clean source revision; never relabel a diagnostic producer or bypass
 `execution_producer()` to run the production proof.
 
+Cold-boot kernel console replacement accepts `console=` as the last command-line
+argument, without requiring a trailing space or another boot option. The
+restored-Silo fixture uses this form before its first capture.
+
 Accepted operations belong to the VM, not to the caller waiting for a reply.
 A caller deadline is not cancellation. Reconcile capture status using the
 exact retained capture identity before accepting, abandoning or releasing

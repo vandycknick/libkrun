@@ -809,10 +809,11 @@ pub fn build_microvm(
         let console_start_idx = cmdline.find("console=").unwrap();
         let console_end_idx = cmdline
             .get(console_start_idx..)
-            .and_then(|s| s.find(" ").map(|i| i + console_start_idx));
+            .and_then(|s| s.find(" ").map(|i| i + console_start_idx))
+            .unwrap_or(cmdline.len());
 
         let cmdline = cmdline.replace(
-            &cmdline[console_start_idx..console_end_idx.unwrap()],
+            &cmdline[console_start_idx..console_end_idx],
             format!("console={kernel_console}").as_str(),
         );
         kernel_cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
