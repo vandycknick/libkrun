@@ -8,7 +8,6 @@ pub use self::device::Balloon;
 pub enum BalloonMemoryPolicy {
     Untracked,
     TrackedCapture,
-    RestoredInput,
     RestoredPrivate,
 }
 

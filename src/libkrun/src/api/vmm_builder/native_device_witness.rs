@@ -269,7 +269,10 @@ impl Witness {
                 .address
                 .lock()
                 .map_err(|_| "witness address poisoned")? = Some(address);
-            if !vmm.reopen_memory_for_resume(barrier.key)? {
+            if !vmm
+                .reopen_memory_for_resume(barrier.key)
+                .map_err(|error| error.to_string())?
+            {
                 return Err("source witness native writers remain outstanding".into());
             }
             let memory = &vmm.guest_memory;

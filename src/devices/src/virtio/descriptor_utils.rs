@@ -1737,7 +1737,7 @@ mod tests {
         control.drain_host_dirty(&cut, &mut dirty).unwrap();
         assert_eq!(dirty.count(), 0);
         let epoch = cut.issue_epoch(2).unwrap();
-        control.reopen(cut, epoch).unwrap();
+        control.reopen(&cut, &epoch).unwrap();
 
         let source = TempFile::new().unwrap();
         source.as_file().write_all_at(b"data", 0).unwrap();

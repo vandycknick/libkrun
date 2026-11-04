@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+#[cfg(feature = "native-device-probe")]
+use crate::vmm::linux::vstate::CpuDirtyRecoveryObservation;
 use crate::vmm::linux::vstate::VmFdOwner;
 use arch::guest_memory::{
     ConstructionAuthority, CpuHarvest, CpuTrackingEpoch, DirtyEffect, DirtyFailure, DirtyLocation,
@@ -94,6 +96,7 @@ fn slot_pages(bytes: u64, granule: u32) -> Result<usize, DirtyFailure> {
 struct RegisteredKvmSlot {
     region: Option<RegionId>,
     installed: kvm_userspace_memory_region,
+    original_slot: u32,
     original_flags: u32,
     dirty: Option<KvmSlotBitmap>,
 }
@@ -102,6 +105,7 @@ impl RegisteredKvmSlot {
     fn new(installed: kvm_userspace_memory_region) -> Self {
         Self {
             region: None,
+            original_slot: installed.slot,
             original_flags: installed.flags,
             installed,
             dirty: None,
@@ -136,6 +140,11 @@ pub(crate) struct KvmMemory {
     backing: Option<Arc<GuestMemoryMmap>>,
     domain: Option<Arc<MemoryDomain>>,
     state: TrackingState,
+    last_issued_epoch: u64,
+    #[cfg(feature = "native-device-probe")]
+    next_get_fault: Option<u32>,
+    #[cfg(feature = "native-device-probe")]
+    recovery_observation: CpuDirtyRecoveryObservation,
 }
 
 impl KvmMemory {
@@ -145,6 +154,11 @@ impl KvmMemory {
             backing: None,
             domain: None,
             state: TrackingState::Constructing,
+            last_issued_epoch: 0,
+            #[cfg(feature = "native-device-probe")]
+            next_get_fault: None,
+            #[cfg(feature = "native-device-probe")]
+            recovery_observation: CpuDirtyRecoveryObservation::default(),
         }
     }
 
@@ -169,6 +183,73 @@ impl KvmMemory {
         {
             return Err("kvm/native/dirty-tracking-not-armed".into());
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    pub(crate) fn arm_cpu_dirty_get_fault(
+        &mut self,
+        permit: &NativeEffectsPermit,
+    ) -> Result<u32, DirtyFailure> {
+        let refusal = || {
+            failure(
+                DirtyOperation::Collect,
+                None,
+                DirtyEffect::PreEffectRefusal,
+                0,
+            )
+        };
+        let domain = self.domain.as_ref().ok_or_else(refusal)?;
+        permit.validate_domain(domain).map_err(|_| refusal())?;
+        if domain.tracking_mode() != Some(TrackingMode::Capture)
+            || self.state != TrackingState::Armed(self.last_issued_epoch)
+            || self.last_issued_epoch == 0
+            || self.next_get_fault.is_some()
+        {
+            return Err(refusal());
+        }
+        let slot = self.slots.last().ok_or_else(refusal)?;
+        if slot.dirty.is_none() {
+            return Err(refusal());
+        }
+        let target = slot.installed.slot;
+        self.prepare_recovery_observation()?;
+        self.next_get_fault = Some(target);
+        self.recovery_observation.harvest_failure = None;
+        Ok(target)
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    pub(crate) fn cpu_dirty_recovery_observation(&self) -> &CpuDirtyRecoveryObservation {
+        &self.recovery_observation
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    fn prepare_recovery_observation(&mut self) -> Result<(), DirtyFailure> {
+        let observation = &mut self.recovery_observation;
+        observation.registered_slots.clear();
+        observation.successful_slots.clear();
+        observation.epoch = None;
+        observation.failure = None;
+        let refusal = || {
+            failure(
+                DirtyOperation::Reestablish,
+                None,
+                DirtyEffect::PreEffectRefusal,
+                0,
+            )
+        };
+        observation
+            .registered_slots
+            .try_reserve(self.slots.len())
+            .map_err(|_| refusal())?;
+        observation
+            .successful_slots
+            .try_reserve(self.slots.len())
+            .map_err(|_| refusal())?;
+        observation
+            .registered_slots
+            .extend(self.slots.iter().map(|slot| slot.installed.slot));
         Ok(())
     }
 
@@ -269,6 +350,7 @@ impl KvmMemory {
             self.slots.push(record);
         }
         self.state = TrackingState::Armed(1);
+        self.last_issued_epoch = 1;
         Ok(epoch)
     }
 
@@ -380,6 +462,7 @@ impl KvmMemory {
             slot.installed = registration;
         }
         self.state = TrackingState::Armed(1);
+        self.last_issued_epoch = 1;
         Ok(epoch)
     }
 
@@ -429,52 +512,26 @@ impl KvmMemory {
                 0,
             )
         })?;
-        if retained.page_count() != domain.layout().page_count()
-            || self.slots.len() != domain.layout().regions().len()
-        {
-            return Err(failure(
-                DirtyOperation::Collect,
-                None,
-                DirtyEffect::PreEffectRefusal,
-                0,
-            ));
-        }
-        // Validate the complete retained inventory before the first destructive GET.
-        for (slot, region) in self.slots.iter().zip(domain.layout().regions()) {
-            if slot.region != Some(region.id())
-                || slot.installed.flags != (slot.original_flags | KVM_MEM_LOG_DIRTY_PAGES)
-            {
-                return Err(failure(
-                    DirtyOperation::Collect,
-                    Some(slot.installed.slot),
-                    DirtyEffect::PreEffectRefusal,
-                    0,
-                ));
-            }
-            slot.dirty
-                .as_ref()
-                .ok_or_else(|| {
-                    failure(
-                        DirtyOperation::Collect,
-                        Some(slot.installed.slot),
-                        DirtyEffect::PreEffectRefusal,
-                        0,
-                    )
-                })?
-                .validate(slot.installed.memory_size, domain.layout().granule())
-                .map_err(|_| {
-                    failure(
-                        DirtyOperation::Collect,
-                        Some(slot.installed.slot),
-                        DirtyEffect::PreEffectRefusal,
-                        0,
-                    )
-                })?;
-        }
+        self.validate_inventory(cut, retained, DirtyOperation::Collect)?;
+        #[cfg(feature = "native-device-probe")]
+        let fault_slot = self.next_get_fault.take();
         for (slot, region) in self.slots.iter_mut().zip(domain.layout().regions()) {
-            if let Err(error) = harvest_slot_into(fd, slot, region, retained) {
+            #[cfg(feature = "native-device-probe")]
+            let fault_copy = fault_slot == Some(slot.installed.slot);
+            if let Err(error) = harvest_slot_into(
+                fd,
+                slot,
+                region,
+                retained,
+                #[cfg(feature = "native-device-probe")]
+                fault_copy,
+            ) {
                 self.state = TrackingState::Failed;
                 domain.invalidate_coverage();
+                #[cfg(feature = "native-device-probe")]
+                {
+                    self.recovery_observation.harvest_failure = Some(error);
+                }
                 return Err(error);
             }
         }
@@ -536,6 +593,132 @@ impl KvmMemory {
         })?;
         // Ordinary GET has already reprotected the slots; the witness consumes that success.
         self.state = TrackingState::Armed(harvested.epoch());
+        self.last_issued_epoch = harvested.epoch();
+        Ok(epoch)
+    }
+
+    fn validate_inventory(
+        &self,
+        cut: &MemoryCut,
+        retained: &DirtyPageMap,
+        operation: DirtyOperation,
+    ) -> Result<(), DirtyFailure> {
+        let refusal = || failure(operation, None, DirtyEffect::PreEffectRefusal, 0);
+        let domain = self.domain.as_ref().ok_or_else(refusal)?;
+        cut.validate_domain(domain).map_err(|_| refusal())?;
+        let backing = self.backing.as_ref().ok_or_else(refusal)?;
+        if domain.tracking_mode() != Some(TrackingMode::Capture)
+            || !domain.matches_mapping(backing)
+            || retained.page_count() != domain.layout().page_count()
+            || self.slots.len() != domain.layout().regions().len()
+        {
+            return Err(refusal());
+        }
+        for (slot, region) in self.slots.iter().zip(domain.layout().regions()) {
+            let refusal = || {
+                failure(
+                    operation,
+                    Some(slot.installed.slot),
+                    DirtyEffect::PreEffectRefusal,
+                    0,
+                )
+            };
+            if slot.region != Some(region.id())
+                || slot.installed.slot != slot.original_slot
+                || slot.installed.guest_phys_addr != region.guest_range().start()
+                || slot.installed.memory_size != region.guest_range().byte_len()
+                || !domain.matches_region_mapping(region.id(), slot.installed.userspace_addr)
+                || slot.installed.flags != (slot.original_flags | KVM_MEM_LOG_DIRTY_PAGES)
+            {
+                return Err(refusal());
+            }
+            slot.dirty
+                .as_ref()
+                .ok_or_else(refusal)?
+                .validate(slot.installed.memory_size, domain.layout().granule())
+                .map_err(|_| refusal())?;
+        }
+        Ok(())
+    }
+
+    fn prepare_reestablishment(
+        &self,
+        cut: &MemoryCut,
+        retained: &DirtyPageMap,
+    ) -> Result<CpuTrackingEpoch, DirtyFailure> {
+        let refusal = || {
+            failure(
+                DirtyOperation::Reestablish,
+                None,
+                DirtyEffect::PreEffectRefusal,
+                0,
+            )
+        };
+        if self.state != TrackingState::Failed || self.last_issued_epoch == 0 {
+            return Err(refusal());
+        }
+        self.validate_inventory(cut, retained, DirtyOperation::Reestablish)?;
+        let next = self.last_issued_epoch.checked_add(1).ok_or_else(refusal)?;
+        cut.issue_epoch(next).map_err(|_| refusal())
+    }
+
+    pub(crate) fn reestablish(
+        &mut self,
+        fd: &VmFd,
+        cut: &MemoryCut,
+        retained: &mut DirtyPageMap,
+    ) -> Result<CpuTrackingEpoch, DirtyFailure> {
+        #[cfg(feature = "native-device-probe")]
+        if let Err(error) = self.prepare_recovery_observation() {
+            self.recovery_observation.failure = Some(error);
+            return Err(error);
+        }
+        let epoch = match self.prepare_reestablishment(cut, retained) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                #[cfg(feature = "native-device-probe")]
+                {
+                    self.recovery_observation.failure = Some(error);
+                }
+                return Err(error);
+            }
+        };
+        let domain = self.domain.as_ref().ok_or_else(|| {
+            failure(
+                DirtyOperation::Reestablish,
+                None,
+                DirtyEffect::PreEffectRefusal,
+                0,
+            )
+        })?;
+        for (slot, region) in self.slots.iter_mut().zip(domain.layout().regions()) {
+            if let Err(mut error) = harvest_slot_into(
+                fd,
+                slot,
+                region,
+                retained,
+                #[cfg(feature = "native-device-probe")]
+                false,
+            ) {
+                domain.invalidate_coverage();
+                error.operation = DirtyOperation::Reestablish;
+                #[cfg(feature = "native-device-probe")]
+                {
+                    self.recovery_observation.failure = Some(error);
+                }
+                return Err(error);
+            }
+            #[cfg(feature = "native-device-probe")]
+            self.recovery_observation
+                .successful_slots
+                .push(slot.installed.slot);
+        }
+        self.last_issued_epoch = epoch.epoch();
+        self.state = TrackingState::Armed(epoch.epoch());
+        #[cfg(feature = "native-device-probe")]
+        {
+            self.recovery_observation.epoch = Some(epoch.epoch());
+        }
         Ok(epoch)
     }
 }
@@ -545,6 +728,7 @@ fn harvest_slot_into(
     slot: &mut RegisteredKvmSlot,
     region: &RegisteredRamRegion,
     retained: &mut DirtyPageMap,
+    #[cfg(feature = "native-device-probe")] fault_copy: bool,
 ) -> Result<(), DirtyFailure> {
     let bitmap = slot.dirty.as_mut().ok_or_else(|| {
         failure(
@@ -555,12 +739,18 @@ fn harvest_slot_into(
         )
     })?;
     bitmap.words.fill(0);
+    let dirty_bitmap = bitmap.words.as_mut_ptr().cast();
+    #[cfg(feature = "native-device-probe")]
+    let dirty_bitmap = if fault_copy {
+        // Exercise the kernel's destructive GET/copy failure, not a fabricated result.
+        std::ptr::null_mut()
+    } else {
+        dirty_bitmap
+    };
     let log = kvm_dirty_log {
         slot: slot.installed.slot,
         padding1: 0,
-        __bindgen_anon_1: kvm_dirty_log__bindgen_ty_1 {
-            dirty_bitmap: bitmap.words.as_mut_ptr().cast(),
-        },
+        __bindgen_anon_1: kvm_dirty_log__bindgen_ty_1 { dirty_bitmap },
     };
     // The exact retained registration determines the kernel's copy size, checked before entry.
     let result = unsafe { ioctl_with_ref(fd, get_dirty_log_into(), &log) };
@@ -658,7 +848,7 @@ mod tests {
         assert_eq!(tracking.state, TrackingState::Armed(2));
         assert!(tracking.rearm(&cut, cut.issue_harvest(2).unwrap()).is_err());
         assert_eq!(retained.words(), before);
-        control.reopen(cut, epoch).unwrap();
+        control.reopen(&cut, &epoch).unwrap();
         let newer = seal(&mut control);
         tracking.state = TrackingState::Harvested {
             epoch: 3,
@@ -911,5 +1101,175 @@ mod tests {
         assert_eq!(error.effect, DirtyEffect::PreEffectRefusal);
         assert!(tracking.backing.is_none());
         assert!(tracking.slots.is_empty());
+    }
+
+    fn armed_inventory() -> (KvmMemory, DomainControl) {
+        let memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 3 * 4096),
+            (GuestAddress(0x10_0000), 65 * 4096),
+        ])
+        .unwrap();
+        let (domain, authority, mut control) =
+            MemoryDomain::construct(memory, 4096, BackingKind::Boot).unwrap();
+        let mut tracking = KvmMemory::new();
+        let (epoch, records) = tracking.prepare_tracked(&domain, &authority).unwrap();
+        control.finish_tracked(authority, epoch).unwrap();
+        tracking.slots = records;
+        tracking.domain = Some(domain);
+        tracking.state = TrackingState::Armed(1);
+        tracking.last_issued_epoch = 1;
+        (tracking, control)
+    }
+
+    fn failed_inventory() -> (KvmMemory, DomainControl, MemoryCut) {
+        let (mut tracking, mut control) = armed_inventory();
+        tracking.state = TrackingState::Failed;
+        tracking.last_issued_epoch = 9;
+        tracking.domain.as_ref().unwrap().invalidate_coverage();
+        let cut = seal(&mut control);
+        (tracking, control, cut)
+    }
+
+    #[test]
+    fn recovery_preflight_retains_epoch_and_dirties_without_healing_coverage() {
+        let (tracking, _control, cut) = failed_inventory();
+        let domain = tracking.domain.as_ref().unwrap();
+        let mut retained = DirtyPageMap::new(domain.layout());
+        retained.set(PageIndex::new(67)).unwrap();
+        let epoch = tracking.prepare_reestablishment(&cut, &retained).unwrap();
+        assert_eq!(epoch.epoch(), 10);
+        assert_eq!(tracking.last_issued_epoch, 9);
+        assert_eq!(tracking.state, TrackingState::Failed);
+        assert!(retained.contains(PageIndex::new(67)));
+        assert!(!domain.coverage_valid());
+        assert_eq!(
+            tracking
+                .prepare_reestablishment(&cut, &retained)
+                .unwrap()
+                .epoch(),
+            10
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_changed_registration_and_fixed_buffer_before_effects() {
+        for changed in 0..8 {
+            let (mut tracking, _control, cut) = failed_inventory();
+            let mut retained = DirtyPageMap::new(tracking.domain.as_ref().unwrap().layout());
+            retained.set(PageIndex::new(1)).unwrap();
+            let slot = &mut tracking.slots[1];
+            match changed {
+                0 => slot.installed.slot ^= 1 << 16,
+                1 => slot.installed.guest_phys_addr += 4096,
+                2 => slot.installed.userspace_addr += 4096,
+                3 => slot.installed.memory_size -= 4096,
+                4 => slot.installed.flags ^= KVM_MEM_LOG_DIRTY_PAGES,
+                5 => slot.original_flags ^= KVM_MEM_READONLY,
+                6 => slot.dirty.as_mut().unwrap().words = vec![0].into_boxed_slice(),
+                7 => slot.region = None,
+                _ => unreachable!(),
+            }
+            let error = tracking
+                .prepare_reestablishment(&cut, &retained)
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.operation,
+                arch::guest_memory::DirtyOperation::Reestablish
+            );
+            assert_eq!(error.effect, DirtyEffect::PreEffectRefusal);
+            assert_eq!(tracking.state, TrackingState::Failed);
+            assert_eq!(tracking.last_issued_epoch, 9);
+            assert!(retained.contains(PageIndex::new(1)));
+        }
+    }
+
+    #[test]
+    fn recovery_refuses_foreign_cut_bitmap_unissued_epoch_and_exhaustion() {
+        let (mut tracking, _control, cut) = failed_inventory();
+        let (foreign, _foreign_control, foreign_cut) = failed_inventory();
+        let retained = DirtyPageMap::new(tracking.domain.as_ref().unwrap().layout());
+        assert!(
+            tracking
+                .prepare_reestablishment(&foreign_cut, &retained)
+                .is_err()
+        );
+        let wrong = DirtyPageMap::new(
+            &RegisteredRamLayout::from_memory(
+                &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap(),
+                4096,
+            )
+            .unwrap(),
+        );
+        assert!(tracking.prepare_reestablishment(&cut, &wrong).is_err());
+        for epoch in [0, u64::MAX] {
+            tracking.last_issued_epoch = epoch;
+            let error = tracking
+                .prepare_reestablishment(&cut, &retained)
+                .err()
+                .unwrap();
+            assert_eq!(error.effect, DirtyEffect::PreEffectRefusal);
+            assert_eq!(tracking.last_issued_epoch, epoch);
+        }
+        tracking.last_issued_epoch = 9;
+        for state in [
+            TrackingState::Constructing,
+            TrackingState::Bound,
+            TrackingState::Armed(9),
+        ] {
+            tracking.state = state;
+            assert!(tracking.prepare_reestablishment(&cut, &retained).is_err());
+        }
+        assert!(!foreign.domain.as_ref().unwrap().coverage_valid());
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    #[test]
+    fn diagnostic_get_fault_arming_requires_exact_authority_and_is_one_shot() {
+        let (mut tracking, mut control) = armed_inventory();
+        let (_, mut foreign_control) = armed_inventory();
+        let foreign = foreign_control.runtime_native_effects().unwrap();
+        let error = tracking.arm_cpu_dirty_get_fault(&foreign).unwrap_err();
+        assert_eq!(error.effect, DirtyEffect::PreEffectRefusal);
+        assert_eq!(tracking.next_get_fault, None);
+        let permit = control.runtime_native_effects().unwrap();
+        let target = tracking.arm_cpu_dirty_get_fault(&permit).unwrap();
+        assert_eq!(target, tracking.slots.last().unwrap().installed.slot);
+        assert_eq!(tracking.next_get_fault, Some(target));
+        assert!(tracking.arm_cpu_dirty_get_fault(&permit).is_err());
+        assert_eq!(tracking.next_get_fault, Some(target));
+        assert_eq!(tracking.state, TrackingState::Armed(1));
+        assert!(tracking.domain.as_ref().unwrap().coverage_valid());
+        drop(permit);
+        let closing = control.close().unwrap();
+        let std::task::Poll::Ready(Ok(drained)) = control.poll_drained(&closing) else {
+            panic!("unused native authority must drain");
+        };
+        let native = control.native_effects(&drained).unwrap();
+        tracking.state = TrackingState::Failed;
+        assert!(tracking.arm_cpu_dirty_get_fault(&native).is_err());
+        assert_eq!(tracking.next_get_fault, Some(target));
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    #[test]
+    fn recovery_observation_starts_from_actual_inventory_without_claiming_get_success() {
+        let (mut tracking, _control, _cut) = failed_inventory();
+        tracking.prepare_recovery_observation().unwrap();
+        let observation = tracking.cpu_dirty_recovery_observation();
+        assert_eq!(
+            observation.registered_slots,
+            tracking
+                .slots
+                .iter()
+                .map(|slot| slot.installed.slot)
+                .collect::<Vec<_>>()
+        );
+        assert!(observation.successful_slots.is_empty());
+        assert!(observation.epoch.is_none());
+        assert!(observation.failure.is_none());
+        assert!(observation.successful_slots.capacity() >= observation.registered_slots.len());
+        assert_eq!(tracking.state, TrackingState::Failed);
+        assert!(!tracking.domain.as_ref().unwrap().coverage_valid());
     }
 }

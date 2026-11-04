@@ -7,6 +7,7 @@ Failure retains every artifact; the outer process timeout is not a native reap A
 """
 from __future__ import annotations
 import argparse
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -14,7 +15,15 @@ from pathlib import Path
 import platform
 import signal
 import subprocess
+import socket
+import struct
 import time
+import unittest
+
+from native_ram_image import (
+    MAX_RAM_LAYOUT_BYTES, authenticate_image, authentication_bytes,
+    layout_digest, validate_layout, write_authentication,
+)
 
 CASES = ("future", "due", "due-no-irr", "masked", "pending-future", "in-service", "io", "mmio")
 
@@ -27,13 +36,14 @@ def digest(path: Path) -> bytes:
     return result.digest()
 
 def capture_manifest(directory: Path) -> dict:
-    limits = {"execution.state": 16 * 1024 * 1024, "memory.fixture": 3145728,
+    limits = {"execution.state": 16 * 1024 * 1024, "ram.bin": 3145728,
+              "memory-layout.json": MAX_RAM_LAYOUT_BYTES,
               "capture.json": 65536, "native-inventory.txt": 16 * 1024 * 1024}
     result = {}
     for name, limit in limits.items():
         path = directory / name
         size = path.stat().st_size
-        if not path.is_file() or size > limit or (name == "memory.fixture" and size != limit):
+        if not path.is_file() or size > limit or (name == "ram.bin" and size != limit):
             raise RuntimeError(f"invalid bounded capture object {path}")
         result[name] = {"bytes": size, "sha256": digest(path).hex()}
     return result
@@ -45,16 +55,133 @@ def save(path: Path, value: object) -> None:
         json.dump(value, output, sort_keys=True, indent=2)
         output.write("\n")
 
+def remaining(deadline: float) -> float:
+    duration = deadline - time.monotonic()
+    if duration <= 0:
+        raise TimeoutError("layout binding invocation deadline expired")
+    return duration
 
-def invoke(command: list[str], evidence: Path, name: str, *, timeout: float) -> dict:
+
+def socket_receive(channel: socket.socket, length: int, deadline: float) -> bytes:
+    output = bytearray()
+    while len(output) < length:
+        channel.settimeout(remaining(deadline))
+        block = channel.recv(length - len(output))
+        if not block:
+            raise RuntimeError("layout binding unexpected EOF")
+        output.extend(block)
+    return bytes(output)
+
+
+def receive_layout(channel: socket.socket, deadline: float) -> bytes:
+    length = struct.unpack("<I", socket_receive(channel, 4, deadline))[0]
+    if not 0 < length <= MAX_RAM_LAYOUT_BYTES:
+        raise RuntimeError("layout binding length outside bound")
+    data = socket_receive(channel, length, deadline)
+    validate_layout(data)
+    channel.settimeout(remaining(deadline))
+    if channel.recv(1):
+        raise RuntimeError("layout preparation contains trailing bytes")
+    remaining(deadline)
+    return data
+
+
+def send_binding(channel: socket.socket, material: bytes, deadline: float) -> None:
+    if len(material) != 160:
+        raise RuntimeError("layout binding must contain exactly 160 bytes")
+    pending = memoryview(material)
+    while pending:
+        channel.settimeout(remaining(deadline))
+        count = channel.send(pending)
+        if not count:
+            raise RuntimeError("layout binding write made no progress")
+        pending = pending[count:]
+    remaining(deadline)
+    channel.shutdown(socket.SHUT_WR)
+
+
+def prepare_authentication(
+    directory: Path, expected: bytes, prepared: bytes, ram_fd: int, layout_fd: int,
+) -> dict:
+    authentication = authenticate_image(
+        directory / "ram.bin", directory / "memory-layout.json", expected,
+        prepared=prepared, ram_fd=ram_fd, layout_fd=layout_fd,
+    )
+    target = directory / "ram-authentication.bin"
+    encoded = authentication_bytes(authentication)
+    if target.exists():
+        if target.read_bytes() != encoded:
+            raise RuntimeError("saved RAM authentication changed")
+    else:
+        write_authentication(target, authentication)
+    return authentication
+
+
+def authenticate_checkpoint(directory: Path, expected: bytes, prepared: bytes) -> dict:
+    with ExitStack() as resources:
+        descriptors = []
+        for role in ("ram.bin", "memory-layout.json"):
+            descriptor = os.open(directory / role, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+            resources.callback(os.close, descriptor)
+            descriptors.append(descriptor)
+        return prepare_authentication(directory, expected, prepared, *descriptors)
+
+
+
+def invoke(
+    command: list[str], evidence: Path, name: str, *, timeout: float,
+    layout_binding: tuple[bytes, Path] | None = None,
+    restore_image: tuple[Path, bytes, bytes] | None = None,
+) -> dict:
     started = time.monotonic_ns()
-    with (evidence / f"{name}.stdout").open("xb") as stdout, (evidence / f"{name}.stderr").open("xb") as stderr:
+    deadline = time.monotonic() + timeout
+    authentication = None
+    command = list(command)
+    with ExitStack() as resources:
+        stdout = resources.enter_context((evidence / f"{name}.stdout").open("xb"))
+        stderr = resources.enter_context((evidence / f"{name}.stderr").open("xb"))
         os.chmod(stdout.name, 0o600)
         os.chmod(stderr.name, 0o600)
-        process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
+        inherited = []
+        channel = native_channel = None
+        if layout_binding is not None:
+            channel, native_channel = socket.socketpair()
+            resources.enter_context(channel)
+            resources.enter_context(native_channel)
+            inherited.append(native_channel.fileno())
+            command[3] = str(native_channel.fileno())
+        if restore_image is not None:
+            directory, expected, prepared = restore_image
+            descriptors = []
+            for role in ("ram.bin", "memory-layout.json"):
+                descriptor = os.open(directory / role, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+                resources.callback(os.close, descriptor)
+                descriptors.append(descriptor)
+            authentication = prepare_authentication(directory, expected, prepared, *descriptors)
+            inherited.extend(descriptors)
+            command.extend(str(descriptor) for descriptor in descriptors)
+        remaining(deadline)
+        process = subprocess.Popen(
+            command, stdout=stdout, stderr=stderr, start_new_session=True, pass_fds=tuple(inherited),
+        )
+        if native_channel is not None:
+            native_channel.close()
         try:
-            status = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+            if channel is not None and layout_binding is not None:
+                material, binding_path = layout_binding
+                prepared = receive_layout(channel, deadline)
+                material = material[:96] + layout_digest(prepared) + material[128:]
+                with binding_path.open("xb") as output:
+                    os.chmod(output.name, 0o600)
+                    output.write(material)
+                with (binding_path.parent / "prepared-memory-layout.json").open("xb") as output:
+                    os.chmod(output.name, 0o600)
+                    output.write(prepared)
+                send_binding(channel, material, deadline)
+            status = process.wait(timeout=remaining(deadline))
+        except (subprocess.TimeoutExpired, TimeoutError, RuntimeError, ValueError, OSError) as failure:
+            if channel is not None:
+                channel.close()
             cleanup = {"process_group": process.pid, "grace_seconds": 120,
                        "forced_reap_seconds": 10, "controller_exited_during_grace": False,
                        "group_kill_sent": False, "controller_reaped": False, "errors": []}
@@ -64,10 +191,10 @@ def invoke(command: list[str], evidence: Path, name: str, *, timeout: float) -> 
                 # WNOWAIT reserves the session leader's PID/PGID until the final
                 # group signal. Popen.poll/wait here could reap and release it.
                 while os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
+                    grace_remaining = deadline - time.monotonic()
+                    if grace_remaining <= 0:
                         break
-                    time.sleep(min(.05, remaining))
+                    time.sleep(min(.05, grace_remaining))
                 else:
                     cleanup["controller_exited_during_grace"] = True
             except OSError as error:
@@ -86,13 +213,14 @@ def invoke(command: list[str], evidence: Path, name: str, *, timeout: float) -> 
                 cleanup["controller_reaped"] = True
             except (OSError, subprocess.TimeoutExpired) as error:
                 cleanup["errors"].append(f"controller reap: {error}")
-            save(evidence / f"{name}.invocation.json", {"command": command, "pid": process.pid, "timeout": True,
-                "native_cleanup_acknowledged": False, "duration_ns": time.monotonic_ns() - started,
-                "timeout_seconds": timeout, "cleanup": cleanup})
-            raise RuntimeError(f"{name}: process timeout, NOT a successful native cleanup") from None
+            save(evidence / f"{name}.invocation.json", {"command": command, "pid": process.pid,
+                "timeout": isinstance(failure, (subprocess.TimeoutExpired, TimeoutError)),
+                "error": str(failure), "native_cleanup_acknowledged": False,
+                "duration_ns": time.monotonic_ns() - started, "timeout_seconds": timeout, "cleanup": cleanup})
+            raise RuntimeError(f"{name}: invocation failed ({failure}), NOT a successful native cleanup") from failure
     save(evidence / f"{name}.invocation.json", {"command": command, "pid": process.pid, "exit_status": status,
         "started_monotonic_ns": started, "duration_ns": time.monotonic_ns() - started,
-        "timeout_seconds": timeout})
+        "timeout_seconds": timeout, "caller_authentication": authentication})
     if status:
         raise RuntimeError(f"{name}: native process exited {status}; retain {evidence}")
     if (evidence / f"{name}.stdout").stat().st_size > 16 * 1024 * 1024:
@@ -203,19 +331,23 @@ def main() -> None:
             binding = lane / "binding.bin"
             material = (digest(args.probe) + hashlib.sha256(digest(args.fixture) + digest(args.symbols)).digest()
                         + hashlib.sha256(f"cpu-only:{cpus}".encode()).digest()
-                        + hashlib.sha256(b"fixture-ram:0:3145728:no-reclaim").digest() + os.urandom(32))
-            binding.write_bytes(material)
-            binding.chmod(0o600)
+                        + bytes(32) + os.urandom(32))
             symbols_arg = ":".join(f"{symbols[key]:x}" for key in ("interrupt", "io_complete", "mmio_complete"))
             source = lane / "generation-0"
             if case in ("active-pit", "count-lapic"):
-                invoke([str(args.probe), "negative", str(source), str(binding), str(args.fixture), symbols_arg, str(cpus), case], lane, "negative", timeout=120)
+                invoke([str(args.probe), "negative", str(source), "LAYOUT_BINDING_FD", str(args.fixture), symbols_arg, str(cpus), case],
+                       lane, "negative", timeout=120, layout_binding=(material, binding))
                 cases.append({"cpus": cpus, "case": case, "native_refusal": True, "status": "passed"})
                 continue
-            invoke([str(args.probe), "source", str(source), str(binding), str(args.fixture), symbols_arg, str(cpus), case], lane, "source", timeout=120)
+            invoke([str(args.probe), "source", str(source), "LAYOUT_BINDING_FD", str(args.fixture), symbols_arg, str(cpus), case],
+                   lane, "source", timeout=120, layout_binding=(material, binding))
+            prepared = (lane / "prepared-memory-layout.json").read_bytes()
+            expected_layout = binding.read_bytes()[96:128]
+            save(lane / "generation-0.authentication.json", authenticate_checkpoint(source, expected_layout, prepared))
             manifest = capture_manifest(source)
             save(lane / "generation-0.manifest.json", manifest)
-            invoke([str(args.probe), "partial", str(source), str(binding), str(cpus), "2"], lane, "partial-install", timeout=120)
+            invoke([str(args.probe), "partial", str(source), str(binding), str(cpus), "2"],
+                   lane, "partial-install", timeout=120, restore_image=(source, expected_layout, prepared))
             if capture_manifest(source) != manifest:
                 raise RuntimeError("failed destination installation modified the source checkpoint")
             previous = source
@@ -223,7 +355,10 @@ def main() -> None:
             for generation in range(3):
                 child = lane / f"generation-{generation + 1}"
                 invoke([str(args.probe), "restore", str(previous), str(child), str(binding), str(cpus), generation_case,
-                       str(generation + 2), str(args.dwell_ms)], lane, f"restore-{generation + 1}", timeout=120)
+                       str(generation + 2), str(args.dwell_ms)], lane, f"restore-{generation + 1}", timeout=120,
+                       restore_image=(previous, expected_layout, prepared))
+                save(lane / f"generation-{generation + 1}.authentication.json",
+                     authenticate_checkpoint(child, expected_layout, prepared))
                 save(lane / f"generation-{generation + 1}.manifest.json", capture_manifest(child))
                 previous = child
                 if generation_case == "offline":
@@ -241,6 +376,89 @@ def main() -> None:
     print(json.dumps({"status": "passed", "scope": "cpu-execution-only", "production": production["status"],
                       "qualification_eligible": False, "evidence": str(args.evidence),
                       "absolute_no_early_requirement": "not-measured"}))
+
+
+class LayoutBindingTests(unittest.TestCase):
+    """Socket, caller-boundary and actual subprocess tests. No hypervisor."""
+
+    @staticmethod
+    def canonical_layout() -> bytes:
+        return (
+            b'{"architecture":"x86_64","kind":"ram-layout","packedLength":4096,'
+            b'"pageGranule":4096,"regions":[{"guestPhysicalAddress":0,"length":4096,'
+            b'"streamOffset":0}],"schema":1,"topology":{"firmwareAddress":0,'
+            b'"initrdAddress":4096,"ramAboveGap":0,"ramBelowGap":4096,'
+            b'"ramLastAddress":4096,"shmStartAddress":4294967296}}'
+        )
+
+    def test_exact_layout_and_binding_half_close(self) -> None:
+        native, controller = socket.socketpair()
+        with native, controller:
+            layout = self.canonical_layout()
+            native.sendall(struct.pack("<I", len(layout)) + layout)
+            native.shutdown(socket.SHUT_WR)
+            prepared = receive_layout(controller, time.monotonic() + 1)
+            self.assertEqual(prepared, layout)
+            material = b"a" * 96 + layout_digest(prepared) + b"b" * 32
+            send_binding(controller, material, time.monotonic() + 1)
+            self.assertEqual(socket_receive(native, 160, time.monotonic() + 1), material)
+            self.assertEqual(native.recv(1), b"")
+
+    def test_layout_rejects_bounds_eof_noncanonical_and_extra(self) -> None:
+        layout = self.canonical_layout()
+        frames = [
+            b"", b"\x01\x00", struct.pack("<I", 0),
+            struct.pack("<I", MAX_RAM_LAYOUT_BYTES + 1),
+            struct.pack("<I", len(layout)) + layout[:-1],
+            struct.pack("<I", len(layout) + 1) + layout + b"\n",
+            struct.pack("<I", len(layout)) + layout + b"x",
+        ]
+        for frame in frames:
+            with self.subTest(frame=frame[:4]):
+                native, controller = socket.socketpair()
+                with native, controller:
+                    native.sendall(frame)
+                    native.shutdown(socket.SHUT_WR)
+                    with self.assertRaises((RuntimeError, ValueError)):
+                        receive_layout(controller, time.monotonic() + 1)
+
+    def test_absolute_deadline_and_binding_width(self) -> None:
+        native, controller = socket.socketpair()
+        with native, controller:
+            native.sendall(b"\x01")
+            with self.assertRaises(TimeoutError):
+                receive_layout(controller, time.monotonic() + .01)
+            with self.assertRaises(TimeoutError):
+                socket_receive(controller, 1, time.monotonic() - 1)
+            for length in (0, 159, 161):
+                with self.assertRaises(RuntimeError):
+                    send_binding(controller, bytes(length), time.monotonic() + 1)
+
+    def test_correct_width_wrong_layout_digest_fails_before_ram_scan(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = self.canonical_layout()
+            (root / "memory-layout.json").write_bytes(layout)
+            (root / "ram.bin").write_bytes(bytes(4096))
+            wrong = bytes(value ^ 1 for value in layout_digest(layout))
+            with self.assertRaises((RuntimeError, ValueError)):
+                authenticate_checkpoint(root, wrong, layout)
+            with self.assertRaises((RuntimeError, ValueError)):
+                authenticate_checkpoint(root, layout_digest(layout), layout + b"\n")
+
+    def test_invoke_launches_waits_and_records_actual_child_exit(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            command = [os.sys.executable, "-c", "raise SystemExit(7)"]
+            with self.assertRaisesRegex(RuntimeError, "native process exited 7"):
+                invoke(command, evidence, "actual-child", timeout=5)
+            record = json.loads((evidence / "actual-child.invocation.json").read_text())
+            self.assertEqual(record["exit_status"], 7)
+            self.assertEqual(record["command"], command)
+            self.assertGreater(record["pid"], 0)
+            self.assertGreater(record["duration_ns"], 0)
 
 
 if __name__ == "__main__":

@@ -397,6 +397,16 @@ impl KvmContext {
     }
 }
 
+#[cfg(feature = "native-device-probe")]
+#[derive(Default)]
+pub(crate) struct CpuDirtyRecoveryObservation {
+    pub(crate) registered_slots: Vec<u32>,
+    pub(crate) successful_slots: Vec<u32>,
+    pub(crate) epoch: Option<u64>,
+    pub(crate) harvest_failure: Option<DirtyFailure>,
+    pub(crate) failure: Option<DirtyFailure>,
+}
+
 pub struct VmFdOwner {
     // The last native VM descriptor must close before registered backing can disappear.
     fd: VmFd,
@@ -949,6 +959,50 @@ impl Vm {
         {
             let _ = (cut, harvested);
             Err(unsupported_dirty(DirtyOperation::Rearm))
+        }
+    }
+
+    pub(crate) fn reestablish_cpu_dirty(
+        &mut self,
+        cut: &MemoryCut,
+        retained: &mut DirtyPageMap,
+    ) -> std::result::Result<CpuTrackingEpoch, DirtyFailure> {
+        #[cfg(not(feature = "tee"))]
+        {
+            self.memory.reestablish(&self.fd, cut, retained)
+        }
+        #[cfg(feature = "tee")]
+        {
+            let _ = (cut, retained);
+            Err(unsupported_dirty(DirtyOperation::Reestablish))
+        }
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    pub(crate) fn arm_cpu_dirty_get_fault(
+        &mut self,
+        permit: &NativeEffectsPermit,
+    ) -> std::result::Result<u32, DirtyFailure> {
+        #[cfg(not(feature = "tee"))]
+        {
+            self.memory.arm_cpu_dirty_get_fault(permit)
+        }
+        #[cfg(feature = "tee")]
+        {
+            let _ = permit;
+            Err(unsupported_dirty(DirtyOperation::Collect))
+        }
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    pub(crate) fn cpu_dirty_recovery_observation(&self) -> Option<&CpuDirtyRecoveryObservation> {
+        #[cfg(not(feature = "tee"))]
+        {
+            Some(self.memory.cpu_dirty_recovery_observation())
+        }
+        #[cfg(feature = "tee")]
+        {
+            None
         }
     }
 

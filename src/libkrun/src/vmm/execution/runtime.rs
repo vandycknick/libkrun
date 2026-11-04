@@ -68,9 +68,9 @@ impl TimePreparation {
 pub(crate) struct ExecutionOwner {
     pub retained: Option<RetainedCut>,
     pending: Option<PendingCut>,
-    envelope: Option<Arc<ExecutionEnvelope>>,
+    pub(crate) envelope: Option<Arc<ExecutionEnvelope>>,
     devices: Option<Arc<crate::vmm::execution::device_restore::DeviceEnvelope>>,
-    binding: Option<StateBinding>,
+    pub(crate) binding: Option<StateBinding>,
     pub failed_install: bool,
     pub prepared_time: Option<BarrierKey>,
     preparation: Option<TimePreparation>,
@@ -79,6 +79,9 @@ pub(crate) struct ExecutionOwner {
 }
 
 impl ExecutionOwner {
+    pub(crate) fn captured_envelope(&self) -> Option<&Arc<ExecutionEnvelope>> {
+        self.envelope.as_ref()
+    }
     pub fn preparation_observation(&self) -> Option<&TimePreparation> {
         self.preparation.as_ref()
     }
@@ -431,7 +434,10 @@ impl Vmm {
             .as_ref()
             .ok_or("capture cut absent")?
             .key;
-        if !self.finish_memory_cut(key)? {
+        if !self
+            .finish_memory_cut(key)
+            .map_err(|error| error.to_string())?
+        {
             return Poll::Pending;
         }
         if let Some(envelope) = &self.execution.envelope {
@@ -657,6 +663,9 @@ impl Vmm {
         request: RequestId,
         barrier: BarrierRequest,
     ) -> Result<(), String> {
+        if self.memory.has_attempt() {
+            return Err("RAM capture attempt is unresolved".into());
+        }
         let cut_key = self
             .execution
             .retained
@@ -666,7 +675,10 @@ impl Vmm {
         if cut_key.generation != barrier.key.generation {
             return Err("memory resume generation mismatch".into());
         }
-        while !self.reopen_memory_for_resume(cut_key)? {
+        while !self
+            .reopen_memory_for_resume(cut_key)
+            .map_err(|error| error.to_string())?
+        {
             if Instant::now() >= barrier.deadline {
                 return Err("native writer drain deadline".into());
             }
@@ -693,6 +705,9 @@ impl Vmm {
         request: RequestId,
         barrier: BarrierRequest,
     ) -> Result<(), String> {
+        if self.memory.has_attempt() {
+            return Err("RAM capture attempt is unresolved".into());
+        }
         if self.mmio_device_manager.quiescence.has_transports()
             || !self
                 .mmio_device_manager

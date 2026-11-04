@@ -242,6 +242,16 @@ impl Vm {
         self.hvf_vm.ram_protection().rearm_cpu_dirty(cut, harvested)
     }
 
+    pub fn reestablish_cpu_dirty(
+        &mut self,
+        cut: &MemoryCut,
+        retained: &mut DirtyPageMap,
+    ) -> std::result::Result<CpuTrackingEpoch, DirtyFailure> {
+        self.hvf_vm
+            .ram_protection()
+            .reestablish_cpu_dirty(cut, retained)
+    }
+
     pub fn host_memory_remapper(&self) -> Option<Arc<hvf::remap::HostMemoryRemapper>> {
         self.remapper.clone()
     }
@@ -343,9 +353,6 @@ impl Vm {
         let reason = match (domain.backing_kind(), domain.tracking_mode()) {
             (BackingKind::RestoredPrivate, Some(TrackingMode::Capture)) => {
                 Some(ReclaimInhibition::RestoredPrivateMapping)
-            }
-            (BackingKind::RestoredInput, Some(TrackingMode::Capture)) => {
-                Some(ReclaimInhibition::RestoredInput)
             }
             (_, Some(TrackingMode::Capture)) => Some(ReclaimInhibition::TrackedCapture),
             (BackingKind::Boot, Some(TrackingMode::Disabled)) => None,

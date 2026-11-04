@@ -1,4 +1,5 @@
 use std::fmt::{Display, Formatter};
+use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::Poll;
@@ -39,7 +40,6 @@ impl TopologyGeneration {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackingKind {
     Boot,
-    RestoredInput,
     RestoredPrivate,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -360,6 +360,12 @@ impl AtomicDirtyPageMap {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackingFileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
 pub struct MemoryDomain {
     memory: GuestMemoryMmap,
     layout: RegisteredRamLayout,
@@ -407,6 +413,21 @@ impl MemoryDomain {
     }
     pub fn layout(&self) -> &RegisteredRamLayout {
         &self.layout
+    }
+    pub fn file_backing_identities(
+        &self,
+    ) -> impl Iterator<Item = std::io::Result<BackingFileIdentity>> + '_ {
+        self.memory.iter().filter_map(|region| {
+            region.file_offset().map(|offset| {
+                offset
+                    .file()
+                    .metadata()
+                    .map(|metadata| BackingFileIdentity {
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                    })
+            })
+        })
     }
     pub fn topology_generation(&self) -> TopologyGeneration {
         TopologyGeneration(0)
@@ -915,12 +936,29 @@ impl DomainControl {
         }
         Ok(())
     }
-    pub fn reopen(&mut self, cut: MemoryCut, epoch: CpuTrackingEpoch) -> Result<(), MemoryError> {
-        self.validate_cut(&cut)?;
+    pub fn validate_epoch(
+        &self,
+        cut: &MemoryCut,
+        epoch: &CpuTrackingEpoch,
+    ) -> Result<(), MemoryError> {
+        self.validate_cut(cut)?;
         epoch.validate_domain(&self.domain)?;
         if epoch.close_generation != cut.generation {
             return Err(MemoryError::Authority);
         }
+        Ok(())
+    }
+    pub fn restore_coverage(
+        &mut self,
+        cut: &MemoryCut,
+        epoch: &CpuTrackingEpoch,
+    ) -> Result<(), MemoryError> {
+        self.validate_epoch(cut, epoch)?;
+        self.domain.coverage_lost.store(false, Ordering::Release);
+        Ok(())
+    }
+    pub fn reopen(&mut self, cut: &MemoryCut, epoch: &CpuTrackingEpoch) -> Result<(), MemoryError> {
+        self.validate_epoch(cut, epoch)?;
         self.domain
             .gate
             .compare_exchange(CLOSED, 0, Ordering::AcqRel, Ordering::Acquire)
@@ -1069,6 +1107,7 @@ pub enum DirtyOperation {
     Arm,
     Collect,
     Rearm,
+    Reestablish,
     Native,
     Fault,
 }
@@ -1606,7 +1645,7 @@ mod tests {
         };
         let epoch = first.issue_epoch(2).unwrap();
         let old_epoch = epoch.clone();
-        control.reopen(first, epoch).unwrap();
+        control.reopen(&first, &epoch).unwrap();
         assert!(stale.validate_domain(&domain).is_err());
         let second = seal(&mut control);
         assert!(stale.issue_harvest(2).is_err());
@@ -1614,7 +1653,7 @@ mod tests {
         let foreign_cut = seal(&mut foreign_control);
         assert!(foreign_cut.validate_domain(&domain).is_err());
         assert_eq!(
-            control.reopen(second, old_epoch),
+            control.reopen(&second, &old_epoch),
             Err(MemoryError::Authority)
         );
     }
@@ -1630,7 +1669,7 @@ mod tests {
         assert!(!domain.host_page_dirty(PageIndex::new(0)).unwrap());
         assert_eq!(pending.count(), 1);
         let epoch = cut.issue_epoch(2).unwrap();
-        control.reopen(cut, epoch).unwrap();
+        control.reopen(&cut, &epoch).unwrap();
         drop(domain.write(GuestAddress(0), 1).unwrap());
         drop(domain.write(GuestAddress(4096), 1).unwrap());
         assert!(domain.host_page_dirty(PageIndex::new(0)).unwrap());
@@ -1655,14 +1694,12 @@ mod tests {
     }
 
     #[test]
-    fn restored_inputs_require_tracking_and_never_export_raw_mapping() {
-        for backing in [BackingKind::RestoredInput, BackingKind::RestoredPrivate] {
-            let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
-            let (domain, authority, mut control) =
-                MemoryDomain::construct(raw, 4096, backing).unwrap();
-            assert!(domain.with_external_mapping(|_| ()).is_err());
-            assert!(control.finish_untracked(authority).is_err());
-        }
+    fn restored_private_requires_tracking_and_never_exports_raw_mapping() {
+        let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let (domain, authority, mut control) =
+            MemoryDomain::construct(raw, 4096, BackingKind::RestoredPrivate).unwrap();
+        assert!(domain.with_external_mapping(|_| ()).is_err());
+        assert!(control.finish_untracked(authority).is_err());
     }
     #[test]
     fn concurrent_construction_writer_cannot_cross_finalization_unmarked() {
@@ -1705,8 +1742,73 @@ mod tests {
         let cut = seal(&mut control);
         assert!(domain.host_page_dirty(PageIndex::new(0)).unwrap());
         let epoch = cut.issue_epoch(2).unwrap();
-        control.reopen(cut, epoch).unwrap();
+        control.reopen(&cut, &epoch).unwrap();
         let permit = control.runtime_native_effects().unwrap();
         assert!(permit.validate_domain(&domain).is_ok());
+    }
+
+    #[test]
+    fn coverage_reset_requires_exact_still_sealed_cut_and_epoch() {
+        let (domain, mut control) = tracked(&[(GuestAddress(0), 4096)]);
+        let (foreign, mut foreign_control) = tracked(&[(GuestAddress(0), 4096)]);
+        let cut = seal(&mut control);
+        let foreign_cut = seal(&mut foreign_control);
+        let epoch = cut.issue_epoch(2).unwrap();
+        let foreign_epoch = foreign_cut.issue_epoch(2).unwrap();
+        domain.invalidate_coverage();
+        assert_eq!(
+            control.restore_coverage(&cut, &foreign_epoch),
+            Err(MemoryError::Authority)
+        );
+        assert_eq!(
+            control.restore_coverage(&foreign_cut, &epoch),
+            Err(MemoryError::Authority)
+        );
+        assert!(!domain.coverage_valid());
+        assert!(foreign.coverage_valid());
+        control.restore_coverage(&cut, &epoch).unwrap();
+        assert!(domain.coverage_valid());
+        control.reopen(&cut, &epoch).unwrap();
+        domain.invalidate_coverage();
+        assert_eq!(
+            control.restore_coverage(&cut, &epoch),
+            Err(MemoryError::Authority)
+        );
+        assert!(!domain.coverage_valid());
+    }
+
+    #[test]
+    fn backing_inventory_projects_only_file_inode_metadata() {
+        use std::os::unix::fs::MetadataExt;
+        use utils::tempfile::TempFile;
+        use vm_memory::{FileOffset, GuestRegionMmap, MmapRegion};
+        let file = TempFile::new().unwrap();
+        file.as_file().set_len(4096).unwrap();
+        let metadata = file.as_file().metadata().unwrap();
+        let mapping = MmapRegion::<()>::build(
+            Some(FileOffset::new(file.as_file().try_clone().unwrap(), 0)),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE,
+        )
+        .unwrap();
+        let memory = GuestMemoryMmap::from_regions(vec![
+            GuestRegionMmap::new(mapping, GuestAddress(0)).unwrap(),
+            GuestRegionMmap::new(MmapRegion::<()>::new(4096).unwrap(), GuestAddress(8192)).unwrap(),
+        ])
+        .unwrap();
+        let (domain, _, _) =
+            MemoryDomain::construct(memory, 4096, BackingKind::RestoredPrivate).unwrap();
+        let identities = domain
+            .file_backing_identities()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            identities,
+            [crate::guest_memory::BackingFileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }]
+        );
     }
 }

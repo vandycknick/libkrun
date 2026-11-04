@@ -619,12 +619,12 @@ static void emit_devices(uint64_t sequence, const char *token) {
 
 /* The undrained vmsplice pipe retains real page references, not just virtual
  * mlock residency. No fork follows allocation, and no pipe reader consumes them.
- * Only D writes the CPU page; the host page is never reused by Linux or workers. */
+ * Only D/Z write the CPU page; the host page is never reused by Linux or workers. */
 static unsigned char *memory_pages;
 static int memory_pin_pipe[2] = {-1, -1};
 static uint64_t memory_gpa[2];
 static unsigned memory_cpu_byte = 0x43, memory_cpu_generation;
-static int memory_buffers(const char *token, int cpu_write) {
+static int memory_buffers(const char *token, int cpu_write, int cpu_zero) {
     const size_t page = 4096;
     if (!memory_pages) {
         if (sysconf(_SC_PAGESIZE) != (long)page) { errno = ENOTSUP; return -1; }
@@ -677,9 +677,11 @@ static int memory_buffers(const char *token, int cpu_write) {
     int held_bytes = 0;
     if (ioctl(memory_pin_pipe[0], FIONREAD, &held_bytes)) return -1;
     if (held_bytes != (int)(2 * page)) { errno = EIO; return -1; }
-    if (cpu_write) {
-        if (memory_cpu_byte == 255) { errno = EOVERFLOW; return -1; }
-        ++memory_cpu_byte;
+    if (cpu_write || cpu_zero) {
+        if (memory_cpu_generation == UINT_MAX || (cpu_write && memory_cpu_byte == 255)) {
+            errno = EOVERFLOW; return -1;
+        }
+        memory_cpu_byte = cpu_zero ? 0 : memory_cpu_byte + 1;
         ++memory_cpu_generation;
         memset(memory_pages + page, memory_cpu_byte, page);
     }
@@ -697,6 +699,139 @@ static int memory_buffers(const char *token, int cpu_write) {
         "\"mlocked\":true,\"pipe_page_refs_retained\":true,\"pipe_bytes\":8192,"
         "\"pagemap_present\":true}\nOBS-END memory-buffer\n",
         token, memory_gpa[0], memory_gpa[1], host_byte, memory_cpu_byte, memory_cpu_generation);
+}
+
+enum {
+    SHARING_PAGE_SIZE = 4096,
+    SHARING_PAGES = 16384,
+    SHARING_SLOT_PAGES = SHARING_PAGES / 4,
+    SHARING_BYTES = SHARING_PAGE_SIZE * SHARING_PAGES,
+    SHARING_INITIALIZE = 6,
+    SHARING_VERIFY = 7,
+    SHARING_WRITE_FIRST = 8,
+    SHARING_WRITE_LAST = SHARING_WRITE_FIRST + 3,
+};
+struct sharing_memory {
+    unsigned char *bytes;
+    int write_slot;
+    uint64_t baseline_checksum, first_gpa;
+};
+static int sharing_time_left(uint64_t deadline) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return -1;
+    uint64_t current = (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+    if (current >= deadline) { errno = ETIMEDOUT; return -1; }
+    return 0;
+}
+static unsigned char sharing_byte(unsigned page, unsigned offset, unsigned variant) {
+    if (offset < 8) return (unsigned char)((uint64_t)page >> (offset * 8));
+    return (unsigned char)(1 + (page * 17 + offset * 29 + variant * 47) % 255);
+}
+static unsigned sharing_variant(unsigned page, int slot) {
+    return slot >= 0 && (page == 0 || page / SHARING_SLOT_PAGES == (unsigned)slot)
+        ? (unsigned)slot + 1 : 0;
+}
+static int sharing_fill(struct sharing_memory *memory, int slot, uint64_t deadline) {
+    for (unsigned page = 0; page < SHARING_PAGES; ++page) {
+        unsigned variant = sharing_variant(page, slot);
+        if (slot >= 0 && !variant) continue;
+        if (sharing_time_left(deadline)) return -1;
+        for (unsigned offset = 0; offset < SHARING_PAGE_SIZE; ++offset)
+            memory->bytes[(size_t)page * SHARING_PAGE_SIZE + offset] = sharing_byte(page, offset, variant);
+    }
+    return 0;
+}
+static int sharing_scan(const struct sharing_memory *memory, uint64_t deadline, uint64_t *checksum) {
+    const volatile unsigned char *bytes = memory->bytes;
+    uint64_t hash = UINT64_C(14695981039346656037), mismatches = 0;
+    for (unsigned page = 0; page < SHARING_PAGES; ++page) {
+        if (sharing_time_left(deadline)) return -1;
+        unsigned variant = sharing_variant(page, memory->write_slot);
+        for (unsigned offset = 0; offset < SHARING_PAGE_SIZE; ++offset) {
+            unsigned char actual = bytes[(size_t)page * SHARING_PAGE_SIZE + offset];
+            mismatches += actual != sharing_byte(page, offset, variant);
+            hash = (hash ^ actual) * UINT64_C(1099511628211);
+        }
+    }
+    if (mismatches) { errno = EIO; return -1; }
+    *checksum = hash;
+    return sharing_time_left(deadline);
+}
+static int sharing_identity(const unsigned char *bytes, uint64_t *gpa) {
+    int fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    uint64_t entry = 0;
+    off_t offset = (off_t)(((uintptr_t)bytes / SHARING_PAGE_SIZE) * sizeof(entry));
+    ssize_t count = pread(fd, &entry, sizeof(entry), offset);
+    int error = count < 0 ? errno : count != sizeof(entry) ? EIO : 0;
+    if (close(fd) && !error) error = errno;
+    if (error) { errno = error; return -1; }
+    uint64_t pfn = entry & ((UINT64_C(1) << 55) - 1);
+    if (!(entry & (UINT64_C(1) << 63)) || (entry & (UINT64_C(1) << 62)) ||
+        !pfn || pfn > UINT64_MAX / SHARING_PAGE_SIZE) {
+        errno = ENOTSUP; return -1;
+    }
+    *gpa = pfn * SHARING_PAGE_SIZE;
+    return 0;
+}
+static int sharing_initialize(struct sharing_memory *memory, uint64_t deadline) {
+    if (sysconf(_SC_PAGESIZE) != SHARING_PAGE_SIZE) { errno = ENOTSUP; return -1; }
+    void *mapping = mmap(NULL, SHARING_BYTES, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) return -1;
+    struct sharing_memory initialized = {.bytes = mapping, .write_slot = -1};
+    if (madvise(mapping, SHARING_BYTES, MADV_NOHUGEPAGE) ||
+        mlock(mapping, SHARING_BYTES) ||
+        sharing_fill(&initialized, -1, deadline) ||
+        sharing_scan(&initialized, deadline, &initialized.baseline_checksum) ||
+        sharing_identity(initialized.bytes, &initialized.first_gpa)) {
+        int error = errno;
+        if (munmap(mapping, SHARING_BYTES)) return -1;
+        errno = error; return -1;
+    }
+    *memory = initialized;
+    return 0;
+}
+static int sharing_observation(struct sharing_memory *memory, const char *token,
+    int command, uint64_t deadline) {
+    if (sharing_time_left(deadline)) return -1;
+    int initialized = !memory->bytes;
+    if (!memory->bytes) {
+        if (command != SHARING_INITIALIZE) { errno = ENODATA; return -1; }
+        if (sharing_initialize(memory, deadline)) return -1;
+    }
+    if (command == SHARING_INITIALIZE && memory->write_slot >= 0) {
+        errno = EBUSY; return -1;
+    }
+    int slot = command >= SHARING_WRITE_FIRST ? command - SHARING_WRITE_FIRST : -1;
+    if (slot >= 0 && memory->write_slot >= 0 && slot != memory->write_slot) {
+        errno = EBUSY; return -1;
+    }
+    uint64_t checksum = memory->baseline_checksum, first_gpa;
+    if (sharing_identity(memory->bytes, &first_gpa)) return -1;
+    if (first_gpa != memory->first_gpa) { errno = ESTALE; return -1; }
+    /* Verify before writing so a damaged sibling/baseline cannot be repaired
+     * into a successful acknowledgment by a later write command. */
+    if (!initialized && sharing_scan(memory, deadline, &checksum)) return -1;
+    if (slot >= 0) {
+        memory->write_slot = slot;
+        if (sharing_fill(memory, slot, deadline) ||
+            sharing_scan(memory, deadline, &checksum)) return -1;
+    }
+    if (sharing_identity(memory->bytes, &first_gpa)) return -1;
+    if (first_gpa != memory->first_gpa) { errno = ESTALE; return -1; }
+    if (sharing_time_left(deadline)) return -1;
+    char write_slot[16];
+    if (memory->write_slot < 0) strcpy(write_slot, "null");
+    else snprintf(write_slot, sizeof(write_slot), "%d", memory->write_slot);
+    return emit_record(output,
+        "OBS-BEGIN memory-sharing\n"
+        "{\"schema\":1,\"request_token\":\"%s\",\"bytes\":67108864,"
+        "\"page_size\":4096,\"pages\":16384,\"write_slot\":%s,"
+        "\"verified_bytes\":67108864,\"mismatches\":0,\"checksum\":\"%016" PRIx64
+        "\",\"baseline_checksum\":\"%016" PRIx64 "\",\"first_gpa\":%" PRIu64
+        ",\"mlocked\":true}\nOBS-END memory-sharing\n",
+        token, write_slot, checksum, memory->baseline_checksum, first_gpa);
 }
 
 int main(void) {
@@ -741,10 +876,15 @@ int main(void) {
     }
     uint64_t sequence = 0;
     char pressure_command[1024]; size_t pressure_length = 0; int pressure_forward = 0;
+    struct sharing_memory sharing = {.write_slot = -1};
+    uint64_t sharing_deadline = 0;
     for (;;) {
         int status;
         if (waitpid(registers, &status, WNOHANG) == registers) { fail("live-register-fixture-exited"); return 9; }
         if (pressure > 0 && waitpid(pressure, &status, WNOHANG) == pressure) { fail("pressure-fixture-exited"); return 13; }
+        if (pressure_forward >= SHARING_INITIALIZE && sharing_time_left(sharing_deadline)) {
+            fail("memory-sharing-request"); return 18;
+        }
         char input[64]; ssize_t count = read(control_input, input, sizeof(input));
         for (ssize_t i = 0; i < count; ++i) {
             if (pressure_forward) {
@@ -753,28 +893,55 @@ int main(void) {
                         pressure_command[pressure_length++] = '\n';
                         if (write(pressure_pipe[1], pressure_command, pressure_length) != (ssize_t)pressure_length) fail("pressure-command-write");
                     } else {
-                        if (pressure_length != 32) { errno = EINVAL; fail("device-counter-request"); return 14; }
+                        if (pressure_length != 32) {
+                            errno = EINVAL;
+                            fail(pressure_forward >= SHARING_INITIALIZE ? "memory-sharing-request" : "device-counter-request");
+                            return pressure_forward >= SHARING_INITIALIZE ? 18 : 14;
+                        }
                         pressure_command[pressure_length] = '\0';
                         for (size_t index = 0; index < pressure_length; ++index) {
                             char byte = pressure_command[index];
                             if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f'))) {
-                                errno = EINVAL; fail("device-counter-request"); return 14;
+                                errno = EINVAL;
+                                fail(pressure_forward >= SHARING_INITIALIZE ? "memory-sharing-request" : "device-counter-request");
+                                return pressure_forward >= SHARING_INITIALIZE ? 18 : 14;
                             }
                         }
                         if (pressure_forward == 2) emit_devices(++sequence, pressure_command);
-                        else if (memory_buffers(pressure_command, pressure_forward == 4)) {
+                        else if (pressure_forward >= SHARING_INITIALIZE) {
+                            if (sharing_observation(&sharing, pressure_command, pressure_forward, sharing_deadline)) {
+                                fail("memory-sharing"); return 18;
+                            }
+                        } else if (memory_buffers(pressure_command, pressure_forward == 4, pressure_forward == 5)) {
                             fail("memory-buffer"); return 17;
                         }
                     }
                     pressure_length = 0; pressure_forward = 0;
+                } else if (pressure_forward >= SHARING_INITIALIZE && pressure_length >= 32) {
+                    errno = EINVAL; fail("memory-sharing-request"); return 18;
                 } else if (pressure_length + 1 < sizeof(pressure_command)) pressure_command[pressure_length++] = input[i];
                 else { fail("pressure-command-bound"); return 14; }
+                continue;
+            }
+            int sharing_command = input[i] == 'A' ? SHARING_INITIALIZE :
+                input[i] == 'E' ? SHARING_VERIFY :
+                input[i] == 'I' ? SHARING_WRITE_FIRST :
+                input[i] == 'J' ? SHARING_WRITE_FIRST + 1 :
+                input[i] == 'K' ? SHARING_WRITE_FIRST + 2 :
+                input[i] == 'L' ? SHARING_WRITE_LAST : 0;
+            if (sharing_command) {
+                struct timespec now;
+                if (clock_gettime(CLOCK_MONOTONIC, &now)) { fail("memory-sharing-clock"); return 18; }
+                sharing_deadline = (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+                    (uint64_t)now.tv_nsec + UINT64_C(15000000000);
+                pressure_forward = sharing_command;
                 continue;
             }
             if (input[i] == 'P' && pressure > 0) { pressure_forward = 1; continue; }
             if (input[i] == 'C') { pressure_forward = 2; continue; }
             if (input[i] == 'H') { pressure_forward = 3; continue; }
             if (input[i] == 'D') { pressure_forward = 4; continue; }
+            if (input[i] == 'Z') { pressure_forward = 5; continue; }
             if (input[i] == 'B') atomic_store(&console_burst, 1);
             if (input[i] == 'O') observations();
             if (input[i] == 'M' && network_mac(1)) fail("destination-mac");

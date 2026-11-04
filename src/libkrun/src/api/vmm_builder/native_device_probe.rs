@@ -1,5 +1,4 @@
-//! Explicit standalone production-kernel driver. RAM transfer is bounded gate
-//! machinery, not the delivered RAM image or public capture API.
+//! Explicit standalone production-kernel driver over the native capture coordinator.
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -12,7 +11,8 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use arch::guest_memory::ReadGuestMemory;
+#[cfg(feature = "native-device-probe")]
+use arch::guest_memory::{MemoryDomain, ReadGuestMemory};
 use devices::legacy::{Serial, state::LegacyPayload};
 use devices::virtio::block::{Block, CacheType, DiskFormat, SyncMode};
 use devices::virtio::lifecycle::ProviderFault;
@@ -23,7 +23,8 @@ use polly::event_manager::{
 };
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+#[cfg(feature = "native-device-probe")]
+use vm_memory::GuestAddress;
 
 use crate::api::capabilities::execution_state_producer;
 use crate::api::device_builders::{AttachContext, AttachDevice, BalloonBinding, MmioDeviceManager};
@@ -39,6 +40,11 @@ use crate::vmm::execution::device_restore::{
 };
 use crate::vmm::execution::runtime::KvmCaptureProfile;
 use crate::vmm::execution::{ExecutionEnvelope, ExecutionLane, StateBinding, ValidatedExecution};
+use crate::vmm::memory::image::ValidatedRamLayout;
+use crate::vmm::memory::image::{
+    AuthenticatedRamImage, RamImageAuthentication, RamOutputFiles, map_restore_ram,
+};
+use crate::vmm::memory::{AttemptId, CompletedCandidate, DirtyCrossoverPercent, RamCaptureRequest};
 #[cfg(feature = "native-device-probe")]
 use crate::vmm::vstate::NativeRunObserver;
 
@@ -118,6 +124,65 @@ mod witness;
 #[path = "native_device_pressure.rs"]
 mod pressure;
 
+#[cfg(feature = "native-device-probe")]
+fn diagnostic_memory_mappings(domain: &Arc<MemoryDomain>) -> Result<String, String> {
+    use arch::guest_memory::BackingKind;
+    use std::fmt::Write as FmtWrite;
+
+    if domain.backing_kind() != BackingKind::RestoredPrivate {
+        return Err("mapping evidence requires restored private RAM".into());
+    }
+    let layout = domain.layout();
+    layout
+        .validate_capture()
+        .map_err(|error| error.to_string())?;
+    let mut identities = domain.file_backing_identities();
+    let mut output = format!(
+        "{{\"schema\":1,\"native_pid\":{},\"packed_len\":{},\"regions\":[",
+        std::process::id(),
+        layout.packed_len()
+    );
+    for (index, region) in layout.regions().iter().enumerate() {
+        let identity = identities
+            .next()
+            .ok_or("registered RAM region lacks retained file backing")?
+            .map_err(|error| error.to_string())?;
+        let range = region.guest_range();
+        let length = usize::try_from(range.byte_len()).map_err(|error| error.to_string())?;
+        let guard = domain
+            .read(GuestAddress(range.start()), length)
+            .map_err(|error| error.to_string())?;
+        let host_start = guard
+            .read_view(0, 1)
+            .map_err(|error| error.to_string())?
+            .as_ptr() as usize as u64;
+        if !domain.matches_region_mapping(region.id(), host_start)
+            || host_start.checked_add(range.byte_len()).is_none()
+        {
+            return Err("registered RAM mapping identity mismatch".into());
+        }
+        if index != 0 {
+            output.push(',');
+        }
+        write!(
+            output,
+            "{{\"gpa\":{},\"length\":{},\"stream_offset\":{},\"host_start\":{},\"device\":{},\"inode\":{}}}",
+            range.start(),
+            range.byte_len(),
+            region.stream_offset(),
+            host_start,
+            identity.device,
+            identity.inode,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    if identities.next().is_some() {
+        return Err("file backing inventory exceeds registered RAM".into());
+    }
+    output.push_str("]}\n");
+    Ok(output)
+}
+
 #[derive(Clone)]
 struct Resource {
     id: String,
@@ -146,6 +211,12 @@ impl<'a> AttachDevice<'a> for Resource {
     }
 }
 
+struct MemoryCaptureOptions {
+    full: bool,
+    prepared: bool,
+    fail_output: bool,
+}
+
 struct Driver {
     vmm: Arc<Mutex<Vmm>>,
     events: EventManager,
@@ -153,6 +224,13 @@ struct Driver {
     operation: u64,
     token: Option<PauseToken>,
     stopped: bool,
+    prepared_layout: Option<Arc<ValidatedRamLayout>>,
+    memory_attempt: Option<AttemptId>,
+    memory_candidate: Option<CompletedCandidate>,
+    memory_directory: Option<std::path::PathBuf>,
+    memory_prepared: bool,
+    memory_stats: Option<Vec<u8>>,
+    prepared_devices: Option<Arc<DeviceEnvelope>>,
     #[cfg(feature = "native-device-probe")]
     witness: Arc<witness::Witness>,
     #[cfg(feature = "native-device-probe")]
@@ -175,6 +253,11 @@ impl Driver {
         Ok(())
     }
     fn call(&mut self, kind: RequestKind) -> Result<ControlReply, String> {
+        let command = match &kind {
+            RequestKind::Resume(_) => Some("resume"),
+            RequestKind::ReleaseRestore => Some("release"),
+            _ => None,
+        };
         self.operation = self
             .operation
             .checked_add(1)
@@ -197,7 +280,14 @@ impl Driver {
             }
             call.join()
                 .map_err(|_| "driver control caller panicked")?
-                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    if let Some(command) = command
+                        && matches!(&error, crate::vmm::control::ControlFailure::Busy)
+                    {
+                        println!("MEMORY_COMMAND_FAILURE {{\"schema\":1,\"command\":\"{command}\",\"kind\":\"busy\"}}");
+                    }
+                    error.to_string()
+                })
         })
     }
     fn refuse(mut self, reason: &str) -> Result<(), String> {
@@ -270,23 +360,55 @@ impl Driver {
         &mut self,
         directory: &Path,
         binding: StateBinding,
-        profile: &KvmCaptureProfile,
+        profile: Option<&KvmCaptureProfile>,
         disks: [&Path; 2],
+        options: MemoryCaptureOptions,
     ) -> Result<(), String> {
+        let MemoryCaptureOptions {
+            full,
+            prepared,
+            fail_output,
+        } = options;
         let mut vmm = self.vmm.try_lock().map_err(|_| "driver VMM lock")?;
-        let active = vmm
-            .control
-            .active
+        if self.memory_attempt.is_some() {
+            return Err("memory candidate unresolved".into());
+        }
+        let layout = vmm.memory_layout().map_err(|error| error.to_string())?;
+        if self
+            .prepared_layout
             .as_ref()
-            .ok_or("capture without retained whole-machine pause")?;
-        let barrier = active.barrier;
-        let request = active.request.id;
-        vmm.flush_devices_for_capture(barrier.key)?;
-        vmm.begin_execution_capture(request, barrier, binding, profile, false)?;
-        let execution = match vmm.poll_execution_capture() {
-            Poll::Ready(result) => result?,
-            Poll::Pending => {
-                return Err("completed pause did not retain completed execution cut".into());
+            .is_none_or(|prepared| prepared.canonical_bytes() != layout.canonical_bytes())
+        {
+            return Err("capture requires exact canonical layout preparation".into());
+        }
+        if !prepared {
+            let active = vmm
+                .control
+                .active
+                .as_ref()
+                .ok_or("capture without retained whole-machine pause")?;
+            let barrier = active.barrier;
+            let request = active.request.id;
+            vmm.flush_devices_for_capture(barrier.key)?;
+            vmm.begin_execution_capture(
+                request,
+                barrier,
+                binding,
+                profile.ok_or("capture profile absent")?,
+                false,
+            )?;
+        }
+        let execution = if prepared {
+            vmm.execution
+                .captured_envelope()
+                .cloned()
+                .ok_or("prepared execution envelope absent")?
+        } else {
+            match vmm.poll_execution_capture() {
+                Poll::Ready(result) => result?,
+                Poll::Pending => {
+                    return Err("completed pause did not retain completed execution cut".into());
+                }
             }
         };
         let retained = vmm
@@ -302,15 +424,15 @@ impl Driver {
                 "captured execution envelope differs from current retained native state".into(),
             );
         }
-        let devices = vmm.captured_devices()?;
+        let devices = if prepared {
+            self.prepared_devices
+                .clone()
+                .ok_or("prepared device envelope absent")?
+        } else {
+            vmm.captured_devices()?
+        };
         #[cfg(feature = "native-device-probe")]
-        let dirty = diagnostic_dirty_memory(
-            &vmm,
-            self.token
-                .as_ref()
-                .ok_or("capture without exact pause token")?,
-            &execution,
-        )?;
+        let dirty = diagnostic_dirty_memory(&vmm, self.token.as_ref(), &execution)?;
         fs::DirBuilder::new()
             .mode(0o700)
             .create(directory)
@@ -342,11 +464,164 @@ impl Driver {
             &directory.join("devices.state"),
             &devices.encode().map_err(|error| error.to_string())?,
         )?;
-        transfer_ram(
-            RamTransfer::Capture(vmm.guest_memory.read_only()),
-            &execution,
-            &directory.join("memory.ram"),
-        )?;
+        let token = vmm.baseline_token();
+        let baseline_generation = token.as_ref().map(|token| token.memory_generation());
+        let request = if full {
+            RamCaptureRequest::Full
+        } else {
+            RamCaptureRequest::Incremental {
+                baseline: token.as_ref(),
+                crossover: DirtyCrossoverPercent::default(),
+            }
+        };
+        #[cfg(feature = "native-device-probe")]
+        let key = vmm
+            .execution
+            .retained
+            .as_ref()
+            .ok_or("memory cut absent")?
+            .key;
+        let attempt = if prepared {
+            #[cfg(feature = "native-device-probe")]
+            {
+                vmm.diagnostic_begin_memory_capture(key, request)
+            }
+            #[cfg(not(feature = "native-device-probe"))]
+            {
+                return Err("prepared capture requires native-device-probe".into());
+            }
+        } else {
+            vmm.begin_memory_capture(
+                self.token
+                    .as_ref()
+                    .ok_or("capture without exact pause token")?,
+                request,
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        self.memory_attempt = Some(attempt.clone());
+        self.memory_directory = Some(directory.to_path_buf());
+        self.memory_prepared = prepared;
+        let ram = image_output(&directory.join("memory.ram"))?;
+        let ram = if fail_output {
+            drop(ram);
+            File::open(directory.join("memory.ram")).map_err(|error| error.to_string())?
+        } else {
+            ram
+        };
+        let output = RamOutputFiles::new(ram, image_output(&directory.join("memory-layout.json"))?);
+        let result = if prepared {
+            #[cfg(feature = "native-device-probe")]
+            {
+                vmm.diagnostic_write_memory_capture(key, &attempt, output, Instant::now() + WAIT)
+            }
+            #[cfg(not(feature = "native-device-probe"))]
+            {
+                return Err("prepared capture requires native-device-probe".into());
+            }
+        } else {
+            vmm.write_memory_capture(
+                self.token
+                    .as_ref()
+                    .ok_or("capture without exact pause token")?,
+                &attempt,
+                output,
+                Instant::now() + WAIT,
+            )
+        };
+        let candidate = match result {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                if let crate::vmm::memory::CaptureError::Write(failure) = &error {
+                    use crate::vmm::memory::image::{
+                        DescriptorProblem, RamFileRole, RamImageEffects, RamImageError,
+                    };
+                    if let RamImageError::DescriptorRole {
+                        role: RamFileRole::OutputRam,
+                        problem: DescriptorProblem::WrongAccess,
+                    } = &failure.error
+                    {
+                        let effects = match failure.effects {
+                            RamImageEffects::None => "none",
+                            RamImageEffects::Started => "started",
+                        };
+                        let baseline = baseline_generation
+                            .map_or("null".into(), |generation| generation.to_string());
+                        let stats = &failure.stats;
+                        let evidence = format!(
+                            "{{\"schema\":1,\"kind\":\"ram-image-failure\",\"role\":\"output-ram\",\"problem\":\"wrong-access\",\"effects\":\"{effects}\",\"baseline_generation\":{baseline},\"attempt_sequence\":{},\"stats\":{{\"logical_bytes\":{},\"live_bytes_read\":{},\"baseline_bytes_read\":{},\"baseline_bytes_written\":{},\"overlay_bytes_written\":{},\"full_bytes_written\":{},\"layout_bytes_written\":{},\"baseline_hole_bytes\":{},\"zero_bytes_omitted\":{},\"explicit_zero_bytes_written\":{},\"extent_queries\":{}}}}}\n",
+                            attempt.sequence(),
+                            stats.logical_bytes,
+                            stats.live_bytes_read,
+                            stats.baseline_bytes_read,
+                            stats.baseline_bytes_written,
+                            stats.overlay_bytes_written,
+                            stats.full_bytes_written,
+                            stats.layout_bytes_written,
+                            stats.baseline_hole_bytes,
+                            stats.zero_bytes_omitted,
+                            stats.explicit_zero_bytes_written,
+                            stats.extent_queries,
+                        );
+                        write_new(&directory.join("memory-failure.json"), evidence.as_bytes())
+                            .map_err(|evidence_error| {
+                                format!("{error}; recording failure: {evidence_error}")
+                            })?;
+                    }
+                }
+                return Err(error.to_string());
+            }
+        };
+        let receipt = candidate.receipt();
+        let stats = receipt.stats();
+        let mode = if matches!(
+            receipt.mode(),
+            crate::vmm::memory::image::RamCaptureMode::Full
+        ) {
+            "full"
+        } else {
+            "incremental"
+        };
+        let baseline_json =
+            baseline_generation.map_or("null".into(), |generation| generation.to_string());
+        let fallback = match candidate.full_reason() {
+            None => "null",
+            Some(crate::vmm::memory::FullCaptureReason::Requested) => "\"requested-full\"",
+            Some(crate::vmm::memory::FullCaptureReason::NoBaseline) => "\"no-baseline\"",
+            Some(crate::vmm::memory::FullCaptureReason::BaselineToken) => "\"baseline-token\"",
+            Some(crate::vmm::memory::FullCaptureReason::CoverageLost) => "\"coverage-lost\"",
+            Some(crate::vmm::memory::FullCaptureReason::DirtyCrossover) => "\"dirty-crossover\"",
+        };
+        let chunks = receipt
+            .affected_chunks()
+            .map(|chunk| chunk.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let dirty_pages = if prepared {
+            #[cfg(feature = "native-device-probe")]
+            {
+                vmm.diagnostic_memory_dirty_pages(key)
+                    .map_err(|error| error.to_string())?
+                    .count()
+            }
+            #[cfg(not(feature = "native-device-probe"))]
+            {
+                return Err("prepared capture requires native-device-probe".into());
+            }
+        } else {
+            vmm.memory_dirty_pages(self.token.as_ref().ok_or("pause absent")?)?
+                .count()
+        };
+        let metadata = format!(
+            "{{\"schema\":1,\"scope\":\"accepted-baseline-ledger\",\"mode\":\"{mode}\",\"fallback\":{fallback},\"baseline_generation\":{baseline_json},\"candidate_generation\":{},\"attempt_sequence\":{},\"pause_generation\":{},\"dirty_pages\":{dirty_pages},\"stats\":{{\"logical_bytes\":{},\"live_bytes_read\":{},\"baseline_bytes_read\":{},\"baseline_bytes_written\":{},\"overlay_bytes_written\":{},\"full_bytes_written\":{},\"layout_bytes_written\":{},\"baseline_hole_bytes\":{},\"zero_bytes_omitted\":{},\"explicit_zero_bytes_written\":{},\"extent_queries\":{}}},\"affected_chunks\":[{chunks}]}}\n",
+            candidate.memory_generation(), attempt.sequence(), execution.binding.pause_generation,
+            stats.logical_bytes, stats.live_bytes_read, stats.baseline_bytes_read, stats.baseline_bytes_written,
+            stats.overlay_bytes_written, stats.full_bytes_written, stats.layout_bytes_written, stats.baseline_hole_bytes,
+            stats.zero_bytes_omitted, stats.explicit_zero_bytes_written, stats.extent_queries,
+        ).into_bytes();
+        self.memory_candidate = Some(candidate);
+        self.memory_stats = Some(metadata.clone());
+        write_new(&directory.join("memory-image.json"), &metadata)?;
         #[cfg(feature = "native-device-probe")]
         {
             write_new(&directory.join("memory-dirty.json"), &dirty.0)?;
@@ -354,11 +629,140 @@ impl Driver {
         }
         Ok(())
     }
+    fn prepare_layout(&mut self, path: &Path) -> Result<(), String> {
+        let vmm = self.vmm.try_lock().map_err(|_| "driver VMM lock")?;
+        let layout = vmm.memory_layout().map_err(|error| error.to_string())?;
+        if layout.packed_len() > MAX_RAM {
+            return Err("standalone RAM exceeds fixture bound".into());
+        }
+        write_new(path, layout.canonical_bytes())?;
+        self.prepared_layout = Some(layout);
+        Ok(())
+    }
+
+    fn abandon_memory(&mut self) -> Result<(), String> {
+        let Some(attempt) = self.memory_attempt.as_ref() else {
+            return Ok(());
+        };
+        let mut vmm = self.vmm.try_lock().map_err(|_| "driver VMM lock")?;
+        if self.memory_prepared {
+            #[cfg(feature = "native-device-probe")]
+            {
+                let key = vmm
+                    .execution
+                    .retained
+                    .as_ref()
+                    .ok_or("prepared cut absent")?
+                    .key;
+                vmm.diagnostic_abandon_memory(key, attempt)
+            }
+            #[cfg(not(feature = "native-device-probe"))]
+            {
+                return Err("prepared capture requires native-device-probe".into());
+            }
+        } else {
+            vmm.abandon_memory(self.token.as_ref().ok_or("pause absent")?, attempt)
+        }
+        .map_err(|error| error.to_string())?;
+        self.memory_candidate = None;
+        self.memory_attempt = None;
+        Ok(())
+    }
+
+    fn accept_memory(&mut self, authentication: &Path) -> Result<(), String> {
+        let bytes: [u8; 64] = bounded(authentication, 64)?
+            .try_into()
+            .map_err(|_| "authentication must contain 64 bytes")?;
+        let directory = self
+            .memory_directory
+            .as_ref()
+            .ok_or("candidate directory absent")?;
+        let mut vmm = self.vmm.try_lock().map_err(|_| "driver VMM lock")?;
+        let state = vmm
+            .execution
+            .captured_envelope()
+            .ok_or("execution envelope absent")?
+            .binding
+            .clone();
+        if bytes[..32] != state.ram_layout {
+            return Err("authentication layout binding mismatch".into());
+        }
+        let stream = bytes[32..]
+            .try_into()
+            .map_err(|_| "stream identity width")?;
+        let candidate = self
+            .memory_candidate
+            .as_mut()
+            .ok_or("completed candidate absent")?;
+        let image = candidate
+            .seal(
+                File::open(directory.join("memory.ram")).map_err(|error| error.to_string())?,
+                File::open(directory.join("memory-layout.json"))
+                    .map_err(|error| error.to_string())?,
+                RamImageAuthentication { state, stream },
+            )
+            .map_err(|error| error.to_string())?;
+        let candidate = self
+            .memory_candidate
+            .take()
+            .ok_or("completed candidate absent")?;
+        if self.memory_prepared {
+            #[cfg(feature = "native-device-probe")]
+            {
+                let key = vmm
+                    .execution
+                    .retained
+                    .as_ref()
+                    .ok_or("prepared cut absent")?
+                    .key;
+                vmm.diagnostic_accept_memory(key, candidate, image)
+            }
+            #[cfg(not(feature = "native-device-probe"))]
+            {
+                return Err("prepared capture requires native-device-probe".into());
+            }
+        } else {
+            vmm.accept_memory(self.token.as_ref().ok_or("pause absent")?, candidate, image)
+        }
+        .map_err(|error| error.to_string())?;
+        self.memory_attempt = None;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "native-device-probe")]
+fn dirty_failure_json(failure: Option<arch::guest_memory::DirtyFailure>) -> String {
+    use arch::guest_memory::{DirtyEffect, DirtyLocation, DirtyOperation};
+    let Some(failure) = failure else {
+        return "null".into();
+    };
+    let operation = match failure.operation {
+        DirtyOperation::Bind => "bind",
+        DirtyOperation::Arm => "arm",
+        DirtyOperation::Collect => "collect",
+        DirtyOperation::Rearm => "rearm",
+        DirtyOperation::Reestablish => "reestablish",
+        DirtyOperation::Native => "native",
+        DirtyOperation::Fault => "fault",
+    };
+    let effect = match failure.effect {
+        DirtyEffect::PreEffectRefusal => "pre-effect-refusal",
+        DirtyEffect::CoverageLost => "coverage-lost",
+        DirtyEffect::ProtectionUnknown => "protection-unknown",
+    };
+    let slot = match failure.location {
+        DirtyLocation::Slot(slot) => slot.to_string(),
+        _ => "null".into(),
+    };
+    format!(
+        "{{\"operation\":\"{operation}\",\"slot\":{slot},\"native_code\":{},\"effect\":\"{effect}\"}}",
+        failure.native_code
+    )
 }
 #[cfg(feature = "native-device-probe")]
 fn diagnostic_dirty_memory(
     vmm: &Vmm,
-    token: &PauseToken,
+    token: Option<&PauseToken>,
     execution: &ExecutionEnvelope,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     use std::fmt::Write as FmtWrite;
@@ -366,7 +770,18 @@ fn diagnostic_dirty_memory(
     layout
         .validate_capture()
         .map_err(|error| error.to_string())?;
-    let dirty = vmm.memory_dirty_pages(token)?;
+    let dirty = if let Some(token) = token {
+        vmm.memory_dirty_pages(token)?
+    } else {
+        vmm.diagnostic_memory_dirty_pages(
+            vmm.execution
+                .retained
+                .as_ref()
+                .ok_or("prepared cut absent")?
+                .key,
+        )
+        .map_err(|error| error.to_string())?
+    };
     if layout.packed_len() > MAX_RAM
         || layout.regions().len() != execution.memory_regions.len()
         || layout.page_count() != dirty.page_count()
@@ -374,8 +789,13 @@ fn diagnostic_dirty_memory(
     {
         return Err("standalone dirty geometry exceeds bounds or differs from RAM".into());
     }
+    let scope = if vmm.baseline_token().is_some() {
+        "accepted-baseline-ledger"
+    } else {
+        "cumulative-union-no-accepted-baseline"
+    };
     let mut metadata = format!(
-        "{{\"schema\":1,\"scope\":\"cumulative-union-no-accepted-baseline\",\"bitmap_encoding\":\"u64-le-lsb0-dense\",\"granule\":{},\"packed_len\":{},\"page_count\":{},\"dirty_pages\":{},\"bitmap_bytes\":{},\"pause_generation\":{},\"regions\":[",
+        "{{\"schema\":1,\"scope\":\"{scope}\",\"bitmap_encoding\":\"u64-le-lsb0-dense\",\"granule\":{},\"packed_len\":{},\"page_count\":{},\"dirty_pages\":{},\"bitmap_bytes\":{},\"pause_generation\":{},\"regions\":[",
         layout.granule(),
         layout.packed_len(),
         layout.page_count(),
@@ -557,67 +977,14 @@ fn binding(directory: &Path, generation: u64) -> Result<StateBinding, String> {
         pause_generation: generation,
     })
 }
-enum RamTransfer<'a> {
-    Capture(ReadGuestMemory<'a>),
-    Restore(&'a GuestMemoryMmap),
-}
-
-fn transfer_ram(
-    memory: RamTransfer<'_>,
-    execution: &ExecutionEnvelope,
-    path: &Path,
-) -> Result<(), String> {
-    let restore = matches!(&memory, RamTransfer::Restore(_));
-    let total = execution
-        .memory_regions
-        .iter()
-        .try_fold(0u64, |total, region| total.checked_add(region.byte_len()))
-        .ok_or("RAM size overflow")?;
-    if total > MAX_RAM {
-        return Err("standalone RAM transfer exceeds 1GiB fixture bound".into());
-    }
-    let mut file = if restore {
-        File::open(path)
-    } else {
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-    }
-    .map_err(|error| error.to_string())?;
-    if restore && file.metadata().map_err(|error| error.to_string())?.len() != total {
-        return Err("standalone RAM length mismatch".into());
-    }
-    let mut chunk = vec![0u8; 1024 * 1024];
-    for region in &execution.memory_regions {
-        let mut offset = 0;
-        while offset < region.byte_len() {
-            let length = (region.byte_len() - offset).min(chunk.len() as u64) as usize;
-            let address = GuestAddress(region.start() + offset);
-            match &memory {
-                RamTransfer::Restore(memory) => {
-                    file.read_exact(&mut chunk[..length])
-                        .map_err(|error| error.to_string())?;
-                    memory
-                        .write_slice(&chunk[..length], address)
-                        .map_err(|error| error.to_string())?;
-                }
-                RamTransfer::Capture(memory) => {
-                    memory
-                        .read_slice(&mut chunk[..length], address)
-                        .map_err(|error| error.to_string())?;
-                    file.write_all(&chunk[..length])
-                        .map_err(|error| error.to_string())?;
-                }
-            }
-            offset += length as u64;
-        }
-    }
-    if !restore {
-        file.sync_all().map_err(|error| error.to_string())?;
-    }
-    Ok(())
+fn image_output(path: &Path) -> Result<File, String> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 fn resource<T: VirtioDevice + Subscriber + 'static>(id: &str, device: T) -> Resource {
@@ -845,6 +1212,13 @@ fn cold(arguments: &BTreeMap<String, String>, resources: Vec<Resource>) -> Resul
         operation: 0,
         token: None,
         stopped: false,
+        prepared_layout: None,
+        memory_attempt: None,
+        memory_candidate: None,
+        memory_directory: None,
+        memory_prepared: false,
+        memory_stats: None,
+        prepared_devices: None,
         #[cfg(feature = "native-device-probe")]
         witness: Arc::default(),
         #[cfg(feature = "native-device-probe")]
@@ -881,29 +1255,30 @@ fn restore(
     .map_err(|error| error.to_string())?;
     let devices =
         ValidatedDevices::validate(saved.clone(), &execution).map_err(|error| error.to_string())?;
-    let ranges = execution
-        .memory_regions
-        .iter()
-        .map(|region| {
-            usize::try_from(region.byte_len())
-                .map(|length| (GuestAddress(region.start()), length))
-                .map_err(|_| "RAM length cannot fit host")
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let total = execution
-        .memory_regions
-        .iter()
-        .try_fold(0u64, |sum, region| sum.checked_add(region.byte_len()))
-        .ok_or("RAM overflow")?;
-    if total > MAX_RAM {
+    let authentication: [u8; 64] = bounded(&directory.join("memory-authentication.bin"), 64)?
+        .try_into()
+        .map_err(|_| "RAM authentication must contain 64 bytes")?;
+    if authentication[..32] != expected.ram_layout {
+        return Err("restore RAM authentication layout mismatch".into());
+    }
+    let image = Arc::new(
+        AuthenticatedRamImage::for_restore(
+            File::from(owned_fd(arguments, "ram-image-fd")?),
+            File::from(owned_fd(arguments, "ram-layout-fd")?),
+            RamImageAuthentication {
+                state: expected,
+                stream: authentication[32..]
+                    .try_into()
+                    .map_err(|_| "stream identity width")?,
+            },
+            &validated,
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    if image.layout().packed_len() > MAX_RAM {
         return Err("standalone RAM exceeds fixture bound".into());
     }
-    let memory = GuestMemoryMmap::from_ranges(&ranges).map_err(|error| error.to_string())?;
-    transfer_ram(
-        RamTransfer::Restore(&memory),
-        &execution,
-        &directory.join("memory.ram"),
-    )?;
+    let memory = map_restore_ram(image, &validated).map_err(|error| error.to_string())?;
     let mut bindings = Vec::new();
     for record in &saved.records {
         let resource = resources
@@ -951,10 +1326,9 @@ fn restore(
     };
     let mut events = EventManager::new().map_err(|error| format!("{error:?}"))?;
     #[cfg(feature = "native-device-probe")]
-    let observed_memory = memory.clone();
+    let observed_memory = memory.domain().clone();
     let vmm = match build_restore_prepared(
         memory,
-        arch::ArchMemoryInfo::default(),
         validated,
         prepared,
         &mut events,
@@ -999,7 +1373,7 @@ fn restore(
                         let install_succeeded = ack.result.is_ok();
                         let unreconciled = !attempt.control.cpus.reconciled();
                         let ram_comparison = ram_difference(
-                            &observed_memory,
+                            observed_memory.read_only(),
                             &execution.memory_regions,
                             &directory.join("memory.ram"),
                         );
@@ -1034,6 +1408,13 @@ fn restore(
                     operation: 0,
                     token: None,
                     stopped: false,
+                    prepared_layout: None,
+                    memory_attempt: None,
+                    memory_candidate: None,
+                    memory_directory: None,
+                    memory_prepared: false,
+                    memory_stats: None,
+                    prepared_devices: None,
                     #[cfg(feature = "native-device-probe")]
                     witness: Arc::default(),
                     #[cfg(feature = "native-device-probe")]
@@ -1150,6 +1531,13 @@ fn restore(
             operation: 0,
             token: None,
             stopped: false,
+            prepared_layout: None,
+            memory_attempt: None,
+            memory_candidate: None,
+            memory_directory: None,
+            memory_prepared: false,
+            memory_stats: None,
+            prepared_devices: Some(Arc::new(saved.clone())),
             #[cfg(feature = "native-device-probe")]
             witness: Arc::default(),
             #[cfg(feature = "native-device-probe")]
@@ -1169,6 +1557,13 @@ fn restore(
         operation: 0,
         token: None,
         stopped: false,
+        prepared_layout: None,
+        memory_attempt: None,
+        memory_candidate: None,
+        memory_directory: None,
+        memory_prepared: false,
+        memory_stats: None,
+        prepared_devices: Some(Arc::new(saved.clone())),
         #[cfg(feature = "native-device-probe")]
         witness: Arc::default(),
         #[cfg(feature = "native-device-probe")]
@@ -1182,7 +1577,7 @@ fn options_partial(arguments: &BTreeMap<String, String>) -> bool {
 
 #[cfg(feature = "native-device-probe")]
 fn ram_difference(
-    memory: &GuestMemoryMmap,
+    memory: ReadGuestMemory<'_>,
     regions: &[arch::guest_memory::GuestRange],
     path: &Path,
 ) -> Result<Option<String>, String> {
@@ -1249,6 +1644,13 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
         "mux-fd",
     ]
     .into_iter()
+    .chain(
+        options
+            .contains_key("restore")
+            .then_some(["ram-image-fd", "ram-layout-fd"])
+            .into_iter()
+            .flatten(),
+    )
     .map(|key| {
         argument(&options, key)?
             .parse::<i32>()
@@ -1352,6 +1754,57 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
                         "memory-host-write" => diagnostic_host_write(&driver, operand)?,
                         #[cfg(feature = "native-device-probe")]
                         "memory-host-page" => diagnostic_host_page(&driver, operand)?,
+                        #[cfg(feature = "native-device-probe")]
+                        "memory-fail-next-harvest" => {
+                            if !operand.is_empty() {
+                                return Err("memory-fail-next-harvest takes no operands".into());
+                            }
+                            let slot = driver
+                                .vmm
+                                .try_lock()
+                                .map_err(|_| "driver VMM lock")?
+                                .diagnostic_fail_next_memory_harvest()
+                                .map_err(|error| error.to_string())?;
+                            println!("MEMORY_FAIL_NEXT_HARVEST_SLOT {slot}");
+                        }
+                        #[cfg(feature = "native-device-probe")]
+                        "memory-recover-cut" => {
+                            if !operand.is_empty() {
+                                return Err("memory-recover-cut takes no operands".into());
+                            }
+                            let mut vmm = driver.vmm.try_lock().map_err(|_| "driver VMM lock")?;
+                            let token = vmm
+                                .diagnostic_recover_memory_cut()
+                                .map_err(|error| error.to_string())?;
+                            driver.token = Some(token);
+                        }
+                        #[cfg(feature = "native-device-probe")]
+                        "memory-recovery-stats" => {
+                            let vmm = driver.vmm.try_lock().map_err(|_| "driver VMM lock")?;
+                            let observation = vmm.diagnostic_memory_recovery_observation();
+                            let registered = observation.map_or("null".into(), |value| {
+                                format!("{:?}", value.registered_slots)
+                            });
+                            let successful = observation.map_or("null".into(), |value| {
+                                format!("{:?}", value.successful_slots)
+                            });
+                            let epoch = observation
+                                .and_then(|value| value.epoch)
+                                .map_or("null".into(), |value| value.to_string());
+                            let failure =
+                                dirty_failure_json(observation.and_then(|value| value.failure));
+                            let tracking_failure = dirty_failure_json(
+                                vmm.diagnostic_memory_tracking_failure().or_else(|| {
+                                    observation.and_then(|value| value.harvest_failure)
+                                }),
+                            );
+                            let coverage = vmm.diagnostic_memory_coverage_valid();
+                            let full_required = vmm.diagnostic_memory_full_required();
+                            let output = format!(
+                                "{{\"schema\":1,\"registered_slots\":{registered},\"successful_slots\":{successful},\"epoch\":{epoch},\"failure\":{failure},\"tracking_failure\":{tracking_failure},\"coverage_valid\":{coverage},\"full_required\":{full_required}}}\n"
+                            );
+                            write_new(Path::new(operand), output.as_bytes())?;
+                        }
                         "cancel" => {
                             let operation =
                                 operand.parse::<u64>().map_err(|_| "cancel operation")?;
@@ -1463,7 +1916,156 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
                                 driver.poll()?;
                             }
                         }
-                        "capture" => {
+                        "memory-layout" => driver.prepare_layout(Path::new(operand))?,
+                        "memory-accept" => driver.accept_memory(Path::new(operand))?,
+                        "memory-abandon" => driver.abandon_memory()?,
+                        "memory-stats" => write_new(
+                            Path::new(operand),
+                            driver.memory_stats.as_ref().ok_or("memory stats absent")?,
+                        )?,
+                        #[cfg(feature = "native-device-probe")]
+                        "memory-reporting" => {
+                            use std::sync::atomic::Ordering;
+
+                            let vmm = driver.vmm.try_lock().map_err(|_| "driver VMM lock")?;
+                            let mut resources = activation_resources
+                                .iter()
+                                .filter(|resource| resource.id == "balloon0");
+                            let resource =
+                                resources.next().ok_or("actual balloon resource absent")?;
+                            if resources.next().is_some() {
+                                return Err("actual balloon resource is not unique".into());
+                            }
+                            let device = resource
+                                .device
+                                .try_lock()
+                                .map_err(|_| "actual balloon resource lock")?;
+                            let balloon = (*device)
+                                .as_any()
+                                .downcast_ref::<Balloon>()
+                                .ok_or("actual balloon resource type")?;
+                            let queue = balloon.pressure_reporting_queue();
+                            let used_idx = queue
+                                .used_ring
+                                .map(|ring| {
+                                    let address = ring
+                                        .checked_add(2)
+                                        .ok_or("reporting used-ring address overflow")?;
+                                    vmm.memory_domain
+                                        .read_only()
+                                        .load::<u16>(GuestAddress(address), Ordering::Acquire)
+                                        .map(u16::from_le)
+                                        .map_err(|error| error.to_string())
+                                })
+                                .transpose()?;
+                            let next_used = queue
+                                .next_used
+                                .map_or("null".into(), |value| value.to_string());
+                            let used_idx =
+                                used_idx.map_or("null".into(), |value| value.to_string());
+                            let used_ring = queue
+                                .used_ring
+                                .map_or("null".into(), |value| value.to_string());
+                            let output = format!(
+                                "{{\"schema\":1,\"native_pid\":{},\"reporting_negotiated\":{},\"host_reclaim_enabled\":{},\"ready\":{},\"next_used\":{next_used},\"used_idx\":{used_idx},\"used_ring\":{used_ring}}}\n",
+                                std::process::id(),
+                                queue.reporting_negotiated,
+                                balloon.pressure_reclaim_enabled(),
+                                queue.ready,
+                            );
+                            write_new(Path::new(operand), output.as_bytes())?;
+                        }
+                        #[cfg(feature = "native-device-probe")]
+                        "memory-mappings" => {
+                            use crate::vmm::control::ControlState;
+                            let vmm = driver.vmm.try_lock().map_err(|_| "driver VMM lock")?;
+                            if !matches!(
+                                &vmm.control.state,
+                                ControlState::Paused(_) | ControlState::RestorePrepared { .. }
+                            ) {
+                                return Err("mapping evidence requires a stopped RAM owner".into());
+                            }
+                            write_new(
+                                Path::new(operand),
+                                diagnostic_memory_mappings(&vmm.memory_domain)?.as_bytes(),
+                            )?;
+                        }
+                        #[cfg(feature = "native-device-probe")]
+                        "memory-prepared" => {
+                            let vmm = driver.vmm.try_lock().map_err(|_| "driver VMM lock")?;
+                            let envelope = vmm
+                                .execution
+                                .captured_envelope()
+                                .ok_or("prepared envelope absent")?;
+                            let runs = vmm
+                                .vcpus_handles
+                                .iter()
+                                .map(|owner| owner.native_run_observer().attempts())
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let mut wall_clock_gpas = Vec::new();
+                            for cpu in &envelope.cpus {
+                                if let crate::vmm::execution::CpuExecutionState::Kvm(
+                                    crate::vmm::execution::kvm::KvmCpuState::X86(cpu),
+                                ) = cpu
+                                {
+                                    for msr in &cpu.msrs {
+                                        if matches!(msr.index, 0x11 | 0x4b564d00)
+                                            && msr.value != 0
+                                            && !wall_clock_gpas.contains(&msr.value)
+                                        {
+                                            wall_clock_gpas.push(msr.value);
+                                        }
+                                    }
+                                }
+                            }
+                            let backing = vmm
+                                .memory_domain
+                                .file_backing_identities()
+                                .next()
+                                .ok_or("prepared backing absent")?
+                                .map_err(|error| error.to_string())?;
+                            let generation = vmm
+                                .baseline_token()
+                                .ok_or("prepared baseline absent")?
+                                .memory_generation();
+                            let output = format!(
+                                "{{\"schema\":1,\"native_run_entries\":{runs:?},\"wall_clock_gpas\":{wall_clock_gpas:?},\"baseline_generation\":{generation},\"backing\":{{\"device\":{},\"inode\":{}}}}}\n",
+                                backing.device, backing.inode
+                            );
+                            write_new(Path::new(operand), output.as_bytes())?;
+                        }
+                        #[cfg(feature = "native-device-probe")]
+                        "prepared-memory-dirty" => {
+                            let vmm = driver.vmm.try_lock().map_err(|_| "driver VMM lock")?;
+                            let envelope = vmm
+                                .execution
+                                .captured_envelope()
+                                .ok_or("prepared envelope absent")?;
+                            let (metadata, bitmap) = diagnostic_dirty_memory(&vmm, None, envelope)?;
+                            let directory = Path::new(operand);
+                            fs::DirBuilder::new()
+                                .mode(0o700)
+                                .create(directory)
+                                .map_err(|error| error.to_string())?;
+                            write_new(&directory.join("memory-dirty.json"), &metadata)?;
+                            write_new(&directory.join("memory-dirty.bitmap"), &bitmap)?;
+                        }
+                        "capture"
+                        | "capture-cumulative"
+                        | "memory-capture"
+                        | "memory-capture-fail"
+                        | "prepared-memory-capture" => {
+                            let (operand, mode) =
+                                if matches!(command, "capture" | "capture-cumulative") {
+                                    (operand, "full")
+                                } else {
+                                    operand
+                                        .rsplit_once(' ')
+                                        .ok_or("expected PATH full|incremental")?
+                                };
+                            if !matches!(mode, "full" | "incremental") {
+                                return Err("invalid RAM capture mode".into());
+                            }
                             let (generation, profile) = {
                                 let vmm = driver.vmm.try_lock().map_err(|_| "driver lock")?;
                                 let generation = vmm
@@ -1474,19 +2076,21 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
                                     .key
                                     .generation
                                     .0;
-                                (
-                                    generation,
-                                    vmm.execution.profile.clone().ok_or("profile absent")?,
-                                )
+                                (generation, vmm.execution.profile.clone())
                             };
                             driver.capture(
                                 Path::new(operand),
                                 binding(Path::new(argument(&options, "binding")?), generation)?,
-                                &profile,
+                                profile.as_ref(),
                                 [
                                     Path::new(argument(&options, "disk0")?),
                                     Path::new(argument(&options, "disk1")?),
                                 ],
+                                MemoryCaptureOptions {
+                                    full: mode == "full",
+                                    prepared: command == "prepared-memory-capture",
+                                    fail_output: command == "memory-capture-fail",
+                                },
                             )?;
                         }
                         "status" => {
@@ -1682,6 +2286,102 @@ fn observed_profile(directory: &Path) -> Result<KvmCaptureProfile, String> {
 mod tests {
     use crate::api::vmm_builder::native_device_probe::observed_broadcast_uses_pit;
 
+    #[cfg(feature = "native-device-probe")]
+    #[test]
+    fn mapping_evidence_binds_actual_region_addresses_and_retained_file_identity() {
+        use crate::api::vmm_builder::native_device_probe::diagnostic_memory_mappings;
+        use arch::guest_memory::{BackingKind, MemoryDomain};
+        use std::fs::{File, OpenOptions, remove_file};
+        use std::os::unix::fs::MetadataExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use vm_memory::mmap::MmapRegion;
+        use vm_memory::{
+            FileOffset, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion,
+            GuestRegionMmap, MemoryRegionAddress,
+        };
+
+        let path = std::env::temp_dir().join(format!(
+            "silo-mapping-evidence-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        output.set_len(8192).unwrap();
+        drop(output);
+        let input = File::open(&path).unwrap();
+        let metadata = input.metadata().unwrap();
+        let mut regions = Vec::new();
+        for (gpa, offset) in [(0x1000, 0), (0x4000, 4096)] {
+            let mapping = MmapRegion::<()>::build(
+                Some(FileOffset::new(input.try_clone().unwrap(), offset)),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+            )
+            .unwrap();
+            regions.push(GuestRegionMmap::new(mapping, GuestAddress(gpa)).unwrap());
+        }
+        let memory = GuestMemoryMmap::from_regions(regions).unwrap();
+        let hosts = memory
+            .iter()
+            .map(|region| region.get_host_address(MemoryRegionAddress(0)).unwrap() as usize as u64)
+            .collect::<Vec<_>>();
+        let (domain, _, _) =
+            MemoryDomain::construct(memory, 4096, BackingKind::RestoredPrivate).unwrap();
+        remove_file(path).unwrap();
+        let expected = format!(
+            "{{\"schema\":1,\"native_pid\":{},\"packed_len\":8192,\"regions\":[{{\"gpa\":4096,\"length\":4096,\"stream_offset\":0,\"host_start\":{},\"device\":{},\"inode\":{}}},{{\"gpa\":16384,\"length\":4096,\"stream_offset\":4096,\"host_start\":{},\"device\":{},\"inode\":{}}}]}}\n",
+            std::process::id(),
+            hosts[0],
+            metadata.dev(),
+            metadata.ino(),
+            hosts[1],
+            metadata.dev(),
+            metadata.ino(),
+        );
+        assert_eq!(diagnostic_memory_mappings(&domain).unwrap(), expected);
+
+        let anonymous = GuestMemoryMmap::from_ranges(&[(GuestAddress(0x1000), 4096)]).unwrap();
+        let (domain, _, _) =
+            MemoryDomain::construct(anonymous, 4096, BackingKind::RestoredPrivate).unwrap();
+        assert!(diagnostic_memory_mappings(&domain).is_err());
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    #[test]
+    fn dirty_failure_evidence_projects_typed_native_facts() {
+        use crate::api::vmm_builder::native_device_probe::dirty_failure_json;
+        use arch::guest_memory::{DirtyEffect, DirtyFailure, DirtyLocation, DirtyOperation};
+        assert_eq!(dirty_failure_json(None), "null");
+        let failure = DirtyFailure {
+            operation: DirtyOperation::Collect,
+            location: DirtyLocation::Slot(7),
+            native_code: 14,
+            effect: DirtyEffect::CoverageLost,
+        };
+        assert_eq!(
+            dirty_failure_json(Some(failure)),
+            "{\"operation\":\"collect\",\"slot\":7,\"native_code\":14,\"effect\":\"coverage-lost\"}",
+        );
+        let recovery = DirtyFailure {
+            operation: DirtyOperation::Reestablish,
+            location: DirtyLocation::Vm,
+            native_code: -5,
+            effect: DirtyEffect::ProtectionUnknown,
+        };
+        assert_eq!(
+            dirty_failure_json(Some(recovery)),
+            "{\"operation\":\"reestablish\",\"slot\":null,\"native_code\":-5,\"effect\":\"protection-unknown\"}",
+        );
+    }
+
     #[test]
     fn device_profile_broadcast_requires_actual_complete_read() {
         let header = "path=/sys/devices/system/clockevents/broadcast/current_device\nread_complete=1\nbytes_read=";
@@ -1750,11 +2450,23 @@ mod tests {
         file.write_all(&bytes).unwrap();
         file.write_all(&bytes).unwrap();
         drop(file);
-        let unchanged = ram_difference(&memory, &regions, &path);
+        let unchanged = ram_difference(
+            arch::guest_memory::ReadGuestMemory::new(&memory),
+            &regions,
+            &path,
+        );
         memory.write_slice(&[0x5a], GuestAddress(0x4fff)).unwrap();
-        let difference = ram_difference(&memory, &regions, &path);
+        let difference = ram_difference(
+            arch::guest_memory::ReadGuestMemory::new(&memory),
+            &regions,
+            &path,
+        );
         memory.write_slice(&[0x5a], GuestAddress(0x1003)).unwrap();
-        let bounded = ram_difference(&memory, &regions, &path);
+        let bounded = ram_difference(
+            arch::guest_memory::ReadGuestMemory::new(&memory),
+            &regions,
+            &path,
+        );
         remove_file(path).unwrap();
         assert_eq!(unchanged, Ok(None));
         assert_eq!(difference, Ok(Some("{\"region_index\":1,\"region_offset\":4095,\"gpa\":20479,\"file_offset\":8191,\"expected\":[165],\"actual\":[90]}".into())));

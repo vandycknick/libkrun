@@ -148,7 +148,6 @@ pub enum ReclaimQualification {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReclaimInhibition {
     TrackedCapture,
-    RestoredInput,
     RestoredPrivateMapping,
 }
 
@@ -770,7 +769,6 @@ mod tests {
         let granule = crate::discard::native_page_size().unwrap() as u64;
         for reason in [
             ReclaimInhibition::TrackedCapture,
-            ReclaimInhibition::RestoredInput,
             ReclaimInhibition::RestoredPrivateMapping,
         ] {
             let state = ReclaimState::new();

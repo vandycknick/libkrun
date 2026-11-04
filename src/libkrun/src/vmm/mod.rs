@@ -16,6 +16,7 @@ pub mod control;
 pub(crate) mod device_manager;
 #[allow(dead_code)]
 pub mod execution;
+#[allow(dead_code)]
 pub mod memory;
 /// Resource store for configured microVM resources.
 pub mod resources;

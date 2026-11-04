@@ -50,6 +50,13 @@ struct Mapping {
     permissions: RamPermissions,
 }
 
+impl Mapping {
+    fn recovery_permissions(&self) -> Option<u8> {
+        let permissions = self.permissions.bits();
+        (permissions & RamPermissions::WRITE != 0).then_some(permissions & !RamPermissions::WRITE)
+    }
+}
+
 struct EpochPages {
     dirty: DirtyPageMap,
     writable: DirtyPageMap,
@@ -61,6 +68,7 @@ struct ProtectionInner {
     lifecycle: Lifecycle,
     pages: Option<EpochPages>,
     epoch: Option<CpuTrackingEpoch>,
+    last_issued_epoch: u64,
 }
 
 pub struct HvfRamProtection {
@@ -111,6 +119,7 @@ impl HvfRamProtection {
                 lifecycle: Lifecycle::Unarmed,
                 pages: None,
                 epoch: None,
+                last_issued_epoch: 0,
             }),
         }
     }
@@ -287,6 +296,7 @@ impl HvfRamProtection {
             }
         }
         inner.lifecycle = Lifecycle::Armed(1);
+        inner.last_issued_epoch = 1;
         inner.epoch = Some(epoch.clone());
         Ok(epoch)
     }
@@ -563,12 +573,112 @@ impl HvfRamProtection {
         pages.dirty.clear();
         pages.writable.clear();
         inner.lifecycle = Lifecycle::Armed(next);
+        inner.last_issued_epoch = next;
+        inner.epoch = Some(epoch.clone());
+        Ok(epoch)
+    }
+
+    pub fn reestablish_cpu_dirty(
+        &self,
+        cut: &MemoryCut,
+        retained: &mut DirtyPageMap,
+    ) -> Result<CpuTrackingEpoch, DirtyFailure> {
+        let mut inner = self.lock(DirtyOperation::Reestablish)?;
+        let epoch = inner.prepare_reestablishment(cut, retained)?;
+        let pages = inner
+            .pages
+            .as_ref()
+            .ok_or_else(|| refused(DirtyOperation::Reestablish))?;
+        retained
+            .merge(&pages.dirty)
+            .map_err(|_| refused(DirtyOperation::Reestablish))?;
+        for index in 0..inner.mappings.len() {
+            let mapping = inner.mappings[index];
+            if let Some(permissions) = mapping.recovery_permissions() {
+                let result = protect(mapping.guest, mapping.len, permissions);
+                inner.record_reestablishment_result(mapping, result)?;
+            }
+        }
+        let pages = inner
+            .pages
+            .as_mut()
+            .ok_or_else(|| refused(DirtyOperation::Reestablish))?;
+        pages.dirty.clear();
+        pages.writable.clear();
+        inner.last_issued_epoch = epoch.epoch();
+        inner.lifecycle = Lifecycle::Armed(epoch.epoch());
         inner.epoch = Some(epoch.clone());
         Ok(epoch)
     }
 }
 
 impl ProtectionInner {
+    fn next_reestablishment_epoch(&self) -> Result<u64, DirtyFailure> {
+        if self.lifecycle != Lifecycle::Failed || self.last_issued_epoch == 0 {
+            return Err(refused(DirtyOperation::Reestablish));
+        }
+        self.last_issued_epoch
+            .checked_add(1)
+            .ok_or_else(|| refused(DirtyOperation::Reestablish))
+    }
+
+    fn prepare_reestablishment(
+        &self,
+        cut: &MemoryCut,
+        retained: &DirtyPageMap,
+    ) -> Result<CpuTrackingEpoch, DirtyFailure> {
+        let refusal = || refused(DirtyOperation::Reestablish);
+        let next = self.next_reestablishment_epoch()?;
+        let domain = self.domain.as_ref().ok_or_else(refusal)?;
+        cut.validate_domain(domain).map_err(|_| refusal())?;
+        let pages = self.pages.as_ref().ok_or_else(refusal)?;
+        let count = domain.layout().page_count();
+        if domain.tracking_mode() != Some(TrackingMode::Capture)
+            || retained.page_count() != count
+            || pages.dirty.page_count() != count
+            || pages.writable.page_count() != count
+            || self.mappings.len() != domain.layout().regions().len()
+        {
+            return Err(refusal());
+        }
+        for (mapping, region) in self.mappings.iter().zip(domain.layout().regions()) {
+            if mapping.region != Some(region.id())
+                || mapping.guest != region.guest_range().start()
+                || mapping.len != region.guest_range().byte_len()
+                || mapping.permissions != region.permissions()
+                || mapping.host.checked_add(mapping.len).is_none()
+                || usize::try_from(mapping.len).is_err()
+                || !domain.matches_region_mapping(region.id(), mapping.host)
+            {
+                return Err(failure(
+                    DirtyOperation::Reestablish,
+                    DirtyLocation::Region(region.id()),
+                    DirtyEffect::PreEffectRefusal,
+                    0,
+                ));
+            }
+        }
+        cut.issue_epoch(next).map_err(|_| refusal())
+    }
+
+    fn record_reestablishment_result(
+        &mut self,
+        mapping: Mapping,
+        result: Result<(), i64>,
+    ) -> Result<(), DirtyFailure> {
+        result.map_err(|code| {
+            self.fail();
+            failure(
+                DirtyOperation::Reestablish,
+                mapping
+                    .region
+                    .map_or(DirtyLocation::Vm, DirtyLocation::Region),
+                DirtyEffect::ProtectionUnknown,
+                code,
+            )
+        })
+    }
+
     fn fail(&mut self) {
         self.lifecycle = Lifecycle::Failed;
         if let Some(domain) = &self.domain {
@@ -755,5 +865,88 @@ mod tests {
                 .map(|failure| failure.effect),
             Some(DirtyEffect::ProtectionUnknown)
         ));
+    }
+
+    #[test]
+    fn recovery_counter_survives_failure_and_refuses_unissued_or_exhausted_epochs() {
+        use crate::dirty::HvfRamProtection;
+        use arch::guest_memory::DirtyOperation;
+
+        let protection = HvfRamProtection::new();
+        let mut inner = protection.lock(DirtyOperation::Reestablish).unwrap();
+        inner.lifecycle = Lifecycle::Armed(7);
+        inner.last_issued_epoch = 7;
+        assert!(inner.next_reestablishment_epoch().is_err());
+        inner.fail();
+        assert_eq!(inner.last_issued_epoch, 7);
+        assert_eq!(inner.next_reestablishment_epoch().unwrap(), 8);
+        assert_eq!(inner.next_reestablishment_epoch().unwrap(), 8);
+        assert_eq!(inner.lifecycle, Lifecycle::Failed);
+        assert!(inner.epoch.is_none());
+        for last in [0, u64::MAX] {
+            inner.last_issued_epoch = last;
+            assert!(inner.next_reestablishment_epoch().is_err());
+            assert_eq!(inner.last_issued_epoch, last);
+        }
+    }
+
+    #[test]
+    fn recovery_protection_result_never_publishes_an_epoch_or_unfences_a_prefix() {
+        use crate::dirty::{HvfRamProtection, Mapping};
+        use arch::guest_memory::{DirtyEffect, DirtyLocation, DirtyOperation, RamPermissions};
+
+        let protection = HvfRamProtection::new();
+        let mut inner = protection.lock(DirtyOperation::Reestablish).unwrap();
+        inner.lifecycle = Lifecycle::Failed;
+        inner.last_issued_epoch = 11;
+        let mapping = Mapping {
+            region: None,
+            host: 0x10_0000,
+            guest: 0x20_0000,
+            len: 4096,
+            permissions: RamPermissions::READ_WRITE_EXECUTE,
+        };
+        inner
+            .record_reestablishment_result(mapping, Ok(()))
+            .unwrap();
+        assert_eq!(inner.lifecycle, Lifecycle::Failed);
+        assert_eq!(inner.last_issued_epoch, 11);
+        assert!(inner.epoch.is_none());
+        let error = inner
+            .record_reestablishment_result(mapping, Err(0x1234))
+            .unwrap_err();
+        assert_eq!(error.operation, DirtyOperation::Reestablish);
+        assert_eq!(error.effect, DirtyEffect::ProtectionUnknown);
+        assert_eq!(error.location, DirtyLocation::Vm);
+        assert_eq!(error.native_code, 0x1234);
+        assert_eq!(inner.lifecycle, Lifecycle::Failed);
+        assert_eq!(inner.last_issued_epoch, 11);
+        assert!(inner.allow_mapping_mutation().is_err());
+        assert!(inner.epoch.is_none());
+    }
+
+    #[test]
+    fn recovery_permissions_preserve_original_read_and_execute_for_every_mapping() {
+        use crate::dirty::Mapping;
+        use arch::guest_memory::RamPermissions;
+
+        let mappings = [0, 0x10_0000, 0x20_0000].map(|guest| Mapping {
+            region: None,
+            host: guest + 0x100_0000,
+            guest,
+            len: 4096,
+            permissions: RamPermissions::READ_WRITE_EXECUTE,
+        });
+        let permissions = mappings
+            .iter()
+            .map(|mapping| mapping.recovery_permissions().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            permissions,
+            [RamPermissions::READ | RamPermissions::EXECUTE; 3]
+        );
+        assert!(mappings.iter().all(|mapping| {
+            mapping.permissions.bits() == RamPermissions::READ_WRITE_EXECUTE.bits()
+        }));
     }
 }

@@ -6,6 +6,11 @@ use arch::ArchMemoryInfo;
 use devices::legacy::{IrqChip, IrqChipDevice};
 use kernel::cmdline::Cmdline;
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
+#[cfg(all(
+    feature = "native-execution-probe",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
 use vm_memory::GuestMemoryMmap;
 
 use crate::api::capabilities::execution_state_producer;
@@ -24,6 +29,7 @@ use crate::vmm::execution::runtime::{ExecutionOwner, RetainedCut};
 use crate::vmm::execution::{
     CpuExecutionInput, ExecutionLane, ValidatedExecution, VmExecutionState,
 };
+use crate::vmm::memory::image::RestoredRam;
 use crate::vmm::vstate::{Vcpu, Vm};
 
 pub(crate) struct RestoreFailure {
@@ -87,8 +93,7 @@ fn assemble(
 }
 
 pub(crate) fn build_restore_prepared(
-    memory: GuestMemoryMmap,
-    info: ArchMemoryInfo,
+    ram: RestoredRam,
     execution: ValidatedExecution,
     mut devices: PreparedDeviceInstall,
     events: &mut polly::event_manager::EventManager,
@@ -102,7 +107,7 @@ pub(crate) fn build_restore_prepared(
         return Err(refusal("execution/device cut binding mismatch"));
     }
     saved.validate().map_err(refusal)?;
-    saved.validate_memory(&memory).map_err(refusal)?;
+    ram.domain().layout().validate_capture().map_err(refusal)?;
     if saved.attachments.len() != devices.devices.len()
         || saved
             .attachments
@@ -140,14 +145,10 @@ pub(crate) fn build_restore_prepared(
     }
     validate_legacy_bindings(saved, &devices).map_err(refusal)?;
     devices
-        .validate_memory(&arch::guest_memory::ReadGuestMemory::new(&memory))
+        .validate_memory(&ram.domain().read_only())
         .map_err(refusal)?;
-    let (memory_domain, authority, memory_control) = arch::guest_memory::MemoryDomain::construct(
-        memory.clone(),
-        saved.page_granule,
-        arch::guest_memory::BackingKind::RestoredInput,
-    )
-    .map_err(refusal)?;
+    let (memory_domain, authority, memory_control, baseline, info) =
+        ram.into_parts(&execution).map_err(refusal)?;
     let mut memory_coordinator =
         crate::vmm::memory::MemoryCoordinator::new(memory_control, authority);
     let exit = EventFd::new(EFD_NONBLOCK).map_err(refusal)?;
@@ -164,7 +165,13 @@ pub(crate) fn build_restore_prepared(
     let mut vm = vm;
     #[cfg(target_os = "macos")]
     let (mut vm, epoch) = {
-        let mut vm = setup_vm(&memory, &info, false, false, true).map_err(refusal)?;
+        let memory = memory_coordinator
+            .construction
+            .as_ref()
+            .ok_or_else(|| refusal("construction authority missing"))?
+            .memory()
+            .map_err(refusal)?;
+        let mut vm = setup_vm(memory, &info, false, false, true).map_err(refusal)?;
         vm.bind_memory_domain(memory_domain.clone())
             .map_err(refusal)?;
         let epoch = vm
@@ -178,6 +185,9 @@ pub(crate) fn build_restore_prepared(
         (vm, epoch)
     };
     memory_coordinator.finish_tracked(epoch).map_err(refusal)?;
+    memory_coordinator
+        .seed_restored(baseline)
+        .map_err(refusal)?;
     #[cfg(target_os = "macos")]
     vm.configure_reclaim(&info, false).map_err(refusal)?;
     let mut base = arch::MMIO_MEM_START;
@@ -329,7 +339,7 @@ pub(crate) fn build_restore_prepared(
         for binding in &attempt.balloon_bindings {
             binding
                 .finalize(
-                    devices::virtio::balloon::BalloonMemoryPolicy::RestoredInput,
+                    devices::virtio::balloon::BalloonMemoryPolicy::RestoredPrivate,
                     #[cfg(target_os = "macos")]
                     attempt.vm.reclaim_state(),
                     #[cfg(target_os = "macos")]
@@ -449,7 +459,12 @@ pub(crate) fn build_restore_prepared(
             cpus: saved.cpus.clone(),
             legacy: saved.legacy.clone(),
         });
-        while !attempt.finish_memory_cut(request.key)? {
+        attempt.execution.binding = Some(saved.binding.clone());
+        attempt.execution.envelope = Some(Arc::new(saved.clone()));
+        while !attempt
+            .finish_memory_cut(request.key)
+            .map_err(|error| error.to_string())?
+        {
             if Instant::now() >= deadline {
                 return Err("restore native writer drain deadline".into());
             }

@@ -1486,3 +1486,106 @@ Pause admission performs read-only device preflight before checking the
 construction-time memory tracking mode. An unsupported attached provider
 therefore retains its named refusal instead of being masked by the resulting
 untracked-memory policy; neither check starts pause effects.
+
+### Sparse RAM images and accepted generations
+
+`--memory-incremental` exercises the production RAM writer and accepted-baseline
+ledger in an ordinary-kernel KVM guest. It is an explicitly invoked diagnostic,
+not a Cargo test or a public live-operation qualification record:
+
+```sh
+make BLK=1 NET=1 native-device-witness-probe native-execution-probe
+cc -O2 -pthread -static -o target/native-device-inputs/native-device-linux \
+  src/libkrun/examples/native_device_linux.c
+python3 src/libkrun/examples/native_device_controller.py \
+  --memory-incremental \
+  --probe target/debug/examples/native-device-probe \
+  --netd "$NETD_BIN" \
+  --guest-init target/native-device-inputs/native-device-linux \
+  --register-fixture target/native-device-inputs/native-execution-linux \
+  --kernel "$KERNEL_PATH" --evidence "$EVIDENCE_DIR"
+```
+
+Use the real register fixture and emitted kernel configuration described above.
+The evidence parent must exist; the selected evidence directory must be new.
+This mode requires 24 GiB of available storage for its bounded retained outputs.
+It does not rebuild inputs or remove failed samples.
+
+Each successful output is one complete sparse RAM file plus a bounded canonical
+layout, not a delta chain. The caller authenticates the layout and resolved
+8 MiB-chunk stream identity before native acceptance. Caller file reads are
+recorded separately from the writer's live-RAM reads. File descriptors, exact
+completion receipts, layout geometry and execution binding are validated;
+a pathname or matching length is not acceptance authority.
+The consuming restore boundary checks the exact execution state binding again:
+RAM mapped for one capture cannot be paired with another execution envelope
+merely because their memory geometry matches.
+
+The probe compares full and incremental outputs at the same stopped cut,
+including nonzero changes and explicit zero updates. An outstanding attempt
+blocks resume until exact acceptance or explicit abandonment. Abandonment and
+output failure preserve pending dirty coverage. A real invalid dirty-log
+destination exercises `KVM_GET_DIRTY_LOG` failure, retained failed state,
+all-slot re-establishment, required full capture and later incremental capture.
+Receipt acceptance alone cannot repair failed tracking.
+
+Fresh child workers restore the authenticated file through private mappings,
+arm child-local tracking before execution/device installation, and recapture
+installation changes without an initial RAM scan. The CPU-only controller also
+uses the authenticated RAM-image path for its partial-install check and three
+fresh restore generations.
+
+`memory-incremental-report.json` retains comparisons, actual native I/O
+accounting, failure/recovery records, child results and process-reaping evidence.
+A successful report proves only its exercised accepted-generation behavior.
+Physical-sharing measurements, pressure/lifetime checks and restored-reclaim
+qualification are separate gates. Destructive reclaim remains disabled for
+capture-tracked sources and restored private mappings.
+
+### Private RAM sharing and mapping lifetime
+
+Run `--memory-sharing` as sequential cohorts of 1, 2 and 4 children. Each
+cohort creates a fresh source and baseline. The N=1 report is the resident
+control for N=2 and N=4; retain it after removing disposable payloads.
+Use a new evidence directory and dedicated user service for each invocation:
+
+```sh
+systemd-run --user --quiet --wait --pipe --collect \
+  --unit=silo-phase10-sharing-n1-check \
+  -p MemoryAccounting=yes -p MemoryMax=6G -p MemoryHigh=5G \
+  -p RuntimeMaxSec=600 -p TimeoutStopSec=30 \
+  -p WorkingDirectory="$PWD" \
+  /usr/bin/env LD_LIBRARY_PATH="$LD_LIBRARY_PATH" python3 \
+  src/libkrun/examples/native_device_controller.py \
+  --memory-sharing 1 --sharing-unit silo-phase10-sharing-n1-check.service \
+  --probe target/debug/examples/native-device-probe \
+  --netd "$NETD_BIN" \
+  --guest-init target/native-device-inputs/native-device-linux \
+  --register-fixture target/native-execution-inputs/native-execution-linux \
+  --kernel "$KERNEL_PATH" --evidence "$EVIDENCE_DIR"
+```
+
+Invoke from the native checkout. Use absolute paths for environment-provided
+inputs and evidence. For later cohorts, change the count, unit and evidence
+directory and add `--sharing-control` naming the successful N=1
+`memory-sharing-report.json`. Inputs must match that control.
+
+The guest verifies a distinctive, mlocked 64 MiB set, then each child writes
+its own quarter. Measurements select actual registered native HVA ranges and
+retained per-region file identities, not pathnames or inode numbers alone.
+This also handles filesystems whose stat and smaps device numbers differ.
+Reports retain raw smaps, private/anonymous/file-PSS accounting, declared
+tolerances, source exit, unlink, child contents and recapture comparisons.
+
+Pressure is confined to the named service after checking its actual cgroup
+membership. A bounded 512 MiB helper and temporary high watermark must produce
+measured high, scan, steal and PSI deltas without max/OOM events; the original
+watermark is restored. Balloon readiness observes actual used-ring publication
+before pause, including wrapped advancement from each child's baseline.
+Reporting completion does not establish destructive reclaim qualification.
+
+Keep failed samples for diagnosis. After a successful report and complete
+owner reaping, preserve text, identities and exact shared inputs before
+removing generated RAM/disk payloads. The deliberately unlinked baseline and
+removed payloads are not replayable. This diagnostic grants no public
+live-operation capability and does not qualify restored-private discard.

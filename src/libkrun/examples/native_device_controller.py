@@ -17,12 +17,15 @@ import re
 import select
 import shutil
 import signal
+import stat
 import socket
 import struct
 import subprocess
 import tempfile
 import time
 import tty
+
+from native_ram_image import authenticate_image, layout_digest, validate_layout, write_authentication
 
 WAIT = 30
 COUNTERS = ("disk0", "disk1", "rng", "report", "console_tx", "console_rx", "net_tx", "net_rx", "vsock")
@@ -122,8 +125,14 @@ class Session:
         self.last_release = None
         self.releases = []
         self.profile_sequence = 0
+        self.layout_sequence = 0
+        self.prepared_layout = None
+        self.inherited_binding = None
         self.binding = directory / "binding"
         shutil.copytree(restore / "binding" if restore else args.binding, self.binding)
+        if restore:
+            self.inherited_binding = {name: (self.binding / name).read_bytes() for name in
+                                      ("silo-producer", "profile", "topology", "ram-layout", "source-run", "capture")}
         for name in ("silo-producer", "profile", "topology", "ram-layout", "source-run", "capture"):
             (self.binding / name).chmod(0o600)
         self.log = (directory / "driver.log").open("wb")
@@ -164,6 +173,19 @@ class Session:
         self.process = None
         self.netd = None
         self.fds = []
+        ram_fds = ()
+        if restore:
+            ram_fd = os.open(restore / "memory.ram", os.O_RDONLY | os.O_NONBLOCK)
+            self.fds.append(ram_fd)
+            layout_fd = os.open(restore / "memory-layout.json", os.O_RDONLY | os.O_NONBLOCK)
+            self.fds.append(layout_fd)
+            authentication = authenticate_image(
+                restore / "memory.ram", restore / "memory-layout.json",
+                (self.binding / "ram-layout").read_bytes(), ram_fd=ram_fd, layout_fd=layout_fd)
+            if (restore / "memory-authentication.bin").read_bytes() != bytes.fromhex(authentication["layout_digest"] + authentication["stream_digest"]):
+                raise RuntimeError("restore RAM stream authentication mismatch")
+            save(directory / "restore-ram-authentication.json", authentication)
+            ram_fds = (ram_fd, layout_fd)
         self.sockets = []
         master, slave = pty.openpty()
         tty.setraw(master)
@@ -212,7 +234,7 @@ class Session:
                    "--console-fd", str(slave), "--console-input-fd", str(input_guest.fileno()),
                    "--console-output-fd", str(output_guest.fileno()), "--net-fd", str(self.net.fileno()), "--mux-fd", str(mux_guest.fileno())]
         if restore:
-            command += ["--restore", str(restore)]
+            command += ["--restore", str(restore), "--ram-image-fd", str(ram_fds[0]), "--ram-layout-fd", str(ram_fds[1])]
         if args.execution_completeness:
             command += ["--witness", "1"]
         if partial:
@@ -220,7 +242,7 @@ class Session:
         if generic:
             command += ["--net-profile", "generic"]
         save(directory / "command.json", command)
-        inherited = (slave, input_guest.fileno(), output_guest.fileno(), self.net.fileno(), mux_guest.fileno())
+        inherited = (slave, input_guest.fileno(), output_guest.fileno(), self.net.fileno(), mux_guest.fileno(), *ram_fds)
         error = (directory / "driver.stderr").open("wb")
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=error, pass_fds=inherited)
         error.close()
@@ -229,6 +251,9 @@ class Session:
              "command_sha256": digest(directory / "command.json")})
         # Drop every parent duplicate of a transferred destination resource.
         input_guest.close(); output_guest.close(); mux_guest.close(); self.net.close(); os.close(slave); self.fds.remove(slave)
+        for fd in ram_fds:
+            os.close(fd)
+            self.fds.remove(fd)
         for endpoint_socket in (input_host, output_host, mux_host):
             endpoint_socket.setblocking(False)
         os.set_blocking(master, False)
@@ -463,6 +488,51 @@ class Session:
             self.pump()
 
     def command(self, command, error=False, timeout=WAIT):
+        name = command.split(" ", 1)[0]
+        captures = ("capture", "capture-cumulative", "memory-capture", "memory-capture-fail", "prepared-memory-capture")
+        if name not in captures:
+            return self._command(command, error=error, timeout=timeout)
+        self.layout_sequence += 1
+        preparation = self.directory / f"memory-layout-prepared-{self.layout_sequence}.json"
+        self._command(f"memory-layout {preparation}", timeout=timeout)
+        with os.fdopen(os.open(preparation, os.O_RDONLY | os.O_NONBLOCK), "rb") as source:
+            metadata = os.fstat(source.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= 64 * 1024:
+                raise RuntimeError("native RAM layout preparation file/byte bound")
+            prepared = source.read(64 * 1024 + 1)
+        validate_layout(prepared)
+        (self.binding / "ram-layout").write_bytes(layout_digest(prepared))
+        self.prepared_layout = prepared
+        operand = command.split(" ", 1)[1]
+        directory = Path(operand if name in ("capture", "capture-cumulative") else operand.rsplit(" ", 1)[0])
+        try:
+            result = self._command(command, error=error, timeout=timeout)
+            if result.startswith("ERROR"):
+                if name in ("capture", "capture-cumulative"):
+                    self._command("memory-abandon", timeout=timeout)
+                return result
+            shutil.copytree(self.binding, directory / "binding")
+            if name == "prepared-memory-capture":
+                if self.inherited_binding is None:
+                    raise RuntimeError("prepared capture without inherited execution binding")
+                for field, value in self.inherited_binding.items():
+                    (directory / "binding" / field).write_bytes(value)
+            if name in ("capture", "capture-cumulative"):
+                authentication = authenticate_image(directory / "memory.ram", directory / "memory-layout.json",
+                                                    layout_digest(prepared), prepared)
+                save(directory / "memory-authentication.json", authentication)
+                write_authentication(directory / "memory-authentication.bin", authentication)
+                if name == "capture":
+                    self._command(f"memory-accept {directory / 'memory-authentication.bin'}", timeout=timeout)
+                else:
+                    self._command("memory-abandon", timeout=timeout)
+            return result
+        except BaseException:
+            if name in ("capture", "capture-cumulative"):
+                self._command("memory-abandon", timeout=timeout)
+            raise
+
+    def _command(self, command, error=False, timeout=WAIT):
         start = len(self.replies)
         name = command.split(" ", 1)[0]
         if name in ("pause", "resume", "release", "activate", "capture", "stop"):
@@ -480,10 +550,8 @@ class Session:
                 "prepared_dwell_ns": started - self.ready_monotonic_ns if self.prepared and name == "release" else None}
             self.releases.append(self.last_release)
             save(self.directory / f"release-{len(self.releases)}.json", self.last_release)
-        if not error and name == "pause":
+        if not error and name in ("pause", "memory-recover-cut"):
             (self.binding / "capture").write_bytes(os.urandom(16))
-        if not error and name == "capture":
-            shutil.copytree(self.binding, Path(command.split(" ", 1)[1]) / "binding")
         if name in ("pause", "resume", "release", "activate", "capture", "stop"):
             self.record_network_state(f"after:{result}")
         return result
@@ -810,7 +878,7 @@ class Session:
 
 def seal_cut(directory):
     manifest = {}
-    names = ["execution.state", "devices.state", "memory.ram", "disk0.raw", "disk1.raw"]
+    names = ["execution.state", "devices.state", "memory.ram", "memory-layout.json", "memory-authentication.bin", "disk0.raw", "disk1.raw"]
     names.extend(f"binding/{name}" for name in ("silo-producer", "profile", "topology", "ram-layout", "source-run", "capture"))
     for name in names:
         path = directory / name
@@ -949,13 +1017,26 @@ def main():
     parser.add_argument("--busy-devices", action="store_true")
     parser.add_argument("--memory-dirty", action="store_true",
                         help="standalone commit-7 cumulative CPU/host dirty coverage proof")
+    parser.add_argument("--memory-incremental", action="store_true",
+                        help="accepted-generation native RAM image and private restore proof")
+    parser.add_argument("--memory-sharing", type=int, choices=(1, 2, 4),
+                        help="one fresh KVM sharing/lifetime cohort, N=1 before N=2/4")
+    parser.add_argument("--sharing-unit",
+                        help="this invocation's isolated silo-phase10-sharing-*.service user unit")
+    parser.add_argument("--sharing-control", type=Path,
+                        help="successful N=1 memory-sharing-report.json, required for N=2/4")
     parser.add_argument("--witness-dir", type=Path)
     parser.add_argument("--device-pressure", type=Path)
     args = parser.parse_args()
     if args.execution_completeness != args.busy_devices:
         parser.error("closed production extension requires both --execution-completeness and --busy-devices")
-    if args.memory_dirty and args.execution_completeness:
-        parser.error("--memory-dirty is a focused source proof, not the execution-completeness cohort")
+    memory_modes = int(args.memory_dirty) + int(args.memory_incremental) + int(args.memory_sharing is not None)
+    if memory_modes > 1 or (memory_modes and args.execution_completeness):
+        parser.error("memory proof modes are mutually exclusive with each other and execution-completeness")
+    if args.memory_sharing is not None and not args.sharing_unit:
+        parser.error("--memory-sharing requires --sharing-unit for this isolated user unit")
+    if args.memory_sharing is None and (args.sharing_unit is not None or args.sharing_control is not None):
+        parser.error("--sharing-unit/--sharing-control require --memory-sharing")
     if args.netd is None:
         parser.error("supply actual netd with NETD_BIN or --netd")
     args.guest_init = args.guest_init or args.register_fixture.parent / "native-device-linux"
@@ -1016,13 +1097,21 @@ def main():
          "kernel_config": {"source": str(args.kernel_config_source),
                            "retained": str(args.kernel_config) if args.kernel_config else None,
                            "config_modules": args.kernel_modules},
-         "ram_transfer": "bounded-standalone-only", "native_pause": False, "pending_lanes": ["kvm-arm64", "hvf-arm64"]})
+         "ram_images": "complete-sparse-private-restore", "native_pause": False, "pending_lanes": ["kvm-arm64", "hvf-arm64"]})
     echo = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     echo.bind(("127.0.0.1", 0)); echo.setblocking(False)
     report = {"schema": 1, "scope": "whole-machine-production", "native_pause": False, "pid": os.getpid(),
               "qualification_granted": False, "qualification_eligible": False}
     try:
-        if args.memory_dirty:
+        if args.memory_sharing is not None:
+            from native_memory_sharing import run
+            report["scope"] = "commit8-native-kvm-sharing-lifetime"
+            report["memory"] = run(args, echo)
+        elif args.memory_incremental:
+            from native_memory_controller import run_incremental
+            report["scope"] = "commit8-accepted-generations-memory-images"
+            report["memory"] = run_incremental(args, echo)
+        elif args.memory_dirty:
             from native_memory_controller import run
             report["scope"] = "commit7-cumulative-memory-dirty-observations"
             report["memory"] = run(args, echo)

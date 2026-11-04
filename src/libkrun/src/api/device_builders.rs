@@ -1960,8 +1960,6 @@ mod tests {
 
         let base = devices::virtio::Balloon::new().unwrap().avail_features() & !(1 << 5);
         for (offer, policy) in [
-            (base, BalloonMemoryPolicy::RestoredInput),
-            (base | (1 << 5), BalloonMemoryPolicy::RestoredInput),
             (base, BalloonMemoryPolicy::RestoredPrivate),
             (base | (1 << 5), BalloonMemoryPolicy::RestoredPrivate),
         ] {

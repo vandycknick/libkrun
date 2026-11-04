@@ -74,6 +74,15 @@ pub struct VirtioBalloonConfig {
 // Safe because it only has data and has no implicit padding.
 unsafe impl ByteValued for VirtioBalloonConfig {}
 
+#[cfg(feature = "native-device-probe")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReportingQueueObservation {
+    pub reporting_negotiated: bool,
+    pub ready: bool,
+    pub next_used: Option<u16>,
+    pub used_ring: Option<u64>,
+}
+
 pub struct Balloon {
     pub(crate) queues: Option<Vec<DeviceQueue>>,
     pub(crate) avail_features: u64,
@@ -139,11 +148,7 @@ impl Balloon {
         if self.memory_policy.is_some()
             || self.is_activated()
             || self.acked_features != 0
-            || (self.restored_offer
-                && !matches!(
-                    policy,
-                    BalloonMemoryPolicy::RestoredInput | BalloonMemoryPolicy::RestoredPrivate
-                ))
+            || (self.restored_offer && !matches!(policy, BalloonMemoryPolicy::RestoredPrivate))
         {
             return Err(BalloonError::InvalidMemoryPolicy);
         }
@@ -171,6 +176,23 @@ impl Balloon {
     #[cfg(feature = "native-device-probe")]
     pub fn pressure_reclaim_enabled(&self) -> bool {
         self.host_reclaim_enabled
+    }
+
+    #[cfg(feature = "native-device-probe")]
+    pub fn pressure_reporting_queue(&self) -> ReportingQueueObservation {
+        let queue = self
+            .queues
+            .as_ref()
+            .and_then(|queues| queues.get(FRQ_INDEX))
+            .map(|queue| &queue.queue)
+            .filter(|queue| queue.ready);
+        ReportingQueueObservation {
+            reporting_negotiated: self.acked_features & (1 << uapi::VIRTIO_BALLOON_F_REPORTING)
+                != 0,
+            ready: queue.is_some(),
+            next_used: queue.map(|queue| queue.next_used.0),
+            used_ring: queue.map(|queue| queue.used_ring.0),
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1101,7 +1123,6 @@ mod tests {
         use crate::virtio::balloon::BalloonMemoryPolicy;
         for policy in [
             BalloonMemoryPolicy::TrackedCapture,
-            BalloonMemoryPolicy::RestoredInput,
             BalloonMemoryPolicy::RestoredPrivate,
         ] {
             let mut balloon = Balloon::new().unwrap();
@@ -1287,6 +1308,14 @@ mod tests {
         let epoch = authority.issue_epoch(1).unwrap();
         control.finish_tracked(authority, epoch).unwrap();
         let mut balloon = Balloon::new().unwrap();
+        #[cfg(feature = "native-device-probe")]
+        {
+            let observed = balloon.pressure_reporting_queue();
+            assert!(!observed.reporting_negotiated);
+            assert!(!observed.ready);
+            assert_eq!(observed.next_used, None);
+            assert_eq!(observed.used_ring, None);
+        }
         balloon
             .finalize_memory_policy(BalloonMemoryPolicy::TrackedCapture)
             .unwrap();
@@ -1308,8 +1337,23 @@ mod tests {
                     .collect(),
             )
             .unwrap();
+        #[cfg(feature = "native-device-probe")]
+        {
+            let observed = balloon.pressure_reporting_queue();
+            assert!(observed.reporting_negotiated);
+            assert!(observed.ready);
+            assert_eq!(observed.next_used, Some(0));
+            assert!(observed.used_ring.is_some());
+        }
         assert!(balloon.process_frq().unwrap());
         assert_eq!(rings[FRQ_INDEX].used.idx.get(), 1);
+        #[cfg(feature = "native-device-probe")]
+        {
+            let observed = balloon.pressure_reporting_queue();
+            assert!(observed.reporting_negotiated);
+            assert!(observed.ready);
+            assert_eq!(observed.next_used, Some(rings[FRQ_INDEX].used.idx.get()));
+        }
         let mut contents = vec![0; page_size];
         memory.read_slice(&mut contents, report_address).unwrap();
         assert_eq!(contents, vec![0x5a; page_size]);

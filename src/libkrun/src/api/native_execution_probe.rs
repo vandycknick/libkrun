@@ -1,10 +1,12 @@
 //! Standalone, qualification-ineligible CPU execution diagnostic.
-//! RAM transfer here is bounded fixture machinery, not the production RAM-image API.
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::net::Shutdown;
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,6 +31,12 @@ use crate::vmm::execution::runtime::KvmCaptureProfile;
 use crate::vmm::execution::{
     CpuExecutionState, CpuIdentity, ExecutionEnvelope, ExecutionLane, StateBinding,
     ValidatedExecution, VmExecutionState,
+};
+use crate::vmm::memory::RamCaptureRequest;
+use crate::vmm::memory::image::layout::MAX_RAM_LAYOUT_BYTES;
+use crate::vmm::memory::image::{
+    AuthenticatedRamImage, RamImageAuthentication, RamOutputFiles, RestoredRam, ValidatedRamLayout,
+    map_restore_ram,
 };
 
 const RAM_BYTES: usize = 0x300000;
@@ -190,9 +198,9 @@ fn key(generation: u64) -> BarrierKey {
     }
 }
 fn binding(path: &Path, generation: u64) -> Result<StateBinding, String> {
-    // Digests are supplied by the external controller over exact fixture/build/layout bytes.
-    // They correlate diagnostic inputs, never grant production admission or pause authority.
-    let bytes = bounded_read(path, 160)?;
+    decode_binding(&bounded_read(path, 160)?, generation)
+}
+fn decode_binding(bytes: &[u8], generation: u64) -> Result<StateBinding, String> {
     if bytes.len() != 160 {
         return Err("fixture binding must contain exactly 160 bytes".into());
     }
@@ -215,7 +223,7 @@ fn binding(path: &Path, generation: u64) -> Result<StateBinding, String> {
     let capture = identity[16..]
         .try_into()
         .map_err(|_| "capture identity width")?;
-    Ok(StateBinding {
+    let binding = StateBinding {
         native_producer: execution_state_producer()?,
         silo_producer,
         profile,
@@ -224,7 +232,168 @@ fn binding(path: &Path, generation: u64) -> Result<StateBinding, String> {
         source_run,
         pause_generation: generation,
         capture,
+    };
+    binding.validate().map_err(|error| error.to_string())?;
+    Ok(binding)
+}
+
+fn remaining(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "layout binding deadline expired".into())
+}
+
+fn socket_write(
+    stream: &mut UnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    while !bytes.is_empty() {
+        stream
+            .set_write_timeout(Some(remaining(deadline)?))
+            .map_err(|e| e.to_string())?;
+        match stream.write(bytes) {
+            Ok(0) => return Err("layout binding write made no progress".into()),
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == ErrorKind::Interrupted => (),
+            Err(error) => return Err(format!("layout binding write: {error}")),
+        }
+    }
+    Ok(())
+}
+
+fn socket_read(
+    stream: &mut UnixStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    while !bytes.is_empty() {
+        stream
+            .set_read_timeout(Some(remaining(deadline)?))
+            .map_err(|e| e.to_string())?;
+        match stream.read(bytes) {
+            Ok(0) => return Err("layout binding unexpected EOF".into()),
+            Ok(count) => bytes = &mut bytes[count..],
+            Err(error) if error.kind() == ErrorKind::Interrupted => (),
+            Err(error) => return Err(format!("layout binding read: {error}")),
+        }
+    }
+    Ok(())
+}
+
+fn exchange_binding(
+    stream: &mut UnixStream,
+    layout: &[u8],
+    deadline: Instant,
+) -> Result<StateBinding, String> {
+    if layout.is_empty() || layout.len() > MAX_RAM_LAYOUT_BYTES {
+        return Err("layout binding length outside bound".into());
+    }
+    let length = u32::try_from(layout.len()).map_err(|_| "layout binding length overflow")?;
+    socket_write(stream, &length.to_le_bytes(), deadline)?;
+    socket_write(stream, layout, deadline)?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|error| error.to_string())?;
+    let mut bytes = [0; 160];
+    socket_read(stream, &mut bytes, deadline)?;
+    let mut extra = [0];
+    loop {
+        stream
+            .set_read_timeout(Some(remaining(deadline)?))
+            .map_err(|error| error.to_string())?;
+        match stream.read(&mut extra) {
+            Ok(0) => break,
+            Ok(_) => return Err("layout binding contains trailing bytes".into()),
+            Err(error) if error.kind() == ErrorKind::Interrupted => (),
+            Err(error) => return Err(format!("layout binding framing: {error}")),
+        }
+    }
+    remaining(deadline)?;
+    decode_binding(&bytes, 1)
+}
+
+fn inherited_channel(argument: &OsString) -> Result<UnixStream, String> {
+    let fd = text(argument)?
+        .parse::<i32>()
+        .map_err(|_| "invalid layout binding FD")?;
+    if fd <= 2 {
+        return Err("layout binding FD must be an inherited socket".into());
+    }
+    // The standalone controller transfers this descriptor exactly once via pass_fds.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    stream
+        .peer_addr()
+        .map_err(|error| format!("layout binding socket: {error}"))?;
+    Ok(stream)
+}
+
+fn check_preparation(vmm: &Vmm, prepared: &ValidatedRamLayout) -> Result<(), String> {
+    let current = vmm.memory_layout().map_err(|error| error.to_string())?;
+    if current.canonical_bytes() != prepared.canonical_bytes() {
+        return Err("canonical layout changed after preparation".into());
+    }
+    Ok(())
+}
+
+fn fixture_info() -> Result<ArchMemoryInfo, String> {
+    Ok(ArchMemoryInfo {
+        ram_below_gap: RAM_BYTES as u64,
+        ram_above_gap: 0,
+        ram_last_addr: RAM_BYTES as u64,
+        firmware_addr: 0,
+        shm_start_addr: 0x1_0000_0000,
+        page_size: crate::vmm::execution::host_page_granule().map_err(|error| error.to_string())?
+            as usize,
+        initrd_addr: RAM_BYTES as u64,
     })
+}
+
+fn decode_ram_authentication(
+    bytes: &[u8],
+    state: &StateBinding,
+) -> Result<RamImageAuthentication, String> {
+    if bytes.len() != 64 || bytes[..32] != state.ram_layout {
+        return Err("RAM authentication layout identity mismatch".into());
+    }
+    let stream = bytes[32..]
+        .try_into()
+        .map_err(|_| "RAM stream identity width")?;
+    Ok(RamImageAuthentication {
+        state: state.clone(),
+        stream,
+    })
+}
+
+fn restored_ram(
+    input: &Path,
+    execution: &ValidatedExecution,
+    ram_fd: &OsString,
+    layout_fd: &OsString,
+) -> Result<RestoredRam, String> {
+    let bytes = bounded_read(&input.join("ram-authentication.bin"), 64)?;
+    let authentication = decode_ram_authentication(&bytes, &execution.envelope().binding)?;
+    let parse_fd = |argument: &OsString| -> Result<i32, String> {
+        let fd = text(argument)?
+            .parse::<i32>()
+            .map_err(|_| "invalid inherited RAM FD")?;
+        if fd <= 2 {
+            return Err("RAM FD must be a transferred readonly descriptor".into());
+        }
+        Ok(fd)
+    };
+    let ram_fd = parse_fd(ram_fd)?;
+    let layout_fd = parse_fd(layout_fd)?;
+    if ram_fd == layout_fd {
+        return Err("RAM and layout descriptors must differ".into());
+    }
+    // The controller transfers each authenticated descriptor exactly once.
+    let ram = unsafe { File::from_raw_fd(ram_fd) };
+    let layout = unsafe { File::from_raw_fd(layout_fd) };
+    let image = AuthenticatedRamImage::for_restore(ram, layout, authentication, execution)
+        .map_err(|error| error.to_string())?;
+    map_restore_ram(Arc::new(image), execution).map_err(|error| error.to_string())
 }
 fn topology(count: u8) -> Vec<CpuIdentity> {
     (0..count)
@@ -481,7 +650,9 @@ fn capture(
     vmm: &mut Vmm,
     expected: &StateBinding,
     request: u64,
+    prepared: &ValidatedRamLayout,
 ) -> Result<Arc<ExecutionEnvelope>, String> {
+    check_preparation(vmm, prepared)?;
     let barrier = BarrierRequest {
         key: key(expected.pause_generation),
         deadline: Instant::now() + WAIT,
@@ -504,7 +675,9 @@ fn capture_withheld(
     vmm: &mut Vmm,
     expected: &StateBinding,
     out: &Path,
+    prepared: &ValidatedRamLayout,
 ) -> Result<Arc<ExecutionEnvelope>, String> {
+    check_preparation(vmm, prepared)?;
     let cpu = vmm
         .vcpus_handles
         .len()
@@ -563,7 +736,7 @@ fn capture_withheld(
         return Err("late capture reconciliation replaced the retained actual payload".into());
     }
     // Reconciliation is not a backdated success for the expired caller.
-    let recaptured = capture(vmm, expected, 4)?;
+    let recaptured = capture(vmm, expected, 4, prepared)?;
     if captured != recaptured {
         return Err("fresh capture changed the reconciled logical cut".into());
     }
@@ -984,10 +1157,11 @@ fn save_capture(
     expected: &StateBinding,
     count: u8,
     case: Case,
+    prepared: &ValidatedRamLayout,
 ) -> Result<Arc<ExecutionEnvelope>, String> {
     prepare_case(&mut attempt.vmm, count, case, &attempt.gate)?;
     park(&mut attempt.vmm, expected.pause_generation, &attempt.gate)?;
-    let first = capture(&mut attempt.vmm, expected, 2)?;
+    let first = capture(&mut attempt.vmm, expected, 2, prepared)?;
     validate_cut(&first, &attempt.vmm.guest_memory, case, count)?;
     let bytes = first.encode().map_err(|e| e.to_string())?;
     let checks = malformed_cases(&bytes, expected, count)?;
@@ -997,20 +1171,42 @@ fn save_capture(
         return Err("exclusive output failure was not exercised".into());
     }
     thread::sleep(Duration::from_millis(20));
-    let second = capture(&mut attempt.vmm, expected, 3)?;
+    let second = capture(&mut attempt.vmm, expected, 3, prepared)?;
     if first != second || bytes != second.encode().map_err(|e| e.to_string())? {
         return Err("repeated capture aged or replaced the retained logical cut".into());
     }
-    private_write(
-        &out.join("memory.fixture"),
-        &ram_bytes(&attempt.vmm.guest_memory)?,
-    )?;
+    let output_file = |name: &str| -> Result<File, String> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(out.join(name))
+            .map_err(|error| error.to_string())
+    };
+    let output = RamOutputFiles::new(output_file("ram.bin")?, output_file("memory-layout.json")?);
+    let cut_key = key(expected.pause_generation);
+    let id = attempt
+        .vmm
+        .diagnostic_begin_memory_capture(cut_key, RamCaptureRequest::Full)
+        .map_err(|error| error.to_string())?;
+    let completed =
+        attempt
+            .vmm
+            .diagnostic_write_memory_capture(cut_key, &id, output, Instant::now() + WAIT);
+    // This diagnostic never continues against a newly accepted source baseline.
+    // Resolve even failed writes explicitly, preserving the coordinator's dirty union.
+    let abandoned = attempt.vmm.diagnostic_abandon_memory(cut_key, &id);
+    let candidate =
+        completed.map_err(|error| format!("RAM output: {error}; abandon={abandoned:?}"))?;
+    abandoned.map_err(|error| error.to_string())?;
+    drop(candidate);
     private_write(
         &out.join("native-inventory.txt"),
         format!("{first:#?}").as_bytes(),
     )?;
     let msr_counts = checked_msr_count_proof(&first)?;
-    private_write(&out.join("capture.json"), format!("{{\"schema\":1,\"scope\":\"cpu-execution-only\",\"qualification_eligible\":false,\"vcpus\":{count},\"case\":{},\"malformed_refusals\":{checks},\"repeated_capture_equal\":true,\"failed_output_recapture_equal\":true,\"native_inventory\":\"native-inventory.txt\",\"execution\":\"execution.state\",\"ram\":\"memory.fixture\",\"msr_checked_counts\":{msr_counts}}}", json_string(&format!("{case:?}"))).as_bytes())?;
+    private_write(&out.join("capture.json"), format!("{{\"schema\":1,\"scope\":\"cpu-execution-only\",\"qualification_eligible\":false,\"vcpus\":{count},\"case\":{},\"malformed_refusals\":{checks},\"repeated_capture_equal\":true,\"failed_output_recapture_equal\":true,\"native_inventory\":\"native-inventory.txt\",\"execution\":\"execution.state\",\"ram\":\"ram.bin\",\"layout\":\"memory-layout.json\",\"memory_attempt\":\"explicitly-abandoned\",\"msr_checked_counts\":{msr_counts}}}", json_string(&format!("{case:?}"))).as_bytes())?;
     Ok(first)
 }
 fn new_output(path: &Path) -> Result<(), String> {
@@ -1081,8 +1277,8 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
     let mode = args.first().ok_or("expected source or restore command")?;
     let mode = text(mode)?;
     if mode == "partial" {
-        if args.len() != 5 {
-            return Err("partial INPUT BINDING CPUS GENERATION".into());
+        if args.len() != 7 {
+            return Err("partial INPUT BINDING CPUS GENERATION RAM_FD LAYOUT_FD".into());
         }
         let input = PathBuf::from(&args[1]);
         let count = cpu_count(&args[3])?;
@@ -1090,21 +1286,13 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
         let expected = binding(Path::new(&args[2]), generation)?;
         let validated = load_state(&input, &expected, count)?;
         let index = usize::from(count - 1);
-        let memory = memory()?;
-        let ram = bounded_read(&input.join("memory.fixture"), RAM_BYTES)?;
-        if ram.len() != RAM_BYTES {
-            return Err("partial fixture RAM extent".into());
-        }
-        memory
-            .write_slice(&ram, GuestAddress(0))
-            .map_err(|e| e.to_string())?;
+        let ram = restored_ram(&input, &validated, &args[5], &args[6])?;
         let gate = Arc::new(CompletionGate::default());
         let (io, mmio) = buses(&gate)?;
         let mut devices = PreparedDeviceInstall::diagnostic(&expected, io, mmio)?;
         devices.hold_diagnostic_install_ack(count - 1)?;
         let mut failure = match build_restore_prepared(
-            memory,
-            ArchMemoryInfo::default(),
+            ram,
             validated,
             devices,
             &mut polly::event_manager::EventManager::new()
@@ -1135,8 +1323,7 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
             gate,
             stopped: false,
         };
-        let no_entry = !attempt.vmm.control.cpus.release_may_have_run()
-            && ram == ram_bytes(&attempt.vmm.guest_memory)?;
+        let no_entry = !attempt.vmm.control.cpus.release_may_have_run();
         let ack = attempt
             .vmm
             .vcpus_handles
@@ -1167,7 +1354,9 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
     }
     if mode == "source" || mode == "negative" {
         if args.len() != 7 {
-            return Err("source|negative OUT BINDING FIXTURE HANDLER:IO:MMIO CPUS CASE".into());
+            return Err(
+                "source|negative OUT LAYOUT_BINDING_FD FIXTURE HANDLER:IO:MMIO CPUS CASE".into(),
+            );
         }
         let negative = mode == "negative";
         let out = PathBuf::from(&args[1]);
@@ -1180,7 +1369,8 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
         if case == Case::Offline && count != 2 {
             return Err("offline witness needs two CPUs".into());
         }
-        let expected = binding(Path::new(&args[2]), 1)?;
+        let mut channel = inherited_channel(&args[2])?;
+        let deadline = Instant::now() + WAIT;
         let symbols = text(&args[4])?
             .split(':')
             .map(|value| {
@@ -1201,13 +1391,13 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
         let (io, mmio) = buses(&gate)?;
         let vmm = build_execution_fixture(
             memory,
-            ArchMemoryInfo::default(),
+            fixture_info()?,
             count,
             ENTRY,
             case == Case::Offline,
             io,
             mmio,
-            Instant::now() + WAIT,
+            deadline,
         )?;
         let mut attempt = Attempt {
             vmm,
@@ -1215,6 +1405,11 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
             stopped: false,
         };
         let result: Result<String, String> = (|| {
+            let prepared = attempt
+                .vmm
+                .memory_layout()
+                .map_err(|error| error.to_string())?;
+            let expected = exchange_binding(&mut channel, prepared.canonical_bytes(), deadline)?;
             new_output(&out)?;
             let vm_capabilities = format!(
                 "{{\"KVM_CAP_XSAVE2\":{},\"KVM_CAP_TSC_DEADLINE_TIMER\":{}}}",
@@ -1238,7 +1433,7 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
             continued(&attempt.vmm.guest_memory, active)?;
             // Observe actual native TSC frequency before allowing the fixture to arm.
             park(&mut attempt.vmm, 1, &attempt.gate)?;
-            let seed = capture_withheld(&mut attempt.vmm, &expected, &out)?;
+            let seed = capture_withheld(&mut attempt.vmm, &expected, &out, &prepared)?;
             release(&mut attempt.vmm, 1)?;
             // Seed writes belong to the reopened epoch, never to the sealed execution cut.
             for (cpu, state) in seed.cpus.iter().enumerate() {
@@ -1262,7 +1457,7 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
                     Ok(word(&attempt.vmm.guest_memory, 0, 40)? == guest_command)
                 })?;
                 park(&mut attempt.vmm, 2, &attempt.gate)?;
-                let native_error = match capture(&mut attempt.vmm, &next, 2) {
+                let native_error = match capture(&mut attempt.vmm, &next, 2, &prepared) {
                     Err(error) => error,
                     Ok(_) => {
                         return Err("active unsupported native timer profile was admitted".into());
@@ -1276,7 +1471,7 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
                     json_string(&native_error)
                 ));
             }
-            let captured = save_capture(&mut attempt, &out, &next, count, case)?;
+            let captured = save_capture(&mut attempt, &out, &next, count, case, &prepared)?;
             let continuation = resume_original(&mut attempt, &captured, count, case)?;
             Ok(format!(
                 "{{\"schema\":1,\"status\":\"passed\",\"scope\":\"cpu-execution-only\",\"qualification_eligible\":false,\"native_pause\":false,\"public_live\":\"not-delivered\",\"source_resumed\":true,\"pid\":{},\"all_reaped\":true,{continuation}}}",
@@ -1285,8 +1480,10 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
         })();
         return finish_attempt(&mut attempt, result);
     }
-    if mode != "restore" || args.len() != 8 {
-        return Err("restore INPUT OUT BINDING CPUS CASE GENERATION DWELL_MS".into());
+    if mode != "restore" || args.len() != 10 {
+        return Err(
+            "restore INPUT OUT BINDING CPUS CASE GENERATION DWELL_MS RAM_FD LAYOUT_FD".into(),
+        );
     }
     let input = PathBuf::from(&args[1]);
     let out = PathBuf::from(&args[2]);
@@ -1300,20 +1497,12 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
     let expected = binding(Path::new(&args[3]), generation)?;
     let validated = load_state(&input, &expected, count)?;
     let original = validated.envelope().clone();
-    let memory = memory()?;
-    let ram = bounded_read(&input.join("memory.fixture"), RAM_BYTES)?;
-    if ram.len() != RAM_BYTES {
-        return Err("fixture RAM has wrong extent".into());
-    }
-    memory
-        .write_slice(&ram, GuestAddress(0))
-        .map_err(|e| e.to_string())?;
+    let ram = restored_ram(&input, &validated, &args[8], &args[9])?;
     let gate = Arc::new(CompletionGate::default());
     let (io, mmio) = buses(&gate)?;
     let devices = PreparedDeviceInstall::diagnostic(&expected, io, mmio)?;
     let vmm = match build_restore_prepared(
-        memory,
-        ArchMemoryInfo::default(),
+        ram,
         validated,
         devices,
         &mut polly::event_manager::EventManager::new()
@@ -1346,6 +1535,10 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
         stopped: false,
     };
     let result: Result<String, String> = (|| {
+        let prepared = attempt
+            .vmm
+            .memory_layout()
+            .map_err(|error| error.to_string())?;
         new_output(&out)?;
         if attempt.vmm.control.cpus.release_may_have_run() {
             return Err("fresh prepared construction accepted a premature CPU Release".into());
@@ -1364,7 +1557,7 @@ fn run_inner(args: &[OsString]) -> Result<String, String> {
         } else {
             case
         };
-        let recaptured = save_capture(&mut attempt, &out, &next, count, recapture_case)?;
+        let recaptured = save_capture(&mut attempt, &out, &next, count, recapture_case, &prepared)?;
         if recaptured.cpus == original.cpus {
             return Err("child recapture copied ancestor CPU state".into());
         }
@@ -1474,5 +1667,130 @@ mod tests {
         std::fs::remove_file(empty).unwrap();
         std::fs::remove_file(file).unwrap();
         std::fs::remove_dir(directory).unwrap();
+    }
+
+    fn binding_material() -> [u8; 160] {
+        let mut material = [1; 160];
+        material[96..128].fill(4);
+        material
+    }
+
+    #[test]
+    fn native_layout_binding_uses_exact_fixed_response_and_eof() {
+        use crate::api::native_execution_probe::{WAIT, exchange_binding};
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+        use std::time::Instant;
+        let (mut native, mut controller) = UnixStream::pair().unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut header = [0; 4];
+            controller.read_exact(&mut header).unwrap();
+            let mut layout = Vec::new();
+            controller.read_to_end(&mut layout).unwrap();
+            assert_eq!(u32::from_le_bytes(header) as usize, layout.len());
+            assert_eq!(layout, b"exact-prepared-bytes");
+            for fragment in binding_material().chunks(7) {
+                controller.write_all(fragment).unwrap();
+            }
+            controller.shutdown(Shutdown::Write).unwrap();
+        });
+        let binding =
+            exchange_binding(&mut native, b"exact-prepared-bytes", Instant::now() + WAIT).unwrap();
+        assert_eq!(binding.ram_layout, [4; 32]);
+        assert_eq!(binding.pause_generation, 1);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn native_layout_binding_rejects_short_extra_invalid_and_expired_frames() {
+        use crate::api::native_execution_probe::{MAX_RAM_LAYOUT_BYTES, WAIT, exchange_binding};
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+        let mut extra = binding_material().to_vec();
+        extra.push(1);
+        for reply in [vec![], vec![1; 159], extra, vec![0; 160]] {
+            let (mut native, mut controller) = UnixStream::pair().unwrap();
+            let peer = std::thread::spawn(move || {
+                let mut layout = Vec::new();
+                controller.read_to_end(&mut layout).unwrap();
+                controller.write_all(&reply).unwrap();
+            });
+            assert!(exchange_binding(&mut native, b"layout", Instant::now() + WAIT).is_err());
+            peer.join().unwrap();
+        }
+        let (mut native, _peer) = UnixStream::pair().unwrap();
+        assert!(exchange_binding(&mut native, &[], Instant::now() + WAIT).is_err());
+        assert!(
+            exchange_binding(
+                &mut native,
+                &vec![1; MAX_RAM_LAYOUT_BYTES + 1],
+                Instant::now() + WAIT
+            )
+            .is_err()
+        );
+        assert!(
+            exchange_binding(
+                &mut native,
+                b"layout",
+                Instant::now() - Duration::from_millis(1)
+            )
+            .is_err()
+        );
+        assert!(
+            exchange_binding(
+                &mut native,
+                b"layout",
+                Instant::now() + Duration::from_millis(10)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_ram_authentication_binds_exact_width_and_layout_identity() {
+        use crate::api::native_execution_probe::{decode_binding, decode_ram_authentication};
+        let binding = decode_binding(&binding_material(), 2).unwrap();
+        let mut auth = [0; 64];
+        auth[..32].copy_from_slice(&binding.ram_layout);
+        let decoded = decode_ram_authentication(&auth, &binding).unwrap();
+        assert_eq!(decoded.state, binding);
+        assert_eq!(decoded.stream, [0; 32]);
+        auth[0] ^= 1;
+        assert!(decode_ram_authentication(&auth, &binding).is_err());
+        assert!(decode_ram_authentication(&auth[..63], &binding).is_err());
+        assert!(decode_binding(&[1; 159], 1).is_err());
+        assert!(decode_binding(&binding_material(), 0).is_err());
+    }
+
+    #[test]
+    fn native_cpu_fixture_prepares_valid_actual_canonical_topology() {
+        use crate::api::native_execution_probe::{RAM_BYTES, fixture_info, memory};
+        use crate::vmm::execution::ExecutionLane;
+        use crate::vmm::memory::image::ValidatedRamLayout;
+        use crate::vmm::memory::runtime_memory_for_test;
+        let memory = runtime_memory_for_test(memory().unwrap());
+        let info = fixture_info().unwrap();
+        let layout = ValidatedRamLayout::from_registered(
+            memory.domain().layout(),
+            &info,
+            ExecutionLane::KvmX86,
+        )
+        .unwrap();
+        assert_eq!(layout.packed_len(), RAM_BYTES as u64);
+        assert_eq!(layout.granule() as usize, info.page_size);
+        assert_eq!(
+            ValidatedRamLayout::decode(layout.canonical_bytes()).unwrap(),
+            layout
+        );
+        assert!(
+            ValidatedRamLayout::from_registered(
+                memory.domain().layout(),
+                &arch::ArchMemoryInfo::default(),
+                ExecutionLane::KvmX86,
+            )
+            .is_err()
+        );
     }
 }

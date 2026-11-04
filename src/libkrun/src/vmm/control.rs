@@ -108,6 +108,8 @@ pub enum ControlFailure {
     Exhausted,
     Unsupported(String),
     Participant(String),
+    Memory(arch::guest_memory::MemoryError),
+    DirtyMemory(arch::guest_memory::DirtyFailure),
     FailedFenced,
 }
 
@@ -599,6 +601,18 @@ impl CpuController {
                 && batch.slots.iter().any(|slot| slot.accepted)
         })
     }
+    pub(crate) fn captured_at(&self, key: BarrierKey) -> bool {
+        self.batches.last().is_some_and(|batch| {
+            batch.command.kind == CpuCommandKind::CaptureExecution
+                && batch.command.barrier.key == key
+                && !batch.slots.is_empty()
+                && batch.slots.iter().all(|slot| {
+                    slot.accepted
+                        && matches!(slot.acknowledgement, Some(Ok(())))
+                        && slot.execution.is_some()
+                })
+        })
+    }
 
     pub(crate) fn poll_capture_for_rollback(
         &mut self,
@@ -736,6 +750,31 @@ impl ControlOwner {
 
     pub fn validate_token(&self, token: &PauseToken) -> bool {
         matches!(&self.state, ControlState::Paused(current) if current == token)
+    }
+    pub(crate) fn validate_memory_resume(
+        &self,
+        token: &PauseToken,
+        unresolved_memory: bool,
+    ) -> Result<(), ControlFailure> {
+        if !self.validate_token(token) {
+            return Err(ControlFailure::InvalidToken);
+        }
+        if unresolved_memory {
+            return Err(ControlFailure::Busy);
+        }
+        Ok(())
+    }
+    pub(crate) fn restore_release_key(
+        &self,
+        unresolved_memory: bool,
+    ) -> Result<BarrierKey, ControlFailure> {
+        let ControlState::RestorePrepared { key } = self.state else {
+            return Err(ControlFailure::Busy);
+        };
+        if unresolved_memory {
+            return Err(ControlFailure::Busy);
+        }
+        Ok(key)
     }
 
     fn retire_admission(&mut self, failure: ControlFailure) -> Result<(), ControlFailure> {
@@ -940,9 +979,8 @@ impl crate::vmm::Vmm {
                 Ok(())
             }
             RequestKind::Resume(token) => {
-                if !self.control.validate_token(token) {
-                    return Err(ControlFailure::InvalidToken);
-                }
+                self.control
+                    .validate_memory_resume(token, self.memory.has_attempt())?;
                 self.control.reserve(request.operation)?;
                 let mut active = self
                     .control
@@ -966,9 +1004,9 @@ impl crate::vmm::Vmm {
                 Ok(())
             }
             RequestKind::ReleaseRestore => {
-                let ControlState::RestorePrepared { key: original } = self.control.state else {
-                    return Err(ControlFailure::Busy);
-                };
+                let original = self
+                    .control
+                    .restore_release_key(self.memory.has_attempt())?;
                 if self.execution.failed_install || self.control.cpus.release_may_have_run() {
                     return Err(ControlFailure::FailedFenced);
                 }
@@ -1263,10 +1301,7 @@ impl crate::vmm::Vmm {
                     Poll::Ready(result) => result.map_err(ControlFailure::Participant)?,
                 }
                 let token = self.control.token(active.original, active.owner);
-                if !self
-                    .finish_memory_cut(active.original)
-                    .map_err(ControlFailure::Participant)?
-                {
+                if !self.finish_memory_cut(active.original)? {
                     return Ok(false);
                 }
                 self.memory
@@ -1333,9 +1368,7 @@ impl crate::vmm::Vmm {
                 if self.memory_domain.tracking_mode()
                     == Some(arch::guest_memory::TrackingMode::Capture)
                     && (!self.execution.has_cut_work() || self.execution.retained.is_some())
-                    && !self
-                        .reopen_memory_for_resume(active.original)
-                        .map_err(ControlFailure::Participant)?
+                    && !self.reopen_memory_for_resume(active.original)?
                 {
                     return Ok(false);
                 }
@@ -1845,6 +1878,7 @@ mod tests {
             Some(Err(_))
         ));
         assert!(controller.captured().is_err());
+        assert!(!controller.captured_at(key()));
         assert!(!controller.release_may_have_run());
     }
 

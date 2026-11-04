@@ -142,7 +142,6 @@ mod tests {
         let granule = crate::discard::native_page_size().unwrap() as u64;
         for reason in [
             ReclaimInhibition::TrackedCapture,
-            ReclaimInhibition::RestoredInput,
             ReclaimInhibition::RestoredPrivateMapping,
         ] {
             let ram = Arc::new(ReclaimState::new());

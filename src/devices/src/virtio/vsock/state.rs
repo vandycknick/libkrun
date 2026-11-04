@@ -975,11 +975,15 @@ mod tests {
                 holder.take().unwrap().join().unwrap();
             }
             let mut destination = polling.join().unwrap();
-            let expected = fault.map_or(Ok(Poll::Pending), Err);
-            assert_eq!(
-                observed.unwrap(),
-                (Err(ProviderFault::ForeignBarrier), expected, expected)
-            );
+            let (foreign, first, repeated) = observed.unwrap();
+            assert_eq!(foreign, Err(ProviderFault::ForeignBarrier));
+            if poison {
+                // A worker can observe the poisoned gate and exit before polling.
+                assert!(first.is_err());
+            } else {
+                assert_eq!(first, fault.map_or(Ok(Poll::Pending), Err));
+            }
+            assert_eq!(repeated, first);
             assert_eq!(destination.provider.journal.snapshot.request, Some(resume));
             assert_eq!(
                 destination.provider.journal.snapshot.stage,
@@ -988,7 +992,8 @@ mod tests {
             for (actual, original) in destination.queue_events.iter().zip(events) {
                 assert!(Arc::ptr_eq(actual, &original));
             }
-            if let Some(fault) = fault {
+            if fault.is_some() {
+                let fault = first.unwrap_err();
                 let retained = destination.provider.journal.snapshot.failure.unwrap();
                 assert_eq!(retained.key, resume.key);
                 assert_eq!(retained.fault, fault);
@@ -1134,15 +1139,18 @@ mod tests {
                 holder.take().unwrap().join().unwrap();
             }
             let mut destination = polling.join().unwrap();
-            assert_eq!(observed.unwrap(), Err(expected));
+            let observed_fault = observed.unwrap().unwrap_err();
+            if !poison {
+                assert_eq!(observed_fault, expected);
+            }
             assert_eq!(destination.provider.activation, Some(release));
             assert_eq!(
                 destination.poll_activation_release(release.key),
-                Err(expected)
+                Err(observed_fault)
             );
             let repeated = destination.begin_activation_release(release).unwrap_err();
             assert!(repeated.accepted);
-            assert_eq!(repeated.fault, expected);
+            assert_eq!(repeated.fault, observed_fault);
             assert_eq!(
                 destination.poll_activation_release(request(4).key),
                 Err(ProviderFault::ForeignBarrier)
