@@ -474,6 +474,12 @@ from the destination inode. Installation starts no worker and performs no queue
 scan, DMA or IRQ. DISCARD and WRITE_ZEROES with UNMAP retain zero-read semantics,
 including non-aligned edges and reopened file capacity.
 
+Read-only VMDK lowers also participate in pause and capture using the same
+queue-drain contract. The captured block payload includes its actual format;
+raw destinations reject VMDK payloads rather than reinterpret them. Writable
+VMDK remains unsupported. This provider admission is not a public runtime
+qualification or a VMDK restore constructor.
+
 The block regressions cover actual write/read/guest FLUSH, final status and used
 length, notification, a real saturated eventfd, invalid used-ring publication
 after a performed write without replay, malformed/no-status chains, checked

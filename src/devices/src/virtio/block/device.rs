@@ -946,6 +946,7 @@ struct BlockPayload<'a> {
     acked: u64,
     byte_length: u64,
     read_only: bool,
+    disk_format: DiskFormat,
     direct_io: bool,
     sync_mode: u32,
     cache_type: u8,
@@ -966,14 +967,14 @@ impl<'a> BlockPayload<'a> {
             }
             let avail = reader.u64()?;
             let acked = reader.u64()?;
-            if reader.u8()? != DiskFormat::Raw as u8 {
-                return Err(utils::state::Error::Invalid("block backend"));
-            }
+            let disk_format = DiskFormat::try_from(u32::from(reader.u8()?))
+                .map_err(|_| utils::state::Error::Invalid("block backend"))?;
             let state = BlockPayload {
                 avail,
                 acked,
                 byte_length: reader.u64()?,
                 read_only: reader.bool()?,
+                disk_format,
                 direct_io: reader.bool()?,
                 sync_mode: reader.u32()?,
                 cache_type: reader.u8()?,
@@ -982,6 +983,11 @@ impl<'a> BlockPayload<'a> {
                 config: VirtioBlkConfig::decode(&mut reader)?,
             };
             reader.finish()?;
+            if state.disk_format != DiskFormat::Raw
+                && !(state.disk_format == DiskFormat::Vmdk && state.read_only)
+            {
+                return Err(utils::state::Error::Invalid("block backend"));
+            }
             Ok(state)
         };
         decode().map_err(|_| ProviderFault::DeviceState)
@@ -1006,6 +1012,7 @@ impl Block {
         if saved.avail != self.avail_features
             || saved.acked & !saved.avail != 0
             || saved.byte_length != self.byte_length
+            || saved.disk_format != self.disk_format
             || saved.read_only != self.is_read_only()
             || saved.direct_io != self.direct_io
             || saved.sync_mode != self.sync_mode as u32
@@ -1025,7 +1032,9 @@ impl VirtioStateProvider for Block {
     }
 
     fn preflight(&self) -> Result<(), ProviderFault> {
-        if self.disk_format != DiskFormat::Raw {
+        if self.disk_format != DiskFormat::Raw
+            && !(self.disk_format == DiskFormat::Vmdk && self.is_read_only())
+        {
             return Err(ProviderFault::Unsupported);
         }
         if let Some(fault) = self.provider_fault {
@@ -1057,7 +1066,9 @@ impl VirtioStateProvider for Block {
             accepted: false,
             fault,
         };
-        if self.disk_format != DiskFormat::Raw {
+        if self.disk_format != DiskFormat::Raw
+            && !(self.disk_format == DiskFormat::Vmdk && self.is_read_only())
+        {
             return Err(refuse(ProviderFault::Unsupported));
         }
         // Stop must recover a real owner even after an effects/IRQ fault.
@@ -1283,7 +1294,7 @@ impl VirtioStateProvider for Block {
             writer.u32(TYPE_BLOCK)?;
             writer.u64(self.avail_features)?;
             writer.u64(self.acked_features)?;
-            writer.u8(DiskFormat::Raw as u8)?;
+            writer.u8(self.disk_format as u8)?;
             writer.u64(self.byte_length)?;
             writer.bool(self.is_read_only())?;
             writer.bool(self.direct_io)?;
@@ -1591,6 +1602,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn readonly_vmdk_capture_preserves_format_and_rejects_raw_substitution() {
+        use std::os::unix::fs::FileExt;
+
+        let extent = TempFile::new().unwrap();
+        extent.as_file().set_len(4096).unwrap();
+        extent.as_file().write_all_at(&[37], 0).unwrap();
+        let descriptor = TempFile::new().unwrap();
+        let text = format!(
+            "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\ncreateType=\"monolithicFlat\"\nRW 8 FLAT \"{}\" 0\n",
+            extent.as_path().display()
+        );
+        descriptor
+            .as_file()
+            .write_all_at(text.as_bytes(), 0)
+            .unwrap();
+        let mut block = Block::new(
+            "lower".into(),
+            None,
+            CacheType::Unsafe,
+            descriptor.as_path().to_str().unwrap().into(),
+            DiskFormat::Vmdk,
+            true,
+            false,
+            SyncMode::Relaxed,
+        )
+        .unwrap();
+        let pause = request(1, 1);
+        let completed = quiesce(&mut block, pause);
+        assert_eq!(completed.fault, None);
+        block.flush_for_capture(pause.key).unwrap();
+        let payload = block.capture_payload(pause.key).unwrap();
+        assert_eq!(
+            BlockPayload::decode(&payload).unwrap().disk_format,
+            DiskFormat::Vmdk
+        );
+        block.validate_payload(&payload).unwrap();
+        let raw = raw_block(&extent, "lower", true);
+        assert!(raw.validate_payload(&payload).is_err());
+        assert!(
+            Block::new_restore_binding(
+                "lower".into(),
+                extent.as_file().try_clone().unwrap(),
+                true,
+                &payload,
+            )
+            .is_err()
+        );
+        let mut writable = payload.clone();
+        writable[31] = 0;
+        assert!(BlockPayload::decode(&writable).is_err());
+        let mut observed = [0];
+        block
+            .disk_image
+            .lock()
+            .unwrap()
+            .read(&mut observed[..], 0)
+            .unwrap();
+        assert_eq!(observed, [37]);
     }
 
     #[test]
