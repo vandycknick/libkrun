@@ -1,10 +1,11 @@
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
+
+use crate::virtio::lifecycle::ActivationExposure;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Owner {
@@ -61,11 +62,29 @@ struct State {
     exited: u8,
     epoch: u64,
     service: Option<u32>,
+    /// Provider-local fence; guest/host entry points use `State::fenced`.
     activation_fenced: bool,
+    /// Shared all-provider commit bound when a restored release is accepted.
+    exposure: Option<ActivationExposure>,
     transport_ready: bool,
     #[cfg(feature = "native-device-probe")]
     counters: WorkerCounters,
     release_pending: bool,
+    /// Identity of the current mux thread; every (re)start replaces it.
+    mux_instance: u64,
+    /// The mux instance whose listener binding completed local preparation.
+    prepared_mux: Option<u64>,
+}
+
+impl State {
+    /// Local release preparation alone never opens a bound exposure gate.
+    fn fenced(&self) -> bool {
+        self.activation_fenced
+            || self
+                .exposure
+                .as_ref()
+                .is_some_and(|exposure| !exposure.is_open())
+    }
 }
 
 pub(crate) struct WorkerControl {
@@ -92,8 +111,11 @@ impl WorkerControl {
                 epoch: 0,
                 service: None,
                 activation_fenced: false,
+                exposure: None,
                 transport_ready: true,
                 release_pending: false,
+                mux_instance: 0,
+                prepared_mux: None,
                 #[cfg(feature = "native-device-probe")]
                 counters: WorkerCounters::default(),
             }),
@@ -133,10 +155,9 @@ impl WorkerControl {
         self.state.lock().map_or(u64::MAX, |state| state.epoch)
     }
 
+    /// Effective fence: provider-local fence or an uncommitted exposure gate.
     pub fn activation_fenced(&self) -> bool {
-        self.state
-            .lock()
-            .map_or(true, |state| state.activation_fenced)
+        self.state.lock().map_or(true, |state| state.fenced())
     }
 
     pub fn bind_activation(&self, service: u32) -> io::Result<()> {
@@ -152,8 +173,24 @@ impl WorkerControl {
 
     pub fn admits(&self, service: u32) -> bool {
         self.state.lock().is_ok_and(|state| {
-            state.transport_ready && (!state.activation_fenced || state.service == Some(service))
+            state.transport_ready && (!state.fenced() || state.service == Some(service))
         })
+    }
+
+    /// Back off a fenced host entry point for at most `timeout`, waking early
+    /// on the shared exposure commit instead of spinning on its readiness.
+    pub fn await_exposure(&self, timeout: Duration) {
+        let exposure = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.exposure.clone());
+        match exposure {
+            Some(exposure) => {
+                exposure.wait_open(timeout);
+            }
+            None => std::thread::sleep(timeout),
+        }
     }
 
     pub fn transport_ready(&self) -> bool {
@@ -167,7 +204,8 @@ impl WorkerControl {
         let _ = self.wake.write(1);
     }
 
-    pub fn release_activation(&self) -> io::Result<()> {
+    /// Begin local release preparation bound to the shared exposure commit.
+    pub fn release_activation(&self, exposure: &ActivationExposure) -> io::Result<()> {
         let mut state = self
             .state
             .lock()
@@ -175,6 +213,10 @@ impl WorkerControl {
         if !state.transport_ready {
             return Err(io::Error::other("vsock reset is still pending"));
         }
+        if !state.activation_fenced || state.exposure.is_some() {
+            return Err(io::Error::other("vsock activation release already bound"));
+        }
+        state.exposure = Some(exposure.clone());
         state.release_pending = true;
         state.reconciled &= !(Owner::Mux as u8);
         state.epoch = state.epoch.wrapping_add(1);
@@ -185,15 +227,70 @@ impl WorkerControl {
         self.state.lock().is_ok_and(|state| state.release_pending)
     }
 
-    pub fn complete_activation_release(&self, epoch: u64) {
+    /// Register a new mux thread. Any earlier preparation belonged to another
+    /// thread's listener registration and is invalidated.
+    pub fn bind_mux(&self) -> io::Result<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("vsock worker control poisoned"))?;
+        state.mux_instance = state.mux_instance.wrapping_add(1);
+        state.prepared_mux = None;
+        Ok(state.mux_instance)
+    }
+
+    pub fn complete_activation_release(&self, epoch: u64, instance: u64) {
         if let Ok(mut state) = self.state.lock()
             && state.epoch == epoch
+            && state.mux_instance == instance
             && state.release_pending
             && !self.failed.load(Ordering::Acquire)
         {
             state.activation_fenced = false;
             state.release_pending = false;
+            state.prepared_mux = Some(instance);
         }
+    }
+
+    /// Re-prove, before the exposure commit, that the current mux thread is the
+    /// one that bound the listeners and nothing fallible remains after the gate
+    /// opens. Only contention or a transient owner reconciliation is pending.
+    pub fn validate_prepared(
+        &self,
+    ) -> Result<std::task::Poll<()>, crate::virtio::lifecycle::ProviderFault> {
+        use crate::virtio::lifecycle::ProviderFault;
+        use std::task::Poll;
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return match self.retained_fault() {
+                    Some(fault) => Err(fault),
+                    None => Ok(Poll::Pending),
+                };
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(ProviderFault::DeviceLock),
+        };
+        if self.failed.load(Ordering::Acquire) {
+            return Err(ProviderFault::Worker);
+        }
+        if state.pause
+            || state.stop
+            || state.activation_fenced
+            || state.release_pending
+            || !state.transport_ready
+            || state.prepared_mux != Some(state.mux_instance)
+            || state
+                .exposure
+                .as_ref()
+                .is_none_or(|exposure| exposure.is_open() || exposure.is_sealed())
+        {
+            return Err(ProviderFault::InvalidTransition);
+        }
+        Ok(if self.running_state(&state) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        })
     }
 
     pub fn fail(&self) {
@@ -318,7 +415,7 @@ impl WorkerControl {
             exited: state.exited,
             reconciled: state.reconciled,
             paused: state.pause,
-            activation_fenced: state.activation_fenced,
+            activation_fenced: state.fenced(),
             transport_ready: state.transport_ready,
             counters: state.counters,
         })
@@ -481,5 +578,58 @@ mod tests {
         assert!(completed.is_ok());
         assert_eq!(fault, Some(ProviderFault::Worker));
         assert_eq!(running, Err(ProviderFault::Worker));
+    }
+
+    #[test]
+    fn provider_vsock_mux_registration_after_prepare_invalidates_listener_proof() {
+        use crate::virtio::lifecycle::ActivationExposure;
+        use crate::virtio::vsock::worker_control::Owner;
+        use std::task::Poll;
+
+        let control = WorkerControl::new().unwrap();
+        control.bind_activation(1027).unwrap();
+        control.transport_reset_completed();
+        let owners = [
+            Owner::Mux,
+            Owner::Reaper,
+            #[cfg(target_os = "macos")]
+            Owner::Timesync,
+        ];
+        let instance = control.bind_mux().unwrap();
+        for owner in owners {
+            control.expect_owner(owner);
+            assert!(control.boundary(owner));
+        }
+        let exposure = ActivationExposure::new();
+        control.release_activation(&exposure).unwrap();
+        let epoch = control.epoch();
+        control.complete_activation_release(epoch, instance);
+        for owner in owners {
+            control.reconciled(owner, epoch);
+        }
+        assert_eq!(control.validate_prepared(), Ok(Poll::Ready(())));
+        assert!(control.activation_fenced(), "prepared is not exposed");
+
+        // The registration step every Muxer::activate performs before spawning.
+        let restarted = control.bind_mux().unwrap();
+        assert_ne!(restarted, instance);
+        assert_eq!(
+            control.validate_prepared(),
+            Err(ProviderFault::InvalidTransition),
+            "a new mux registration cannot inherit the earlier listener binding"
+        );
+        // Neither the stale nor the new thread can re-prepare under the closed gate.
+        control.complete_activation_release(epoch, instance);
+        control.complete_activation_release(epoch, restarted);
+        assert_eq!(
+            control.validate_prepared(),
+            Err(ProviderFault::InvalidTransition)
+        );
+        assert!(control.activation_fenced());
+        assert!(!control.admits(1028));
+        assert!(control.admits(1027), "agent control remains admitted");
+        assert!(exposure.seal());
+        assert!(control.activation_fenced());
+        assert!(!control.admits(1028));
     }
 }

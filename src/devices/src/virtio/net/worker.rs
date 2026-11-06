@@ -1,5 +1,5 @@
 use crate::virtio::descriptor_utils::{DescriptorChainSnapshot, ValidatedDescriptorChain};
-use crate::virtio::lifecycle::ProviderFault;
+use crate::virtio::lifecycle::{ActivationExposure, ProviderFault};
 use crate::virtio::net::backend::{ConnectError, NetBackend, ReadError, WriteError};
 use crate::virtio::net::device::VirtioNetBackend;
 #[cfg(target_os = "linux")]
@@ -27,9 +27,28 @@ pub(crate) struct WorkerAdmission {
     pub closed: bool,
     pub stop: bool,
     pub running: bool,
+    /// Provider-local mode; guest-facing paths use `effective_mode`.
     pub mode: EndpointMode,
     pub release: Option<BarrierRequest>,
     pub released: Option<BarrierKey>,
+    /// Shared all-provider commit bound when a restored release is accepted.
+    pub exposure: Option<ActivationExposure>,
+}
+
+impl WorkerAdmission {
+    /// Local release preparation alone never opens a bound exposure gate.
+    pub fn effective_mode(&self) -> EndpointMode {
+        if self.mode == EndpointMode::Open
+            && self
+                .exposure
+                .as_ref()
+                .is_none_or(ActivationExposure::is_open)
+        {
+            EndpointMode::Open
+        } else {
+            EndpointMode::ActivationFenced
+        }
+    }
 }
 
 pub(crate) struct ParkedNetWorker {
@@ -94,6 +113,7 @@ impl ParkedNetWorker {
                 mode,
                 release: None,
                 released: None,
+                exposure: None,
             })),
             wake,
             fault: None,
@@ -315,7 +335,7 @@ impl NetWorker {
             if admission.closed || admission.stop {
                 break;
             }
-            let mode = admission.mode;
+            let mode = admission.effective_mode();
             let head = self.tx_q.queue.pop(&self.state.mem);
             drop(admission);
             let Some(head) = head else {
@@ -422,7 +442,7 @@ impl NetWorker {
                     Err(_) => return Err(ProviderFault::Worker),
                 }
             }
-            if admission.mode == EndpointMode::ActivationFenced {
+            if admission.effective_mode() == EndpointMode::ActivationFenced {
                 self.state.rx_deferred = false;
                 self.state.rx_len = 0;
                 continue;
@@ -501,7 +521,7 @@ impl NetWorker {
         if std::time::Instant::now() >= request.deadline {
             return Err(ProviderFault::Deadline);
         }
-        if admission.mode != EndpointMode::ActivationFenced {
+        if admission.mode != EndpointMode::ActivationFenced || admission.exposure.is_none() {
             return Err(ProviderFault::InvalidTransition);
         }
         // The caller holds the managed reservation's ingress fence through this ACK.
@@ -546,6 +566,8 @@ impl NetWorker {
                 .map_err(|_| ProviderFault::Worker)?;
             return Ok(());
         }
+        // Prepared only: the bound exposure gate keeps both directions fenced
+        // until the owner commits every provider together.
         admission.mode = EndpointMode::Open;
         admission.released = Some(request.key);
         admission.release = None;
@@ -556,7 +578,7 @@ impl NetWorker {
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod tests {
     use crate::legacy::{IrqChipDevice, KvmIoapic};
-    use crate::virtio::lifecycle::ProviderFault;
+    use crate::virtio::lifecycle::{ActivationExposure, ProviderFault};
     use crate::virtio::net::VNET_HDR_LEN;
     use crate::virtio::net::device::VirtioNetBackend;
     use crate::virtio::net::worker::{EndpointMode, NetWorker, ParkedNetWorker};
@@ -680,11 +702,21 @@ mod tests {
             .unwrap();
         let release = request();
         worker.state.admission.lock().unwrap().release = Some(release);
-        worker.release_activation().unwrap();
         assert_eq!(
-            worker.state.admission.lock().unwrap().released,
-            Some(release.key)
+            worker.release_activation(),
+            Err(ProviderFault::InvalidTransition),
+            "release preparation requires a bound all-provider exposure gate"
         );
+        assert_eq!(tx.used.idx.get(), 1, "refused preparation consumed nothing");
+        let exposure = ActivationExposure::new();
+        worker.state.admission.lock().unwrap().exposure = Some(exposure.clone());
+        worker.release_activation().unwrap();
+        {
+            let admission = worker.state.admission.lock().unwrap();
+            assert_eq!(admission.released, Some(release.key));
+            assert_eq!(admission.mode, EndpointMode::Open);
+            assert_eq!(admission.effective_mode(), EndpointMode::ActivationFenced);
+        }
         assert_eq!(tx.used.idx.get(), 2);
         worker.process_rx().unwrap();
         assert_eq!(rx.used.idx.get(), 0);
@@ -692,18 +724,84 @@ mod tests {
             peer.recv(&mut packet).unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
-        peer.send(b"fresh").unwrap();
+        // Prepared but uncommitted: both directions stay fenced.
+        peer.send(b"prepared-ingress").unwrap();
         worker.process_rx().unwrap();
-        assert_eq!(rx.used.idx.get(), 1);
+        assert_eq!(rx.used.idx.get(), 0);
         tx.dtable[2].set(0x5200, (VNET_HDR_LEN + 5) as u32, 0, 0);
         tx.avail.ring[2].set(2);
         tx.avail.idx.set(3);
         memory
-            .write_slice(b"fresh", GuestAddress(0x5200 + VNET_HDR_LEN as u64))
+            .write_slice(b"early", GuestAddress(0x5200 + VNET_HDR_LEN as u64))
+            .unwrap();
+        worker.process_tx().unwrap();
+        assert_eq!(tx.used.idx.get(), 3);
+        assert_eq!(
+            peer.recv(&mut packet).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "prepared provider must not send before the shared commit"
+        );
+        assert!(exposure.open());
+        assert_eq!(
+            worker.state.admission.lock().unwrap().effective_mode(),
+            EndpointMode::Open
+        );
+        peer.send(b"fresh").unwrap();
+        worker.process_rx().unwrap();
+        assert_eq!(rx.used.idx.get(), 1);
+        tx.dtable[3].set(0x5300, (VNET_HDR_LEN + 5) as u32, 0, 0);
+        tx.avail.ring[3].set(3);
+        tx.avail.idx.set(4);
+        memory
+            .write_slice(b"fresh", GuestAddress(0x5300 + VNET_HDR_LEN as u64))
             .unwrap();
         worker.process_tx().unwrap();
         assert_eq!(peer.recv(&mut packet).unwrap(), 5);
         assert_eq!(&packet[..5], b"fresh");
+    }
+
+    #[test]
+    fn net_provider_sealed_exposure_keeps_prepared_endpoint_fenced() {
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let rx = VirtQueue::new(GuestAddress(0), &memory, 8);
+        let tx = VirtQueue::new(GuestAddress(0x1000), &memory, 8);
+        let (mut worker, peer) = worker(
+            &memory,
+            queue(&rx),
+            queue(&tx),
+            EndpointMode::ActivationFenced,
+        );
+        let exposure = ActivationExposure::new();
+        let release = request();
+        {
+            let mut admission = worker.state.admission.lock().unwrap();
+            admission.release = Some(release);
+            admission.exposure = Some(exposure.clone());
+        }
+        worker.release_activation().unwrap();
+        assert!(exposure.seal());
+        assert!(!exposure.open(), "a sealed gate never commits");
+        rx.dtable[0].set(0x4000, 128, 2, 0);
+        rx.avail.ring[0].set(0);
+        rx.avail.idx.set(1);
+        peer.send(b"after-failure").unwrap();
+        worker.process_rx().unwrap();
+        assert_eq!(rx.used.idx.get(), 0);
+        tx.dtable[0].set(0x5000, (VNET_HDR_LEN + 5) as u32, 0, 0);
+        tx.avail.ring[0].set(0);
+        tx.avail.idx.set(1);
+        memory
+            .write_slice(b"leak?", GuestAddress(0x5000 + VNET_HDR_LEN as u64))
+            .unwrap();
+        worker.process_tx().unwrap();
+        let mut packet = [0; 128];
+        assert_eq!(
+            peer.recv(&mut packet).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let admission = worker.state.admission.lock().unwrap();
+        assert_eq!(admission.released, Some(release.key));
+        assert_eq!(admission.effective_mode(), EndpointMode::ActivationFenced);
     }
 
     #[test]
@@ -841,7 +939,10 @@ mod tests {
                 };
                 let (mut worker, peer) = worker(&memory, queue(&rx), queue(&tx), mode);
                 let result = if release == 2 {
-                    worker.state.admission.lock().expect("admission").release = Some(request());
+                    let mut admission = worker.state.admission.lock().expect("admission");
+                    admission.release = Some(request());
+                    admission.exposure = Some(ActivationExposure::new());
+                    drop(admission);
                     worker.release_activation()
                 } else {
                     worker.process_tx()

@@ -4,9 +4,10 @@
 //! Internal, nonblocking provider contracts. No concrete device is admitted by default.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::task::Poll;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use polly::event_manager::{BarrierKey, BarrierRequest};
 use utils::eventfd::EventFd;
@@ -99,6 +100,109 @@ pub struct DormantDeviceContext {
     pub reclaim_policy: RestoredReclaimPolicy,
 }
 
+const EXPOSURE_CLOSED: u8 = 0;
+const EXPOSURE_OPEN: u8 = 1;
+const EXPOSURE_SEALED: u8 = 2;
+
+/// One run-local visibility commit shared by every restored provider release.
+///
+/// ```text
+///   provider-local fence ──┐
+///                          ├─ effective fence = local OR gate closed
+///   ActivationExposure ────┘
+///
+///   begin/poll(net, vsock, ..)   fallible preparation, gate Closed
+///   all prepared  ──► open()     one atomic store opens every provider
+///   any failure   ──► seal()     no provider ever becomes visible
+/// ```
+///
+/// Providers bind the gate when they accept a release and consult it on every
+/// guest-facing data path, so completing provider-local preparation exposes
+/// nothing by itself. A sealed gate can never open.
+#[derive(Clone, Debug)]
+pub struct ActivationExposure(Arc<ExposureShared>);
+
+#[derive(Debug)]
+struct ExposureShared {
+    state: AtomicU8,
+    waiters: Mutex<()>,
+    changed: Condvar,
+}
+
+impl ActivationExposure {
+    pub fn new() -> Self {
+        Self(Arc::new(ExposureShared {
+            state: AtomicU8::new(EXPOSURE_CLOSED),
+            waiters: Mutex::new(()),
+            changed: Condvar::new(),
+        }))
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.0.state.load(Ordering::Acquire) == EXPOSURE_OPEN
+    }
+
+    pub fn is_sealed(&self) -> bool {
+        self.0.state.load(Ordering::Acquire) == EXPOSURE_SEALED
+    }
+
+    /// The single visibility commit. Returns false only for a sealed gate, in
+    /// which case nothing was exposed.
+    pub fn open(&self) -> bool {
+        let opened = match self.0.state.compare_exchange(
+            EXPOSURE_CLOSED,
+            EXPOSURE_OPEN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(current) => current == EXPOSURE_OPEN,
+        };
+        if opened {
+            // Waking is advisory: waiters use bounded waits and re-read the state.
+            drop(self.0.waiters.lock());
+            self.0.changed.notify_all();
+        }
+        opened
+    }
+
+    /// Permanently refuse exposure. Returns false only if the gate already opened.
+    pub fn seal(&self) -> bool {
+        match self.0.state.compare_exchange(
+            EXPOSURE_CLOSED,
+            EXPOSURE_SEALED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(current) => current == EXPOSURE_SEALED,
+        }
+    }
+
+    /// Wait at most `timeout` for the commit. A sealed gate never opens, so
+    /// waiters back off for the whole bound instead of spinning on readiness.
+    pub fn wait_open(&self, timeout: Duration) -> bool {
+        if self.is_open() {
+            return true;
+        }
+        let guard = self
+            .0
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = self.0.changed.wait_timeout_while(guard, timeout, |_| {
+            self.0.state.load(Ordering::Acquire) != EXPOSURE_OPEN
+        });
+        self.is_open()
+    }
+}
+
+impl Default for ActivationExposure {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A provider retains backend, worker handles and faults until terminal cleanup.
 /// Begin/poll must not wait for workers or join an unfinished thread. An accepted
 /// send is recorded before a fallible wake. Ready transfers queues exactly once;
@@ -148,8 +252,11 @@ pub trait VirtioStateProvider: Send {
     fn flush_for_capture(&self, _key: BarrierKey) -> Result<(), ProviderFault> {
         Ok(())
     }
-    fn backing_file_identity(&self) -> Result<Option<(u64, u64)>, ProviderFault> {
-        Ok(None)
+    /// Every host file the provider's backend reads or writes, as
+    /// `(device, inode)`: a raw disk's file, or a VMDK's descriptor and each
+    /// extent. Live capture refuses output files that alias any of them.
+    fn backing_file_identities(&self) -> Result<&[(u64, u64)], ProviderFault> {
+        Ok(&[])
     }
     fn activation_fenced(&self) -> Result<Option<bool>, ProviderFault> {
         Ok(None)
@@ -170,16 +277,31 @@ pub trait VirtioStateProvider: Send {
     ) -> Result<(), ProviderFault> {
         Err(ProviderFault::Unsupported)
     }
+    /// Prepare release while `exposure` is closed. Every fallible step (discard
+    /// of inherited/queued traffic, listener binding) completes before Ready;
+    /// the provider stays effectively fenced until the owner opens `exposure`.
+    /// The first accepted request binds its gate; later gates cannot open it.
     fn begin_activation_release(
         &mut self,
         _request: BarrierRequest,
+        _exposure: &ActivationExposure,
     ) -> Result<(), ProviderBeginError> {
         Err(ProviderBeginError {
             accepted: false,
             fault: ProviderFault::Unsupported,
         })
     }
+    /// Ready means prepared, not visible: visibility is the shared gate commit.
     fn poll_activation_release(&mut self, _key: BarrierKey) -> Result<Poll<()>, ProviderFault> {
+        Err(ProviderFault::Unsupported)
+    }
+    /// Re-prove, immediately before the commit and under the caller's device
+    /// lock, that the Ready preparation for `key` is still the provider's
+    /// current state: no worker restart, reset, quiesce or fault replaced it
+    /// and nothing fallible would remain after the gate opens. Pending means
+    /// only transient owner contention; any invalidation is an error so the
+    /// caller seals the gate instead of exposing anything.
+    fn validate_activation_prepared(&self, _key: BarrierKey) -> Result<Poll<()>, ProviderFault> {
         Err(ProviderFault::Unsupported)
     }
 }
@@ -820,5 +942,50 @@ mod tests {
         assert_eq!(completion.fault, Some(ProviderFault::Notification));
         assert_eq!(completion.queues.len(), 1);
         assert!(queues.is_none());
+    }
+
+    #[test]
+    fn activation_exposure_commit_and_seal_are_mutually_exclusive_and_final() {
+        let committed = ActivationExposure::new();
+        let provider_view = committed.clone();
+        assert!(!provider_view.is_open());
+        assert!(committed.open());
+        assert!(
+            provider_view.is_open(),
+            "every clone observes the one commit"
+        );
+        assert!(committed.open(), "replayed commit stays committed");
+        assert!(!committed.seal(), "an opened gate cannot be sealed");
+        assert!(provider_view.is_open());
+
+        let sealed = ActivationExposure::new();
+        let provider_view = sealed.clone();
+        assert!(sealed.seal());
+        assert!(sealed.seal(), "sealing is idempotent");
+        assert!(!provider_view.open(), "no holder can open a sealed gate");
+        assert!(provider_view.is_sealed());
+        assert!(!provider_view.is_open());
+    }
+
+    #[test]
+    fn activation_exposure_waiters_wake_on_commit_and_back_off_when_sealed() {
+        let exposure = ActivationExposure::new();
+        let waiter = exposure.clone();
+        let started = Instant::now();
+        let waiting = std::thread::spawn(move || waiter.wait_open(Duration::from_secs(10)));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(exposure.open());
+        assert!(waiting.join().unwrap(), "the commit wakes a bounded waiter");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(exposure.wait_open(Duration::from_secs(10)));
+
+        let sealed = ActivationExposure::new();
+        assert!(sealed.seal());
+        let started = Instant::now();
+        assert!(!sealed.wait_open(Duration::from_millis(30)));
+        assert!(
+            started.elapsed() >= Duration::from_millis(30),
+            "a sealed gate never opens, so waiters back off instead of spinning"
+        );
     }
 }

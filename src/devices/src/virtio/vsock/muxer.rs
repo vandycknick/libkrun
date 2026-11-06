@@ -248,6 +248,7 @@ pub(crate) struct VsockMuxer {
     pub(crate) worker_control: Arc<WorkerControl>,
     pub(crate) activation_service: Option<u32>,
     pub(crate) retired_source_ports: Vec<u32>,
+    pub(crate) source_ports: Arc<crate::virtio::vsock::muxer_thread::SourcePortAllocator>,
 }
 
 #[cfg(feature = "native-device-probe")]
@@ -454,6 +455,12 @@ impl VsockMuxer {
             worker_control: WorkerControl::new()?,
             activation_service: None,
             retired_source_ports: Vec::new(),
+            source_ports: Arc::new(
+                crate::virtio::vsock::muxer_thread::SourcePortAllocator::new(
+                    crate::virtio::vsock::muxer_thread::SOURCE_PORT_START,
+                    crate::virtio::vsock::muxer_thread::SOURCE_PORT_END,
+                ),
+            ),
         })
     }
 
@@ -501,6 +508,7 @@ impl VsockMuxer {
 
         let (sender, receiver) = unbounded();
 
+        let instance = self.worker_control.bind_mux()?;
         let thread = MuxerThread::new(
             self.cid,
             epoll,
@@ -517,6 +525,9 @@ impl VsockMuxer {
             self.control_handle.clone(),
             self.worker_control.clone(),
             self.retired_source_ports.clone(),
+            #[cfg(unix)]
+            self.source_ports.clone(),
+            instance,
         );
         self.workers.push((Owner::Mux, thread.run()?));
         self.worker_control.expect_owner(Owner::Mux);

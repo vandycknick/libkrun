@@ -4,6 +4,28 @@
 //! bounds observation, never cancellation. Completed receipts have no writers.
 
 #[cfg(all(
+    feature = "native-device-probe",
+    feature = "blk",
+    feature = "net",
+    target_os = "linux",
+    target_arch = "x86_64",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
+pub mod irq_probe;
+
+#[cfg(all(
+    not(any(feature = "tee", feature = "aws-nitro")),
+    any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
+pub mod inspection;
+
+#[cfg(all(
     not(any(feature = "tee", feature = "aws-nitro")),
     any(
         all(
@@ -294,6 +316,8 @@ pub enum StoppedOwner<'a> {
 #[derive(Clone, Debug)]
 pub struct LiveProviderSnapshot {
     pub attachment: crate::vmm::device_manager::quiescence::AttachmentIdentity,
+    /// Effective fence: `Some(true)` until the all-provider exposure commit,
+    /// even after this provider finished its local release preparation.
     pub activation_fenced: Option<bool>,
 }
 
@@ -567,6 +591,20 @@ impl VmmHandle {
             _ => Err(ControlFailure::OwnerUnavailable.into()),
         }
     }
+    /// Release every restored network and vsock activation fence as one commit.
+    ///
+    /// All fallible provider preparation completes while a shared exposure gate
+    /// keeps both network directions and non-control vsock fenced; the owner then
+    /// holds every provider lock, has each re-prove its exact prepared state,
+    /// rechecks this exact restore token, the acknowledged FreshIdentity ticket,
+    /// `deadline` and stop, and opens every provider with one atomic commit.
+    /// `Ok` means all providers are exposed; a replay after that is `Ok`. A
+    /// refusal before acceptance (authority, `Busy` while one is in flight)
+    /// changes nothing. Any failure of an accepted release seals the gate: no
+    /// provider was or will be exposed, `activation_failed` is set and later
+    /// calls report `FailedFenced`. A caller timeout is not a fence receipt;
+    /// the owner keeps the release to its original deadline, observable through
+    /// `live_snapshot`.
     pub fn release_activation_fences(
         &self,
         restore: &RestoreToken,

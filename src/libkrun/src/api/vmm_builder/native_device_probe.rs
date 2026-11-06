@@ -124,7 +124,7 @@ const MAX_RAM: u64 = 1024 * 1024 * 1024;
 
 #[cfg(feature = "native-device-probe")]
 #[path = "native_device_witness.rs"]
-mod witness;
+pub(crate) mod witness;
 
 #[cfg(feature = "native-device-probe")]
 #[path = "native_device_pressure.rs"]
@@ -248,6 +248,57 @@ struct Driver {
     witness_source: bool,
 }
 impl Driver {
+    #[cfg(feature = "native-device-probe")]
+    fn witness_command(&mut self, command: &str, operand: &str) -> Result<(), String> {
+        match command {
+            "witness-init" => {
+                if !self.witness_source {
+                    return Err(
+                        "restored native CPUs cannot enter source fixture construction".into(),
+                    );
+                }
+                let directory = Path::new(operand);
+                let fixture = crate::api::live::irq_probe::Fixture::new(
+                    bounded(&directory.join("witness.bin"), 0x3000)?,
+                    String::from_utf8(bounded(&directory.join("witness.nm"), 65536)?)
+                        .map_err(|_| "witness symbol UTF-8")?,
+                )?;
+                let bootstrap = {
+                    let mut vmm = self.vmm.try_lock().map_err(|_| "witness VMM lock")?;
+                    self.witness
+                        .begin_initialize(&mut vmm, fixture, Instant::now() + WAIT)?
+                };
+                loop {
+                    let result = {
+                        let mut vmm = self.vmm.try_lock().map_err(|_| "witness VMM lock")?;
+                        self.witness.poll_initialize(&mut vmm, &bootstrap)
+                    };
+                    match result {
+                        Poll::Ready(result) => return result,
+                        Poll::Pending => self.poll()?,
+                    }
+                }
+            }
+            "witness-arm" => {
+                let case = operand
+                    .parse::<u64>()
+                    .map_err(|_| "witness command number")?;
+                let vmm = self.vmm.try_lock().map_err(|_| "witness VMM lock")?;
+                self.witness.arm(&vmm, case)
+            }
+            "witness-snapshot" => {
+                let vmm = self.vmm.try_lock().map_err(|_| "witness VMM lock")?;
+                self.witness.snapshot(&vmm, Path::new(operand))
+            }
+            "witness-cut" => {
+                let (case, path) = operand.split_once(' ').ok_or("witness-cut CASE PATH")?;
+                let vmm = self.vmm.try_lock().map_err(|_| "witness VMM lock")?;
+                self.witness.validate(&vmm, case)?;
+                self.witness.snapshot(&vmm, Path::new(path))
+            }
+            _ => Err("unknown witness command".into()),
+        }
+    }
     fn poll(&mut self) -> Result<(), String> {
         self.poll_control()?;
         self.events
@@ -287,7 +338,10 @@ impl Driver {
             while !call.is_finished() {
                 self.poll()?;
                 #[cfg(feature = "native-device-probe")]
-                self.witness.release_accepted_park(self)?;
+                {
+                    let vmm = self.vmm.try_lock().map_err(|_| "witness VMM lock")?;
+                    self.witness.release_accepted_park(&vmm)?;
+                }
             }
             call.join()
                 .map_err(|_| "driver control caller panicked")?
@@ -1757,8 +1811,14 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
         return driver.refuse("partial native install unexpectedly completed");
     }
     #[cfg(feature = "native-device-probe")]
-    if let Err(error) = driver.witness.attach(&driver) {
-        return driver.refuse(&format!("witness observation registration: {error}"));
+    {
+        let attached = {
+            let vmm = driver.vmm.try_lock().map_err(|_| "witness VMM lock")?;
+            driver.witness.attach(&vmm)
+        };
+        if let Err(error) = attached {
+            return driver.refuse(&format!("witness observation registration: {error}"));
+        }
     }
     #[cfg(not(feature = "native-device-probe"))]
     if options.contains_key("witness") {
@@ -1798,10 +1858,7 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
                     match command {
                         #[cfg(feature = "native-device-probe")]
                         command if command.starts_with("witness-") => {
-                            driver
-                                .witness
-                                .clone()
-                                .command(&mut driver, command, operand)?;
+                            driver.witness_command(command, operand)?;
                         }
                         #[cfg(feature = "native-device-probe")]
                         "pressure" => {
@@ -2061,6 +2118,8 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
                                 },
                                 deadline: Instant::now() + WAIT,
                             };
+                            // Dropping an unopened gate on any error keeps every provider fenced.
+                            let exposure = devices::virtio::lifecycle::ActivationExposure::new();
                             let mut completed = vec![false; activation_resources.len()];
                             for (resource, completed) in
                                 activation_resources.iter().zip(&mut completed)
@@ -2086,7 +2145,7 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
                                     let provider = device
                                         .state_provider_mut()
                                         .ok_or("activation provider missing")?;
-                                    match provider.begin_activation_release(request) {
+                                    match provider.begin_activation_release(request, &exposure) {
                                         Ok(()) => break,
                                         Err(error)
                                             if !error.accepted
@@ -2139,6 +2198,53 @@ pub fn run(arguments: Vec<OsString>) -> Result<(), String> {
                                 if !pending {
                                     break;
                                 }
+                                driver.poll()?;
+                            }
+                            // Commit only under every provider lock after each
+                            // re-proves its exact prepared state.
+                            loop {
+                                if Instant::now() >= request.deadline {
+                                    return Err("activation release deadline".into());
+                                }
+                                let mut guards = Vec::with_capacity(activation_resources.len());
+                                let mut busy = false;
+                                for resource in &activation_resources {
+                                    match resource.device.try_lock() {
+                                        Ok(guard) => guards.push(guard),
+                                        Err(TryLockError::WouldBlock) => {
+                                            busy = true;
+                                            break;
+                                        }
+                                        Err(TryLockError::Poisoned(_)) => {
+                                            return Err("activation resource lock poisoned".into());
+                                        }
+                                    }
+                                }
+                                if !busy {
+                                    for guard in &guards {
+                                        if !matches!(guard.device_type(), 1 | 19) {
+                                            continue;
+                                        }
+                                        let proof = guard
+                                            .state_provider()
+                                            .ok_or("activation provider missing")?
+                                            .validate_activation_prepared(request.key)
+                                            .map_err(|error| {
+                                                format!("activation proof: {error:?}")
+                                            })?;
+                                        if proof.is_pending() {
+                                            busy = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !busy {
+                                    if !exposure.open() {
+                                        return Err("activation exposure commit refused".into());
+                                    }
+                                    break;
+                                }
+                                drop(guards);
                                 driver.poll()?;
                             }
                         }

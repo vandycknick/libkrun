@@ -730,11 +730,12 @@ mod tests {
     #[test]
     fn pressure_observation_real_transport_contention_is_pending_but_poison_is_terminal() {
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let device = Arc::new(Mutex::new(Rng::new().unwrap()));
         let transport = Arc::new(Mutex::new(
             MmioTransport::new(
                 crate::vmm::memory::runtime_memory_for_test(memory),
                 DummyIrqChip::new().into(),
-                Arc::new(Mutex::new(Rng::new().unwrap())),
+                device.clone(),
                 None,
             )
             .unwrap(),
@@ -746,7 +747,7 @@ mod tests {
             irq: 5,
         };
         let mut inventory = DeviceQuiescence::default();
-        inventory.retain_transport(identity.clone(), transport.clone());
+        inventory.retain_transport(identity.clone(), transport.clone(), device);
         let held = transport
             .lock()
             .expect("hold the actual observed transport");

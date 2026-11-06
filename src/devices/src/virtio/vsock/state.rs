@@ -7,8 +7,8 @@ use polly::event_manager::{BarrierKey, BarrierRequest};
 use utils::state::{Reader, Writer};
 
 use crate::virtio::lifecycle::{
-    DormantDeviceContext, LifecycleJournal, ProviderBeginError, ProviderFault, ProviderStage,
-    QuiesceCompletion, ResumeAcceptance, VirtioStateProvider,
+    ActivationExposure, DormantDeviceContext, LifecycleJournal, ProviderBeginError, ProviderFault,
+    ProviderStage, QuiesceCompletion, ResumeAcceptance, VirtioStateProvider,
 };
 use crate::virtio::vsock::Vsock;
 use crate::virtio::vsock::defs::uapi;
@@ -75,6 +75,7 @@ struct Saved {
     reset_pending: bool,
     listeners: Vec<(u32, bool)>,
     retired_ports: Vec<u32>,
+    next_source_port: u32,
 }
 
 impl Saved {
@@ -96,6 +97,7 @@ impl Saved {
             for port in &self.retired_ports {
                 writer.u32(*port)?;
             }
+            writer.u32(self.next_source_port)?;
             Ok::<_, utils::state::Error>(writer.finish())
         })();
         result.map_err(|_| ProviderFault::DeviceState)
@@ -135,6 +137,13 @@ impl Saved {
                 }
                 retired_ports.push(port);
             }
+            let next_source_port = reader.u32()?;
+            if !(crate::virtio::vsock::muxer_thread::SOURCE_PORT_START
+                ..=crate::virtio::vsock::muxer_thread::SOURCE_PORT_END)
+                .contains(&next_source_port)
+            {
+                return Err(utils::state::Error::Invalid("vsock source port cursor"));
+            }
             reader.finish()?;
             Ok(Self {
                 available,
@@ -143,6 +152,7 @@ impl Saved {
                 reset_pending,
                 listeners,
                 retired_ports,
+                next_source_port,
             })
         })();
         result.map_err(|_| ProviderFault::DeviceState)
@@ -150,6 +160,23 @@ impl Saved {
 }
 
 impl Vsock {
+    pub fn restore_queue_config() -> &'static [crate::virtio::QueueConfig] {
+        &crate::virtio::vsock::defs::QUEUE_CONFIG
+    }
+
+    pub fn inspect_restore_payload(payload: &[u8]) -> Result<u64, ProviderFault> {
+        let saved = Saved::decode(payload)?;
+        if saved.available != crate::virtio::vsock::device::AVAIL_FEATURES
+            || saved.acknowledged & !saved.available != 0
+            || saved.cid <= 2
+            || saved.cid == u64::MAX
+            || !saved.listeners.is_empty()
+        {
+            return Err(ProviderFault::DeviceState);
+        }
+        Ok(saved.cid)
+    }
+
     pub fn bind_restore_control_service(&mut self, port: u32) -> Result<(), ProviderFault> {
         if port == 0 || self.is_activated() || self.provider.dormant {
             return Err(ProviderFault::InvalidTransition);
@@ -166,6 +193,7 @@ impl Vsock {
             reset_pending: self.pending_reset,
             listeners: self.muxer.listener_shape(),
             retired_ports: self.muxer.retired_ports()?,
+            next_source_port: self.muxer.source_ports.next(),
         })
     }
 
@@ -673,6 +701,12 @@ impl VirtioStateProvider for Vsock {
             )
             .map_err(|_| ProviderFault::Worker)?;
         self.muxer.retired_source_ports = saved.retired_ports;
+        self.muxer.source_ports = std::sync::Arc::new(
+            crate::virtio::vsock::muxer_thread::SourcePortAllocator::new(
+                saved.next_source_port,
+                crate::virtio::vsock::muxer_thread::SOURCE_PORT_END,
+            ),
+        );
         self.provider
             .journal
             .begin(request, ProviderStage::Quiescing);
@@ -692,6 +726,7 @@ impl VirtioStateProvider for Vsock {
     fn begin_activation_release(
         &mut self,
         request: BarrierRequest,
+        exposure: &ActivationExposure,
     ) -> Result<(), ProviderBeginError> {
         if self.provider.activation == Some(request) {
             return self.provider.activation_fault.map_or(Ok(()), |fault| {
@@ -719,10 +754,12 @@ impl VirtioStateProvider for Vsock {
             });
         }
         self.provider.activation = Some(request);
+        // The mux binds listeners while the shared gate keeps non-control
+        // traffic, host listener acceptance and timesync fenced.
         let result = self
             .muxer
             .worker_control
-            .release_activation()
+            .release_activation(exposure)
             .and_then(|()| self.muxer.worker_control.resume());
         result.map_err(|_| {
             self.provider.activation_fault = Some(ProviderFault::Worker);
@@ -770,6 +807,32 @@ impl VirtioStateProvider for Vsock {
             }
         }
     }
+
+    fn validate_activation_prepared(&self, key: BarrierKey) -> Result<Poll<()>, ProviderFault> {
+        if self
+            .provider
+            .activation
+            .is_none_or(|request| request.key != key)
+        {
+            return Err(ProviderFault::ForeignBarrier);
+        }
+        if let Some(fault) = self.provider.activation_fault {
+            return Err(fault);
+        }
+        if !self.provider.activation_done
+            || self.provider.journal.snapshot.stage != ProviderStage::Running
+            || self.provider.dormant
+            || self.pending_reset
+            || !self.is_activated()
+        {
+            return Err(ProviderFault::InvalidTransition);
+        }
+        match self.preflight() {
+            Ok(()) => self.muxer.worker_control.validate_prepared(),
+            Err(ProviderFault::LockBusy) => Ok(Poll::Pending),
+            Err(fault) => Err(fault),
+        }
+    }
 }
 
 fn close_queue(
@@ -806,8 +869,8 @@ mod tests {
 
     use crate::legacy::DummyIrqChip;
     use crate::virtio::lifecycle::{
-        DormantDeviceContext, ProviderFault, QuiesceCompletion, RestoredReclaimPolicy,
-        ResumeAcceptance, VirtioStateProvider,
+        ActivationExposure, DormantDeviceContext, ProviderFault, QuiesceCompletion,
+        RestoredReclaimPolicy, ResumeAcceptance, VirtioStateProvider,
     };
     use crate::virtio::queue::tests::VirtQueue;
     use crate::virtio::vsock::{TsiFlags, Vsock};
@@ -844,6 +907,7 @@ mod tests {
         (device, peer, observer)
     }
 
+    #[track_caller]
     fn until(mut predicate: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !predicate() {
@@ -1039,7 +1103,10 @@ mod tests {
         let (mut destination, control) = activation_destination();
         assert_eq!(destination.activation_fenced(), Ok(Some(true)));
         let release = request(3);
-        destination.begin_activation_release(release).unwrap();
+        let exposure = ActivationExposure::new();
+        destination
+            .begin_activation_release(release, &exposure)
+            .unwrap();
         let gate = destination.muxer.worker_control.clone();
         let epoch = gate.epoch();
         let held_gate = gate.clone();
@@ -1081,7 +1148,19 @@ mod tests {
                 .unwrap()
                 .is_ready()
         });
+        assert_eq!(
+            destination.activation_fenced(),
+            Ok(Some(true)),
+            "prepared mux stays fenced until the shared commit"
+        );
+        assert!(
+            !gate.admits(1028),
+            "non-control vsock stays fenced while prepared"
+        );
+        assert!(gate.admits(1027), "agent control remains admitted");
+        assert!(exposure.open());
         assert_eq!(destination.activation_fenced(), Ok(Some(false)));
+        assert!(gate.admits(1028));
         assert_eq!(gate.epoch(), epoch, "accepted release must not be replayed");
         let released = connect(&control, 1028);
         until(|| {
@@ -1109,6 +1188,60 @@ mod tests {
     }
 
     #[test]
+    fn provider_vsock_transition_between_prepare_and_commit_invalidates_exposure() {
+        // Reachable provider transitions after a Ready preparation: an owner
+        // quiesce (workers paused) and a sticky real worker failure. A second
+        // Muxer::activate on a live mux is not a reachable transition: it shares
+        // the epoll instance and fails the provider on the duplicate owner-wake
+        // registration; the mux-instance binding is covered on WorkerControl.
+        for quiesce in [true, false] {
+            let (mut destination, _control) = activation_destination();
+            let release = request(3);
+            let exposure = ActivationExposure::new();
+            assert_eq!(
+                destination.validate_activation_prepared(release.key),
+                Err(ProviderFault::ForeignBarrier)
+            );
+            destination
+                .begin_activation_release(release, &exposure)
+                .unwrap();
+            until(|| {
+                destination
+                    .poll_activation_release(release.key)
+                    .unwrap()
+                    .is_ready()
+            });
+            until(
+                || match destination.validate_activation_prepared(release.key) {
+                    Ok(Poll::Pending) => false,
+                    Ok(Poll::Ready(())) => true,
+                    Err(fault) => panic!("prepared mux failed its proof: {fault:?}"),
+                },
+            );
+            let gate = destination.muxer.worker_control.clone();
+            let expected = if quiesce {
+                destination.begin_quiesce(request(4)).unwrap();
+                ProviderFault::InvalidTransition
+            } else {
+                gate.fail();
+                ProviderFault::Worker
+            };
+            assert_eq!(
+                destination.validate_activation_prepared(release.key),
+                Err(expected),
+                "quiesce={quiesce}: an earlier proof cannot survive the transition"
+            );
+            assert_eq!(destination.activation_fenced(), Ok(Some(true)));
+            assert!(!gate.admits(1028), "non-control vsock stays fenced");
+            // The owner seals on the failed proof; nothing ever becomes visible.
+            assert!(exposure.seal());
+            assert!(!exposure.open());
+            assert_eq!(destination.activation_fenced(), Ok(Some(true)));
+            assert!(!gate.admits(1028));
+        }
+    }
+
+    #[test]
     fn provider_vsock_activation_owner_faults_and_deadline_are_sticky() {
         for expected in [
             ProviderFault::Deadline,
@@ -1125,7 +1258,10 @@ mod tests {
             } else {
                 request(3)
             };
-            destination.begin_activation_release(release).unwrap();
+            let exposure = ActivationExposure::new();
+            destination
+                .begin_activation_release(release, &exposure)
+                .unwrap();
             let gate = destination.muxer.worker_control.clone();
             let held_gate = gate.clone();
             let (held_sender, held_receiver) = std::sync::mpsc::sync_channel(1);
@@ -1172,7 +1308,11 @@ mod tests {
                 destination.poll_activation_release(release.key),
                 Err(observed_fault)
             );
-            let repeated = destination.begin_activation_release(release).unwrap_err();
+            let repeated = destination
+                .begin_activation_release(release, &exposure)
+                .unwrap_err();
+            assert!(exposure.seal(), "owner failure seals the shared gate");
+            assert_eq!(destination.activation_fenced(), Ok(Some(true)));
             assert!(repeated.accepted);
             assert_eq!(repeated.fault, observed_fault);
             assert_eq!(
@@ -1400,7 +1540,11 @@ mod tests {
             destination.pending_reset,
             "preposted buffers are not reset completion"
         );
-        assert!(destination.begin_activation_release(request(3)).is_err());
+        assert!(
+            destination
+                .begin_activation_release(request(3), &ActivationExposure::new())
+                .is_err()
+        );
         destination_ev.dtable[2].set(0x6020, 4, 2, 0);
         destination_ev.avail.ring[2].set(2);
         destination_ev.avail.idx.set(3);
@@ -1455,13 +1599,21 @@ mod tests {
         let denied = connect(&destination_control, 1028);
         until(|| recv(denied.as_raw_fd(), &mut [0u8; 1], MsgFlags::MSG_DONTWAIT) == Ok(0));
         let release = request(6);
-        destination.begin_activation_release(release).unwrap();
+        let exposure = ActivationExposure::new();
+        destination
+            .begin_activation_release(release, &exposure)
+            .unwrap();
         until(|| {
             destination
                 .poll_activation_release(release.key)
                 .unwrap()
                 .is_ready()
         });
+        // Listeners are bound and the mux is prepared, but nothing is exposed yet.
+        let gated = connect(&destination_control, 1028);
+        until(|| recv(gated.as_raw_fd(), &mut [0u8; 1], MsgFlags::MSG_DONTWAIT) == Ok(0));
+        assert_eq!(destination.activation_fenced(), Ok(Some(true)));
+        assert!(exposure.open());
         let _released = connect(&destination_control, 1028);
         until(|| {
             destination

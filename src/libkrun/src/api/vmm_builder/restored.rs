@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use devices::legacy::Serial;
 use devices::virtio::PortDescription;
+use devices::virtio::block::MAX_VMDK_FLAT_RECORDS;
 use devices::virtio::generation::{DEVICE_TYPE, Generation};
 use devices::virtio::{VirtioDevice, port_io};
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
@@ -25,12 +26,10 @@ use crate::vmm::control::ControlState;
 use crate::vmm::execution::device_restore::{
     DeviceEnvelope, PreparedDeviceInstall, RestoreDeviceBinding, ValidatedDevices,
 };
-use crate::vmm::execution::{
-    ExecutionEnvelope, ExecutionLane, MAX_EXECUTION_BYTES, ValidatedExecution,
-};
+use crate::vmm::execution::{ExecutionEnvelope, MAX_EXECUTION_BYTES, ValidatedExecution};
 use crate::vmm::memory::image::{AuthenticatedRamImage, map_restore_ram};
 
-const MAX_DEVICES_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_DEVICES_BYTES: usize = 32 * 1024 * 1024;
 type Inode = (u64, u64);
 
 fn descriptor(role: RestoreRole, problem: RestoreProblem) -> RestoreError {
@@ -61,7 +60,11 @@ fn flags(fd: impl AsFd, role: RestoreRole) -> Result<OFlag, RestoreError> {
         .map(OFlag::from_bits_truncate)
         .map_err(|error| io(role, error.into()))
 }
-fn inspect(file: &File, role: RestoreRole, writable: bool) -> Result<Inode, RestoreError> {
+pub(crate) fn inspect(
+    file: &File,
+    role: RestoreRole,
+    writable: bool,
+) -> Result<Inode, RestoreError> {
     let flags = flags(file, role)?;
     let expected = if writable {
         OFlag::O_RDWR
@@ -88,7 +91,7 @@ fn distinct(inodes: &mut Vec<Inode>, inode: Inode, role: RestoreRole) -> Result<
     inodes.push(inode);
     Ok(())
 }
-fn read_object(
+pub(crate) fn read_object(
     file: &File,
     role: RestoreRole,
     expected: &StateObjectIdentity,
@@ -138,12 +141,21 @@ fn preflight(inputs: &RestoreInputs, resources: &RestoreResources) -> Result<(),
     {
         return Err(RestoreError::Refused(RestoreProblem::Inventory));
     }
+    // Repeated read-only extents are legitimate (split and repeated layers,
+    // ADR 0014), so they stay out of the exclusive set and are checked against
+    // it once every exclusive role is known.
+    let mut extents: Vec<Inode> = Vec::new();
     for block in &resources.blocks {
-        distinct(
-            &mut inodes,
-            inspect(&block.file, RestoreRole::Block, !block.read_only)?,
-            RestoreRole::Block,
-        )?;
+        match &block.backing {
+            RestoreBlockBacking::Raw { file, read_only } => distinct(
+                &mut inodes,
+                inspect(file, RestoreRole::Block, !read_only)?,
+                RestoreRole::Block,
+            )?,
+            RestoreBlockBacking::ReadonlyVmdk(closure) => {
+                preflight_vmdk(closure, &mut inodes, &mut extents)?
+            }
+        }
     }
     for net in &resources.networks {
         flags(&net.socket, RestoreRole::Network)?;
@@ -193,7 +205,67 @@ fn preflight(inputs: &RestoreInputs, resources: &RestoreResources) -> Result<(),
         }
         inodes.extend(endpoint);
     }
+    if extents.iter().any(|extent| inodes.contains(extent)) {
+        return Err(descriptor(RestoreRole::VmdkExtent, RestoreProblem::Alias));
+    }
     Ok(())
+}
+
+fn preflight_vmdk(
+    closure: &ReadonlyVmdk,
+    inodes: &mut Vec<Inode>,
+    extents: &mut Vec<Inode>,
+) -> Result<(), RestoreError> {
+    if closure.extents.is_empty() {
+        return Err(descriptor(RestoreRole::VmdkExtent, RestoreProblem::Closure));
+    }
+    if closure.extents.len() > MAX_VMDK_FLAT_RECORDS.saturating_sub(extents.len()) {
+        return Err(RestoreError::Refused(RestoreProblem::Inventory));
+    }
+    distinct(
+        inodes,
+        inspect(&closure.descriptor, RestoreRole::VmdkDescriptor, false)?,
+        RestoreRole::VmdkDescriptor,
+    )?;
+    let mut held = Vec::with_capacity(closure.extents.len());
+    for extent in &closure.extents {
+        let inode = inspect(&extent.file, RestoreRole::VmdkExtent, false)?;
+        // Cold attach reads extents through buffered read-only opens.
+        #[cfg(target_os = "linux")]
+        if flags(&extent.file, RestoreRole::VmdkExtent)?.contains(OFlag::O_DIRECT) {
+            return Err(descriptor(RestoreRole::VmdkExtent, RestoreProblem::Access));
+        }
+        // One path per held inode: a second spelling is not a repeat.
+        distinct(&mut held, inode, RestoreRole::VmdkExtent)?;
+    }
+    extents.extend(held);
+    Ok(())
+}
+
+#[cfg(feature = "blk")]
+fn block_binding(error: devices::virtio::block::RestoreBindingError) -> RestoreError {
+    use devices::virtio::block::RestoreBindingError as Binding;
+    use devices::virtio::block::vmdk::VmdkClosureFault as Fault;
+    match error {
+        Binding::Payload => RestoreError::Codec(utils::state::Error::Invalid("block payload")),
+        Binding::Format => descriptor(RestoreRole::Block, RestoreProblem::Format),
+        Binding::Binding => RestoreError::Refused(RestoreProblem::Topology),
+        Binding::Io(source) => io(RestoreRole::Block, source),
+        Binding::Closure(fault) => {
+            let (role, problem) = match fault {
+                Fault::DescriptorLength => (RestoreRole::VmdkDescriptor, RestoreProblem::Length),
+                Fault::DescriptorGrammar | Fault::RecordLimit | Fault::Reader => {
+                    (RestoreRole::VmdkDescriptor, RestoreProblem::Closure)
+                }
+                Fault::UndeclaredExtent | Fault::UnreferencedExtent | Fault::DuplicateExtent => {
+                    (RestoreRole::VmdkExtent, RestoreProblem::Closure)
+                }
+                Fault::ExtentRange => (RestoreRole::VmdkExtent, RestoreProblem::Length),
+                Fault::ExtentAccess => (RestoreRole::VmdkExtent, RestoreProblem::Access),
+            };
+            descriptor(role, problem)
+        }
+    }
 }
 
 fn matches(
@@ -253,7 +325,7 @@ fn take_binding<T>(
     Ok(items.remove(index))
 }
 
-fn validate_profile(
+pub(crate) fn validate_profile(
     records: &[crate::vmm::execution::device_restore::DeviceRecord],
 ) -> Result<(), RestoreError> {
     if records
@@ -351,11 +423,10 @@ fn reconstruct(
                 Arc::new(Mutex::new(
                     devices::virtio::Block::new_restore_binding(
                         block.attachment.configured_id,
-                        block.file,
-                        block.read_only,
+                        block.backing,
                         &record.payload,
                     )
-                    .map_err(|error| io(RestoreRole::Block, error))?,
+                    .map_err(block_binding)?,
                 ))
             }
             #[cfg(feature = "net")]
@@ -555,25 +626,13 @@ impl<'a> VmmBuilder<'a> {
         let envelope = ExecutionEnvelope::decode(&bytes)
             .map_err(RestoreError::from)
             .map_err(refusal)?;
-        let lane = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            ExecutionLane::KvmX86
-        } else if cfg!(target_os = "linux") {
-            ExecutionLane::KvmArm64
-        } else {
-            ExecutionLane::HvfArm64
-        };
+        let lane = crate::api::live::inspection::native_lane();
         let execution = ValidatedExecution::validate(envelope, &inputs.expected.binding, lane)
             .map_err(RestoreError::from)
             .map_err(refusal)?;
         let saved = execution.envelope();
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        if !matches!(&saved.vm,
-            crate::vmm::execution::VmExecutionState::Kvm(
-                crate::vmm::execution::kvm::KvmVmState::X86(state)
-            ) if state.pit_profile == 1
-        ) {
-            return Err(refusal(RestoreError::Refused(RestoreProblem::Topology)));
-        }
+        crate::api::live::inspection::validate_execution_profile(&execution)
+            .map_err(|error| refusal(native(RestoreStage::Validation, error)))?;
         let ram_length = saved
             .memory_regions
             .iter()
@@ -748,7 +807,7 @@ pub(crate) fn cleanup(vm: &mut Vmm<'_>, cleanup: &mut RestoreCleanup, deadline: 
     false
 }
 
-fn sha256(bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -828,6 +887,8 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use crate::api::live::restore::*;
+    #[cfg(feature = "blk")]
+    use crate::api::vmm_builder::restored::block_binding;
     use crate::api::vmm_builder::restored::{
         distinct, inspect, preflight, read_object, register_owner_roles, sha256, take_binding,
         validate_bindings, validate_profile,
@@ -966,15 +1027,15 @@ mod tests {
         ));
         let restore = inputs(&files);
         let resources = RestoreResources {
-            blocks: vec![RestoreBlock {
-                attachment: RestoreAttachment {
+            blocks: vec![RestoreBlock::raw(
+                RestoreAttachment {
                     configured_id: "root".into(),
                     address: 0xd0000000,
                     irq: 5,
                 },
-                file: restore.ram.try_clone().unwrap(),
-                read_only: true,
-            }],
+                restore.ram.try_clone().unwrap(),
+                true,
+            )],
             ..RestoreResources::default()
         };
         assert!(matches!(
@@ -994,6 +1055,290 @@ mod tests {
             .expect("malformed state must refuse before constructing a VM");
         assert!(matches!(failure.reason, RestoreError::Codec(_)));
         assert!(failure.failed.is_none());
+    }
+
+    fn lower(descriptor: File, extents: Vec<VmdkExtent>) -> RestoreBlock {
+        RestoreBlock::readonly_vmdk(
+            RestoreAttachment {
+                configured_id: "silo-root-lower".into(),
+                address: 0xd0000000,
+                irq: 5,
+            },
+            descriptor,
+            extents,
+        )
+    }
+
+    fn held(path: &str, backing: &TempFile) -> VmdkExtent {
+        VmdkExtent {
+            path: path.into(),
+            file: File::open(backing.as_path()).unwrap(),
+        }
+    }
+
+    fn refusal(
+        resources: RestoreResources,
+        files: &[TempFile; 4],
+    ) -> (RestoreRole, RestoreProblem) {
+        match preflight(&inputs(files), &resources) {
+            Err(RestoreError::Descriptor { role, problem }) => (role, problem),
+            other => panic!("expected descriptor refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vmdk_preflight_admits_repeated_readonly_extents_and_rejects_aliases_and_access() {
+        let files = [file(b"ram"), file(b"layout"), file(b"bad"), file(b"bad")];
+        let descriptor = file(b"descriptor");
+        let other_descriptor = file(b"descriptor");
+        let first = file(b"first");
+        let second = file(b"second");
+        let only = |blocks| RestoreResources {
+            blocks,
+            ..RestoreResources::default()
+        };
+
+        // The same immutable extent may back several read-only closures.
+        preflight(
+            &inputs(&files),
+            &only(vec![
+                lower(
+                    File::open(descriptor.as_path()).unwrap(),
+                    vec![held("/pool/first", &first), held("/pool/second", &second)],
+                ),
+                lower(
+                    File::open(other_descriptor.as_path()).unwrap(),
+                    vec![held("/pool/first", &first)],
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let cases: Vec<(&str, Vec<RestoreBlock>, (RestoreRole, RestoreProblem))> = vec![
+            (
+                "one inode under two paths",
+                vec![lower(
+                    File::open(descriptor.as_path()).unwrap(),
+                    vec![held("/pool/a", &first), held("/pool/b", &first)],
+                )],
+                (RestoreRole::VmdkExtent, RestoreProblem::Alias),
+            ),
+            (
+                "extent aliases a writable raw disk",
+                vec![
+                    RestoreBlock::raw(
+                        RestoreAttachment {
+                            configured_id: "silo-root-upper".into(),
+                            address: 0xd0001000,
+                            irq: 6,
+                        },
+                        File::options()
+                            .read(true)
+                            .write(true)
+                            .open(first.as_path())
+                            .unwrap(),
+                        false,
+                    ),
+                    lower(
+                        File::open(descriptor.as_path()).unwrap(),
+                        vec![held("/pool/first", &first)],
+                    ),
+                ],
+                (RestoreRole::VmdkExtent, RestoreProblem::Alias),
+            ),
+            (
+                "extent aliases its descriptor",
+                vec![lower(
+                    File::open(first.as_path()).unwrap(),
+                    vec![held("/pool/first", &first)],
+                )],
+                (RestoreRole::VmdkExtent, RestoreProblem::Alias),
+            ),
+            (
+                "descriptor shared by two closures",
+                vec![
+                    lower(
+                        File::open(descriptor.as_path()).unwrap(),
+                        vec![held("/pool/first", &first)],
+                    ),
+                    lower(
+                        File::open(descriptor.as_path()).unwrap(),
+                        vec![held("/pool/first", &first)],
+                    ),
+                ],
+                (RestoreRole::VmdkDescriptor, RestoreProblem::Alias),
+            ),
+            (
+                "writable extent",
+                vec![lower(
+                    File::open(descriptor.as_path()).unwrap(),
+                    vec![VmdkExtent {
+                        path: "/pool/first".into(),
+                        file: File::options()
+                            .read(true)
+                            .write(true)
+                            .open(first.as_path())
+                            .unwrap(),
+                    }],
+                )],
+                (RestoreRole::VmdkExtent, RestoreProblem::Access),
+            ),
+            (
+                "writable descriptor",
+                vec![lower(
+                    File::options()
+                        .read(true)
+                        .write(true)
+                        .open(descriptor.as_path())
+                        .unwrap(),
+                    vec![held("/pool/first", &first)],
+                )],
+                (RestoreRole::VmdkDescriptor, RestoreProblem::Access),
+            ),
+            (
+                "empty closure",
+                vec![lower(File::open(descriptor.as_path()).unwrap(), Vec::new())],
+                (RestoreRole::VmdkExtent, RestoreProblem::Closure),
+            ),
+        ];
+        for (name, blocks, expected) in cases {
+            assert_eq!(refusal(only(blocks), &files), expected, "{name}");
+        }
+
+        let restore = inputs(&files);
+        let ram_extent = only(vec![lower(
+            File::open(descriptor.as_path()).unwrap(),
+            vec![VmdkExtent {
+                path: "/pool/ram".into(),
+                file: restore.ram.try_clone().unwrap(),
+            }],
+        )]);
+        assert!(matches!(
+            preflight(&restore, &ram_extent),
+            Err(RestoreError::Descriptor {
+                role: RestoreRole::VmdkExtent,
+                problem: RestoreProblem::Alias
+            })
+        ));
+
+        let inherited = held("/pool/first", &first);
+        nix::fcntl::fcntl(
+            inherited.file.as_fd(),
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+        )
+        .unwrap();
+        assert_eq!(
+            refusal(
+                only(vec![lower(
+                    File::open(descriptor.as_path()).unwrap(),
+                    vec![inherited]
+                )]),
+                &files
+            ),
+            (RestoreRole::VmdkExtent, RestoreProblem::CloseOnExec)
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // tmpfs may refuse O_DIRECT; the check needs a real direct handle.
+            if let Ok(direct) = File::options()
+                .read(true)
+                .custom_flags(nix::fcntl::OFlag::O_DIRECT.bits())
+                .open(first.as_path())
+            {
+                assert_eq!(
+                    refusal(
+                        only(vec![lower(
+                            File::open(descriptor.as_path()).unwrap(),
+                            vec![VmdkExtent {
+                                path: "/pool/first".into(),
+                                file: direct,
+                            }]
+                        )]),
+                        &files
+                    ),
+                    (RestoreRole::VmdkExtent, RestoreProblem::Access)
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "blk")]
+    #[test]
+    fn block_binding_failures_keep_typed_vmdk_roles() {
+        use devices::virtio::block::RestoreBindingError as Binding;
+        use devices::virtio::block::vmdk::VmdkClosureFault as Fault;
+        for (fault, role, problem) in [
+            (
+                Fault::DescriptorLength,
+                RestoreRole::VmdkDescriptor,
+                RestoreProblem::Length,
+            ),
+            (
+                Fault::DescriptorGrammar,
+                RestoreRole::VmdkDescriptor,
+                RestoreProblem::Closure,
+            ),
+            (
+                Fault::RecordLimit,
+                RestoreRole::VmdkDescriptor,
+                RestoreProblem::Closure,
+            ),
+            (
+                Fault::Reader,
+                RestoreRole::VmdkDescriptor,
+                RestoreProblem::Closure,
+            ),
+            (
+                Fault::UndeclaredExtent,
+                RestoreRole::VmdkExtent,
+                RestoreProblem::Closure,
+            ),
+            (
+                Fault::UnreferencedExtent,
+                RestoreRole::VmdkExtent,
+                RestoreProblem::Closure,
+            ),
+            (
+                Fault::DuplicateExtent,
+                RestoreRole::VmdkExtent,
+                RestoreProblem::Closure,
+            ),
+            (
+                Fault::ExtentRange,
+                RestoreRole::VmdkExtent,
+                RestoreProblem::Length,
+            ),
+            (
+                Fault::ExtentAccess,
+                RestoreRole::VmdkExtent,
+                RestoreProblem::Access,
+            ),
+        ] {
+            assert!(
+                matches!(
+                    block_binding(Binding::Closure(fault)),
+                    RestoreError::Descriptor { role: r, problem: p } if r == role && p == problem
+                ),
+                "{fault:?}"
+            );
+        }
+        assert!(matches!(
+            block_binding(Binding::Format),
+            RestoreError::Descriptor {
+                role: RestoreRole::Block,
+                problem: RestoreProblem::Format
+            }
+        ));
+        assert!(matches!(
+            block_binding(Binding::Binding),
+            RestoreError::Refused(RestoreProblem::Topology)
+        ));
+        assert!(matches!(
+            block_binding(Binding::Payload),
+            RestoreError::Codec(_)
+        ));
     }
 
     #[cfg(target_os = "linux")]

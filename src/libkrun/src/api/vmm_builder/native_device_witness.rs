@@ -11,7 +11,9 @@ use devices::bus::BusAccessObserver;
 use devices::virtio::RuntimeGuestMemory;
 use vm_memory::GuestAddress;
 
-use crate::api::vmm_builder::native_device_probe::{Driver, bounded, write_new};
+use crate::api::live::irq_probe::{Fixture, FixtureLayout, ProbeObservation};
+use crate::api::vmm_builder::native_device_probe::write_new;
+use crate::vmm::Vmm;
 use crate::vmm::control::CpuCommandKind;
 use crate::vmm::execution::kvm::{KvmCpuState, KvmCpuTimePlan, KvmVmState, Segment, lapic_u32};
 use crate::vmm::execution::{
@@ -68,6 +70,28 @@ fn fixture_symbol(symbols: &str, name: &str) -> Result<u64, String> {
     found.ok_or_else(|| format!("missing witness symbol {name}"))
 }
 
+pub(crate) fn fixture_layout(code: &[u8], symbols: &str) -> Result<FixtureLayout, String> {
+    let symbol = |name| fixture_symbol(symbols, name);
+    let layout = FixtureLayout {
+        handler: symbol("witness_interrupt")?,
+        idt: symbol("witness_idt")?,
+        completion_ips: [
+            symbol("witness_io_complete")?,
+            symbol("witness_mmio_complete")?,
+        ],
+    };
+    let end = CODE + code.len() as u64;
+    if symbol("_start")? != CODE
+        || code.is_empty()
+        || layout.idt + 225 * 16 > end
+        || layout.handler >= end
+        || layout.completion_ips.iter().any(|ip| *ip >= end)
+    {
+        return Err("witness symbols/code extent disagree".into());
+    }
+    Ok(layout)
+}
+
 #[derive(Default)]
 struct GateState {
     armed: bool,
@@ -115,8 +139,7 @@ impl BusAccessObserver for Witness {
     }
 }
 impl Witness {
-    pub fn attach(self: &Arc<Self>, driver: &Driver) -> Result<(), String> {
-        let vmm = driver.vmm.try_lock().map_err(|_| "witness VMM lock")?;
+    pub fn attach(self: &Arc<Self>, vmm: &Vmm) -> Result<(), String> {
         *self
             .address
             .lock()
@@ -125,7 +148,7 @@ impl Witness {
             .quiescence
             .attachment_identities()
             .into_iter()
-            .find(|a| a.configured_id == "rng-line-padding-0")
+            .find(|a| matches!(a.configured_id.as_str(), "rng-line-padding-0" | "rng"))
             .map(|a| a.address + 0x30);
         vmm.mmio_device_manager
             .bus
@@ -133,14 +156,11 @@ impl Witness {
             .map_err(|e| e.to_string())?;
         vmm.mmio_device_manager.observe_probe_io(self.clone())
     }
-    pub fn release_accepted_park(&self, driver: &Driver) -> Result<(), String> {
+    pub fn release_accepted_park(&self, vmm: &Vmm) -> Result<(), String> {
         let mut state = self.gate.lock().map_err(|_| "witness gate poisoned")?;
         if state.entered
             && !state.released
-            && driver
-                .vmm
-                .try_lock()
-                .map_err(|_| "witness VMM lock")?
+            && vmm
                 .control
                 .cpus
                 .active_request()
@@ -157,71 +177,37 @@ impl Witness {
             self.wake.notify_all();
         }
     }
-    pub fn command(&self, driver: &mut Driver, command: &str, operand: &str) -> Result<(), String> {
-        match command {
-            "witness-init" => self.initialize(driver, Path::new(operand)),
-            "witness-arm" => {
-                let case = operand
-                    .parse::<u64>()
-                    .map_err(|_| "witness command number")?;
-                if !matches!(case, 1..=13) {
-                    return Err("witness command out of range".into());
-                }
-                if matches!(case, 3 | 7 | 8) {
-                    *self.gate.lock().map_err(|_| "witness gate poisoned")? = GateState {
-                        armed: true,
-                        ..GateState::default()
-                    };
-                }
-                self.set(driver, 3, case)
-            }
-            "witness-snapshot" => self.snapshot(driver, Path::new(operand)),
-            "witness-cut" => {
-                let (case, path) = operand.split_once(' ').ok_or("witness-cut CASE PATH")?;
-                self.validate(driver, case)?;
-                self.snapshot(driver, Path::new(path))
-            }
-            _ => Err("unknown witness command".into()),
+    pub(crate) fn arm(&self, vmm: &Vmm, case: u64) -> Result<(), String> {
+        if !matches!(case, 1..=13) {
+            return Err("witness command out of range".into());
         }
+        if matches!(case, 3 | 7 | 8) {
+            *self.gate.lock().map_err(|_| "witness gate poisoned")? = GateState {
+                armed: true,
+                ..GateState::default()
+            };
+        }
+        write_command(vmm, case)
     }
-    fn set(&self, driver: &Driver, index: u64, value: u64) -> Result<(), String> {
-        driver
-            .vmm
-            .try_lock()
-            .map_err(|_| "witness VMM lock")?
-            .guest_memory
-            .store(value, GuestAddress(SLOT + index * 8), Ordering::SeqCst)
-            .map_err(|e| e.to_string())
-    }
-    fn initialize(&self, driver: &mut Driver, directory: &Path) -> Result<(), String> {
-        if !driver.witness_source {
-            return Err("restored native CPUs cannot enter source fixture construction".into());
-        }
-        let code = bounded(&directory.join("witness.bin"), 0x3000)?;
-        let symbols = String::from_utf8(bounded(&directory.join("witness.nm"), 65536)?)
-            .map_err(|_| "witness symbol UTF-8")?;
-        let symbol = |name| fixture_symbol(&symbols, name);
-        let handler = symbol("witness_interrupt")?;
-        let idt = symbol("witness_idt")?;
-        let ips = [
-            symbol("witness_io_complete")?,
-            symbol("witness_mmio_complete")?,
-        ];
-        let end = CODE + code.len() as u64;
-        if symbol("_start")? != CODE
-            || code.is_empty()
-            || idt + 225 * 16 > end
-            || handler >= end
-            || ips.iter().any(|ip| *ip >= end)
-        {
-            return Err("witness symbols/code extent disagree".into());
-        }
+    pub(crate) fn begin_initialize(
+        &self,
+        vmm: &mut Vmm,
+        fixture: Fixture,
+        deadline: Instant,
+    ) -> Result<Arc<CpuExecutionInput>, String> {
+        let Fixture { code, layout } = fixture;
+        let FixtureLayout {
+            handler,
+            idt,
+            completion_ips: ips,
+        } = layout;
+        validate_source(vmm)?;
         *self
             .completion_ips
             .lock()
             .map_err(|_| "witness completion lock poisoned")? = Some(ips);
         let (request, barrier, inputs) = {
-            let mut vmm = driver.vmm.try_lock().map_err(|_| "witness VMM lock")?;
+            let vmm = &mut *vmm;
             let active = vmm
                 .control
                 .active
@@ -261,7 +247,7 @@ impl Witness {
                 .quiescence
                 .attachment_identities()
                 .into_iter()
-                .find(|a| a.configured_id == "rng-line-padding-0")
+                .find(|a| matches!(a.configured_id.as_str(), "rng-line-padding-0" | "rng"))
                 .ok_or("real RNG witness attachment missing")?
                 .address
                 + 0x30;
@@ -379,13 +365,15 @@ impl Witness {
             )
         };
         {
-            let mut vmm = driver.vmm.try_lock().map_err(|_| "witness VMM lock")?;
             let vmm = &mut *vmm;
             vmm.control
                 .cpus
                 .begin_execution(
                     request,
-                    barrier,
+                    polly::event_manager::BarrierRequest {
+                        deadline,
+                        ..barrier
+                    },
                     CpuCommandKind::InitializeDeviceWitness,
                     &inputs,
                     &vmm.vcpus_handles,
@@ -393,40 +381,42 @@ impl Witness {
                 )
                 .map_err(|e| e.to_string())?;
         }
-        loop {
-            let result = {
-                let mut vmm = driver.vmm.try_lock().map_err(|_| "witness VMM lock")?;
-                let vmm = &mut *vmm;
-                vmm.control.cpus.poll(&mut vmm.vcpus_handles)
-            };
-            match result {
-                Poll::Ready(result) => {
-                    result.map_err(|e| e.to_string())?;
-                    let Some(CpuExecutionInput::InitializeDeviceWitness(bootstrap)) =
-                        inputs[2].as_deref()
-                    else {
-                        return Err("source bootstrap payload disappeared".into());
-                    };
-                    let mut vmm = driver.vmm.try_lock().map_err(|_| "witness VMM lock")?;
-                    let Some(CpuExecutionState::Kvm(KvmCpuState::X86(cpu))) = vmm
-                        .execution
-                        .retained
-                        .as_mut()
-                        .and_then(|cut| cut.cpus.get_mut(2))
-                    else {
-                        return Err("source retained AP2 disappeared".into());
-                    };
-                    cpu.regs = bootstrap.regs;
-                    cpu.special = bootstrap.special.clone();
-                    cpu.mp_state = 0;
-                    return Ok(());
+        inputs
+            .into_iter()
+            .nth(2)
+            .flatten()
+            .ok_or_else(|| "source bootstrap payload disappeared".into())
+    }
+    pub(crate) fn poll_initialize(
+        &self,
+        vmm: &mut Vmm,
+        input: &CpuExecutionInput,
+    ) -> Poll<Result<(), String>> {
+        let CpuExecutionInput::InitializeDeviceWitness(bootstrap) = input else {
+            return Poll::Ready(Err("source bootstrap payload disappeared".into()));
+        };
+        match vmm.control.cpus.poll(&mut vmm.vcpus_handles) {
+            Poll::Ready(result) => {
+                if let Err(error) = result {
+                    return Poll::Ready(Err(error.to_string()));
                 }
-                Poll::Pending => driver.poll()?,
+                let Some(CpuExecutionState::Kvm(KvmCpuState::X86(cpu))) = vmm
+                    .execution
+                    .retained
+                    .as_mut()
+                    .and_then(|cut| cut.cpus.get_mut(2))
+                else {
+                    return Poll::Ready(Err("source retained AP2 disappeared".into()));
+                };
+                cpu.regs = bootstrap.regs;
+                cpu.special = bootstrap.special.clone();
+                cpu.mp_state = 0;
+                Poll::Ready(Ok(()))
             }
+            Poll::Pending => Poll::Pending,
         }
     }
-    fn validate(&self, driver: &Driver, case: &str) -> Result<(), String> {
-        let vmm = driver.vmm.try_lock().map_err(|_| "witness VMM lock")?;
+    pub(crate) fn validate(&self, vmm: &Vmm, case: &str) -> Result<(), String> {
         let cut = vmm
             .execution
             .retained
@@ -531,16 +521,12 @@ impl Witness {
         }
         Ok(())
     }
-    fn snapshot(&self, driver: &Driver, path: &Path) -> Result<(), String> {
-        let (words, irq_publication) = {
-            let vmm = driver.vmm.try_lock().map_err(|_| "witness VMM lock")?;
-            irq_words(&vmm.guest_memory)?
-        };
+    pub(crate) fn snapshot(&self, vmm: &Vmm, path: &Path) -> Result<(), String> {
+        let (words, irq_publication) = irq_words(&vmm.guest_memory)?;
         let state = self.gate.lock().map_err(|_| "witness gate poisoned")?;
         if state.timed_out {
             return Err("actual bus completion hold timed out".into());
         }
-        let vmm = driver.vmm.try_lock().map_err(|_| "witness VMM lock")?;
         let ap = vmm
             .guest_memory
             .read_obj::<u8>(GuestAddress(LOW + 0xf000))
@@ -649,6 +635,74 @@ impl Witness {
         write_new(path, json.as_bytes())
     }
 }
+pub(crate) fn write_command(vmm: &Vmm, value: u64) -> Result<(), String> {
+    vmm.guest_memory
+        .store(value, GuestAddress(SLOT + 24), Ordering::SeqCst)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn observe(vmm: &Vmm) -> Result<ProbeObservation, String> {
+    let (words, irq_publication) = irq_words(&vmm.guest_memory)?;
+    let native = match vmm
+        .execution
+        .retained
+        .as_ref()
+        .and_then(|cut| cut.cpus.get(2))
+    {
+        Some(CpuExecutionState::Kvm(KvmCpuState::X86(cpu))) => Some((
+            lapic_u32(&cpu.lapic, 0x270).map_err(|e| e.to_string())? & 1 != 0,
+            lapic_u32(&cpu.lapic, 0x170).map_err(|e| e.to_string())? & 1 != 0,
+            cpu.deadline,
+        )),
+        Some(_) => return Err("foreign witness CPU inventory".into()),
+        None => None,
+    };
+    Ok(ProbeObservation {
+        words,
+        irq_publication,
+        pending: native.map(|value| value.0),
+        in_service: native.map(|value| value.1),
+        deadline: native.map(|value| value.2),
+    })
+}
+
+fn source_commandline(commandline: &str) -> Result<(), String> {
+    let mut maxcpus = false;
+    let mut high = false;
+    let mut low = false;
+    for word in commandline.split_whitespace() {
+        let duplicate = match word {
+            "maxcpus=2" => std::mem::replace(&mut maxcpus, true),
+            "memmap=16M$448M" => std::mem::replace(&mut high, true),
+            "memmap=64K$448K" => std::mem::replace(&mut low, true),
+            word if word.starts_with("maxcpus=") || word.starts_with("memmap=") => true,
+            _ => false,
+        };
+        if duplicate {
+            return Err("source witness has conflicting CPU/RAM construction arguments".into());
+        }
+    }
+    if !maxcpus || !high || !low {
+        return Err("source witness requires reserved high/low RAM and maxcpus=2".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_source(vmm: &Vmm) -> Result<(), String> {
+    source_commandline(vmm.kernel_cmdline.as_str())?;
+    if vmm.memory.restore_installation().is_some()
+        || vmm.memory_domain.backing_kind() == arch::guest_memory::BackingKind::RestoredPrivate
+        || !matches!(
+            vmm.control.state,
+            crate::vmm::control::ControlState::Paused(_)
+        )
+        || !vmm.control.cpus.reconciled()
+    {
+        return Err("witness construction requires a reconciled paused original source".into());
+    }
+    Ok(())
+}
+
 impl Drop for Witness {
     fn drop(&mut self) {
         self.release();
@@ -662,8 +716,22 @@ mod tests {
     use vm_memory::{GuestAddress, GuestMemoryMmap};
 
     use crate::api::vmm_builder::native_device_probe::witness::{
-        CODE, SLOT, fixture_symbol, irq_words,
+        CODE, SLOT, fixture_symbol, irq_words, source_commandline,
     };
+
+    #[test]
+    fn source_construction_requires_actual_reserved_ram_and_offline_ap_commandline() {
+        let valid = "console=hvc0 maxcpus=2 memmap=16M$448M memmap=64K$448K";
+        assert!(source_commandline(valid).is_ok());
+        assert!(source_commandline("").is_err());
+        assert!(source_commandline("maxcpus=2 memmap=16M$448M").is_err());
+        assert!(source_commandline(&valid.replace("maxcpus=2", "maxcpus=4")).is_err());
+        assert!(source_commandline(&format!("{valid} maxcpus=4")).is_err());
+        assert!(source_commandline(&format!("{valid} maxcpus=2")).is_err());
+        assert!(source_commandline(&valid.replace("memmap=64K$448K", "memmap=64K$449K")).is_err());
+        assert!(source_commandline(&format!("{valid} memmap=exactmap")).is_err());
+        assert!(source_commandline(&format!("{valid} memmap=16M$448M")).is_err());
+    }
 
     #[test]
     fn device_witness_symbols_bind_exact_source_text() {

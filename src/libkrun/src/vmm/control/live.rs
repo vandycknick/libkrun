@@ -22,7 +22,7 @@ use std::time::Instant;
 use crossbeam_channel::Sender;
 use devices::virtio::VirtioDevice;
 use devices::virtio::generation::GenerationObservation;
-use devices::virtio::lifecycle::ProviderFault;
+use devices::virtio::lifecycle::{ActivationExposure, ProviderFault};
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 
 #[cfg(any(
@@ -40,9 +40,10 @@ use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 ))]
 use crate::api::live::OutputReceipt;
 use crate::api::live::{
-    BaselineImage, CaptureId, CaptureStage, CaptureStatus, CaptureTicket, CompletedCapture,
-    ExecutionCaptureReceipt, ExecutionOutputs, FlushReceipt, LiveError, LiveSnapshot, LiveStage,
-    LiveSubject, MemoryCaptureRequest, MemoryOutputs, OutputProblem, OutputRole,
+    ActivationStage, BaselineImage, CaptureId, CaptureStage, CaptureStatus, CaptureTicket,
+    CompletedCapture, ExecutionCaptureReceipt, ExecutionOutputs, FlushReceipt, LiveError,
+    LiveSnapshot, LiveStage, LiveSubject, MemoryCaptureRequest, MemoryOutputs, OutputProblem,
+    OutputRole,
 };
 use crate::vmm::Vmm;
 use crate::vmm::control::{
@@ -86,6 +87,15 @@ pub(crate) enum LiveRequest {
     Baseline,
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     Profile(crate::vmm::linux::execution::KvmCaptureProfile),
+    #[cfg(all(
+        feature = "native-device-probe",
+        feature = "blk",
+        feature = "net",
+        target_os = "linux",
+        target_arch = "x86_64",
+        not(any(feature = "tee", feature = "aws-nitro"))
+    ))]
+    IrqProbe(crate::api::live::irq_probe::ProbeRequest),
 }
 impl LiveRequest {
     pub(crate) fn context(&self) -> (LiveStage, LiveSubject) {
@@ -114,6 +124,15 @@ impl LiveRequest {
             }
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             Self::Profile(_) => (LiveStage::Profile, LiveSubject::Vm),
+            #[cfg(all(
+                feature = "native-device-probe",
+                feature = "blk",
+                feature = "net",
+                target_os = "linux",
+                target_arch = "x86_64",
+                not(any(feature = "tee", feature = "aws-nitro"))
+            ))]
+            Self::IrqProbe(_) => (LiveStage::Observation, LiveSubject::Vm),
         }
     }
 }
@@ -130,6 +149,15 @@ pub enum LiveReply {
     Layout(Arc<ValidatedRamLayout>),
     Snapshot(LiveSnapshot),
     Complete,
+    #[cfg(all(
+        feature = "native-device-probe",
+        feature = "blk",
+        feature = "net",
+        target_os = "linux",
+        target_arch = "x86_64",
+        not(any(feature = "tee", feature = "aws-nitro"))
+    ))]
+    IrqProbe(crate::api::live::irq_probe::ProbeObservation),
 }
 struct PendingExecution {
     outputs: ExecutionOutputs,
@@ -158,13 +186,186 @@ impl CaptureRecord {
 struct ActivationDevice {
     device: Arc<Mutex<dyn VirtioDevice>>,
     begun: bool,
-    complete: bool,
+    prepared: bool,
 }
-struct ActivationRelease {
+/// All-provider activation exposure, a prepare-all/commit barrier:
+///
+/// ```text
+///   begin/poll each provider ── fallible, gate closed, nothing visible
+///        │ any failure, deadline, stop, revoked authority, invalidation
+///        ├──────────────────────────────► seal(): no provider ever exposed
+///        │ every provider prepared
+///        ▼
+///   hold every provider lock ─► re-validate each prepared state
+///        ─► recheck authority + deadline ─► exposure.open(): one atomic commit
+/// ```
+///
+/// Providers bind `exposure` on acceptance and stay effectively fenced until it
+/// opens, so a provider that prepares before another fails exposes nothing and
+/// no rollback is ever needed. Holding every provider lock across validation
+/// and the open means no worker restart, reset or quiesce can replace a
+/// prepared state between its proof and the commit.
+struct ActivationBarrier {
     request: BarrierRequest,
+    exposure: ActivationExposure,
     devices: Vec<ActivationDevice>,
+}
+/// The retained restore authority and caller of one accepted release.
+struct ActivationRelease {
+    restore: RestoreToken,
+    generation: GenerationTicket,
+    barrier: ActivationBarrier,
     reply: Reply,
-    failure: Option<LiveError>,
+}
+impl ActivationBarrier {
+    fn new(request: BarrierRequest, devices: Vec<Arc<Mutex<dyn VirtioDevice>>>) -> Self {
+        Self {
+            request,
+            exposure: ActivationExposure::new(),
+            devices: devices
+                .into_iter()
+                .map(|device| ActivationDevice {
+                    device,
+                    begun: false,
+                    prepared: false,
+                })
+                .collect(),
+        }
+    }
+    fn failure(&self, stage: ActivationStage, fault: ProviderFault) -> LiveError {
+        LiveError::Activation {
+            stage,
+            fault,
+            accepted: self.devices.iter().any(|entry| entry.begun),
+        }
+    }
+    /// Drive every provider's fallible preparation. Never exposes anything.
+    fn prepare(&mut self) -> Poll<Result<(), LiveError>> {
+        if Instant::now() >= self.request.deadline {
+            return Poll::Ready(Err(
+                self.failure(ActivationStage::Poll, ProviderFault::Deadline)
+            ));
+        }
+        let mut failure = None;
+        for entry in &mut self.devices {
+            if entry.prepared {
+                continue;
+            }
+            let mut device = match entry.device.try_lock() {
+                Ok(device) => device,
+                Err(TryLockError::WouldBlock) => continue,
+                Err(TryLockError::Poisoned(_)) => {
+                    let stage = if entry.begun {
+                        ActivationStage::Poll
+                    } else {
+                        ActivationStage::Begin
+                    };
+                    failure = Some((stage, ProviderFault::DeviceLock));
+                    break;
+                }
+            };
+            let Some(provider) = device.state_provider_mut() else {
+                failure = Some((ActivationStage::Begin, ProviderFault::Unsupported));
+                break;
+            };
+            if !entry.begun {
+                match provider.begin_activation_release(self.request, &self.exposure) {
+                    Ok(()) => entry.begun = true,
+                    Err(error) if !error.accepted && error.fault == ProviderFault::LockBusy => {
+                        continue;
+                    }
+                    Err(error) => {
+                        entry.begun = error.accepted;
+                        failure = Some((ActivationStage::Begin, error.fault));
+                        break;
+                    }
+                }
+            }
+            match provider.poll_activation_release(self.request.key) {
+                Ok(Poll::Ready(())) => entry.prepared = true,
+                Ok(Poll::Pending) => {}
+                Err(fault) => {
+                    failure = Some((ActivationStage::Poll, fault));
+                    break;
+                }
+            }
+        }
+        if let Some((stage, fault)) = failure {
+            Poll::Ready(Err(self.failure(stage, fault)))
+        } else if self.devices.iter().all(|entry| entry.prepared) {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+    /// The only exposure point. Any failure seals the shared gate; success is
+    /// one atomic open after every provider, authority and the absolute
+    /// deadline are rechecked.
+    fn settle(
+        &mut self,
+        stopping: bool,
+        authority: impl FnOnce() -> Result<(), LiveError>,
+    ) -> Poll<Result<(), LiveError>> {
+        let result = if stopping {
+            Err(self.failure(ActivationStage::Poll, ProviderFault::InvalidTransition))
+        } else {
+            match self.prepare() {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => Err(error),
+                Poll::Ready(Ok(())) => match self.commit(authority) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result,
+                },
+            }
+        };
+        if result.is_err() {
+            self.exposure.seal();
+        }
+        Poll::Ready(result)
+    }
+    /// Re-prove every prepared provider under its device lock, then open. The
+    /// guards are held until after the open so no provider transition can
+    /// interleave; contention only retries, it never commits a stale proof.
+    fn commit(
+        &self,
+        authority: impl FnOnce() -> Result<(), LiveError>,
+    ) -> Poll<Result<(), LiveError>> {
+        let mut guards = Vec::with_capacity(self.devices.len());
+        for entry in &self.devices {
+            match entry.device.try_lock() {
+                Ok(guard) => guards.push(guard),
+                Err(TryLockError::WouldBlock) => return Poll::Pending,
+                Err(TryLockError::Poisoned(_)) => {
+                    return Poll::Ready(Err(
+                        self.failure(ActivationStage::Poll, ProviderFault::DeviceLock)
+                    ));
+                }
+            }
+        }
+        for guard in &guards {
+            let Some(provider) = guard.state_provider() else {
+                return Poll::Ready(Err(
+                    self.failure(ActivationStage::Poll, ProviderFault::Unsupported)
+                ));
+            };
+            match provider.validate_activation_prepared(self.request.key) {
+                Ok(Poll::Ready(())) => {}
+                Ok(Poll::Pending) => return Poll::Pending,
+                Err(fault) => return Poll::Ready(Err(self.failure(ActivationStage::Poll, fault))),
+            }
+        }
+        let result = authority().and_then(|()| {
+            if Instant::now() >= self.request.deadline {
+                Err(self.failure(ActivationStage::Poll, ProviderFault::Deadline))
+            } else if self.exposure.open() {
+                Ok(())
+            } else {
+                Err(self.failure(ActivationStage::Poll, ProviderFault::InvalidTransition))
+            }
+        });
+        drop(guards);
+        Poll::Ready(result)
+    }
 }
 #[derive(Default)]
 pub(crate) struct LiveOwner {
@@ -175,12 +376,43 @@ pub(crate) struct LiveOwner {
     activation: Option<ActivationRelease>,
     pub(crate) activation_released: bool,
     pub(crate) activation_failed: bool,
+    #[cfg(all(
+        feature = "native-device-probe",
+        feature = "blk",
+        feature = "net",
+        target_os = "linux",
+        target_arch = "x86_64",
+        not(any(feature = "tee", feature = "aws-nitro"))
+    ))]
+    pub(crate) irq_probe: Option<crate::vmm::control::irq_probe::ProbeOwner>,
 }
 impl LiveOwner {
     pub(crate) fn pending(&self) -> bool {
+        #[cfg(all(
+            feature = "native-device-probe",
+            feature = "blk",
+            feature = "net",
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(any(feature = "tee", feature = "aws-nitro"))
+        ))]
+        if self.irq_probe.as_ref().is_some_and(|probe| probe.pending()) {
+            return true;
+        }
         self.records.values().any(|record| record.pending.is_some()) || self.activation.is_some()
     }
     pub(crate) fn unresolved(&self) -> bool {
+        #[cfg(all(
+            feature = "native-device-probe",
+            feature = "blk",
+            feature = "net",
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(any(feature = "tee", feature = "aws-nitro"))
+        ))]
+        if self.irq_probe.as_ref().is_some_and(|probe| probe.pending()) {
+            return true;
+        }
         self.records.values().any(|record| !record.resolved())
     }
     fn validate_ticket(&self, run: &Arc<()>, ticket: &CaptureTicket) -> Result<(), LiveError> {
@@ -336,11 +568,7 @@ impl Vmm {
     }
     fn preflight_live_outputs(&self, files: &[(OutputRole, &File); 2]) -> Result<(), LiveError> {
         let facts = inspect_outputs(files)?;
-        let devices = self
-            .mmio_device_manager
-            .quiescence
-            .live_devices()
-            .map_err(|error| LiveError::Execution(error.to_string()))?;
+        let devices = self.mmio_device_manager.quiescence.live_devices();
         for ((role, _), fact) in files.iter().zip(facts) {
             if self
                 .memory
@@ -369,14 +597,14 @@ impl Vmm {
             }
             for (_, device) in &devices {
                 let device = device.try_lock().map_err(|_| ControlFailure::Busy)?;
-                let identity = device
+                let identities = device
                     .state_provider()
                     .ok_or_else(|| LiveError::Execution("provider absent".into()))?
-                    .backing_file_identity()
+                    .backing_file_identities()
                     .map_err(|error| {
                         LiveError::Execution(format!("backing identity: {error:?}"))
                     })?;
-                if identity == Some((fact.0, fact.1)) {
+                if identities.contains(&(fact.0, fact.1)) {
                     return Err(output_error(*role, OutputProblem::Alias));
                 }
             }
@@ -409,6 +637,28 @@ impl Vmm {
         if Instant::now() >= deadline {
             return Err(ControlFailure::Deadline.into());
         }
+        #[cfg(all(
+            feature = "native-device-probe",
+            feature = "blk",
+            feature = "net",
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(any(feature = "tee", feature = "aws-nitro"))
+        ))]
+        {
+            if let LiveRequest::IrqProbe(request) = request {
+                return self.dispatch_irq_probe(request, operation, deadline, reply);
+            }
+            if self
+                .control
+                .live
+                .irq_probe
+                .as_ref()
+                .is_some_and(|probe| probe.pending())
+            {
+                return Err(ControlFailure::Busy.into());
+            }
+        }
         if !matches!(
             request,
             LiveRequest::Status(_)
@@ -420,6 +670,15 @@ impl Vmm {
             self.control.reserve(operation)?;
         }
         let result = match request {
+            #[cfg(all(
+                feature = "native-device-probe",
+                feature = "blk",
+                feature = "net",
+                target_os = "linux",
+                target_arch = "x86_64",
+                not(any(feature = "tee", feature = "aws-nitro"))
+            ))]
+            LiveRequest::IrqProbe(_) => return Err(ControlFailure::InvalidOperation.into()),
             LiveRequest::Status(id) => LiveReply::Status(self.control.live.status(id)?),
             LiveRequest::Baseline => LiveReply::CurrentBaseline(self.memory.baseline_token()),
             LiveRequest::Layout => LiveReply::Layout(self.memory_layout().map_err(|error| {
@@ -432,12 +691,7 @@ impl Vmm {
                     file_backings.push((fact.device, fact.inode));
                 }
                 let mut providers = Vec::new();
-                for (attachment, device) in self
-                    .mmio_device_manager
-                    .quiescence
-                    .live_devices()
-                    .map_err(|error| LiveError::Execution(error.to_string()))?
-                {
+                for (attachment, device) in self.mmio_device_manager.quiescence.live_devices() {
                     let device = device.try_lock().map_err(|_| ControlFailure::Busy)?;
                     let activation_fenced = device
                         .state_provider()
@@ -750,17 +1004,7 @@ impl Vmm {
                 restore,
                 generation,
             } => {
-                self.control.validate_restore_token(&restore)?;
-                self.validate_generation_ticket(&generation)?;
-                if generation.stopped != restore.key
-                    || generation.attempt.request().flags != 1
-                    || !matches!(
-                        generation.observe(Instant::now()),
-                        GenerationObservation::Acknowledged(_)
-                    )
-                {
-                    return Err(ControlFailure::InvalidToken.into());
-                }
+                self.activation_authority(&restore, &generation)?;
                 if self.control.live.activation_failed {
                     return Err(ControlFailure::FailedFenced.into());
                 }
@@ -776,28 +1020,24 @@ impl Vmm {
                     .mmio_device_manager
                     .quiescence
                     .live_devices()
-                    .map_err(|error| LiveError::Execution(error.to_string()))?
                     .into_iter()
                     .filter(|(identity, _)| {
                         matches!(identity.device_type, devices::DeviceType::Virtio(1 | 19))
                     })
-                    .map(|(_, device)| ActivationDevice {
-                        device,
-                        begun: false,
-                        complete: false,
-                    })
+                    .map(|(_, device)| device)
                     .collect();
-                self.control.live.activation = Some(ActivationRelease {
-                    request: BarrierRequest {
-                        key: BarrierKey {
-                            operation,
-                            generation: restore.key.generation,
-                        },
-                        deadline,
+                let request = BarrierRequest {
+                    key: BarrierKey {
+                        operation,
+                        generation: restore.key.generation,
                     },
-                    devices,
+                    deadline,
+                };
+                self.control.live.activation = Some(ActivationRelease {
+                    restore,
+                    generation,
+                    barrier: ActivationBarrier::new(request, devices),
                     reply: reply.clone(),
-                    failure: None,
                 });
                 return Ok(None);
             }
@@ -805,6 +1045,15 @@ impl Vmm {
         Ok(Some(result))
     }
     pub(crate) fn poll_live(&mut self) {
+        #[cfg(all(
+            feature = "native-device-probe",
+            feature = "blk",
+            feature = "net",
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(any(feature = "tee", feature = "aws-nitro"))
+        ))]
+        self.poll_irq_probe();
         let pending = self
             .control
             .live
@@ -886,99 +1135,54 @@ impl Vmm {
         }
         self.poll_live_activation();
     }
+    /// Exact restore token plus acknowledged FreshIdentity ticket for its cut.
+    fn activation_authority(
+        &self,
+        restore: &RestoreToken,
+        generation: &GenerationTicket,
+    ) -> Result<(), LiveError> {
+        self.control.validate_restore_token(restore)?;
+        self.validate_generation_ticket(generation)?;
+        if generation.stopped != restore.key
+            || generation.attempt.request().flags != 1
+            || !matches!(
+                generation.observe(Instant::now()),
+                GenerationObservation::Acknowledged(_)
+            )
+        {
+            return Err(ControlFailure::InvalidToken.into());
+        }
+        Ok(())
+    }
     fn poll_live_activation(&mut self) {
         let Some(mut release) = self.control.live.activation.take() else {
             return;
         };
-        let mut accepted = release.devices.iter().any(|entry| entry.begun);
-        if Instant::now() >= release.request.deadline
-            || matches!(
-                self.control.state,
-                ControlState::Stopping | ControlState::Stopped | ControlState::FailedFenced
-            )
+        // Stop is serialized on this owner thread: a latched stop always wins
+        // over a commit that has not happened yet.
+        let stopping = matches!(
+            self.control.state,
+            ControlState::Stopping | ControlState::Stopped | ControlState::FailedFenced
+        );
+        let restore = &release.restore;
+        let generation = &release.generation;
+        let result = match release
+            .barrier
+            .settle(stopping, || self.activation_authority(restore, generation))
         {
-            let fault = if Instant::now() >= release.request.deadline {
-                ProviderFault::Deadline
-            } else {
-                ProviderFault::InvalidTransition
-            };
-            release.failure.get_or_insert(LiveError::Activation {
-                stage: crate::api::live::ActivationStage::Poll,
-                fault,
-                accepted,
-            });
-        }
-        if release.failure.is_none() {
-            for entry in &mut release.devices {
-                if entry.complete {
-                    continue;
-                }
-                let mut device = match entry.device.try_lock() {
-                    Ok(device) => device,
-                    Err(TryLockError::WouldBlock) => continue,
-                    Err(TryLockError::Poisoned(_)) => {
-                        release.failure = Some(LiveError::Activation {
-                            stage: crate::api::live::ActivationStage::Begin,
-                            fault: ProviderFault::DeviceLock,
-                            accepted,
-                        });
-                        break;
-                    }
-                };
-                let Some(provider) = device.state_provider_mut() else {
-                    release.failure = Some(LiveError::Activation {
-                        stage: crate::api::live::ActivationStage::Begin,
-                        fault: ProviderFault::Unsupported,
-                        accepted,
-                    });
-                    break;
-                };
-                if !entry.begun {
-                    match provider.begin_activation_release(release.request) {
-                        Ok(()) => {
-                            entry.begun = true;
-                            accepted = true;
-                        }
-                        Err(error) if !error.accepted && error.fault == ProviderFault::LockBusy => {
-                            continue;
-                        }
-                        Err(error) => {
-                            entry.begun = error.accepted;
-                            accepted |= error.accepted;
-                            release.failure = Some(LiveError::Activation {
-                                stage: crate::api::live::ActivationStage::Begin,
-                                fault: error.fault,
-                                accepted,
-                            });
-                            break;
-                        }
-                    }
-                }
-                match provider.poll_activation_release(release.request.key) {
-                    Ok(Poll::Ready(())) => entry.complete = true,
-                    Ok(Poll::Pending) => {}
-                    Err(fault) => {
-                        release.failure = Some(LiveError::Activation {
-                            stage: crate::api::live::ActivationStage::Poll,
-                            fault,
-                            accepted: true,
-                        });
-                        break;
-                    }
-                }
+            Poll::Pending => {
+                self.control.live.activation = Some(release);
+                return;
             }
+            Poll::Ready(result) => result,
+        };
+        match result {
+            Ok(()) => self.control.live.activation_released = true,
+            // The gate is sealed: every provider stays effectively fenced and
+            // retains its accepted release state until the normal terminal stop.
+            Err(_) => self.control.live.activation_failed = true,
         }
-        if let Some(error) = &release.failure {
-            self.control.live.activation_failed = true;
-            answer(&release.reply, Err(error.clone()));
-            // Providers retain accepted release ownership until the normal terminal stop.
-            self.control.live.activation = Some(release);
-        } else if release.devices.iter().all(|entry| entry.complete) {
-            self.control.live.activation_released = true;
-            answer(&release.reply, Ok(LiveReply::Complete));
-        } else {
-            self.control.live.activation = Some(release);
-        }
+        answer(&release.reply, result.map(|()| LiveReply::Complete));
     }
 }
 
@@ -1398,5 +1602,462 @@ mod tests {
             owner.generation_authority(&GenerationAuthority::RestoreToken(token), false),
             Err(ControlFailure::InvalidToken)
         );
+    }
+
+    #[cfg(feature = "net")]
+    type SharedNet = Arc<std::sync::Mutex<devices::virtio::Net>>;
+
+    #[cfg(feature = "net")]
+    fn activation_request(
+        operation: u64,
+        deadline: std::time::Instant,
+    ) -> crate::vmm::control::BarrierRequest {
+        crate::vmm::control::BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(operation),
+                generation: BarrierGeneration(9),
+            },
+            deadline,
+        }
+    }
+
+    /// A real restored, resumed, still-fenced network provider and its peer.
+    #[cfg(feature = "net")]
+    fn restored_net(name: &str) -> (SharedNet, std::os::unix::net::UnixDatagram) {
+        use devices::legacy::DummyIrqChip;
+        use devices::virtio::lifecycle::{
+            DormantDeviceContext, RestoredReclaimPolicy, ResumeAcceptance, VirtioStateProvider,
+        };
+        use devices::virtio::{InterruptTransport, Net};
+        use std::os::unix::net::UnixDatagram;
+        use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let cut = activation_request(31, deadline);
+        let (source_socket, _source_peer) = UnixDatagram::pair().unwrap();
+        let mut source =
+            Net::new_managed(name.into(), source_socket.into(), [2, 0, 0, 0, 0, 1], 0).unwrap();
+        source.begin_quiesce(cut).unwrap();
+        assert!(source.poll_quiesce(cut.key).unwrap().is_ready());
+        let payload = source.capture_payload(cut.key).unwrap();
+        let (socket, peer) = UnixDatagram::pair().unwrap();
+        let mut net =
+            Net::new_restore_binding(name.into(), socket.into(), [2, 0, 0, 0, 0, 2], 0).unwrap();
+        net.prepare_restore(
+            cut,
+            &payload,
+            DormantDeviceContext {
+                memory: crate::vmm::memory::runtime_memory_for_test(
+                    GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+                ),
+                interrupt: InterruptTransport::new(
+                    DummyIrqChip::new().into(),
+                    format!("{name}-activation"),
+                    None,
+                )
+                .unwrap(),
+                activated: false,
+                reclaim_policy: RestoredReclaimPolicy::Disabled,
+            },
+        )
+        .unwrap();
+        let resume = activation_request(32, deadline);
+        assert!(matches!(
+            net.begin_resume(resume, Vec::new()),
+            ResumeAcceptance::Accepted
+        ));
+        assert!(net.poll_resume(resume.key).unwrap().is_ready());
+        (Arc::new(std::sync::Mutex::new(net)), peer)
+    }
+
+    #[cfg(feature = "net")]
+    fn fenced(net: &SharedNet) -> Option<bool> {
+        use devices::virtio::lifecycle::VirtioStateProvider;
+        net.lock().unwrap().activation_fenced().unwrap()
+    }
+
+    #[cfg(feature = "net")]
+    fn activation_barrier(
+        nets: &[&SharedNet],
+        deadline: std::time::Instant,
+    ) -> crate::vmm::control::live::ActivationBarrier {
+        crate::vmm::control::live::ActivationBarrier::new(
+            activation_request(33, deadline),
+            nets.iter()
+                .map(|net| {
+                    let device: Arc<std::sync::Mutex<dyn devices::virtio::VirtioDevice>> =
+                        (*net).clone();
+                    device
+                })
+                .collect(),
+        )
+    }
+
+    /// Poll until `index` finished local preparation while another provider is busy.
+    #[cfg(feature = "net")]
+    fn prepare_only(
+        barrier: &mut crate::vmm::control::live::ActivationBarrier,
+        index: usize,
+        deadline: std::time::Instant,
+    ) {
+        while !barrier.devices[index].prepared {
+            assert!(
+                barrier
+                    .settle(false, || unreachable!("no commit while a provider is busy"))
+                    .is_pending()
+            );
+            assert!(std::time::Instant::now() < deadline, "preparation stalled");
+        }
+    }
+
+    #[cfg(feature = "net")]
+    fn settled(
+        barrier: &mut crate::vmm::control::live::ActivationBarrier,
+        mut authority: impl FnMut() -> Result<(), LiveError>,
+        deadline: std::time::Instant,
+    ) -> Result<(), LiveError> {
+        loop {
+            match barrier.settle(false, &mut authority) {
+                std::task::Poll::Ready(result) => return result,
+                std::task::Poll::Pending => {
+                    assert!(
+                        std::time::Instant::now() < deadline + std::time::Duration::from_secs(1),
+                        "barrier never settled"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn activation_barrier_transport_ownership_does_not_refuse_or_expose_early() {
+        use crate::vmm::device_manager::quiescence::{AttachmentIdentity, DeviceQuiescence};
+        use devices::legacy::DummyIrqChip;
+        use devices::virtio::{MmioTransport, VirtioDevice};
+        use std::sync::Mutex;
+        use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+        let (first, _first_peer) = restored_net("eth0");
+        let (second, _second_peer) = restored_net("eth1");
+        let mut inventory = DeviceQuiescence::default();
+        let mut transports = Vec::new();
+        for (index, net) in [&first, &second].into_iter().enumerate() {
+            let device: Arc<Mutex<dyn VirtioDevice>> = net.clone();
+            let transport = Arc::new(Mutex::new(
+                MmioTransport::new(
+                    crate::vmm::memory::runtime_memory_for_test(
+                        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+                    ),
+                    DummyIrqChip::new().into(),
+                    device.clone(),
+                    None,
+                )
+                .unwrap(),
+            ));
+            inventory.retain_transport(
+                AttachmentIdentity {
+                    device_type: devices::DeviceType::Virtio(1),
+                    configured_id: format!("eth{index}"),
+                    address: 0xd000_0000 + index as u64 * 0x1000,
+                    irq: 5 + index as u32,
+                },
+                transport.clone(),
+                device,
+            );
+            transports.push(transport);
+        }
+        // Keep real bus-owner guards across inventory, preparation and commit,
+        // rather than racing a timed lock release.
+        let _first_transport = transports[0].try_lock().unwrap();
+        let _second_transport = transports[1].try_lock().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let devices = inventory
+            .live_devices()
+            .into_iter()
+            .map(|(_, device)| device)
+            .collect();
+        let mut barrier = super::ActivationBarrier::new(activation_request(33, deadline), devices);
+        let second_owner = second.try_lock().unwrap();
+        prepare_only(&mut barrier, 0, deadline);
+        assert!(!barrier.devices[1].begun);
+        assert!(!barrier.exposure.is_open());
+        assert_eq!(fenced(&first), Some(true));
+        let first_owner = first.try_lock().unwrap();
+        drop(second_owner);
+        prepare_only(&mut barrier, 1, deadline);
+        assert!(!barrier.exposure.is_open());
+        assert!(!barrier.exposure.is_sealed());
+        assert_eq!(fenced(&second), Some(true));
+        drop(first_owner);
+        let mut commits = 0;
+        settled(
+            &mut barrier,
+            || {
+                commits += 1;
+                Ok(())
+            },
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(commits, 1);
+        assert!(barrier.exposure.is_open());
+        assert_eq!(fenced(&first), Some(false));
+        assert_eq!(fenced(&second), Some(false));
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn activation_barrier_exposes_no_provider_until_every_provider_is_prepared() {
+        let (first, _first_peer) = restored_net("eth0");
+        let (second, _second_peer) = restored_net("eth1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut barrier = activation_barrier(&[&first, &second], deadline);
+        let held = second.lock().unwrap();
+        prepare_only(&mut barrier, 0, deadline);
+        assert!(!barrier.devices[1].begun);
+        assert_eq!(
+            fenced(&first),
+            Some(true),
+            "a prepared provider stays fenced while another is still pending"
+        );
+        assert!(!barrier.exposure.is_open());
+        drop(held);
+        assert_eq!(fenced(&second), Some(true));
+        let mut commits = 0;
+        let result = settled(
+            &mut barrier,
+            || {
+                commits += 1;
+                Ok(())
+            },
+            deadline,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(commits, 1, "authority is rechecked once, at the commit");
+        assert!(barrier.exposure.is_open());
+        assert_eq!(fenced(&first), Some(false));
+        assert_eq!(fenced(&second), Some(false));
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn activation_barrier_provider_failure_after_partial_preparation_exposes_nothing() {
+        let (first, _first_peer) = restored_net("eth0");
+        let (socket, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        // A cold provider has no restored fence to release and refuses begin.
+        let cold: SharedNet = Arc::new(std::sync::Mutex::new(
+            devices::virtio::Net::new_managed("eth1".into(), socket.into(), [2, 0, 0, 0, 0, 3], 0)
+                .unwrap(),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut barrier = activation_barrier(&[&first, &cold], deadline);
+        let held = cold.lock().unwrap();
+        prepare_only(&mut barrier, 0, deadline);
+        drop(held);
+        let result = settled(
+            &mut barrier,
+            || unreachable!("no commit after a provider failure"),
+            deadline,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(LiveError::Activation {
+                    stage: crate::api::live::ActivationStage::Begin,
+                    fault: devices::virtio::lifecycle::ProviderFault::InvalidTransition,
+                    accepted: true,
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(barrier.exposure.is_sealed());
+        assert!(!barrier.exposure.open(), "no later commit can reopen it");
+        assert_eq!(
+            fenced(&first),
+            Some(true),
+            "the already prepared provider never became visible"
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn activation_barrier_deadline_with_a_busy_provider_seals_every_provider() {
+        let (first, _first_peer) = restored_net("eth0");
+        let (second, _second_peer) = restored_net("eth1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let mut barrier = activation_barrier(&[&first, &second], deadline);
+        let held = second.lock().unwrap();
+        prepare_only(&mut barrier, 0, deadline);
+        let result = settled(
+            &mut barrier,
+            || unreachable!("no commit past the absolute deadline"),
+            deadline,
+        );
+        drop(held);
+        assert!(std::time::Instant::now() >= deadline);
+        assert!(
+            matches!(
+                result,
+                Err(LiveError::Activation {
+                    stage: crate::api::live::ActivationStage::Poll,
+                    fault: devices::virtio::lifecycle::ProviderFault::Deadline,
+                    accepted: true,
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(barrier.exposure.is_sealed());
+        assert_eq!(fenced(&first), Some(true));
+        assert_eq!(fenced(&second), Some(true));
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn activation_barrier_latched_stop_wins_over_an_uncommitted_release() {
+        let (first, _first_peer) = restored_net("eth0");
+        let (second, _second_peer) = restored_net("eth1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        let mut untouched = activation_barrier(&[&first, &second], deadline);
+        let result = untouched.settle(true, || unreachable!("stop precedes any commit"));
+        assert!(
+            matches!(
+                result,
+                std::task::Poll::Ready(Err(LiveError::Activation {
+                    fault: devices::virtio::lifecycle::ProviderFault::InvalidTransition,
+                    accepted: false,
+                    ..
+                }))
+            ),
+            "{result:?}"
+        );
+        assert!(untouched.exposure.is_sealed());
+        assert!(untouched.devices.iter().all(|entry| !entry.begun));
+
+        let mut barrier = activation_barrier(&[&first, &second], deadline);
+        let held = second.lock().unwrap();
+        prepare_only(&mut barrier, 0, deadline);
+        drop(held);
+        let result = barrier.settle(true, || unreachable!("stop precedes any commit"));
+        assert!(
+            matches!(
+                result,
+                std::task::Poll::Ready(Err(LiveError::Activation {
+                    fault: devices::virtio::lifecycle::ProviderFault::InvalidTransition,
+                    accepted: true,
+                    ..
+                }))
+            ),
+            "{result:?}"
+        );
+        assert!(barrier.exposure.is_sealed());
+        assert_eq!(fenced(&first), Some(true));
+        assert_eq!(fenced(&second), Some(true));
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn activation_barrier_revoked_authority_at_commit_exposes_nothing() {
+        let (first, _first_peer) = restored_net("eth0");
+        let (second, _second_peer) = restored_net("eth1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut barrier = activation_barrier(&[&first, &second], deadline);
+        let result = settled(
+            &mut barrier,
+            || Err(ControlFailure::InvalidToken.into()),
+            deadline,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(LiveError::Control(ControlFailure::InvalidToken))
+            ),
+            "{result:?}"
+        );
+        assert!(barrier.devices.iter().all(|entry| entry.prepared));
+        assert!(barrier.exposure.is_sealed());
+        assert_eq!(fenced(&first), Some(true));
+        assert_eq!(fenced(&second), Some(true));
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn activation_barrier_provider_transition_between_prepare_and_commit_exposes_nothing() {
+        use devices::virtio::lifecycle::VirtioStateProvider;
+        let (first, _first_peer) = restored_net("eth0");
+        let (second, _second_peer) = restored_net("eth1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut barrier = activation_barrier(&[&first, &second], deadline);
+        let held = second.lock().unwrap();
+        prepare_only(&mut barrier, 0, deadline);
+        // The already prepared provider leaves Running before the last one is
+        // ready; its earlier proof must not be committed.
+        first
+            .lock()
+            .unwrap()
+            .begin_quiesce(activation_request(34, deadline))
+            .unwrap();
+        drop(held);
+        let result = settled(
+            &mut barrier,
+            || unreachable!("no authority check after a failed provider proof"),
+            deadline,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(LiveError::Activation {
+                    stage: crate::api::live::ActivationStage::Poll,
+                    fault: devices::virtio::lifecycle::ProviderFault::InvalidTransition,
+                    accepted: true,
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(barrier.devices.iter().all(|entry| entry.prepared));
+        assert!(barrier.exposure.is_sealed());
+        assert_eq!(fenced(&first), Some(true));
+        assert_eq!(fenced(&second), Some(true));
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn activation_barrier_commit_contention_retries_without_a_stale_commit() {
+        let (first, _first_peer) = restored_net("eth0");
+        let (second, _second_peer) = restored_net("eth1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut barrier = activation_barrier(&[&first, &second], deadline);
+        let held_second = second.lock().unwrap();
+        prepare_only(&mut barrier, 0, deadline);
+        // Hold the prepared provider so the last preparation completes while the
+        // commit cannot take every provider lock.
+        let held_first = first.lock().unwrap();
+        drop(held_second);
+        prepare_only(&mut barrier, 1, deadline);
+        assert!(
+            barrier
+                .settle(false, || unreachable!(
+                    "no commit without every provider lock"
+                ))
+                .is_pending()
+        );
+        assert!(!barrier.exposure.is_open());
+        assert!(!barrier.exposure.is_sealed(), "contention is not failure");
+        drop(held_first);
+        let mut commits = 0;
+        let result = settled(
+            &mut barrier,
+            || {
+                commits += 1;
+                Ok(())
+            },
+            deadline,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(commits, 1);
+        assert!(barrier.exposure.is_open());
+        assert_eq!(fenced(&first), Some(false));
+        assert_eq!(fenced(&second), Some(false));
     }
 }

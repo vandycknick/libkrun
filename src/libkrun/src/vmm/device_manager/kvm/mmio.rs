@@ -309,17 +309,24 @@ impl MMIODeviceManager {
     }
 
     pub fn set_restore_position(&mut self, address: u64, irq: u32) -> Result<()> {
-        if self.route_request.is_some()
-            || irq < arch::IRQ_BASE
-            || irq > self.last_irq
+        if self.route_request.is_some() {
+            return Err(Error::BarrierActive);
+        }
+        Self::validate_restore_position(address, irq, self.last_irq)?;
+        self.mmio_base = address;
+        self.irq = irq;
+        Ok(())
+    }
+
+    pub(crate) fn validate_restore_position(address: u64, irq: u32, last_irq: u32) -> Result<()> {
+        if irq < arch::IRQ_BASE
+            || irq > last_irq
             || address < arch::MMIO_MEM_START
             || address.checked_add(MMIO_LEN).is_none()
             || !address.is_multiple_of(MMIO_LEN)
         {
             return Err(Error::BarrierActive);
         }
-        self.mmio_base = address;
-        self.irq = irq;
         Ok(())
     }
 
@@ -731,6 +738,7 @@ impl MMIODeviceManager {
 
         mmio_device.set_irq_line(self.irq);
 
+        let device = mmio_device.device();
         let transport = Arc::new(Mutex::new(mmio_device));
         self.bus
             .insert(transport.clone(), self.mmio_base, MMIO_LEN)
@@ -744,6 +752,7 @@ impl MMIODeviceManager {
                 irq: self.irq,
             },
             transport,
+            device,
         );
         let ret = (self.mmio_base, self.irq);
         self.id_to_dev_info.insert(

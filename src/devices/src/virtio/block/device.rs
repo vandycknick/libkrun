@@ -29,9 +29,11 @@ use utils::state::{Reader, Writer};
 
 use crate::virtio::RuntimeGuestMemory;
 use imago::{
-    DynStorage, FormatAccess, FormatDriverBuilder, PermissiveImplicitOpenGate, Storage,
-    StorageOpenOptions, file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk,
+    DynStorage, FormatAccess, Storage, StorageOpenOptions, file::File as ImagoFile, qcow2::Qcow2,
+    raw::Raw,
 };
+#[cfg(not(unix))]
+use imago::{FormatDriverBuilder, PermissiveImplicitOpenGate, vmdk::Vmdk};
 use log::{error, warn};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::{
@@ -56,7 +58,7 @@ use crate::virtio::{
 
 use crate::virtio::{
     ActivateError, InterruptTransport,
-    block::{DiskFormat, SyncMode},
+    block::{DiskFormat, ReadonlyVmdk, RestoreBlockBacking, SyncMode},
 };
 
 /// Configuration options for disk caching.
@@ -277,6 +279,56 @@ pub struct BlockPressureOwnership {
     pub consumed_kicks: u64,
 }
 
+/// Saved block identity and backend facts a restore binding must reproduce.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestoreBlockShape {
+    pub id: String,
+    pub format: DiskFormat,
+    pub byte_length: u64,
+    pub read_only: bool,
+    pub direct_io: bool,
+    pub sync_mode: SyncMode,
+    pub cache_type: CacheType,
+}
+
+/// Why destination backing cannot be bound to a saved block payload.
+#[derive(Debug)]
+pub enum RestoreBindingError {
+    /// The saved payload is not a valid native block payload.
+    Payload,
+    /// The backing format differs from the saved format; raw is never
+    /// substituted for a saved VMDK, nor the reverse.
+    Format,
+    /// The read-only VMDK closure is not the admitted generated closure.
+    #[cfg(unix)]
+    Closure(crate::virtio::block::vmdk::VmdkClosureFault),
+    /// The rebuilt device disagrees with the saved identity or geometry.
+    Binding,
+    Io(io::Error),
+}
+
+impl std::fmt::Display for RestoreBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Payload => f.write_str("invalid saved block payload"),
+            Self::Format => f.write_str("block backing format differs from the saved format"),
+            #[cfg(unix)]
+            Self::Closure(fault) => write!(f, "read-only VMDK closure: {fault:?}"),
+            Self::Binding => f.write_str("block destination binding differs from the saved device"),
+            Self::Io(error) => write!(f, "block restore I/O: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RestoreBindingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 /// Virtio device for exposing block level read/write operations on a host file.
 pub struct Block {
     // Host file and properties.
@@ -298,7 +350,8 @@ pub struct Block {
     byte_length: u64,
     direct_io: bool,
     sync_mode: SyncMode,
-    backing_identity: Option<(u64, u64)>,
+    /// Every host file the backend reads or writes, as `(device, inode)`.
+    backing_identities: Box<[(u64, u64)]>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -338,18 +391,20 @@ impl Block {
         let disk_image = open.open(PathBuf::from(&disk_image_path))?;
 
         let disk_image_id = DiskProperties::build_disk_image_id(&disk_image, &id);
+        // Every host file the backend reads, so live capture can refuse output
+        // files that alias any of them. A VMDK adds each extent as it opens.
         #[cfg(unix)]
-        let backing_identity = if disk_image_format == DiskFormat::Raw {
+        let mut backing_identities = if disk_image_format == DiskFormat::Qcow2 {
+            Vec::new()
+        } else {
             let metadata = disk_image.metadata()?;
-            Some((
+            vec![(
                 std::os::unix::fs::MetadataExt::dev(&metadata),
                 std::os::unix::fs::MetadataExt::ino(&metadata),
-            ))
-        } else {
-            None
+            )]
         };
         #[cfg(not(unix))]
-        let backing_identity = None;
+        let backing_identities = Vec::new();
         #[cfg(target_os = "macos")]
         let relaxed_sync_file = if disk_image_format == DiskFormat::Raw {
             Self::prepare_owned_raw_file(&disk_image, direct_io, sync_mode)?
@@ -360,6 +415,18 @@ impl Block {
         let file = match disk_image_format {
             #[cfg(unix)]
             DiskFormat::Raw => ImagoFile::try_from(disk_image)?,
+            // Parse the already opened descriptor whose inode was recorded,
+            // keeping its path so relative extent names still resolve. It is
+            // read once at open, so it stays buffered regardless of direct_io.
+            #[cfg(unix)]
+            DiskFormat::Vmdk => {
+                let options = StorageOpenOptions::new()
+                    .write(!is_disk_read_only)
+                    .filename(&disk_image_path);
+                #[cfg(target_os = "macos")]
+                let options = options.relaxed_sync(sync_mode == SyncMode::Relaxed);
+                ImagoFile::from_open_file(disk_image, options)?
+            }
             _ => {
                 let file_opts = StorageOpenOptions::new()
                     .write(!is_disk_read_only)
@@ -387,13 +454,15 @@ impl Block {
                     Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), !is_disk_read_only)?;
                 FormatAccess::new(raw)
             }
+            #[cfg(unix)]
             DiskFormat::Vmdk => {
-                let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
-                    Box::new(file),
-                )
-                .open(PermissiveImplicitOpenGate::default())?;
-                FormatAccess::new(vmdk)
+                crate::virtio::block::vmdk::open_cold(file, &mut backing_identities)?
             }
+            #[cfg(not(unix))]
+            DiskFormat::Vmdk => FormatAccess::new(
+                Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(Box::new(file))
+                    .open(PermissiveImplicitOpenGate::default())?,
+            ),
         };
 
         Self::from_storage(
@@ -407,7 +476,7 @@ impl Block {
             direct_io,
             sync_mode,
             disk_image_id,
-            backing_identity,
+            backing_identities,
             #[cfg(target_os = "macos")]
             relaxed_sync_file,
         )
@@ -433,70 +502,148 @@ impl Block {
         }
     }
 
+    /// Decode a saved block payload into the identity and backend facts a
+    /// restore binding must reproduce, without any destination resource.
+    pub fn inspect_restore_payload(payload: &[u8]) -> Result<RestoreBlockShape, ProviderFault> {
+        let saved = BlockPayload::decode(payload)?;
+        let capacity = saved.config.capacity;
+        if saved.acked & !saved.avail != 0
+            || capacity != saved.byte_length >> SECTOR_SHIFT
+            || saved.read_only != (saved.avail & (1u64 << VIRTIO_BLK_F_RO) != 0)
+        {
+            return Err(ProviderFault::DeviceState);
+        }
+        Ok(RestoreBlockShape {
+            id: std::str::from_utf8(saved.id)
+                .map_err(|_| ProviderFault::DeviceState)?
+                .to_owned(),
+            format: saved.disk_format,
+            byte_length: saved.byte_length,
+            read_only: saved.read_only,
+            direct_io: saved.direct_io,
+            sync_mode: SyncMode::try_from(saved.sync_mode)
+                .map_err(|_| ProviderFault::DeviceState)?,
+            cache_type: match saved.cache_type {
+                0 => CacheType::Unsafe,
+                1 => CacheType::Writeback,
+                _ => return Err(ProviderFault::DeviceState),
+            },
+        })
+    }
+
+    /// Bind a saved block payload to destination backing of the same format.
+    /// Nothing is opened by path; a read-only VMDK is rebuilt from its held
+    /// descriptor and extent handles. Close-on-exec and cross-role alias
+    /// checks belong to the caller's preflight.
     #[cfg(unix)]
     pub fn new_restore_binding(
         id: String,
-        file: File,
-        read_only: bool,
+        backing: RestoreBlockBacking,
         payload: &[u8],
-    ) -> io::Result<Self> {
-        let saved = BlockPayload::decode(payload)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "block restore payload"))?;
-        let cache_type = match saved.cache_type {
-            0 => CacheType::Unsafe,
-            1 => CacheType::Writeback,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "block cache mode",
-                ));
+    ) -> Result<Self, RestoreBindingError> {
+        let saved =
+            Self::inspect_restore_payload(payload).map_err(|_| RestoreBindingError::Payload)?;
+        let block = match backing {
+            RestoreBlockBacking::Raw { file, read_only } => {
+                if saved.format != DiskFormat::Raw {
+                    return Err(RestoreBindingError::Format);
+                }
+                Self::restore_raw(id, file, read_only, &saved)?
+            }
+            RestoreBlockBacking::ReadonlyVmdk(closure) => {
+                if saved.format != DiskFormat::Vmdk || !saved.read_only {
+                    return Err(RestoreBindingError::Format);
+                }
+                Self::restore_readonly_vmdk(id, &closure, &saved)?
             }
         };
-        let sync_mode = SyncMode::try_from(saved.sync_mode)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "block sync mode"))?;
+        block
+            .validate_block_payload(payload)
+            .map_err(|_| RestoreBindingError::Binding)?;
+        Ok(block)
+    }
+
+    #[cfg(unix)]
+    fn restore_raw(
+        id: String,
+        file: File,
+        read_only: bool,
+        saved: &RestoreBlockShape,
+    ) -> Result<Self, RestoreBindingError> {
         #[cfg(target_os = "linux")]
         {
-            let flags = nix::fcntl::OFlag::from_bits_truncate(nix::fcntl::fcntl(
-                &file,
-                nix::fcntl::FcntlArg::F_GETFL,
-            )?);
-            if flags.contains(nix::fcntl::OFlag::O_DIRECT) != saved.direct_io {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "block direct I/O mode",
-                ));
+            let flags = nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_GETFL)
+                .map_err(|error| RestoreBindingError::Io(error.into()))?;
+            if nix::fcntl::OFlag::from_bits_truncate(flags).contains(nix::fcntl::OFlag::O_DIRECT)
+                != saved.direct_io
+            {
+                return Err(RestoreBindingError::Binding);
             }
         }
-        let metadata = file.metadata()?;
-        let backing_identity = Some((
+        let metadata = file.metadata().map_err(RestoreBindingError::Io)?;
+        let backing_identities = vec![(
             std::os::unix::fs::MetadataExt::dev(&metadata),
             std::os::unix::fs::MetadataExt::ino(&metadata),
-        ));
+        )];
         let disk_image_id = DiskProperties::build_disk_image_id(&file, &id);
         #[cfg(target_os = "macos")]
-        let relaxed_sync_file = Self::prepare_owned_raw_file(&file, saved.direct_io, sync_mode)?;
-        let file = ImagoFile::try_from(file)?;
+        let relaxed_sync_file =
+            Self::prepare_owned_raw_file(&file, saved.direct_io, saved.sync_mode)
+                .map_err(RestoreBindingError::Io)?;
+        let file = ImagoFile::try_from(file).map_err(RestoreBindingError::Io)?;
         let discard_alignment = file.discard_align();
-        let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), !read_only)?;
-        let block = Self::from_storage(
+        let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), !read_only)
+            .map_err(RestoreBindingError::Io)?;
+        Self::from_storage(
             id,
             None,
-            cache_type,
+            saved.cache_type,
             FormatAccess::new(raw),
             discard_alignment,
             DiskFormat::Raw,
             read_only,
             saved.direct_io,
-            sync_mode,
+            saved.sync_mode,
             disk_image_id,
-            backing_identity,
+            backing_identities,
             #[cfg(target_os = "macos")]
             relaxed_sync_file,
-        )?;
-        block
-            .validate_block_payload(payload)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "block destination binding"))?;
-        Ok(block)
+        )
+        .map_err(RestoreBindingError::Io)
+    }
+
+    /// Mirrors cold VMDK attach: descriptor-derived image ID and discard
+    /// alignment, no single backing inode, no relaxed-sync raw clone.
+    #[cfg(unix)]
+    fn restore_readonly_vmdk(
+        id: String,
+        closure: &ReadonlyVmdk,
+        saved: &RestoreBlockShape,
+    ) -> Result<Self, RestoreBindingError> {
+        let disk_image_id = DiskProperties::build_disk_image_id(&closure.descriptor, &id);
+        let opened =
+            crate::virtio::block::vmdk::open_held(closure).map_err(|error| match error {
+                crate::virtio::block::vmdk::OpenError::Closure(fault) => {
+                    RestoreBindingError::Closure(fault)
+                }
+                crate::virtio::block::vmdk::OpenError::Io(error) => RestoreBindingError::Io(error),
+            })?;
+        Self::from_storage(
+            id,
+            None,
+            saved.cache_type,
+            opened.access,
+            opened.discard_alignment,
+            DiskFormat::Vmdk,
+            true,
+            saved.direct_io,
+            saved.sync_mode,
+            disk_image_id,
+            opened.identities,
+            #[cfg(target_os = "macos")]
+            None,
+        )
+        .map_err(RestoreBindingError::Io)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -511,7 +658,7 @@ impl Block {
         direct_io: bool,
         sync_mode: SyncMode,
         disk_image_id: Vec<u8>,
-        backing_identity: Option<(u64, u64)>,
+        backing_identities: Vec<(u64, u64)>,
         #[cfg(target_os = "macos")] relaxed_sync_file: Option<File>,
     ) -> io::Result<Self> {
         let disk_image = Arc::new(Mutex::new(disk_image));
@@ -582,7 +729,7 @@ impl Block {
             byte_length,
             direct_io,
             sync_mode,
-            backing_identity,
+            backing_identities: backing_identities.into_boxed_slice(),
         })
     }
 
@@ -1027,8 +1174,8 @@ impl Block {
 }
 
 impl VirtioStateProvider for Block {
-    fn backing_file_identity(&self) -> Result<Option<(u64, u64)>, ProviderFault> {
-        Ok(self.backing_identity)
+    fn backing_file_identities(&self) -> Result<&[(u64, u64)], ProviderFault> {
+        Ok(&self.backing_identities)
     }
 
     fn preflight(&self) -> Result<(), ProviderFault> {
@@ -1453,7 +1600,7 @@ mod tests {
             .unwrap();
         replacement.set_len(4096).unwrap();
         replacement.write_all_at(&[29], 0).unwrap();
-        assert_eq!(block.backing_file_identity().unwrap(), Some(identity));
+        assert_eq!(block.backing_file_identities().unwrap(), [identity]);
         let mut observed = [0; 1];
         {
             let disk = block
@@ -1499,28 +1646,63 @@ mod tests {
             std::os::unix::fs::MetadataExt::ino(&metadata),
         );
         std::fs::remove_file(destination.as_path()).unwrap();
-        let block = Block::new_restore_binding("data".into(), owned, false, &payload).unwrap();
-        assert_eq!(block.backing_file_identity().unwrap(), Some(identity));
+        let block = Block::new_restore_binding(
+            "data".into(),
+            RestoreBlockBacking::Raw {
+                file: owned,
+                read_only: false,
+            },
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(block.backing_file_identities().unwrap(), [identity]);
         block.validate_restore(&payload).unwrap();
         let wrong = TempFile::new().unwrap();
         wrong.as_file().set_len(8192).unwrap();
-        assert!(
+        assert!(matches!(
             Block::new_restore_binding(
                 "data".into(),
-                wrong.as_file().try_clone().unwrap(),
-                false,
+                RestoreBlockBacking::Raw {
+                    file: wrong.as_file().try_clone().unwrap(),
+                    read_only: false,
+                },
                 &payload,
-            )
-            .is_err()
-        );
-        assert!(
+            ),
+            Err(RestoreBindingError::Binding)
+        ));
+        assert!(matches!(
             Block::new_restore_binding(
                 "foreign".into(),
-                source_file.as_file().try_clone().unwrap(),
-                false,
+                RestoreBlockBacking::Raw {
+                    file: source_file.as_file().try_clone().unwrap(),
+                    read_only: false,
+                },
                 &payload,
-            )
-            .is_err()
+            ),
+            Err(RestoreBindingError::Binding)
+        ));
+        assert!(matches!(
+            Block::new_restore_binding(
+                "data".into(),
+                RestoreBlockBacking::Raw {
+                    file: source_file.as_file().try_clone().unwrap(),
+                    read_only: false,
+                },
+                &payload[..payload.len() - 1],
+            ),
+            Err(RestoreBindingError::Payload)
+        ));
+        assert_eq!(
+            Block::inspect_restore_payload(&payload).unwrap(),
+            RestoreBlockShape {
+                id: "data".into(),
+                format: DiskFormat::Raw,
+                byte_length: 4096,
+                read_only: false,
+                direct_io: false,
+                sync_mode: SyncMode::Relaxed,
+                cache_type: CacheType::Unsafe,
+            }
         );
     }
 
@@ -1604,22 +1786,78 @@ mod tests {
         }
     }
 
-    #[test]
-    fn readonly_vmdk_capture_preserves_format_and_rejects_raw_substitution() {
+    #[cfg(unix)]
+    fn generated_vmdk(records: &[(u64, &TempFile, u64)]) -> TempFile {
         use std::os::unix::fs::FileExt;
-
-        let extent = TempFile::new().unwrap();
-        extent.as_file().set_len(4096).unwrap();
-        extent.as_file().write_all_at(&[37], 0).unwrap();
-        let descriptor = TempFile::new().unwrap();
-        let text = format!(
-            "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\ncreateType=\"monolithicFlat\"\nRW 8 FLAT \"{}\" 0\n",
-            extent.as_path().display()
+        let mut text = String::from(
+            "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n",
         );
+        for (sectors, extent, offset) in records {
+            text.push_str(&format!(
+                "RW {sectors} FLAT \"{}\" {offset}\n",
+                extent.as_path().display()
+            ));
+        }
+        let descriptor = TempFile::new().unwrap();
         descriptor
             .as_file()
             .write_all_at(text.as_bytes(), 0)
             .unwrap();
+        descriptor
+    }
+
+    #[cfg(unix)]
+    fn held_vmdk(descriptor: &TempFile, extents: &[&TempFile]) -> RestoreBlockBacking {
+        RestoreBlockBacking::ReadonlyVmdk(ReadonlyVmdk {
+            descriptor: File::open(descriptor.as_path()).unwrap(),
+            extents: extents
+                .iter()
+                .map(|extent| crate::virtio::block::VmdkExtent {
+                    path: extent.as_path().to_path_buf(),
+                    file: File::open(extent.as_path()).unwrap(),
+                })
+                .collect(),
+        })
+    }
+
+    fn captured(block: &mut Block) -> Vec<u8> {
+        let pause = request(1, 1);
+        let completed = quiesce(block, pause);
+        assert_eq!(completed.fault, None);
+        block.flush_for_capture(pause.key).unwrap();
+        block.capture_payload(pause.key).unwrap()
+    }
+
+    fn read_byte(block: &Block, offset: u64) -> u8 {
+        let mut observed = [0];
+        block
+            .disk_image
+            .lock()
+            .unwrap()
+            .read(&mut observed[..], offset)
+            .unwrap();
+        observed[0]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_vmdk_restore_preserves_format_from_held_closure_and_rejects_raw_substitution() {
+        use std::os::unix::fs::FileExt;
+
+        let first = TempFile::new().unwrap();
+        first.as_file().set_len(4096).unwrap();
+        first.as_file().write_all_at(&[37], 0).unwrap();
+        first.as_file().write_all_at(&[38], 2048).unwrap();
+        let second = TempFile::new().unwrap();
+        second.as_file().set_len(512).unwrap();
+        second.as_file().write_all_at(&[39], 0).unwrap();
+        // A split first extent, a second extent and a repeat of the first.
+        let descriptor = generated_vmdk(&[
+            (4, &first, 0),
+            (4, &first, 4),
+            (1, &second, 0),
+            (1, &first, 0),
+        ]);
         let mut block = Block::new(
             "lower".into(),
             None,
@@ -1631,38 +1869,204 @@ mod tests {
             SyncMode::Relaxed,
         )
         .unwrap();
-        let pause = request(1, 1);
-        let completed = quiesce(&mut block, pause);
-        assert_eq!(completed.fault, None);
-        block.flush_for_capture(pause.key).unwrap();
-        let payload = block.capture_payload(pause.key).unwrap();
-        assert_eq!(
-            BlockPayload::decode(&payload).unwrap().disk_format,
-            DiskFormat::Vmdk
-        );
+        let payload = captured(&mut block);
+        let shape = Block::inspect_restore_payload(&payload).unwrap();
+        assert_eq!(shape.format, DiskFormat::Vmdk);
+        assert!(shape.read_only);
+        assert_eq!(shape.byte_length, 10 * 512);
+        assert_eq!(shape.id, "lower");
         block.validate_payload(&payload).unwrap();
-        let raw = raw_block(&extent, "lower", true);
+        let inode = |file: &TempFile| {
+            let metadata = file.as_file().metadata().unwrap();
+            (
+                std::os::unix::fs::MetadataExt::dev(&metadata),
+                std::os::unix::fs::MetadataExt::ino(&metadata),
+            )
+        };
+        // Descriptor first, then every extent once in first-reference order:
+        // live capture refuses outputs that alias any of them.
+        let identities = [inode(&descriptor), inode(&first), inode(&second)];
+        assert_eq!(block.backing_file_identities().unwrap(), identities);
+
+        let raw = raw_block(&first, "lower", true);
         assert!(raw.validate_payload(&payload).is_err());
-        assert!(
+        assert!(matches!(
             Block::new_restore_binding(
                 "lower".into(),
-                extent.as_file().try_clone().unwrap(),
-                true,
+                RestoreBlockBacking::Raw {
+                    file: File::open(first.as_path()).unwrap(),
+                    read_only: true,
+                },
                 &payload,
-            )
-            .is_err()
+            ),
+            Err(RestoreBindingError::Format)
+        ));
+
+        let held = held_vmdk(&descriptor, &[&first, &second]);
+        // The restore seam never opens a descriptor-named path.
+        std::fs::remove_file(descriptor.as_path()).unwrap();
+        std::fs::remove_file(first.as_path()).unwrap();
+        std::fs::remove_file(second.as_path()).unwrap();
+        let restored = Block::new_restore_binding("lower".into(), held, &payload).unwrap();
+        restored.validate_restore(&payload).unwrap();
+        assert_eq!(restored.disk_format, DiskFormat::Vmdk);
+        assert!(restored.is_read_only());
+        assert_eq!(restored.backing_file_identities().unwrap(), identities);
+        assert_eq!(restored.disk_image_id, block.disk_image_id);
+        for (offset, expected) in [(0, 37), (2048, 38), (4096, 39), (4608, 37)] {
+            assert_eq!(read_byte(&restored, offset), expected, "offset {offset}");
+        }
+        assert!(
+            restored
+                .disk_image
+                .lock()
+                .unwrap()
+                .write(&[1u8][..], 0)
+                .is_err()
         );
+
         let mut writable = payload.clone();
         writable[31] = 0;
         assert!(BlockPayload::decode(&writable).is_err());
-        let mut observed = [0];
-        block
-            .disk_image
-            .lock()
-            .unwrap()
-            .read(&mut observed[..], 0)
+        assert!(Block::inspect_restore_payload(&writable).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cold_vmdk_resolves_relative_extents_and_records_every_backing_inode() {
+        use std::os::unix::fs::FileExt;
+
+        let extent = TempFile::new().unwrap();
+        extent.as_file().set_len(1024).unwrap();
+        extent.as_file().write_all_at(&[53], 512).unwrap();
+        let name = extent.as_path().file_name().unwrap().to_str().unwrap();
+        // Relative names resolve against the descriptor's directory, as
+        // before; the restore seam alone requires absolute generated paths.
+        let descriptor = TempFile::new_in(extent.as_path().parent().unwrap()).unwrap();
+        descriptor
+            .as_file()
+            .write_all_at(
+                format!(
+                    "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\ncreateType=\"monolithicFlat\"\nRW 2 FLAT \"{name}\" 0\nRW 1 FLAT \"{name}\" 1\n"
+                )
+                .as_bytes(),
+                0,
+            )
             .unwrap();
-        assert_eq!(observed, [37]);
+        let block = Block::new(
+            "lower".into(),
+            None,
+            CacheType::Unsafe,
+            descriptor.as_path().to_str().unwrap().into(),
+            DiskFormat::Vmdk,
+            true,
+            false,
+            SyncMode::Relaxed,
+        )
+        .unwrap();
+        let inode = |file: &TempFile| {
+            let metadata = file.as_file().metadata().unwrap();
+            (
+                std::os::unix::fs::MetadataExt::dev(&metadata),
+                std::os::unix::fs::MetadataExt::ino(&metadata),
+            )
+        };
+        assert_eq!(
+            block.backing_file_identities().unwrap(),
+            [inode(&descriptor), inode(&extent)]
+        );
+        assert_eq!(read_byte(&block, 1024), 53);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_vmdk_restore_rejects_wrong_saved_format_identity_geometry_and_closure() {
+        use std::os::unix::fs::FileExt;
+
+        let extent = TempFile::new().unwrap();
+        extent.as_file().set_len(4096).unwrap();
+        extent.as_file().write_all_at(&[41], 0).unwrap();
+        let other = TempFile::new().unwrap();
+        other.as_file().set_len(4096).unwrap();
+        let descriptor = generated_vmdk(&[(8, &extent, 0)]);
+        let mut cold = Block::new(
+            "lower".into(),
+            None,
+            CacheType::Unsafe,
+            descriptor.as_path().to_str().unwrap().into(),
+            DiskFormat::Vmdk,
+            true,
+            false,
+            SyncMode::Relaxed,
+        )
+        .unwrap();
+        let payload = captured(&mut cold);
+
+        // A saved raw device is never rebuilt from a VMDK closure.
+        let mut raw = raw_block(&extent, "lower", true);
+        let raw_payload = captured(&mut raw);
+        assert!(matches!(
+            Block::new_restore_binding(
+                "lower".into(),
+                held_vmdk(&descriptor, &[&extent]),
+                &raw_payload
+            ),
+            Err(RestoreBindingError::Format)
+        ));
+        // A saved writable VMDK payload is not a valid payload at all.
+        let mut writable = payload.clone();
+        writable[31] = 0;
+        assert!(matches!(
+            Block::new_restore_binding(
+                "lower".into(),
+                held_vmdk(&descriptor, &[&extent]),
+                &writable
+            ),
+            Err(RestoreBindingError::Payload)
+        ));
+        assert!(matches!(
+            Block::new_restore_binding(
+                "upper".into(),
+                held_vmdk(&descriptor, &[&extent]),
+                &payload
+            ),
+            Err(RestoreBindingError::Binding)
+        ));
+        let shorter = generated_vmdk(&[(4, &extent, 0)]);
+        assert!(matches!(
+            Block::new_restore_binding("lower".into(), held_vmdk(&shorter, &[&extent]), &payload),
+            Err(RestoreBindingError::Binding)
+        ));
+        assert!(matches!(
+            Block::new_restore_binding(
+                "lower".into(),
+                held_vmdk(&descriptor, &[&extent, &other]),
+                &payload
+            ),
+            Err(RestoreBindingError::Closure(
+                crate::virtio::block::vmdk::VmdkClosureFault::UnreferencedExtent
+            ))
+        ));
+        assert!(matches!(
+            Block::new_restore_binding("lower".into(), held_vmdk(&descriptor, &[&other]), &payload),
+            Err(RestoreBindingError::Closure(
+                crate::virtio::block::vmdk::VmdkClosureFault::UndeclaredExtent
+            ))
+        ));
+        let past_end = generated_vmdk(&[(8, &extent, 1)]);
+        assert!(matches!(
+            Block::new_restore_binding("lower".into(), held_vmdk(&past_end, &[&extent]), &payload),
+            Err(RestoreBindingError::Closure(
+                crate::virtio::block::vmdk::VmdkClosureFault::ExtentRange
+            ))
+        ));
+        let restored = Block::new_restore_binding(
+            "lower".into(),
+            held_vmdk(&descriptor, &[&extent]),
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(read_byte(&restored, 0), 41);
     }
 
     #[test]

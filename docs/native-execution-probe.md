@@ -35,6 +35,46 @@ The probe reports a cleanup deadline as failure, never as successful reap.
 These ownership rules do not turn `memory.fixture` into a baseline or production
 RAM image, and grant no additional qualification.
 
+### Candidate-only integrated hardware IRQ witness
+
+Linux x86_64 builds with `native-device-probe`, `blk` and `net` expose the
+Rust-only `api::live::irq_probe` module and `VmmHandle::irq_probe`. This is a
+diagnostic build surface, not a production availability or qualification grant.
+Normal builds contain neither its mailbox requests nor its owner state.
+
+`Fixture::new` bounds binary input to 0x3000 bytes and symbol input to 65536
+bytes, validates the original witness symbols, and supplies explicit source
+construction inputs. `ProbeRequest::Initialize` requires the current paused
+source token, four original CPUs with AP2 still uninitialized, and the actual
+kernel command line `maxcpus=2 memmap=16M$448M memmap=64K$448K`. It uses the
+existing witness parser, RAM bootstrap and native AP2 owner command, with the
+actual RNG attachment (`rng-line-padding-0` or `virtio_rng`), not a duplicate
+fixture device. Its caller deadline is capped at five seconds; accepted native
+effects remain owned through reconciliation. The pause token remains valid for
+the ordinary clock-only generation and resume sequence. Initialization failure
+leaves the owner failed/fenced and retains accepted native effects for cleanup.
+
+`ProbeRequest::Observe` returns the original 23 RAM words, both IRQ publication
+epoch reads, and optional native vector-224 IRR/ISR/deadline values from the
+retained AP2 cut. These native values describe that cut, not a fabricated live
+sample. `ProbeRequest::Command` accepts only `Pending`, `Reset`, `Accept` and
+`Unmask`, which write the existing guest command numbers 2, 12, 11 and 10.
+Commands require a running owner and the original single-initialization RAM
+identity. A restored child can observe and issue those guest commands, but can
+never initialize, register source observers, replace the IDT, or reseed native
+state through this API. Generation, activation and thaw remain the normal owner
+barriers.
+
+The candidate-only capability helpers `diagnostic_execution_producer`,
+`diagnostic_lane` and `query_diagnostic_live_host` retain the actual diagnostic
+build identity. The producer is byte-identical to the native envelope producer.
+The lane still requires complete, clean package bindings and refuses TEE,
+Nitro, control-probe and other unsupported device profiles. The diagnostic host
+query reuses the real machine-less KVM observations and existing prerequisite
+reducers. Ordinary `query_live_host`, `binding_complete`, `execution_producer`
+and `NativeLane::from_build` continue to exclude diagnostic builds; none of
+these helpers changes production admission or qualifies the IRQ experiment.
+
 ## Required evidence, not a reduced production gate
 
 The assembly fixture proves only the CPU execution sub-barrier. It does not boot
@@ -478,7 +518,30 @@ Read-only VMDK lowers also participate in pause and capture using the same
 queue-drain contract. The captured block payload includes its actual format;
 raw destinations reject VMDK payloads rather than reinterpret them. Writable
 VMDK remains unsupported. This provider admission is not a public runtime
-qualification or a VMDK restore constructor.
+qualification.
+
+Restore binds every block to `RestoreBlockBacking`, whose variant is the
+destination format: `Raw { file, read_only }` or `ReadonlyVmdk { descriptor,
+extents }`. There is no writable VMDK variant, and a variant that differs from
+the saved format is refused (`Format`), never substituted. A read-only VMDK is
+rebuilt from held handles only. The descriptor must be byte-for-byte the
+`twoGbMaxExtentFlat` grammar libvm generates (at most 2,097,152 bytes and 1536
+`FLAT` records, absolute paths, at most 4,194,304 sectors per record). Each
+`FLAT` path must match exactly one held `VmdkExtent` path, every held extent
+must be referenced, and each record must end within its extent. imago receives
+duplicates of the held descriptor and extent handles through a gate that
+serves only the next admitted record and refuses any other or writable open.
+The rebuilt device must then match the saved payload's identity, capacity,
+features and configuration. Restore preflight requires read-only,
+close-on-exec, regular, non-`O_DIRECT` extents with one inode per path; extent
+inodes may repeat across read-only closures but never alias a descriptor,
+state role, raw disk or endpoint. Every block reports the inodes its backend
+reads (a raw file, or a VMDK descriptor plus each extent, recorded from the
+held handles on restore and from the single extent opens on cold attach), and
+live capture refuses an output file that aliases any of them. Cargo
+regressions read split and repeated extents after every named path is unlinked
+and cover each closure refusal. The ADR 0014 split-offset semantics require
+imago 0.2.6 or later.
 
 The block regressions cover actual write/read/guest FLUSH, final status and used
 length, notification, a real saturated eventfd, invalid used-ring publication
@@ -504,6 +567,14 @@ not that a real filesystem `fsync` failure has been exercised.
   agent-control service until activation release; old sessions are not copied.
   TRANSPORT_RESET is a real guest event, remains pending under EVQ starvation,
   and cannot be replaced with MMIO reset or destructive control failure fencing.
+  Listener registration is one-time per mux instance, but its epoch-bound
+  activation acknowledgement is retried while release remains pending. An
+  epoch change cannot strand already-bound listeners; the shared exposure
+  gate and exact instance/epoch checks still prevent premature admission.
+  The dynamic host source-port cursor survives mux worker restart and is
+  captured with device state. Restore continues beyond all allocated source
+  tuples, including closed host proxies whose guest socket state may remain.
+  The bounded port range fails on exhaustion rather than recycling a tuple.
 - Console regressions select real sockets/pipes and partial output ownership,
   every input/output/absent/unopened direction queue, and ordered pending
   control state. Fresh endpoints must neither replay accepted output nor
@@ -728,13 +799,38 @@ events and distinguishes poisoned transport locks from ordinary contention.
 After acceptance, net and vsock providers keep that exact request and classify
 their own contended readiness reads as `Poll::Pending`, not a failed activation
 or a new begin. Poison, worker failures, invalid state, foreign keys and expiry
-remain errors; real provider faults stay retained for terminal cleanup. A
+remain errors; real provider faults stay retained for terminal cleanup. Provider
+readiness is preparation only: every begin binds one shared exposure gate, and
+each provider stays effectively fenced (both network directions, non-control
+vsock, host vsock listener acceptance and timesync) until that gate opens. A
 completed exact-key acknowledgement is terminal, and the driver stops polling
 that provider while others remain pending. It checks the unchanged aggregate
-deadline before new effects and before reporting `OK activate`, including when
-the final provider becomes ready after expiry. Failures retain the original
-effects and existing explicit stop/process-reap cleanup; they do not reverse a
-release that may already have run.
+deadline before new effects. Once every provider is prepared it takes every
+provider lock, has each provider re-prove that its exact prepared state is
+still current (no quiesce, stop, worker fault or replaced release; vsock
+listener preparation is bound to the mux thread instance that performed it, so
+a mux restart invalidates it), and only then opens the gate with one atomic
+commit before reporting `OK activate`. Contention retries; it never commits a
+stale proof. Any failure, including expiry after a provider prepared or an
+invalidated proof, leaves the gate closed, so no provider becomes visible and
+nothing needs to be reversed. The production owner
+(`release_activation_fences`) uses the same barrier, additionally rechecking
+the exact restore token, acknowledged FreshIdentity ticket and latched stop
+under those locks immediately before the commit and sealing the gate on
+failure.
+
+The live owner retains each transport's immutable provider handle at attachment
+registration, before vCPUs run. Building the activation inventory therefore
+does not acquire a live MMIO transport lock: ordinary guest MMIO ownership
+cannot turn exposure admission into `participant lock busy`. Preparation and
+commit still acquire the actual provider locks, with bounded pending on
+contention, unchanged deadlines and the same all-provider exposure gate.
+The native regressions
+`live_inventory_retains_actual_vsock_while_mmio_owner_holds_transport` and
+`activation_barrier_transport_ownership_does_not_refuse_or_expose_early` retain
+real transport guards throughout inventory acquisition and activation; the
+latter also holds provider guards through partial preparation and commit
+contention to prove that transport independence does not bypass the fence.
 
 Vsock's accepted resume, which precedes destination activation, follows the
 same readiness rule at both preflight boundaries and the worker-running read.
@@ -1238,7 +1334,7 @@ disjoint write obligations. Borrowed syscall views remain guard-bound through
 completion and errors; the final view is clipped to the requested byte count.
 Descriptor consumption and native iovecs use bounded 64-entry stack scratch,
 without per-call lease clones or temporary vectors. This does not remove pinned
-imago 0.2.4's existing internal vector and pointer-guard allocations.
+imago 0.2.6's existing internal vector and pointer-guard allocations.
 Block IN/OUT requests consume successive bounded batches until the validated
 request length is complete, advancing the file offset with checked arithmetic.
 A zero-progress or failed batch is not successful completion; already-completed
@@ -1824,4 +1920,38 @@ The KVM x86_64 declaration rests on the passed exported-API cohorts `api`,
 arm64 lanes change only after their own exported-path gates pass. A supported native
 operation is a primitive, not public delivery: Silo still reports every public
 live operation `not-delivered`, and a lane declaration does not admit every
-storage or device profile (raw-only block admission still applies).
+storage or device profile (raw and read-only flat VMDK block admission still
+applies).
+
+### Descriptor-only compatibility admission
+
+`krun::live::inspection::inspect_compatibility` borrows read-only, close-on-exec
+execution, device and layout files plus their exact authenticated identities.
+It checks bounded native codecs, the exact native producer, execution lane and
+retired-Linux-PIT profile, cut bindings, RAM geometry, supported provider payloads,
+queue geometry and semantic destination attachment expectations. The immutable
+result exposes the authenticated CPU topology, RAM layout, device routing,
+transport state and provider pins. Callers do not parse or echo opaque native
+device payloads. The destination MAC is not an exact source pin.
+
+On the admitted KVM x86_64 lane, admission observes actual destination CPUID,
+MSR inventory and model values, MCE capability, XSAVE extent/component layout,
+unscaled TSC rate and host clock semantics. These use the same CPU destination
+checks as construction. The documented KVM system APIs cannot return the exact
+vCPU TSC rate or all model-MSR values. Admission therefore owns one ephemeral
+empty host-profile VM and one vCPU, queried only and never run. It installs no
+captured state, registers no RAM, constructs no child identity/directory, opens
+no disks or network resources, and closes both descriptors before returning,
+including on failure or deadline expiry. Every unavailable observation refuses;
+a lane name alone is never compatibility evidence. The unqualified arm64 lanes
+refuse with a missing destination-register-inventory diagnostic.
+
+This observer is distinct from child allocation. All child directory, disk,
+network and restored-VM construction remains after admission. The manager must
+retain immutable-inode leases and verify the complete RAM stream separately.
+Admission grants no install authority: native construction authenticates its
+inputs and repeats destination checks. Cargo regression tests exercise bounded
+malformed metadata, semantic expectation mismatches and queue geometry without
+opening `/dev/kvm`, creating a VM or mapping guest RAM.
+
+KVM semantics: [system feature-MSR queries and vCPU TSC queries](https://docs.kernel.org/virt/kvm/api.html).

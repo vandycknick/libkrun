@@ -27,7 +27,7 @@ pub mod signal_handler;
 pub mod vmm_config;
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub(crate) mod linux;
 #[cfg(target_os = "linux")]
 pub(crate) use crate::vmm::linux::vstate;
 #[cfg(target_os = "macos")]

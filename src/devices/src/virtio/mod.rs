@@ -53,7 +53,9 @@ pub use self::memory::*;
 pub use self::mmio::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;
-pub use self::queue::{Descriptor, DescriptorChain, Queue, QueueOwnershipFault, QueueState};
+pub use self::queue::{
+    Descriptor, DescriptorChain, Error as QueueError, Queue, QueueOwnershipFault, QueueState,
+};
 #[cfg(not(feature = "tee"))]
 pub use self::rng::*;
 #[cfg(feature = "vhost-user")]

@@ -224,6 +224,10 @@ impl NativeBuildFacts {
 
     /// Optional native packages not yet instrumented cannot yield a complete binding.
     pub fn binding_complete(&self) -> bool {
+        self.binding_complete_for_profile(self.live_profile_included())
+    }
+
+    fn binding_complete_for_profile(&self, profile_included: bool) -> bool {
         let required = [
             "libkrun",
             "krun-arch",
@@ -237,7 +241,7 @@ impl NativeBuildFacts {
         self.query_abi == LIVE_QUERY_ABI
             && self.backend != NativeBackend::Unsupported
             && self.architecture != NativeArchitecture::Unsupported
-            && self.live_profile_included()
+            && profile_included
             && required.iter().all(|name| self.has_one_package(name))
             && (self.architecture != NativeArchitecture::X86_64
                 || self.has_one_package("krun-cpuid"))
@@ -272,20 +276,22 @@ impl NativeBuildFacts {
     }
 
     fn live_profile_included(&self) -> bool {
+        self.profile_included(false)
+    }
+
+    fn profile_included(&self, diagnostic: bool) -> bool {
         !self.packages.is_empty()
             && self.packages.iter().all(|package| {
                 package.features.is_some_and(|features| {
-                    !features.iter().any(|feature| {
-                        matches!(
-                            *feature,
-                            "CARGO_FEATURE_TEE"
-                                | "CARGO_FEATURE_AMD_SEV"
-                                | "CARGO_FEATURE_TDX"
-                                | "CARGO_FEATURE_AWS_NITRO"
-                                | "CARGO_FEATURE_NATIVE_CONTROL_PROBE"
-                                | "CARGO_FEATURE_NATIVE_EXECUTION_PROBE"
-                                | "CARGO_FEATURE_NATIVE_DEVICE_PROBE"
-                        )
+                    !features.iter().any(|feature| match *feature {
+                        "CARGO_FEATURE_TEE"
+                        | "CARGO_FEATURE_AMD_SEV"
+                        | "CARGO_FEATURE_TDX"
+                        | "CARGO_FEATURE_AWS_NITRO"
+                        | "CARGO_FEATURE_NATIVE_CONTROL_PROBE" => true,
+                        "CARGO_FEATURE_NATIVE_EXECUTION_PROBE"
+                        | "CARGO_FEATURE_NATIVE_DEVICE_PROBE" => !diagnostic,
+                        _ => false,
                     })
                 })
             })
@@ -305,7 +311,7 @@ impl NativeBuildFacts {
     target_arch = "x86_64",
     any(feature = "native-execution-probe", feature = "native-device-probe")
 ))]
-fn diagnostic_execution_producer() -> Result<String, String> {
+pub fn diagnostic_execution_producer() -> Result<String, String> {
     let mut value = String::from("diagnostic-only;");
     let build = compiled_live_build();
     write!(
@@ -320,6 +326,19 @@ fn diagnostic_execution_producer() -> Result<String, String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(value)
+}
+
+#[cfg(all(
+    feature = "native-device-probe",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub fn diagnostic_lane(build: &NativeBuildFacts) -> Option<NativeLane> {
+    (build.backend == NativeBackend::Kvm
+        && build.architecture == NativeArchitecture::X86_64
+        && build.control_abi == Some(1)
+        && build.binding_complete_for_profile(build.profile_included(true)))
+    .then_some(NativeLane::KvmX86_64)
 }
 
 #[cfg(any(
@@ -853,6 +872,24 @@ pub struct NativeHostReport {
 pub fn query_live_host() -> NativeHostReport {
     let build = compiled_live_build();
     let lane = NativeLane::from_build(build);
+    query_host_for_lane(build, lane)
+}
+
+#[cfg(all(
+    feature = "native-device-probe",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub fn query_diagnostic_live_host() -> NativeHostReport {
+    let build = compiled_live_build();
+    let lane = match diagnostic_lane(build) {
+        Some(lane) => lane,
+        None => NativeLane::Unsupported,
+    };
+    query_host_for_lane(build, lane)
+}
+
+fn query_host_for_lane(build: &'static NativeBuildFacts, lane: NativeLane) -> NativeHostReport {
     let kvm = if lane.queries_kvm() {
         query_kvm()
     } else {
@@ -984,6 +1021,10 @@ mod tests {
         let build = compiled_live_build();
         let producer = execution_state_producer().expect("actual diagnostic build observations");
         assert!(producer.starts_with("diagnostic-only;"));
+        assert_eq!(
+            producer,
+            crate::api::capabilities::diagnostic_execution_producer().expect("same native encoder")
+        );
         assert!(build.execution_producer().is_err());
         assert!(!build.binding_complete());
         assert_eq!(NativeLane::from_build(build), NativeLane::Unsupported);
@@ -1188,6 +1229,75 @@ mod tests {
             ..COMPLETE_PACKAGE
         },
     ];
+
+    #[cfg(all(
+        feature = "native-device-probe",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[test]
+    fn diagnostic_irq_lane_requires_complete_identity_without_production_admission() {
+        use crate::api::capabilities::diagnostic_lane;
+        macro_rules! packages {
+            ($features:expr) => {
+                &[
+                    PackageBuildFacts {
+                        features: $features,
+                        ..COMPLETE_PACKAGES[0]
+                    },
+                    COMPLETE_PACKAGES[1],
+                    COMPLETE_PACKAGES[2],
+                    COMPLETE_PACKAGES[3],
+                    COMPLETE_PACKAGES[4],
+                    COMPLETE_PACKAGES[5],
+                    COMPLETE_PACKAGES[6],
+                    COMPLETE_PACKAGES[7],
+                    PackageBuildFacts {
+                        name: "krun-cpuid",
+                        ..COMPLETE_PACKAGE
+                    },
+                ]
+            };
+        }
+        const PROBE: &[PackageBuildFacts] = packages!(Some(&[
+            "CARGO_FEATURE_NATIVE_DEVICE_PROBE",
+            "CARGO_FEATURE_NATIVE_EXECUTION_PROBE",
+        ]));
+        let mut build = NativeBuildFacts {
+            query_abi: LIVE_QUERY_ABI,
+            control_abi: Some(1),
+            backend: NativeBackend::Kvm,
+            architecture: NativeArchitecture::X86_64,
+            packages: PROBE,
+        };
+        assert_eq!(diagnostic_lane(&build), Some(NativeLane::KvmX86_64));
+        assert!(!build.binding_complete());
+        assert!(build.execution_producer().is_err());
+        assert_eq!(NativeLane::from_build(&build), NativeLane::Unsupported);
+        const REFUSED: &[&[PackageBuildFacts]] = &[
+            packages!(Some(&["CARGO_FEATURE_TEE"])),
+            packages!(Some(&["CARGO_FEATURE_AMD_SEV"])),
+            packages!(Some(&["CARGO_FEATURE_TDX"])),
+            packages!(Some(&["CARGO_FEATURE_AWS_NITRO"])),
+            packages!(Some(&["CARGO_FEATURE_NATIVE_CONTROL_PROBE"])),
+            packages!(Some(&["CARGO_FEATURE_GPU"])),
+            packages!(None),
+            COMPLETE_PACKAGES,
+        ];
+        for packages in REFUSED {
+            build.packages = packages;
+            assert_eq!(diagnostic_lane(&build), None);
+        }
+        build.packages = PROBE;
+        build.control_abi = None;
+        assert_eq!(diagnostic_lane(&build), None);
+        build.control_abi = Some(1);
+        build.backend = NativeBackend::Hvf;
+        assert_eq!(diagnostic_lane(&build), None);
+        build.backend = NativeBackend::Kvm;
+        build.architecture = NativeArchitecture::Aarch64;
+        assert_eq!(diagnostic_lane(&build), None);
+    }
 
     #[test]
     fn native_live_build_binding_refuses_missing_packages_and_unobserved_optional_packages() {

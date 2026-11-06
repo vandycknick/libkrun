@@ -7,6 +7,7 @@ use std::time::Instant;
 use crate::api::live::{RamImageAuthentication, StateBinding};
 use crate::api::vmm_builder::Vmm;
 pub use crate::vmm::control::RestoreToken;
+pub use devices::virtio::block::{ReadonlyVmdk, RestoreBlockBacking, VmdkExtent};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StateObjectIdentity {
@@ -39,10 +40,35 @@ pub struct RestoreAttachment {
     pub irq: u32,
 }
 
+/// The backing variant is the destination format and must equal the format
+/// captured for this attachment: raw is never substituted for a saved VMDK.
 pub struct RestoreBlock {
     pub attachment: RestoreAttachment,
-    pub file: File,
-    pub read_only: bool,
+    pub backing: RestoreBlockBacking,
+}
+impl RestoreBlock {
+    pub fn raw(attachment: RestoreAttachment, file: File, read_only: bool) -> Self {
+        Self {
+            attachment,
+            backing: RestoreBlockBacking::Raw { file, read_only },
+        }
+    }
+
+    /// `descriptor` is the manager-generated launch descriptor; `extents`
+    /// holds one validated handle per distinct `FLAT` path it names.
+    pub fn readonly_vmdk(
+        attachment: RestoreAttachment,
+        descriptor: File,
+        extents: Vec<VmdkExtent>,
+    ) -> Self {
+        Self {
+            attachment,
+            backing: RestoreBlockBacking::ReadonlyVmdk(ReadonlyVmdk {
+                descriptor,
+                extents,
+            }),
+        }
+    }
 }
 pub struct RestoreNetwork {
     pub attachment: RestoreAttachment,
@@ -88,6 +114,8 @@ pub enum RestoreRole {
     Execution,
     Devices,
     Block,
+    VmdkDescriptor,
+    VmdkExtent,
     Network,
     Vsock,
     Console,
@@ -106,6 +134,10 @@ pub enum RestoreProblem {
     Topology,
     Generation,
     Deadline,
+    /// Destination backing format differs from the captured format.
+    Format,
+    /// A read-only VMDK descriptor/extent closure is not the admitted one.
+    Closure,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestoreStage {

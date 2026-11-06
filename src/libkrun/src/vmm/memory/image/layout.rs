@@ -713,11 +713,11 @@ impl Parser<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::vmm::memory::image::layout::{MAX_RAM_LAYOUT_BYTES, RamTopology};
     use crate::vmm::memory::image::{RamImageError, RamRegion, ValidatedRamLayout};
 
-    const X86: &str = "{\"architecture\":\"x86_64\",\"kind\":\"ram-layout\",\"packedLength\":12288,\"pageGranule\":4096,\"regions\":[{\"guestPhysicalAddress\":0,\"length\":4096,\"streamOffset\":0},{\"guestPhysicalAddress\":4096,\"length\":8192,\"streamOffset\":4096}],\"schema\":1,\"topology\":{\"firmwareAddress\":0,\"initrdAddress\":12288,\"ramAboveGap\":0,\"ramBelowGap\":12288,\"ramLastAddress\":12288,\"shmStartAddress\":4294967296}}";
+    pub(crate) const X86: &str = "{\"architecture\":\"x86_64\",\"kind\":\"ram-layout\",\"packedLength\":12288,\"pageGranule\":4096,\"regions\":[{\"guestPhysicalAddress\":0,\"length\":4096,\"streamOffset\":0},{\"guestPhysicalAddress\":4096,\"length\":8192,\"streamOffset\":4096}],\"schema\":1,\"topology\":{\"firmwareAddress\":0,\"initrdAddress\":12288,\"ramAboveGap\":0,\"ramBelowGap\":12288,\"ramLastAddress\":12288,\"shmStartAddress\":4294967296}}";
     const ARM: &str = "{\"architecture\":\"aarch64\",\"kind\":\"ram-layout\",\"packedLength\":4194304,\"pageGranule\":4096,\"regions\":[{\"guestPhysicalAddress\":2147483648,\"length\":4194304,\"streamOffset\":0}],\"schema\":1,\"topology\":{\"fdtAddress\":2149580800,\"firmwareAddress\":0,\"initrdAddress\":2149580799,\"ramLastAddress\":2151677952,\"ramStartAddress\":2147483648,\"shmStartAddress\":3221225472}}";
 
     #[test]

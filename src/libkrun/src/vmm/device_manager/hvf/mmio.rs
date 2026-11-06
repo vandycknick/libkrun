@@ -348,6 +348,7 @@ impl MMIODeviceManager {
             .map_err(Error::Provider)?;
         let source = mmio_device.interrupt_transport().clone();
 
+        let device = mmio_device.device();
         let transport = Arc::new(Mutex::new(mmio_device));
         self.bus
             .insert(transport.clone(), self.mmio_base, MMIO_LEN)
@@ -366,6 +367,7 @@ impl MMIODeviceManager {
                 irq: self.irq,
             },
             transport,
+            device,
         );
         let ret = (self.mmio_base, self.irq);
         self.id_to_dev_info.insert(

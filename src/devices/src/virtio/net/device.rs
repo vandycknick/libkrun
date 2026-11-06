@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::virtio::lifecycle::{
-    DormantDeviceContext, LifecycleJournal, ProviderBeginError, ProviderFault, ProviderStage,
-    QuiesceCompletion, ResumeAcceptance, VirtioStateProvider,
+    ActivationExposure, DormantDeviceContext, LifecycleJournal, ProviderBeginError, ProviderFault,
+    ProviderStage, QuiesceCompletion, ResumeAcceptance, VirtioStateProvider,
 };
 use crate::virtio::net::worker::{EndpointMode, NetWorker, ParkedNetWorker, WorkerAdmission};
 use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG, Result};
@@ -85,6 +85,22 @@ impl NetPayload {
             })
         };
         decode().map_err(|_| ProviderFault::DeviceState)
+    }
+}
+
+impl Net {
+    pub fn inspect_restore_payload(payload: &[u8]) -> std::result::Result<[u8; 6], ProviderFault> {
+        let saved = NetPayload::decode(payload)?;
+        if saved.config.status != 0
+            || saved.config.max_virtqueue_pairs != 0
+            || saved.available & !((u32::MAX as u64) | (1 << 32)) != 0
+            || saved.available
+                & ((1 << VIRTIO_NET_F_MAC) | (1 << VIRTIO_RING_F_EVENT_IDX) | (1 << 32))
+                != ((1 << VIRTIO_NET_F_MAC) | (1 << VIRTIO_RING_F_EVENT_IDX) | (1 << 32))
+        {
+            return Err(ProviderFault::DeviceState);
+        }
+        Ok(saved.config.mac)
     }
 }
 
@@ -715,11 +731,14 @@ impl VirtioStateProvider for Net {
             TryLockError::WouldBlock => ProviderFault::LockBusy,
             TryLockError::Poisoned(_) => ProviderFault::Worker,
         })?;
-        Ok(Some(control.mode == EndpointMode::ActivationFenced))
+        Ok(Some(
+            control.effective_mode() == EndpointMode::ActivationFenced,
+        ))
     }
     fn begin_activation_release(
         &mut self,
         request: BarrierRequest,
+        exposure: &ActivationExposure,
     ) -> std::result::Result<(), ProviderBeginError> {
         if self.activation == Some(request) {
             return self.activation_fault.map_or(Ok(()), |fault| {
@@ -764,6 +783,7 @@ impl VirtioStateProvider for Net {
             },
         })?;
         if control.release.is_some()
+            || control.exposure.is_some()
             || control.mode != EndpointMode::ActivationFenced
             || Instant::now() >= request.deadline
         {
@@ -773,6 +793,8 @@ impl VirtioStateProvider for Net {
             });
         }
         self.activation = Some(request);
+        // Bind the shared commit before the worker can prepare a local release.
+        control.exposure = Some(exposure.clone());
         control.release = Some(request);
         drop(control);
         wake.write(1).map_err(|_| {
@@ -849,6 +871,58 @@ impl VirtioStateProvider for Net {
         }
         result
     }
+    fn validate_activation_prepared(
+        &self,
+        key: BarrierKey,
+    ) -> std::result::Result<Poll<()>, ProviderFault> {
+        if self.activation.is_none_or(|request| request.key != key) {
+            return Err(ProviderFault::ForeignBarrier);
+        }
+        if let Some(fault) = self.activation_fault {
+            return Err(fault);
+        }
+        if !self.activation_done || self.lifecycle.snapshot.stage != ProviderStage::Running {
+            return Err(ProviderFault::InvalidTransition);
+        }
+        self.preflight()?;
+        let (control, _) = self
+            .control
+            .as_ref()
+            .ok_or(ProviderFault::InvalidTransition)?;
+        let control = match control.try_lock() {
+            Ok(control) => control,
+            Err(TryLockError::WouldBlock) => return Ok(Poll::Pending),
+            Err(TryLockError::Poisoned(_)) => return Err(ProviderFault::Worker),
+        };
+        // A quiesce, stop or replaced release after preparation is not the
+        // prepared endpoint the commit would expose.
+        if control.closed
+            || control.stop
+            || control.mode != EndpointMode::Open
+            || control.released != Some(key)
+            || control.release.is_some()
+            || control
+                .exposure
+                .as_ref()
+                .is_none_or(|exposure| exposure.is_open() || exposure.is_sealed())
+        {
+            return Err(ProviderFault::InvalidTransition);
+        }
+        let owner_live = if self.is_activated() {
+            self.worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        } else {
+            self.parked
+                .as_ref()
+                .is_some_and(|state| state.fault.is_none())
+        };
+        if owner_live {
+            Ok(Poll::Ready(()))
+        } else {
+            Err(ProviderFault::Worker)
+        }
+    }
 }
 
 impl Drop for Net {
@@ -890,7 +964,7 @@ mod tests {
         }
     }
 
-    use crate::virtio::lifecycle::{ProviderFault, VirtioStateProvider};
+    use crate::virtio::lifecycle::{ActivationExposure, ProviderFault, VirtioStateProvider};
     use crate::virtio::net::device::{Net, VirtioNetBackend};
     use polly::event_manager::{BarrierGeneration, BarrierKey, BarrierRequest, OperationId};
     use std::os::unix::net::{UnixDatagram, UnixStream};
@@ -985,18 +1059,21 @@ mod tests {
             if expire {
                 release.deadline = Instant::now() + Duration::from_millis(100);
             }
+            let exposure = ActivationExposure::new();
             let admission = Arc::clone(&net.control.as_ref().unwrap().0);
             let held = admission
                 .lock()
                 .expect("hold the unaccepted network owner gate");
             assert_eq!(net.activation_fenced(), Err(ProviderFault::LockBusy));
-            let rejected = net.begin_activation_release(release).unwrap_err();
+            let rejected = net
+                .begin_activation_release(release, &exposure)
+                .unwrap_err();
             assert!(!rejected.accepted);
             assert_eq!(rejected.fault, ProviderFault::LockBusy);
             assert_eq!(net.activation, None);
             assert_eq!(held.release, None);
             drop(held);
-            net.begin_activation_release(release).unwrap();
+            net.begin_activation_release(release, &exposure).unwrap();
             let held = admission
                 .lock()
                 .expect("hold the actual network owner gate");
@@ -1064,6 +1141,12 @@ mod tests {
                 {
                     assert!(Instant::now() < release.deadline);
                 }
+                assert_eq!(
+                    net.activation_fenced(),
+                    Ok(Some(true)),
+                    "prepared release stays fenced until the shared commit"
+                );
+                assert!(exposure.open());
                 assert_eq!(net.activation_fenced(), Ok(Some(false)));
                 let held = admission
                     .lock()
@@ -1092,7 +1175,9 @@ mod tests {
             };
             assert_eq!(net.poll_activation_release(release.key), Err(expected));
             assert_eq!(net.poll_activation_release(release.key), Err(expected));
-            let repeated = net.begin_activation_release(release).unwrap_err();
+            let repeated = net
+                .begin_activation_release(release, &exposure)
+                .unwrap_err();
             assert!(repeated.accepted);
             assert_eq!(repeated.fault, expected);
             assert_eq!(net.activation, Some(release));
@@ -1363,7 +1448,8 @@ mod tests {
             },
             deadline: cut.deadline,
         };
-        net.begin_activation_release(release)
+        let exposure = crate::virtio::lifecycle::ActivationExposure::new();
+        net.begin_activation_release(release, &exposure)
             .expect("explicit activation release");
         while net
             .poll_activation_release(release.key)
@@ -1389,12 +1475,20 @@ mod tests {
             panic!("managed binding lost");
         }
         let state = net.parked.as_ref().expect("retained dormant endpoint");
-        assert_eq!(
-            state.admission.lock().expect("admission").mode,
-            EndpointMode::Open
-        );
+        {
+            let admission = state.admission.lock().expect("admission");
+            assert_eq!(admission.mode, EndpointMode::Open);
+            assert_eq!(
+                admission.effective_mode(),
+                EndpointMode::ActivationFenced,
+                "prepared inactive endpoint stays fenced until the shared commit"
+            );
+        }
         assert!(!state.rx_deferred);
         assert_eq!(state.rx_len, 0);
+        assert_eq!(net.activation_fenced(), Ok(Some(true)));
+        assert!(exposure.open());
+        assert_eq!(net.activation_fenced(), Ok(Some(false)));
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1613,8 +1707,9 @@ mod tests {
             },
             deadline: cut.deadline,
         };
+        let exposure = crate::virtio::lifecycle::ActivationExposure::new();
         wait_for(activation.deadline, || {
-            match net.begin_activation_release(activation) {
+            match net.begin_activation_release(activation, &exposure) {
                 Ok(()) => true,
                 Err(error) if !error.accepted && error.fault == ProviderFault::LockBusy => false,
                 Err(error) => panic!("explicit activation failed: {error:?}"),
@@ -1625,6 +1720,33 @@ mod tests {
                 .expect("discard boundary")
                 .is_ready()
         });
+        // Prepared, not committed: ingress is consumed by the worker and dropped.
+        peer.send(b"gated").expect("prepared endpoint ingress");
+        wait_for(cut.deadline, || {
+            matches!(
+                recv(
+                    endpoint.as_raw_fd(),
+                    &mut packet,
+                    MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT
+                ),
+                Err(nix::Error::EAGAIN)
+            )
+        });
+        // The worker reads and classifies a frame under one admission hold.
+        drop(
+            net.control
+                .as_ref()
+                .expect("activated control")
+                .0
+                .lock()
+                .expect("admission"),
+        );
+        assert_eq!(
+            rx.used.idx.get(),
+            0,
+            "no guest delivery before the shared exposure commit"
+        );
+        assert!(exposure.open());
         peer.send(b"before").expect("open endpoint ingress");
         wait_for(cut.deadline, || rx.used.idx.get() == 1);
         memory

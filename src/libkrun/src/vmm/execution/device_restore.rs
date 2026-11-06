@@ -533,14 +533,14 @@ impl PreparedDeviceInstall {
 }
 
 #[cfg(all(test, not(feature = "tee")))]
-mod tests {
+pub(crate) mod tests {
     use crate::vmm::device_manager::quiescence::AttachmentIdentity;
     use crate::vmm::execution::StateBinding;
     use crate::vmm::execution::device_restore::{PreparedDeviceInstall, RestoreDeviceBinding};
     use devices::virtio::{MmioTransportState, Queue, VirtioDevice};
     use std::sync::{Arc, Mutex};
 
-    fn rng_binding() -> (StateBinding, RestoreDeviceBinding) {
+    pub(crate) fn rng_binding() -> (StateBinding, RestoreDeviceBinding) {
         let rng = devices::virtio::Rng::new().unwrap();
         let state = MmioTransportState {
             device_type: rng.device_type(),

@@ -467,6 +467,17 @@ impl Queue {
         mem: &ReadGuestMemory<'_>,
         state: &QueueState,
     ) -> Result<(), Error> {
+        Self::validate_restored_geometry(max_size, state, |address, length| {
+            mem.validate_range(GuestAddress(address), length)
+                .map_err(Error::GuestMemory)
+        })
+    }
+
+    pub fn validate_restored_geometry(
+        max_size: u16,
+        state: &QueueState,
+        mut validate_range: impl FnMut(u64, usize) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         if state.max_size != max_size {
             return Err(Error::InvalidMaxSize);
         }
@@ -485,8 +496,7 @@ impl Queue {
             if address % alignment != 0 {
                 return Err(Error::InvalidChain);
             }
-            mem.validate_range(GuestAddress(address), length)
-                .map_err(Error::GuestMemory)?;
+            validate_range(address, length)?;
         }
         Ok(())
     }

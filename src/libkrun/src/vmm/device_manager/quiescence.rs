@@ -292,6 +292,9 @@ impl std::error::Error for ManagerError {
 pub struct TransportAttachment {
     pub identity: AttachmentIdentity,
     pub transport: Arc<Mutex<MmioTransport>>,
+    // The transport's device binding is immutable. Retain it before vCPUs can
+    // own the transport, so live activation never needs the MMIO bus lock.
+    device: Arc<Mutex<dyn devices::virtio::VirtioDevice>>,
     /// A begin attempt is retained before entering a fallible provider operation.
     pub attempted: bool,
     pub accepted: bool,
@@ -349,17 +352,10 @@ impl DeviceQuiescence {
             .map(|attachment| attachment.identity.clone())
             .collect()
     }
-    pub(crate) fn live_devices(&self) -> Result<Vec<LiveDevice>, ManagerError> {
+    pub(crate) fn live_devices(&self) -> Vec<LiveDevice> {
         self.attachments
             .iter()
-            .enumerate()
-            .map(|(index, attachment)| {
-                let transport = attachment
-                    .transport
-                    .try_lock()
-                    .map_err(|error| self.lock_error(index, error))?;
-                Ok((attachment.identity.clone(), transport.device()))
-            })
+            .map(|attachment| (attachment.identity.clone(), attachment.device.clone()))
             .collect()
     }
 
@@ -612,10 +608,12 @@ impl DeviceQuiescence {
         &mut self,
         identity: AttachmentIdentity,
         transport: Arc<Mutex<MmioTransport>>,
+        device: Arc<Mutex<dyn devices::virtio::VirtioDevice>>,
     ) {
         self.attachments.push(TransportAttachment {
             identity,
             transport,
+            device,
             attempted: false,
             accepted: false,
             resume_attempted: false,
@@ -1039,6 +1037,47 @@ mod tests {
     };
 
     #[test]
+    #[cfg(not(feature = "tee"))]
+    fn live_inventory_retains_actual_vsock_while_mmio_owner_holds_transport() {
+        use crate::vmm::device_manager::quiescence::AttachmentIdentity;
+        use devices::legacy::DummyIrqChip;
+        use devices::virtio::vsock::{TsiFlags, Vsock};
+        use devices::virtio::{MmioTransport, VirtioDevice};
+        use std::sync::{Arc, Mutex};
+        use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+        let device: Arc<Mutex<dyn VirtioDevice>> = Arc::new(Mutex::new(
+            Vsock::new(3, None, None, TsiFlags::empty()).unwrap(),
+        ));
+        let transport = Arc::new(Mutex::new(
+            MmioTransport::new(
+                crate::vmm::memory::runtime_memory_for_test(
+                    GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+                ),
+                DummyIrqChip::new().into(),
+                device.clone(),
+                None,
+            )
+            .unwrap(),
+        ));
+        let identity = AttachmentIdentity {
+            device_type: devices::DeviceType::Virtio(19),
+            configured_id: "vsock".into(),
+            address: 0xd000_0000,
+            irq: 7,
+        };
+        let mut inventory = DeviceQuiescence::default();
+        inventory.retain_transport(identity.clone(), transport.clone(), device.clone());
+        let held = transport.try_lock().unwrap();
+        let actual = inventory.live_devices();
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].0, identity);
+        assert!(Arc::ptr_eq(&actual[0].1, &device));
+        assert!(Arc::ptr_eq(&actual[0].1, &held.device()));
+        assert!(actual[0].1.try_lock().is_ok());
+    }
+
+    #[test]
     fn missing_legacy_provider_names_actual_attachment() {
         let mut inventory = DeviceQuiescence::default();
         let serial = LegacyAttachment {
@@ -1080,7 +1119,8 @@ mod tests {
             address: 0xd000_0000,
             irq: 5,
         };
-        inventory.retain_transport(identity.clone(), Arc::new(Mutex::new(transport)));
+        let device = transport.device();
+        inventory.retain_transport(identity.clone(), Arc::new(Mutex::new(transport)), device);
         let interrupt = inventory.interrupt_binding(4, "entropy0").unwrap();
         if let Ok(transport) = inventory.attachments[0].transport.try_lock() {
             assert!(interrupt.same_binding(transport.interrupt_transport()));
@@ -1114,7 +1154,8 @@ mod tests {
         assert!(!records[0].state.activated);
         assert_eq!(records[0].payload.len(), 22);
         let transport = inventory.attachments[0].transport.clone();
-        inventory.retain_transport(identity, transport);
+        let device = inventory.attachments[0].device.clone();
+        inventory.retain_transport(identity, transport, device);
         assert!(matches!(inventory.interrupt_binding(4, "entropy0"),
             Err(error) if matches!(error.fault, ManagerFault::InvalidTransition)));
     }
@@ -1245,6 +1286,7 @@ mod tests {
                 irq: 5,
             },
             transport.clone(),
+            device.clone(),
         );
         AdmissionRng {
             inventory,

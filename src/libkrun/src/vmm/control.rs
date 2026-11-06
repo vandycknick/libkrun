@@ -1,4 +1,13 @@
 //! Correlated native control. Accepted work belongs to the VM, never to a waiting caller.
+#[cfg(all(
+    feature = "native-device-probe",
+    feature = "blk",
+    feature = "net",
+    target_os = "linux",
+    target_arch = "x86_64",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
+pub(crate) mod irq_probe;
 pub(crate) mod live;
 
 use std::sync::Arc;
@@ -1183,6 +1192,27 @@ impl crate::vmm::Vmm {
             && Instant::now() >= request.deadline
         {
             return Err(ControlFailure::Deadline);
+        }
+        #[cfg(all(
+            feature = "native-device-probe",
+            feature = "blk",
+            feature = "net",
+            target_os = "linux",
+            target_arch = "x86_64",
+            not(any(feature = "tee", feature = "aws-nitro"))
+        ))]
+        if self
+            .control
+            .live
+            .irq_probe
+            .as_ref()
+            .is_some_and(|probe| probe.pending())
+            && !matches!(
+                request.kind,
+                RequestKind::Stop | RequestKind::CleanupRestore
+            )
+        {
+            return Err(ControlFailure::Busy);
         }
         if matches!(
             request.kind,

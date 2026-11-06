@@ -106,6 +106,11 @@ pub(crate) fn initialize_device_witness(
 }
 #[cfg(target_arch = "x86_64")]
 pub use native::KvmCaptureProfile;
+#[cfg(all(
+    target_arch = "x86_64",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
+pub(crate) use native::inspect_host_execution;
 #[cfg(target_arch = "x86_64")]
 pub(crate) use native::{capture_vm, install_vm, prepare_vm_time};
 

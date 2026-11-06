@@ -702,7 +702,7 @@ impl ExecutionEnvelope {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::vmm::execution::*;
 
     fn registers(ids: &[u16]) -> Vec<hvf::RegisterValue> {
@@ -711,7 +711,7 @@ mod tests {
             .collect()
     }
 
-    fn envelope() -> ExecutionEnvelope {
+    pub(crate) fn envelope() -> ExecutionEnvelope {
         let cpu = hvf::CpuState {
             logical_id: 0,
             mpidr: 0x80000000,

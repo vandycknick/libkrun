@@ -130,6 +130,31 @@ fn decode(payload: &[u8]) -> Result<SavedConsole, Error> {
 }
 
 impl Console {
+    pub fn restore_queue_geometry(ports: usize) -> (usize, u16) {
+        (
+            crate::virtio::console::port_queue_mapping::num_queues(ports),
+            crate::virtio::console::defs::QUEUE_SIZE,
+        )
+    }
+
+    pub fn inspect_restore_payload(
+        payload: &[u8],
+    ) -> Result<Vec<(String, bool, bool, bool)>, ProviderFault> {
+        let saved = decode(payload).map_err(|_| ProviderFault::DeviceState)?;
+        Ok(saved
+            .ports
+            .into_iter()
+            .map(|port| {
+                (
+                    port.name,
+                    port.shape & 1 != 0,
+                    port.shape & 2 != 0,
+                    port.shape & 4 != 0,
+                )
+            })
+            .collect())
+    }
+
     fn checked_saved(&self, payload: &[u8]) -> Result<SavedConsole, ProviderFault> {
         let saved = decode(payload).map_err(|_| ProviderFault::DeviceState)?;
         if saved.ports.len() != self.ports.len() || self.avail_features != AVAIL_FEATURES {

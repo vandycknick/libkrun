@@ -3,15 +3,45 @@
 
 #[cfg(feature = "blk")]
 pub mod device;
+#[cfg(all(feature = "blk", unix))]
+pub mod vmdk;
 #[cfg(feature = "blk")]
 mod worker;
 
 #[cfg(feature = "blk")]
-pub use self::device::{Block, CacheType};
+pub use self::device::{Block, CacheType, RestoreBindingError, RestoreBlockShape};
 
 use vm_memory::GuestMemoryError;
 
-use super::QueueConfig;
+use crate::virtio::QueueConfig;
+use std::fs::File;
+use std::path::PathBuf;
+
+/// The most `FLAT` records one generated lower descriptor may carry (ADR 0014).
+pub const MAX_VMDK_FLAT_RECORDS: usize = 1536;
+
+/// One held immutable extent, named by the exact absolute path its generated
+/// descriptor uses. Restore never opens this path; it is only the key that
+/// binds descriptor records to the caller's already-validated handle.
+pub struct VmdkExtent {
+    pub path: PathBuf,
+    pub file: File,
+}
+
+/// A generated read-only flat VMDK and every extent handle it may reference.
+/// Repeated records of one path share that path's single held extent.
+pub struct ReadonlyVmdk {
+    pub descriptor: File,
+    pub extents: Vec<VmdkExtent>,
+}
+
+/// Destination backing for a restored block device. The variant is the
+/// backing's format and must equal the format recorded at capture; there is no
+/// writable VMDK representation.
+pub enum RestoreBlockBacking {
+    Raw { file: File, read_only: bool },
+    ReadonlyVmdk(ReadonlyVmdk),
+}
 
 pub const CONFIG_SPACE_SIZE: usize = 8;
 pub const SECTOR_SHIFT: u8 = 9;

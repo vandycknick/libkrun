@@ -119,17 +119,32 @@ impl Rng {
         }
     }
 
+    pub fn restore_queue_config() -> &'static [crate::virtio::QueueConfig] {
+        &defs::QUEUE_CONFIG
+    }
+
+    pub fn inspect_restore_payload(payload: &[u8]) -> std::result::Result<(), ProviderFault> {
+        Self::decode_payload_features(payload, AVAIL_FEATURES).map(|_| ())
+    }
+
     fn decode_payload(&self, payload: &[u8]) -> std::result::Result<u64, ProviderFault> {
+        Self::decode_payload_features(payload, self.avail_features)
+    }
+
+    fn decode_payload_features(
+        payload: &[u8],
+        available: u64,
+    ) -> std::result::Result<u64, ProviderFault> {
         let mut reader = Reader::new(payload);
         let decoded = (|| {
             if reader.u16()? != 1
                 || reader.u32()? != uapi::VIRTIO_ID_RNG
-                || reader.u64()? != self.avail_features
+                || reader.u64()? != available
             {
                 return Err(utils::state::Error::Invalid("rng profile"));
             }
             let acked = reader.u64()?;
-            if acked & !self.avail_features != 0 {
+            if acked & !available != 0 {
                 return Err(utils::state::Error::Invalid("rng features"));
             }
             reader.finish()?;

@@ -977,17 +977,35 @@ impl Balloon {
         }
     }
 
+    pub fn restore_queue_config() -> &'static [crate::virtio::QueueConfig] {
+        &defs::QUEUE_CONFIG
+    }
+
+    pub fn inspect_restore_payload(payload: &[u8], available: u64) -> Result<(), ProviderFault> {
+        if available != reporting_features(true) && available != reporting_features(false) {
+            return Err(ProviderFault::Unsupported);
+        }
+        Self::decode_payload_features(payload, available).map(|_| ())
+    }
+
     fn decode_payload(&self, payload: &[u8]) -> Result<(u64, VirtioBalloonConfig), ProviderFault> {
+        Self::decode_payload_features(payload, self.avail_features)
+    }
+
+    fn decode_payload_features(
+        payload: &[u8],
+        available: u64,
+    ) -> Result<(u64, VirtioBalloonConfig), ProviderFault> {
         let mut reader = Reader::new(payload);
         let decoded = (|| {
             if reader.u16()? != 1
                 || reader.u32()? != uapi::VIRTIO_ID_BALLOON
-                || reader.u64()? != self.avail_features
+                || reader.u64()? != available
             {
                 return Err(utils::state::Error::Invalid("balloon profile"));
             }
             let acked = reader.u64()?;
-            if acked & !self.avail_features != 0 {
+            if acked & !available != 0 {
                 return Err(utils::state::Error::Invalid("balloon features"));
             }
             let config = VirtioBalloonConfig {

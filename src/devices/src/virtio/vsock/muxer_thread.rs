@@ -2,9 +2,10 @@ use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 #[cfg(windows)]
 use utils::windows::RawFd;
 
@@ -30,31 +31,38 @@ use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 #[cfg(windows)]
 use utils::windows::AsRawFd;
 
-#[cfg(unix)]
-struct SourcePortAllocator {
-    start: u32,
+/// Upper bound on one fenced-listener backoff; the exposure commit wakes it early.
+const FENCED_LISTENER_BACKOFF: Duration = Duration::from_millis(10);
+
+pub(crate) const SOURCE_PORT_START: u32 = 1 << 30;
+pub(crate) const SOURCE_PORT_END: u32 = 1 << 31;
+
+/// Guest socket state can outlive a removed host proxy. Never reuse its tuple,
+/// including after worker restart or execution restore.
+pub(crate) struct SourcePortAllocator {
     end: u32,
-    next: u32,
+    next: AtomicU32,
 }
 
-#[cfg(unix)]
 impl SourcePortAllocator {
-    fn new(start: u32, end: u32) -> Self {
+    pub(crate) fn new(next: u32, end: u32) -> Self {
         Self {
-            start,
             end,
-            next: start,
+            next: AtomicU32::new(next),
         }
     }
 
-    fn allocate(&mut self, live_proxy_ids: impl IntoIterator<Item = u64> + Clone) -> Option<u32> {
-        for _ in self.start..self.end {
-            let port = self.next;
-            self.next = if port + 1 == self.end {
-                self.start
-            } else {
-                port + 1
-            };
+    pub(crate) fn next(&self) -> u32 {
+        self.next.load(Ordering::Acquire)
+    }
+
+    fn allocate(&self, live_proxy_ids: impl IntoIterator<Item = u64> + Clone) -> Option<u32> {
+        while let Ok(port) = self
+            .next
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                (next < self.end).then(|| next + 1)
+            })
+        {
             if !live_proxy_ids
                 .clone()
                 .into_iter()
@@ -84,10 +92,12 @@ pub(crate) struct MuxerThread {
     #[cfg(unix)]
     control_handle: Option<Arc<ControlHandle>>,
     #[cfg(unix)]
-    source_ports: SourcePortAllocator,
+    source_ports: Arc<SourcePortAllocator>,
     worker_control: Arc<WorkerControl>,
     retired_ports: Vec<u32>,
     initialized: bool,
+    /// This thread's registration; activation preparation is bound to it.
+    instance: u64,
 }
 
 impl MuxerThread {
@@ -106,6 +116,8 @@ impl MuxerThread {
         #[cfg(unix)] control_handle: Option<Arc<ControlHandle>>,
         worker_control: Arc<WorkerControl>,
         retired_ports: Vec<u32>,
+        #[cfg(unix)] source_ports: Arc<SourcePortAllocator>,
+        instance: u64,
     ) -> Self {
         MuxerThread {
             cid,
@@ -124,10 +136,11 @@ impl MuxerThread {
             #[cfg(unix)]
             control_handle,
             #[cfg(unix)]
-            source_ports: SourcePortAllocator::new(1 << 30, 1 << 31),
+            source_ports,
             retired_ports,
             worker_control,
             initialized: false,
+            instance,
         }
     }
 
@@ -241,6 +254,17 @@ impl MuxerThread {
             debug!("signal IRQ");
             self.interrupt.signal_used_queue();
         }
+    }
+
+    /// Host listeners stay owned and registered but never accept while the
+    /// effective activation fence, including an uncommitted exposure, holds.
+    fn fenced_listener(&self, id: u64) -> bool {
+        id as u32 == defs::TSI_PROXY_PORT
+            && self
+                .unix_ipc_port_map
+                .get(&((id >> 32) as u32))
+                .is_some_and(|(_, listen)| *listen)
+            && self.worker_control.activation_fenced()
     }
 
     fn create_listening_ipc_sockets(&self) -> std::io::Result<()> {
@@ -529,6 +553,21 @@ impl MuxerThread {
         Ok(proxy.fail_mux())
     }
 
+    fn prepare_activation_listeners(&mut self, epoch: u64) -> std::io::Result<()> {
+        let release_pending = self.worker_control.release_pending();
+        if !self.initialized && (!self.worker_control.activation_fenced() || release_pending) {
+            self.create_listening_ipc_sockets()?;
+            self.initialized = true;
+        }
+        // Epoch changes invalidate an acknowledgement, not these retained
+        // listener registrations. Retry until this same mux is acknowledged.
+        if self.initialized && release_pending {
+            self.worker_control
+                .complete_activation_release(epoch, self.instance);
+        }
+        Ok(())
+    }
+
     fn work(mut self) {
         #[cfg(unix)]
         const CONTROL_EVENT: u64 = u64::MAX;
@@ -581,16 +620,9 @@ impl MuxerThread {
                 return;
             }
             let epoch = self.worker_control.epoch();
-            if !self.initialized
-                && (!self.worker_control.activation_fenced()
-                    || self.worker_control.release_pending())
-            {
-                if self.create_listening_ipc_sockets().is_err() {
-                    self.worker_control.fail();
-                    return;
-                }
-                self.initialized = true;
-                self.worker_control.complete_activation_release(epoch);
+            if self.prepare_activation_listeners(epoch).is_err() {
+                self.worker_control.fail();
+                return;
             }
             #[cfg(unix)]
             {
@@ -656,6 +688,7 @@ impl MuxerThread {
                             *slot = map.get(&event.data()).cloned();
                         }
                     }
+                    let mut fenced_listener = false;
                     for (index, ev) in epoll_events[..ev_cnt].iter().enumerate() {
                         if !self
                             .worker_control
@@ -696,6 +729,10 @@ impl MuxerThread {
                             continue;
                         }
 
+                        if self.fenced_listener(id) {
+                            fenced_listener = true;
+                            continue;
+                        }
                         if !self.worker_control.admits((id >> 32) as u32) {
                             continue;
                         }
@@ -712,6 +749,9 @@ impl MuxerThread {
                         if let Some(update) = update {
                             self.process_proxy_update(id, update, &mut thread_rng);
                         }
+                    }
+                    if fenced_listener {
+                        self.worker_control.await_exposure(FENCED_LISTENER_BACKOFF);
                     }
                 }
                 Err(e) => {
@@ -789,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn host_source_ports_are_global_and_freed_ports_can_be_reused() {
+    fn host_source_ports_are_global_and_closed_tuples_are_not_reused() {
         let mut allocator = SourcePortAllocator::new(10, 12);
         let proxy_map: ProxyMap = Arc::new(RwLock::new(HashMap::new()));
 
@@ -803,14 +843,7 @@ mod tests {
 
         let first_id = (100u64 << 32) | first as u64;
         proxy_map.write().unwrap().remove(&first_id).unwrap();
-        assert_eq!(allocate(&mut allocator, &proxy_map), Some(first));
-        assert!(
-            proxy_map
-                .read()
-                .unwrap()
-                .keys()
-                .all(|id| *id as u32 != first)
-        );
+        assert_eq!(allocate(&mut allocator, &proxy_map), None);
     }
 
     #[test]
@@ -851,5 +884,56 @@ mod tests {
             3
         );
         assert_eq!(&bytes, b"new");
+    }
+
+    #[test]
+    fn provider_vsock_listener_preparation_retries_a_stale_epoch_without_rebinding() {
+        use crate::legacy::DummyIrqChip;
+        use crate::virtio::InterruptTransport;
+        use crate::virtio::lifecycle::ActivationExposure;
+        use crate::virtio::vsock::muxer_thread::MuxerThread;
+        use crate::virtio::vsock::packet::PacketQueue;
+        use crate::virtio::vsock::worker_control::WorkerControl;
+
+        let path = utils::tempfile::TempFile::new().unwrap();
+        std::fs::remove_file(path.as_path()).unwrap();
+        let control = WorkerControl::new().unwrap();
+        control.bind_activation(1024).unwrap();
+        control.transport_reset_completed();
+        let instance = control.bind_mux().unwrap();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut mux = MuxerThread::new(
+            3,
+            Epoll::new().unwrap(),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap(),
+            Arc::new(Mutex::new(PacketQueue::from_queue(Queue::new(256)))),
+            InterruptTransport::new(DummyIrqChip::new().into(), "vsock-epoch".into(), None)
+                .unwrap(),
+            sender,
+            HashMap::from([(1027, (path.as_path().to_path_buf(), true))]),
+            None,
+            None,
+            control.clone(),
+            Vec::new(),
+            Arc::new(SourcePortAllocator::new(1 << 30, 1 << 31)),
+            instance,
+        );
+        let stale_epoch = control.epoch();
+        let exposure = ActivationExposure::new();
+        control.release_activation(&exposure).unwrap();
+        mux.prepare_activation_listeners(stale_epoch).unwrap();
+        assert!(mux.initialized);
+        assert!(control.release_pending());
+        assert!(control.activation_fenced());
+        // Re-registering the retained listener would fail with EEXIST.
+        mux.prepare_activation_listeners(control.epoch()).unwrap();
+        assert!(!control.release_pending());
+        assert!(
+            control.activation_fenced(),
+            "shared commit must still fence traffic"
+        );
+        assert!(!exposure.is_open());
     }
 }

@@ -340,6 +340,18 @@ fn classify(raw: &[u32], cpuid: &CpuId) -> Result<Vec<MsrDescriptor>, String> {
 
 fn admit_cpuid(cpuid: &CpuId, config: &CpuCaptureConfig) -> Result<(), String> {
     for e in cpuid.as_slice() {
+        if e.function == 0 {
+            let host = config
+                .host_cpuid
+                .as_slice()
+                .iter()
+                .find(|host| host.function == 0 && host.index == 0)
+                .ok_or("kvm/cpuid/destination-vendor-missing")?;
+            if (e.ebx, e.ecx, e.edx) != (host.ebx, host.ecx, host.edx) {
+                return Err("kvm/cpuid/destination-vendor".into());
+            }
+            continue;
+        }
         if e.function == 1 {
             // The production CPUID transformer derives these from virtual topology,
             // independently of the host's HTT bit or physical package/APIC identity.
@@ -355,8 +367,12 @@ fn admit_cpuid(cpuid: &CpuId, config: &CpuCaptureConfig) -> Result<(), String> {
         let registers: &[usize] = match e.function {
             1 => &[2, 3],
             7 if e.index == 0 => &[1, 2, 3],
+            7 => &[0, 1, 2, 3],
             0x80000001 => &[2, 3],
             0xd if e.index == 0 => &[0, 3],
+            0xd if e.index == 1 => &[0, 2, 3],
+            0x80000008 => &[1],
+            0x8000001f => &[0],
             _ => continue,
         };
         let host = config
@@ -648,14 +664,11 @@ pub(crate) fn initialize_device_witness(fd: &VcpuFd, state: &X86CpuState) -> Res
         .map_err(|e| native_error("SET_MP_STATE", e))
 }
 
-pub(crate) fn install_cpu(
+fn admit_cpu_destination(
     fd: &VcpuFd,
-    state: &KvmCpuState,
+    s: &X86CpuState,
     config: &CpuCaptureConfig,
 ) -> Result<(), String> {
-    let KvmCpuState::X86(s) = state else {
-        return Err("kvm/x86/backend".into());
-    };
     if s.xsave.len() != config.xsave_size || s.xstate != xstate_layout() {
         return Err("kvm/xsave2/destination-layout".into());
     }
@@ -673,12 +686,6 @@ pub(crate) fn install_cpu(
         return Err("kvm/msr/destination-model-values".into());
     }
     native_events(s.events)?;
-    fd.set_cpuid2(&cpuid)
-        .map_err(|e| native_error("SET_CPUID2", e))?;
-    ioctl_result(
-        unsafe { ioctl_with_ref(fd, setup_mce(), &s.mce_cap) },
-        "SETUP_MCE",
-    )?;
     if fd
         .get_tsc_khz()
         .map_err(|e| native_error("GET_TSC_KHZ", e))?
@@ -686,6 +693,119 @@ pub(crate) fn install_cpu(
     {
         return Err("kvm/clock/unscaled-rate-mismatch".into());
     }
+    Ok(())
+}
+
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+/// An empty host-profile observer owns no guest memory or external resources.
+/// No saved state is installed and the vCPU is never run.
+pub(crate) fn inspect_host_execution(
+    saved: &crate::vmm::execution::ExecutionEnvelope,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    use crate::vmm::execution::{CpuExecutionState, VmExecutionState};
+    use kvm_ioctls::{Cap, Kvm};
+    let check_deadline = || {
+        if std::time::Instant::now() >= deadline {
+            Err("inspection/deadline".to_owned())
+        } else {
+            Ok(())
+        }
+    };
+    check_deadline()?;
+    let VmExecutionState::Kvm(KvmVmState::X86(vm_state)) = &saved.vm else {
+        return Err("kvm/inspection/backend".into());
+    };
+    admit_host_clock(vm_state)?;
+    let kvm = Kvm::new().map_err(|e| native_error("inspection/open", e))?;
+    if kvm.get_api_version() != KVM_API_VERSION as i32 {
+        return Err("kvm/inspection/api-version".into());
+    }
+    let max_cpus = kvm.check_extension_int(Cap::MaxVcpus);
+    let max_slots = kvm.check_extension_int(Cap::NrMemslots);
+    if max_cpus <= 0
+        || saved.cpus.len() > max_cpus as usize
+        || max_slots <= 0
+        || saved.memory_regions.len() > max_slots as usize
+    {
+        return Err("kvm/inspection/cpu-or-memory-capacity".into());
+    }
+    for id in [
+        KVM_CAP_IRQCHIP,
+        KVM_CAP_PIT2,
+        KVM_CAP_PIT_STATE2,
+        KVM_CAP_XSAVE,
+        KVM_CAP_XCRS,
+        KVM_CAP_TSC_DEADLINE_TIMER,
+        KVM_CAP_VCPU_EVENTS,
+        KVM_CAP_DEBUGREGS,
+        KVM_CAP_GET_TSC_KHZ,
+        KVM_CAP_ADJUST_CLOCK,
+        KVM_CAP_SREGS2,
+        KVM_CAP_MP_STATE,
+        KVM_CAP_MCE,
+    ] {
+        if !kvm.check_extension_raw(id.into()).is_positive() {
+            return Err(format!("kvm/inspection/capability/{id}"));
+        }
+    }
+    let host_cpuid = kvm
+        .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+        .map_err(|e| native_error("inspection/GET_SUPPORTED_CPUID", e))?;
+    let raw_msrs = kvm
+        .get_msr_index_list()
+        .map_err(|e| native_error("inspection/GET_MSR_INDEX_LIST", e))?
+        .as_slice()
+        .to_vec();
+    check_deadline()?;
+    let vm = kvm
+        .create_vm()
+        .map_err(|e| native_error("inspection/CREATE_VM", e))?;
+    let xsave_size = usize::try_from(vm.check_extension_int(Cap::Xsave2))
+        .map_err(|_| "kvm/inspection/XSAVE2/extent")?;
+    let cpu = vm
+        .create_vcpu(0)
+        .map_err(|e| native_error("inspection/CREATE_VCPU", e))?;
+    offset(&cpu, None)?;
+    vm.get_clock()
+        .map_err(|e| native_error("inspection/GET_CLOCK", e))?;
+    let mut config = CpuCaptureConfig {
+        logical_id: 0,
+        host_cpuid,
+        raw_msrs,
+        xsave_size,
+        deadline_supported: vm.check_extension(Cap::TscDeadlineTimer),
+    };
+    for state in &saved.cpus {
+        check_deadline()?;
+        let CpuExecutionState::Kvm(KvmCpuState::X86(state)) = state else {
+            return Err("kvm/inspection/cpu-backend".into());
+        };
+        config.logical_id = state.id;
+        admit_cpu_destination(&cpu, state, &config)?;
+    }
+    check_deadline()?;
+    drop(cpu);
+    drop(vm);
+    Ok(())
+}
+
+pub(crate) fn install_cpu(
+    fd: &VcpuFd,
+    state: &KvmCpuState,
+    config: &CpuCaptureConfig,
+) -> Result<(), String> {
+    let KvmCpuState::X86(s) = state else {
+        return Err("kvm/x86/backend".into());
+    };
+    admit_cpu_destination(fd, s, config)?;
+    let cpuid = native_cpuid(&s.cpuid)?;
+    fd.set_cpuid2(&cpuid)
+        .map_err(|e| native_error("SET_CPUID2", e))?;
+    ioctl_result(
+        unsafe { ioctl_with_ref(fd, setup_mce(), &s.mce_cap) },
+        "SETUP_MCE",
+    )?;
     set_execution_registers(fd, s)?;
     let mut xcr = kvm_xcrs {
         nr_xcrs: s.xcrs.len() as u32,
@@ -1295,5 +1415,69 @@ mod tests {
             assert!(error.contains(&format!("register={register}")), "{error}");
             assert!(error.contains("unsupported-mask="), "{error}");
         }
+    }
+
+    #[test]
+    fn kvm_execution_cpuid_admission_checks_vendor_and_extended_feature_subleaves() {
+        let mut config = admission_config(0);
+        config.host_cpuid = CpuId::from_entries(&[
+            kvm_cpuid_entry2 {
+                function: 0,
+                ebx: 1,
+                ecx: 2,
+                edx: 3,
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 7,
+                index: 1,
+                eax: 1,
+                ..Default::default()
+            },
+        ])
+        .unwrap();
+        let wrong_vendor = CpuId::from_entries(&[kvm_cpuid_entry2 {
+            function: 0,
+            ebx: 9,
+            ecx: 2,
+            edx: 3,
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(
+            admit_cpuid(&wrong_vendor, &config).unwrap_err(),
+            "kvm/cpuid/destination-vendor"
+        );
+        let supported = CpuId::from_entries(&[kvm_cpuid_entry2 {
+            function: 7,
+            index: 1,
+            eax: 1,
+            ..Default::default()
+        }])
+        .unwrap();
+        admit_cpuid(&supported, &config).unwrap();
+        let unsupported = CpuId::from_entries(&[kvm_cpuid_entry2 {
+            function: 7,
+            index: 1,
+            eax: 3,
+            ..Default::default()
+        }])
+        .unwrap();
+        assert!(
+            admit_cpuid(&unsupported, &config)
+                .unwrap_err()
+                .contains("unsupported-feature")
+        );
+        let missing = CpuId::from_entries(&[kvm_cpuid_entry2 {
+            function: 7,
+            index: 2,
+            eax: 1,
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(
+            admit_cpuid(&missing, &config).unwrap_err(),
+            "kvm/cpuid/destination-leaf-missing"
+        );
     }
 }
