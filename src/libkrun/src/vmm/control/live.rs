@@ -47,8 +47,9 @@ use crate::api::live::{
 };
 use crate::vmm::Vmm;
 use crate::vmm::control::{
-    BarrierKey, BarrierRequest, ControlFailure, ControlReply, ControlState, GenerationTicket,
-    OperationId, PauseOwner, PauseToken, RequestId, RestoreToken,
+    BarrierKey, BarrierRequest, ControlFailure, ControlOwner, ControlReply, ControlState,
+    GenerationTicket, OperationId, PauseOwner, PauseToken, Phase, RequestId, RequestKind,
+    RestoreToken,
 };
 use crate::vmm::execution::StateBinding;
 use crate::vmm::memory::image::{RamOutputFiles, ValidatedRamLayout};
@@ -77,6 +78,9 @@ pub(crate) enum LiveRequest {
     Abandon(CaptureTicket),
     Release(CaptureId),
     Preserve(PauseToken),
+    RecoverMemoryCut {
+        pausing: OperationId,
+    },
     Generation(GenerationTicket),
     Activation {
         restore: RestoreToken,
@@ -111,6 +115,9 @@ impl LiveRequest {
             Self::Abandon(ticket) => (LiveStage::Abandon, LiveSubject::Capture(ticket.id())),
             Self::Release(id) => (LiveStage::Release, LiveSubject::Capture(*id)),
             Self::Preserve(pause) => (LiveStage::Preserve, LiveSubject::Pause(pause.clone())),
+            Self::RecoverMemoryCut { pausing } => {
+                (LiveStage::MemoryCutRecovery, LiveSubject::Pausing(*pausing))
+            }
             Self::Generation(ticket) => (
                 LiveStage::GenerationPoll,
                 LiveSubject::Generation(ticket.clone()),
@@ -552,6 +559,25 @@ fn inspect_outputs(files: &[(OutputRole, &File); 2]) -> Result<[(u64, u64, u64);
     Ok(facts)
 }
 
+impl ControlOwner {
+    fn memory_cut_recovery_key(&self, pausing: OperationId) -> Result<BarrierKey, ControlFailure> {
+        let key = match self.state {
+            ControlState::Pausing { key, failed: true } if key.operation == pausing => key,
+            _ => return Err(ControlFailure::InvalidOperation),
+        };
+        if !self.active.as_ref().is_some_and(|active| {
+            active.original == key
+                && active.request.operation == pausing
+                && matches!(active.request.kind, RequestKind::Pause(_))
+                && active.phase == Phase::Cut
+                && active.failed
+        }) {
+            return Err(ControlFailure::InvalidOperation);
+        }
+        Ok(key)
+    }
+}
+
 impl Vmm {
     fn live_pause_key(&self, pause: &PauseToken) -> Result<BarrierKey, LiveError> {
         if !self.control.validate_token(pause) {
@@ -742,6 +768,25 @@ impl Vmm {
                     return Err(ControlFailure::InvalidToken.into());
                 }
                 LiveReply::Generation(ticket.observe(Instant::now()))
+            }
+            LiveRequest::RecoverMemoryCut { pausing } => {
+                let key = self.control.memory_cut_recovery_key(pausing)?;
+                #[cfg(not(feature = "tee"))]
+                {
+                    self.recover_memory_cut(key)?;
+                    match &self.control.state {
+                        ControlState::Paused(token) => LiveReply::Pause(token.clone()),
+                        _ => return Err(ControlFailure::FailedFenced.into()),
+                    }
+                }
+                #[cfg(feature = "tee")]
+                {
+                    let _ = key;
+                    return Err(ControlFailure::Unsupported(
+                        "tracked memory is unsupported for confidential VMs".into(),
+                    )
+                    .into());
+                }
             }
             LiveRequest::Flush(pause) => {
                 let key = self.live_pause_key(&pause)?;
@@ -1311,22 +1356,22 @@ mod tests {
         CaptureId, CaptureStatus, CaptureTicket, LiveError, OutputProblem, OutputRole,
     };
     #[cfg(target_os = "linux")]
+    use crate::vmm::control::ControlClient;
+    #[cfg(target_os = "linux")]
     use crate::vmm::control::live::LiveRequest;
     use crate::vmm::control::live::{
         CaptureRecord, LiveOwner, inspect, inspect_outputs, write_object,
     };
     use crate::vmm::control::{
-        BarrierGeneration, BarrierKey, ControlFailure, ControlOwner, ControlState,
-        GenerationAuthority, OperationId, PauseOwner,
+        ActiveControl, BarrierGeneration, BarrierKey, BarrierRequest, ControlFailure, ControlOwner,
+        ControlRequest, ControlState, GenerationAuthority, OperationId, PauseOwner, Phase,
+        RequestId, RequestKind,
     };
-    #[cfg(target_os = "linux")]
-    use crate::vmm::control::{ControlClient, RequestKind};
     use crate::vmm::execution::StateBinding;
     use std::fs::{self, File, OpenOptions};
     #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
     use std::sync::Arc;
-    #[cfg(target_os = "linux")]
     use std::time::{Duration, Instant};
     use utils::tempfile::TempFile;
 
@@ -1336,6 +1381,119 @@ mod tests {
             generation: BarrierGeneration(1),
         }
     }
+    fn failed_memory_cut_owner() -> ControlOwner {
+        let mut owner = ControlOwner::new(BarrierGeneration(0)).unwrap();
+        owner.reserve(key().operation).unwrap();
+        let barrier = BarrierRequest {
+            key: key(),
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let (reply, _waiting) = crossbeam_channel::bounded(1);
+        owner.active = Some(ActiveControl {
+            request: ControlRequest {
+                id: RequestId(1),
+                operation: key().operation,
+                deadline: barrier.deadline,
+                kind: RequestKind::Pause(PauseOwner::Capture),
+                reply,
+            },
+            barrier,
+            original: key(),
+            owner: PauseOwner::Capture,
+            phase: Phase::Cut,
+            failed: true,
+            devices_begun: true,
+            routes_begun: true,
+            maintenance_closed: true,
+            cpu_parked_at: Some(0),
+        });
+        owner.state = ControlState::Pausing {
+            key: key(),
+            failed: true,
+        };
+        owner
+    }
+
+    #[test]
+    fn memory_cut_recovery_authenticates_exact_failed_pause_operation() {
+        let mut owner = failed_memory_cut_owner();
+        assert_eq!(
+            owner.memory_cut_recovery_key(OperationId(2)),
+            Err(ControlFailure::InvalidOperation)
+        );
+        assert_eq!(owner.memory_cut_recovery_key(OperationId(1)), Ok(key()));
+        assert_eq!(
+            owner.reserve(OperationId(1)),
+            Err(ControlFailure::InvalidOperation)
+        );
+        owner.reserve(OperationId(2)).unwrap();
+        assert_eq!(owner.memory_cut_recovery_key(OperationId(1)), Ok(key()));
+
+        for phase in [
+            Phase::Admission,
+            Phase::MemoryDrain,
+            Phase::RecoverCut,
+            Phase::Stop,
+        ] {
+            owner.active.as_mut().unwrap().phase = phase;
+            assert_eq!(
+                owner.memory_cut_recovery_key(OperationId(1)),
+                Err(ControlFailure::InvalidOperation)
+            );
+        }
+        owner.active.as_mut().unwrap().phase = Phase::Cut;
+        owner.active.as_mut().unwrap().original.generation = BarrierGeneration(2);
+        assert_eq!(
+            owner.memory_cut_recovery_key(OperationId(1)),
+            Err(ControlFailure::InvalidOperation)
+        );
+        owner.active.as_mut().unwrap().original = key();
+        owner.active.as_mut().unwrap().request.operation = OperationId(2);
+        assert_eq!(
+            owner.memory_cut_recovery_key(OperationId(1)),
+            Err(ControlFailure::InvalidOperation)
+        );
+        owner.active.as_mut().unwrap().request.operation = OperationId(1);
+        owner.active.as_mut().unwrap().request.kind = RequestKind::CancelPause(OperationId(1));
+        assert_eq!(
+            owner.memory_cut_recovery_key(OperationId(1)),
+            Err(ControlFailure::InvalidOperation)
+        );
+    }
+
+    #[test]
+    fn memory_cut_recovery_refuses_nonfailed_and_consumed_pause_authority() {
+        let mut owner = failed_memory_cut_owner();
+        owner.active.as_mut().unwrap().failed = false;
+        assert_eq!(
+            owner.memory_cut_recovery_key(OperationId(1)),
+            Err(ControlFailure::InvalidOperation)
+        );
+        owner.active.as_mut().unwrap().failed = true;
+        owner.state = ControlState::Pausing {
+            key: key(),
+            failed: false,
+        };
+        assert_eq!(
+            owner.memory_cut_recovery_key(OperationId(1)),
+            Err(ControlFailure::InvalidOperation)
+        );
+        owner.state = ControlState::Paused(owner.token(key(), PauseOwner::Capture));
+        assert_eq!(
+            owner.memory_cut_recovery_key(OperationId(1)),
+            Err(ControlFailure::InvalidOperation)
+        );
+        owner.state = ControlState::Pausing {
+            key: key(),
+            failed: true,
+        };
+        owner.active = None;
+        assert_eq!(
+            owner.memory_cut_recovery_key(OperationId(1)),
+            Err(ControlFailure::InvalidOperation)
+        );
+    }
+
     fn binding() -> StateBinding {
         StateBinding {
             native_producer: "live-owner-unit".into(),

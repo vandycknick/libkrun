@@ -1840,6 +1840,13 @@ mod tests {
         assert!(memory.tracking_failure.is_none());
         assert!(!memory.control.domain().coverage_valid());
         assert!(memory.pending.as_ref().unwrap().contains(PageIndex::new(1)));
+        let repeated = memory.cut.as_ref().unwrap().issue_epoch(3).unwrap();
+        assert_eq!(
+            memory.finish_tracking_recovery(key(2), repeated),
+            Err(arch::guest_memory::MemoryError::Authority)
+        );
+        assert!(!memory.control.domain().coverage_valid());
+        assert!(memory.pending.as_ref().unwrap().contains(PageIndex::new(1)));
         memory.reopen(key(2)).unwrap();
         stop(&mut memory, key(3));
         let (_, mut candidate, output) = capture(

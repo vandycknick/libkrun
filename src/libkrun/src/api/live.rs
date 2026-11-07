@@ -37,7 +37,9 @@ pub mod inspection;
 ))]
 pub mod restore;
 
-pub use arch::guest_memory::{BackingKind, TrackingMode};
+pub use arch::guest_memory::{
+    BackingKind, DirtyEffect, DirtyFailure, DirtyLocation, DirtyOperation, TrackingMode,
+};
 pub use devices::virtio::lifecycle::ProviderFault;
 use std::fs::File;
 use std::io;
@@ -216,6 +218,7 @@ pub enum LiveStage {
     Abandon,
     Release,
     Preserve,
+    MemoryCutRecovery,
     GenerationPrepare,
     GenerationPoll,
     GenerationSnapshot,
@@ -228,6 +231,7 @@ pub enum LiveStage {
 pub enum LiveSubject {
     Vm,
     Pause(PauseToken),
+    Pausing(OperationId),
     Capture(CaptureId),
     Restore(RestoreToken),
     Generation(GenerationTicket),
@@ -372,6 +376,26 @@ impl VmmHandle {
         self.control
             .call(operation, deadline, request)
             .map_err(|cause| LiveError::from(cause).with_context(operation, stage, subject))
+    }
+    /// Recovers tracking for the exact failed pause without restoring coverage.
+    ///
+    /// `operation` must be a fresh operation ID, distinct from `pausing`. Recovery
+    /// retains the stopped machine cut; only accepting a full baseline restores
+    /// incremental coverage. A failed recovery leaves the machine fenced.
+    pub fn recover_memory_cut(
+        &self,
+        pausing: OperationId,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<PauseToken, LiveError> {
+        match self.live_call(
+            operation,
+            deadline,
+            LiveRequest::RecoverMemoryCut { pausing },
+        )? {
+            LiveReply::Pause(token) => Ok(token),
+            _ => Err(ControlFailure::OwnerUnavailable.into()),
+        }
     }
     pub fn flush_writable_disks(
         &self,

@@ -202,6 +202,24 @@ therefore materializes a full `coverage-lost` image; only acceptance of that ful
 candidate restores reusable baseline coverage. A stale or foreign cut cannot
 authorize this recovery.
 
+The production Rust control handle exposes
+`recover_memory_cut(pausing: OperationId, operation: OperationId, deadline: Instant)`
+and returns `Result<PauseToken, LiveError>`. `pausing` must name the original
+failed pause; `operation` is a separately allocated fresh operation ID. Its typed
+live request authenticates that exact failed pause in the retained `Cut` phase
+before using the existing memory recovery guard. Reconciled, captured CPUs,
+the exact retained execution and memory cuts, uncertain or post-effect dirty
+failure, and no capture attempt are required. Wrong, consumed or repeated
+authority cannot recover another pause. Recovery failure leaves the cut fenced.
+
+Successful recovery returns the original pause's token and continues ordinary
+capture without replaying the failed harvest. It does not clear the retained
+dirty union or restore coverage: incremental requests must select full
+`coverage-lost` until that full baseline is accepted. The diagnostic recovery
+entrypoint still uses the same guarded native implementation. Neither entrypoint
+grants production qualification, and the production live vector remains
+unqualified.
+
 `api::live::inspection::decode_device_transports` reads the existing bounded
 device envelope without constructing a VM. Its validated transport projection
 preserves queue addresses, negotiated features and ring counters, so an external
