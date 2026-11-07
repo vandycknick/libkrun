@@ -32,6 +32,28 @@ pub struct InspectionInputs<'a> {
     pub layout_object: &'a StateObjectIdentity,
 }
 
+/// Structural observation of a saved device file, not authentication or an
+/// execution-admission token. Uses the same bounded codec as actual restore.
+#[derive(Debug)]
+pub struct SavedDeviceTransport {
+    pub configured_id: String,
+    pub transport: MmioTransportState,
+}
+
+pub fn decode_device_transports(
+    bytes: &[u8],
+) -> Result<Vec<SavedDeviceTransport>, utils::state::Error> {
+    let envelope = DeviceEnvelope::decode(bytes)?;
+    Ok(envelope
+        .records
+        .into_iter()
+        .map(|record| SavedDeviceTransport {
+            configured_id: record.identity.configured_id,
+            transport: record.state,
+        })
+        .collect())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpectedDevice {
     pub configured_id: String,
@@ -672,5 +694,30 @@ mod tests {
         device.transport.queues[0].desc_table = 0;
         device.transport.queues[0].size = 3;
         assert!(validate_queue_geometry(&device, &layout).is_err());
+    }
+
+    #[test]
+    fn saved_transport_observation_uses_exact_codec_and_preserves_ring_counters() {
+        let (binding, mut record) = crate::vmm::execution::device_restore::tests::rng_binding();
+        record.state.queues[0].used_ring = 8192;
+        record.state.queues[0].next_used = 13;
+        let expected = record.state.clone();
+        let configured_id = record.identity.configured_id.clone();
+        let bytes = DeviceEnvelope {
+            binding,
+            records: vec![crate::vmm::execution::device_restore::DeviceRecord {
+                identity: record.identity,
+                state: record.state,
+                payload: record.payload,
+            }],
+        }
+        .encode()
+        .unwrap();
+        let observations = decode_device_transports(&bytes).unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].configured_id, configured_id);
+        assert_eq!(observations[0].transport, expected);
+        assert!(decode_device_transports(&bytes[..bytes.len() - 1]).is_err());
+        assert!(decode_device_transports(&vec![0; 32 * 1024 * 1024 + 1]).is_err());
     }
 }

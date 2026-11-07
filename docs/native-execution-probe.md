@@ -195,6 +195,19 @@ dirties, or accept a baseline. Successful ordinary GET already reprotects the
 slot; rearm only consumes its exact cut/epoch witness without another ioctl.
 Tracked registrations cannot be replaced or exported as an untracked mapping.
 
+Resume recovery after an uncertain harvest requires the exact retained memory
+cut and a reconciled or captured CPU execution cut. It re-establishes actual CPU
+tracking, but retains the dirty union and invalid coverage. The next capture
+therefore materializes a full `coverage-lost` image; only acceptance of that full
+candidate restores reusable baseline coverage. A stale or foreign cut cannot
+authorize this recovery.
+
+`api::live::inspection::decode_device_transports` reads the existing bounded
+device envelope without constructing a VM. Its validated transport projection
+preserves queue addresses, negotiated features and ring counters, so an external
+observer can compare a saved reporting completion with the exact sealed RAM.
+This observation does not grant restore or execution authority.
+
 These are implementation invariants, not native qualification evidence. Pure
 slot/bitmap regressions require no KVM. Main must separately exercise every
 actual slot, repeated writes across accepted generations, partial-harvest

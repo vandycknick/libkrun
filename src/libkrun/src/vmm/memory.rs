@@ -420,6 +420,27 @@ impl MemoryCoordinator {
             self.next.as_ref().ok_or(MemoryError::State)?,
         )
     }
+    #[cfg(not(feature = "tee"))]
+    fn finish_tracking_recovery(
+        &mut self,
+        key: BarrierKey,
+        next: CpuTrackingEpoch,
+    ) -> Result<(), MemoryError> {
+        if self.key != Some(key)
+            || self.has_attempt()
+            || self
+                .tracking_failure
+                .as_ref()
+                .is_none_or(|failure| failure.effect == DirtyEffect::PreEffectRefusal)
+        {
+            return Err(MemoryError::Authority);
+        }
+        self.control
+            .validate_epoch(self.cut.as_ref().ok_or(MemoryError::State)?, &next)?;
+        self.next = Some(next);
+        self.tracking_failure = None;
+        Ok(())
+    }
     pub(crate) fn reopen(&mut self, key: BarrierKey) -> Result<(), ControlFailure> {
         if self.has_attempt() {
             return Err(ControlFailure::Busy);
@@ -1046,8 +1067,7 @@ impl Vmm {
                 self.memory.tracking_failure = Some(error);
                 CaptureError::Tracking(error)
             })?;
-        self.memory.next = Some(next);
-        self.memory.tracking_failure = None;
+        self.memory.finish_tracking_recovery(key, next)?;
         let token = self.control.token(key, owner);
         self.memory.bind_pause(key, &token)?;
         self.control.state = ControlState::Paused(token);
@@ -1158,6 +1178,49 @@ impl Vmm {
             return Err(ControlFailure::Memory(MemoryError::State));
         }
         if self.memory.key.is_some() {
+            // Cancellation after an uncertain GET must restore actual tracking
+            // before reopening writers. It does not restore coverage validity or
+            // retire the pending union: the next accepted image must be full.
+            #[cfg(not(feature = "tee"))]
+            if self
+                .memory
+                .tracking_failure
+                .as_ref()
+                .is_some_and(|failure| failure.effect != DirtyEffect::PreEffectRefusal)
+            {
+                if self.memory.key != Some(key)
+                    || !self.control.cpus.reconciled()
+                    || !self.control.cpus.captured_at(key)
+                    || !self
+                        .execution
+                        .retained
+                        .as_ref()
+                        .is_some_and(|cut| cut.key == key)
+                {
+                    return Err(ControlFailure::Memory(MemoryError::Authority));
+                }
+                let cut = self
+                    .memory
+                    .cut
+                    .as_ref()
+                    .ok_or(ControlFailure::Memory(MemoryError::State))?;
+                self.memory
+                    .control
+                    .validate_cut(cut)
+                    .map_err(ControlFailure::Memory)?;
+                let pending = self
+                    .memory
+                    .pending
+                    .as_mut()
+                    .ok_or(ControlFailure::Memory(MemoryError::State))?;
+                let next = self
+                    .vm
+                    .reestablish_cpu_dirty(cut, pending)
+                    .map_err(ControlFailure::DirtyMemory)?;
+                self.memory
+                    .finish_tracking_recovery(key, next)
+                    .map_err(ControlFailure::Memory)?;
+            }
             if self.memory.next.is_none() && !self.finish_memory_cut(key)? {
                 return Ok(false);
             }
@@ -1737,6 +1800,65 @@ mod tests {
             .unwrap();
         assert_ne!(next, baseline);
         assert_eq!(coordinator.pending_dirty_count(), 0);
+    }
+
+    #[test]
+    fn uncertain_harvest_recovery_keeps_union_and_requires_exact_epoch_then_full_acceptance() {
+        use arch::guest_memory::{DirtyEffect, DirtyFailure, DirtyLocation, DirtyOperation};
+        let mut memory = coordinator();
+        stop(&mut memory, key(1));
+        let (baseline, _image, _files) = accept_full(&mut memory, key(1));
+        memory.reopen(key(1)).unwrap();
+        memory
+            .control
+            .domain()
+            .write(GuestAddress(4096), 1)
+            .unwrap()
+            .write_view(0, 1)
+            .unwrap()
+            .write_slice(&[0x7b], 0)
+            .unwrap();
+        stop(&mut memory, key(2));
+        memory.control.domain().invalidate_coverage();
+        memory.tracking_failure = Some(DirtyFailure {
+            operation: DirtyOperation::Collect,
+            location: DirtyLocation::Vm,
+            effect: DirtyEffect::CoverageLost,
+            native_code: 5,
+        });
+        memory.next = None;
+        let mut foreign = coordinator();
+        stop(&mut foreign, key(2));
+        let epoch = foreign.cut.as_ref().unwrap().issue_epoch(3).unwrap();
+        assert!(memory.finish_tracking_recovery(key(2), epoch).is_err());
+        let epoch = memory.cut.as_ref().unwrap().issue_epoch(3).unwrap();
+        assert!(memory.finish_tracking_recovery(key(3), epoch).is_err());
+        assert!(memory.tracking_failure.is_some());
+        assert!(memory.pending.as_ref().unwrap().contains(PageIndex::new(1)));
+        let epoch = memory.cut.as_ref().unwrap().issue_epoch(3).unwrap();
+        memory.finish_tracking_recovery(key(2), epoch).unwrap();
+        assert!(memory.tracking_failure.is_none());
+        assert!(!memory.control.domain().coverage_valid());
+        assert!(memory.pending.as_ref().unwrap().contains(PageIndex::new(1)));
+        memory.reopen(key(2)).unwrap();
+        stop(&mut memory, key(3));
+        let (_, mut candidate, output) = capture(
+            &mut memory,
+            key(3),
+            RamCaptureRequest::Incremental {
+                baseline: Some(&baseline),
+                crossover: DirtyCrossoverPercent::default(),
+            },
+        );
+        assert_eq!(
+            candidate.full_reason(),
+            Some(FullCaptureReason::CoverageLost)
+        );
+        assert_eq!(std::fs::read(output.ram.as_path()).unwrap()[4096], 0x7b);
+        let image = output.seal(&mut candidate, key(3));
+        memory.accept_attempt(key(3), candidate, image).unwrap();
+        assert!(memory.control.domain().coverage_valid());
+        assert_eq!(memory.pending_dirty_count(), 0);
     }
 
     #[test]
