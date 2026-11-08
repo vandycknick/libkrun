@@ -290,7 +290,7 @@ impl ImageWriter<'_> {
         let mut run = None;
         for (index, block) in self.buffer[..len].chunks(self.granule).enumerate() {
             let start = index * self.granule;
-            if block.iter().any(|byte| *byte != 0) {
+            if !is_all_zero(block) {
                 if run.is_none() {
                     run = Some(start);
                 }
@@ -320,6 +320,22 @@ impl ImageWriter<'_> {
         }
         Ok(())
     }
+}
+
+fn is_all_zero(bytes: &[u8]) -> bool {
+    let mut blocks = bytes.chunks_exact(64);
+    for block in &mut blocks {
+        let combined = block.chunks_exact(8).fold(0_u64, |combined, word| {
+            combined
+                | u64::from_ne_bytes([
+                    word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7],
+                ])
+        });
+        if combined != 0 {
+            return false;
+        }
+    }
+    blocks.remainder().iter().all(|byte| *byte == 0)
 }
 
 struct Extents<'a> {
@@ -536,8 +552,8 @@ mod tests {
     use crate::vmm::execution::{ExecutionLane, StateBinding};
     use crate::vmm::memory::AttemptId;
     use crate::vmm::memory::image::writer::{
-        Extents, ImageWriter, WriteKind, account_write, read_exact_at, sync, write_exact_at,
-        write_ram_image,
+        Extents, ImageWriter, WriteKind, account_write, is_all_zero, read_exact_at, sync,
+        write_exact_at, write_ram_image,
     };
     use crate::vmm::memory::image::{
         AuthenticatedRamImage, RamCaptureReceipt, RamFileRole, RamImageAuthentication,
@@ -1388,5 +1404,128 @@ mod tests {
             std::fs::read(files.layout.as_path()).unwrap(),
             layout.canonical_bytes()
         );
+    }
+
+    #[test]
+    fn zero_check_classifies_uniform_granules() {
+        assert!(is_all_zero(&[0; 4096]));
+        assert!(!is_all_zero(&[0xff; 4096]));
+    }
+
+    #[test]
+    fn zero_check_detects_every_single_byte_position_in_a_granule() {
+        let mut granule = [0; 4096];
+        for position in 0..granule.len() {
+            for byte in [1, 0x80, 0xff] {
+                granule[position] = byte;
+                assert!(!is_all_zero(&granule), "position {position}, byte {byte}");
+            }
+            granule[position] = 0;
+        }
+    }
+
+    #[test]
+    fn zero_check_is_exact_for_unaligned_slices_and_every_tail_length() {
+        let mut bytes = [0; 136];
+        for start in 0..8 {
+            for len in 0..=128 {
+                assert!(is_all_zero(&bytes[start..start + len]));
+                for position in start..start + len {
+                    bytes[position] = 0x80;
+                    assert!(
+                        !is_all_zero(&bytes[start..start + len]),
+                        "start {start}, len {len}, position {position}"
+                    );
+                    bytes[position] = 0;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_round_trip_matches_bytewise_reference_on_random_data() {
+        let mut state = 0x49a2_870d_f6bc_315e_u64;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..32 {
+            let len = case * 4096 + case * 3;
+            let mut bytes = vec![0; len];
+            for block in bytes.chunks_mut(4096) {
+                match random() % 4 {
+                    0 => {}
+                    1 => block.fill(0xff),
+                    2 => {
+                        let position = random() as usize % block.len();
+                        block[position] = 1 << (random() % 8);
+                    }
+                    _ => {
+                        for byte in block {
+                            *byte = random() as u8;
+                        }
+                    }
+                }
+            }
+            let offset = if case % 2 == 0 { 0 } else { 8192 + 13 };
+            for kind in [WriteKind::Full, WriteKind::Baseline] {
+                let output = TempFile::new().unwrap();
+                let reference = TempFile::new().unwrap();
+                for file in [output.as_file(), reference.as_file()] {
+                    file.set_len(offset + len as u64 + 4096).unwrap();
+                    file.write_all_at(b"suffix", offset + len as u64).unwrap();
+                }
+                let mut actual_stats = RamIoStats::default();
+                ImageWriter {
+                    ram: output.as_file(),
+                    buffer: &mut bytes,
+                    stats: &mut actual_stats,
+                    deadline: deadline(),
+                    granule: 4096,
+                }
+                .sparse(len, offset, kind)
+                .unwrap();
+                let mut reference_stats = RamIoStats::default();
+                let mut run = None;
+                for (index, block) in bytes.chunks(4096).enumerate() {
+                    let start = index * 4096;
+                    if block.iter().any(|byte| *byte != 0) {
+                        if run.is_none() {
+                            run = Some(start);
+                        }
+                    } else {
+                        reference_stats.zero_bytes_omitted += block.len() as u64;
+                        if let Some(first) = run.take() {
+                            write_exact_at(
+                                reference.as_file(),
+                                &bytes[first..start],
+                                offset + first as u64,
+                                kind,
+                                &mut reference_stats,
+                                deadline(),
+                            )
+                            .unwrap();
+                        }
+                    }
+                }
+                if let Some(first) = run {
+                    write_exact_at(
+                        reference.as_file(),
+                        &bytes[first..],
+                        offset + first as u64,
+                        kind,
+                        &mut reference_stats,
+                        deadline(),
+                    )
+                    .unwrap();
+                }
+                let actual = std::fs::read(output.as_path()).unwrap();
+                assert_eq!(actual, std::fs::read(reference.as_path()).unwrap());
+                assert_eq!(&actual[offset as usize..offset as usize + len], bytes);
+                assert_eq!(actual_stats, reference_stats);
+            }
+        }
     }
 }
