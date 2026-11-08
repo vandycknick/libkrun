@@ -1661,6 +1661,10 @@ layout, not a delta chain. The caller authenticates the layout and resolved
 recorded separately from the writer's live-RAM reads. File descriptors, exact
 completion receipts, layout geometry and execution binding are validated;
 a pathname or matching length is not acceptance authority.
+Native execution, device, RAM and layout capture writers close without file
+or directory synchronization. Their output APIs have no durability flag.
+The controller owns checkpoint publication durability or each fork child's
+background barrier, independently of coherent native capture completion.
 The consuming restore boundary checks the exact execution state binding again:
 RAM mapped for one capture cannot be paired with another execution envelope
 merely because their memory geometry matches.

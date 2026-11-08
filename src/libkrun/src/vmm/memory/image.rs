@@ -73,7 +73,6 @@ pub enum RamIoOperation {
     Write,
     Extent,
     SetLength,
-    Sync,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -169,19 +168,16 @@ pub enum RamImageEffects {
 pub struct RamOutputFiles {
     ram: File,
     layout: File,
-    durable: bool,
     protected_inputs: Option<Arc<AuthenticatedRamImage>>,
 }
 impl RamOutputFiles {
     /// Takes ownership without effects. Open staging roles without truncation so
     /// inode alias preflight can protect existing inputs.
-    /// With `durable = false`, completion closes the writers without synchronizing
-    /// RAM or layout; the caller owns the later durability barrier.
-    pub fn new(ram: File, layout: File, durable: bool) -> Self {
+    /// Completion closes the writers; the caller owns the later durability barrier.
+    pub fn new(ram: File, layout: File) -> Self {
         Self {
             ram,
             layout,
-            durable,
             protected_inputs: None,
         }
     }
@@ -1195,7 +1191,6 @@ mod tests {
         let output = RamOutputFiles::new(
             files.create(&format!("{prefix}-ram"), &[]),
             files.create(&format!("{prefix}-layout"), &[]),
-            true,
         );
         write_ram_image(
             attempt,
@@ -1238,7 +1233,7 @@ mod tests {
             &binding(),
             layout,
             RamWriteMode::Full,
-            RamOutputFiles::new(ram, record, true),
+            RamOutputFiles::new(ram, record),
             &mut RamIoScratch::new().unwrap(),
             deadline(),
         )
@@ -1368,12 +1363,10 @@ mod tests {
             RamOutputFiles::new(
                 files.readonly("ram-sentinel"),
                 files.writable("layout-sentinel"),
-                true,
             ),
             RamOutputFiles::new(
                 files.writable("ram-sentinel"),
                 files.readonly("layout-sentinel"),
-                true,
             ),
         ] {
             let failure = write_ram_image(
@@ -1444,9 +1437,9 @@ mod tests {
                 let sentinel_name = format!("out-{target}-{alias_is_ram}");
                 let sentinel = files.create(&sentinel_name, b"output-sentinel");
                 let mut output = if alias_is_ram {
-                    RamOutputFiles::new(files.writable(target), sentinel, true)
+                    RamOutputFiles::new(files.writable(target), sentinel)
                 } else {
-                    RamOutputFiles::new(sentinel, files.writable(target), true)
+                    RamOutputFiles::new(sentinel, files.writable(target))
                 };
                 output.protect_baseline(Some(baseline.clone()));
                 let failure = write_ram_image(
@@ -1483,7 +1476,7 @@ mod tests {
             &binding(),
             layout,
             RamWriteMode::Full,
-            RamOutputFiles::new(same, dup, true),
+            RamOutputFiles::new(same, dup),
             &mut RamIoScratch::new().unwrap(),
             deadline(),
         )
@@ -1839,7 +1832,6 @@ mod tests {
         let mut output = RamOutputFiles::new(
             files.writable("original-ram"),
             files.create("layout-output", b"layout-sentinel"),
-            true,
         );
         output.protect_baseline(Some(newer));
         assert!(matches!(

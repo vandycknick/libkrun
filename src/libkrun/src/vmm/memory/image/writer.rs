@@ -93,18 +93,6 @@ pub fn write_ram_image(
             layout.canonical_bytes().len() as u64,
             deadline,
         )?;
-        sync(
-            &output.ram,
-            RamFileRole::OutputRam,
-            deadline,
-            output.durable,
-        )?;
-        sync(
-            &output.layout,
-            RamFileRole::OutputLayout,
-            deadline,
-            output.durable,
-        )?;
         check_deadline(deadline)?;
         Ok((preparation, digests.values, chunks))
     })();
@@ -619,20 +607,6 @@ fn set_length(
         .map_err(|error| io_error(RamIoOperation::SetLength, role, error))
 }
 
-fn sync(
-    file: &File,
-    role: RamFileRole,
-    deadline: Instant,
-    durable: bool,
-) -> Result<(), RamImageError> {
-    check_deadline(deadline)?;
-    if durable {
-        file.sync_all()
-            .map_err(|error| io_error(RamIoOperation::Sync, role, error))?;
-    }
-    check_deadline(deadline)
-}
-
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use std::fs::File;
@@ -653,7 +627,7 @@ mod tests {
     use crate::vmm::memory::AttemptId;
     use crate::vmm::memory::image::writer::{
         ChunkDigests, Extents, ImageWriter, WriteKind, account_write, is_all_zero, read_exact_at,
-        sync, write_exact_at, write_ram_image,
+        write_exact_at, write_ram_image,
     };
     use crate::vmm::memory::image::{
         AuthenticatedRamImage, RAM_IDENTITY_CHUNK_BYTES, RamCaptureReceipt, RamFileRole,
@@ -744,7 +718,6 @@ mod tests {
             RamOutputFiles::new(
                 self.ram.as_file().try_clone().unwrap(),
                 self.layout.as_file().try_clone().unwrap(),
-                true,
             )
         }
         fn bytes(&self) -> Vec<u8> {
@@ -1008,7 +981,6 @@ mod tests {
         let alias = RamOutputFiles::new(
             files.ram.as_file().try_clone().unwrap(),
             files.ram.as_file().try_clone().unwrap(),
-            true,
         );
         let failure = write_ram_image(
             AttemptId::for_test(),
@@ -1153,13 +1125,11 @@ mod tests {
                 RamOutputFiles::new(
                     scratch_files.ram.as_file().try_clone().unwrap(),
                     original_files.layout.as_file().try_clone().unwrap(),
-                    true,
                 )
             } else {
                 RamOutputFiles::new(
                     original_files.ram.as_file().try_clone().unwrap(),
                     scratch_files.layout.as_file().try_clone().unwrap(),
-                    true,
                 )
             };
             output.protect_baseline(Some(original_image.clone()));
@@ -1203,7 +1173,6 @@ mod tests {
         let mut output = RamOutputFiles::new(
             original_files.ram.as_file().try_clone().unwrap(),
             scratch_files.layout.as_file().try_clone().unwrap(),
-            true,
         );
         output.protect_baseline(Some(newer_image));
         let failure = write_ram_image(
@@ -1312,11 +1281,7 @@ mod tests {
         )
         .unwrap();
         let layout_inode = sealed_layout.metadata().unwrap().ino();
-        let output = RamOutputFiles::new(
-            files.ram.as_file().try_clone().unwrap(),
-            sealed_layout,
-            true,
-        );
+        let output = RamOutputFiles::new(files.ram.as_file().try_clone().unwrap(), sealed_layout);
         let failure = write_ram_image(
             AttemptId::for_test(),
             key(),
@@ -1448,7 +1413,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn real_enospc_and_each_sync_role_propagate_at_helper_boundary() {
+    fn real_enospc_propagates_at_helper_boundary() {
         let full = File::options().write(true).open("/dev/full").unwrap();
         let mut stats = RamIoStats::default();
         let error = write_exact_at(
@@ -1463,14 +1428,6 @@ mod tests {
         assert!(matches!(error, RamImageError::Io { source, .. }
             if source.raw_os_error() == Some(nix::errno::Errno::ENOSPC as i32)));
         assert_eq!(stats.full_bytes_written, 0);
-        let (read, _write) = nix::unistd::pipe().unwrap();
-        let nonsyncable = File::from(read);
-        for role in [RamFileRole::OutputRam, RamFileRole::OutputLayout] {
-            sync(&nonsyncable, role, deadline(), false).unwrap();
-            let error = sync(&nonsyncable, role, deadline(), true).unwrap_err();
-            assert!(matches!(error, RamImageError::Io { role: failed_role,
-                operation: crate::vmm::memory::image::RamIoOperation::Sync, .. } if failed_role == role));
-        }
     }
 
     #[test]
@@ -1757,7 +1714,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_cut_and_durable_capture_write_identical_bytes_and_digests() {
+    fn repeated_capture_writes_identical_bytes_and_digests() {
         let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 3 * 4096)]).unwrap();
         raw.write_slice(&[0x5a; 4096], GuestAddress(4096)).unwrap();
         let (domain, mut control) = tracked(raw);
@@ -1774,7 +1731,6 @@ mod tests {
         let output = RamOutputFiles::new(
             fork_files.ram.as_file().try_clone().unwrap(),
             fork_files.layout.as_file().try_clone().unwrap(),
-            false,
         );
         let fork = capture(&current, layout, RamWriteMode::Full, output);
         assert_eq!(fork_files.bytes(), sealed_files.bytes());

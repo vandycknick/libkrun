@@ -532,13 +532,9 @@ fn write_object(
     role: OutputRole,
     bytes: &[u8],
     binding: &StateBinding,
-    durable: bool,
 ) -> Result<OutputReceipt, LiveError> {
     file.write_all_at(bytes, 0)
         .map_err(|error| io_error(role, error))?;
-    if durable {
-        file.sync_all().map_err(|error| io_error(role, error))?;
-    }
     let (device, inode, length) = inspect(file, role, false)?;
     if length != bytes.len() as u64 {
         return Err(output_error(role, OutputProblem::Changed));
@@ -893,7 +889,6 @@ impl Vmm {
                     (OutputRole::Ram, &outputs.ram),
                     (OutputRole::Layout, &outputs.layout),
                 ])?;
-                let durable = request.durable;
                 let request = match crossover {
                     None => RamCaptureRequest::Full,
                     Some(crossover) => RamCaptureRequest::Incremental {
@@ -909,7 +904,7 @@ impl Vmm {
                 match self.write_memory_capture(
                     &ticket.pause,
                     &attempt,
-                    RamOutputFiles::new(outputs.ram, outputs.layout, durable),
+                    RamOutputFiles::new(outputs.ram, outputs.layout),
                     deadline,
                 ) {
                     Ok(candidate) => {
@@ -1297,14 +1292,12 @@ impl Vmm {
             OutputRole::Execution,
             &execution_bytes,
             binding,
-            outputs.durable,
         )?;
         let devices = write_object(
             &outputs.devices,
             OutputRole::Devices,
             &device_bytes,
             binding,
-            outputs.durable,
         )?;
         Ok(ExecutionCaptureReceipt {
             ticket: record.ticket.clone(),
@@ -1580,7 +1573,6 @@ mod tests {
             OutputRole::Execution,
             b"portable-state",
             &binding(),
-            true,
         )
         .unwrap();
         assert_eq!(receipt.length, 14);
@@ -1635,11 +1627,7 @@ mod tests {
                 RequestKind::Live(LiveRequest::Execution {
                     pause,
                     binding: Box::new(binding()),
-                    outputs: ExecutionOutputs {
-                        execution,
-                        devices,
-                        durable: true,
-                    },
+                    outputs: ExecutionOutputs { execution, devices },
                 }),
             )
         });
@@ -2231,7 +2219,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_and_device_fork_outputs_match_durable_outputs() {
+    fn execution_and_device_outputs_report_written_bytes() {
         for role in [OutputRole::Execution, OutputRole::Devices] {
             let sealed = TempFile::new().unwrap();
             let fork = TempFile::new().unwrap();
@@ -2243,10 +2231,10 @@ mod tests {
                 .unwrap();
             }
             let bytes = b"portable-state";
-            let durable = write_object(sealed.as_file(), role, bytes, &binding(), true).unwrap();
-            let constructed = write_object(fork.as_file(), role, bytes, &binding(), false).unwrap();
-            assert_eq!(durable.length, constructed.length);
-            assert_eq!(durable.binding, constructed.binding);
+            let first = write_object(sealed.as_file(), role, bytes, &binding()).unwrap();
+            let constructed = write_object(fork.as_file(), role, bytes, &binding()).unwrap();
+            assert_eq!(first.length, constructed.length);
+            assert_eq!(first.binding, constructed.binding);
             assert_eq!(
                 fs::read(sealed.as_path()).unwrap(),
                 fs::read(fork.as_path()).unwrap()
@@ -2256,19 +2244,15 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn fork_object_write_skips_sync_on_a_nonsyncable_descriptor() {
+    fn object_write_rejects_a_nonregular_descriptor_without_syncing() {
         let file = OpenOptions::new().write(true).open("/dev/null").unwrap();
         for role in [OutputRole::Execution, OutputRole::Devices] {
             assert!(matches!(
-                write_object(&file, role, b"state", &binding(), false),
+                write_object(&file, role, b"state", &binding()),
                 Err(LiveError::Output {
                     problem: OutputProblem::NotRegular,
                     ..
                 })
-            ));
-            assert!(matches!(
-                write_object(&file, role, b"state", &binding(), true),
-                Err(LiveError::Io { .. })
             ));
         }
     }

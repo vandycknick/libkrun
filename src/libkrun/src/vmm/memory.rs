@@ -1350,7 +1350,6 @@ mod tests {
             RamOutputFiles::new(
                 self.ram.as_file().try_clone().unwrap(),
                 self.layout.as_file().try_clone().unwrap(),
-                true,
             )
         }
         fn seal(
