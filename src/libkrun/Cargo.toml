@@ -42,6 +42,7 @@ log = "0.4.0"
 once_cell = "1.4.1"
 serde = { version = "1.0.125", optional = true }
 serde_json = { version = "1.0.64", optional = true }
+sha2 = "0.10"
 thiserror = "2"
 vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap"] }
 vmm-sys-util = ">=0.14, <=0.15"

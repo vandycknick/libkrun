@@ -169,15 +169,19 @@ pub enum RamImageEffects {
 pub struct RamOutputFiles {
     ram: File,
     layout: File,
+    durable: bool,
     protected_inputs: Option<Arc<AuthenticatedRamImage>>,
 }
 impl RamOutputFiles {
     /// Takes ownership without effects. Open staging roles without truncation so
     /// inode alias preflight can protect existing inputs.
-    pub fn new(ram: File, layout: File) -> Self {
+    /// With `durable = false`, completion closes the writers without synchronizing
+    /// RAM or layout; the caller owns the later durability barrier.
+    pub fn new(ram: File, layout: File, durable: bool) -> Self {
         Self {
             ram,
             layout,
+            durable,
             protected_inputs: None,
         }
     }
@@ -216,9 +220,10 @@ impl RamIoScratch {
     }
 }
 
-/// The trusted caller verifies the actual opened bytes and excludes all writers.
-/// `stream` is the ADR0014 StreamId, not a whole-file digest. Native code does
-/// not hash RAM or establish immutability from readonly descriptor metadata.
+/// The trusted caller authenticates imported bytes and excludes all writers.
+/// `stream` is the ADR0014 StreamId, not a whole-file digest. Native capture
+/// supplies chunk digests, but does not establish immutability from readonly
+/// descriptor metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RamImageAuthentication {
     pub state: StateBinding,
@@ -331,6 +336,7 @@ pub struct RamCaptureReceipt {
     mode: RamCaptureMode,
     stats: RamIoStats,
     chunks: Vec<u64>,
+    chunk_digests: Vec<Option<[u8; 32]>>,
     completion: Arc<()>,
     writers_closed: bool,
 }
@@ -358,6 +364,7 @@ impl RamCaptureReceipt {
         output: RamOutputFiles,
         stats: RamIoStats,
         chunks: Vec<u64>,
+        chunk_digests: Vec<Option<[u8; 32]>>,
         deadline: Instant,
     ) -> Result<Self, (RamImageError, RamOutputFiles)> {
         let facts = (|| {
@@ -398,6 +405,7 @@ impl RamCaptureReceipt {
             mode,
             stats,
             chunks,
+            chunk_digests,
             completion: preparation.completion,
             writers_closed: true,
         })
@@ -442,6 +450,11 @@ impl RamCaptureReceipt {
                     Some(word_index * 64 + bit)
                 })
             })
+    }
+    /// One digest per 8 MiB logical chunk; `None` denotes all zeros only when
+    /// the corresponding affected-chunk bit is set. Unaffected entries are `None`.
+    pub fn chunk_digests(&self) -> &[Option<[u8; 32]>] {
+        &self.chunk_digests
     }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn matches(
@@ -1182,6 +1195,7 @@ mod tests {
         let output = RamOutputFiles::new(
             files.create(&format!("{prefix}-ram"), &[]),
             files.create(&format!("{prefix}-layout"), &[]),
+            true,
         );
         write_ram_image(
             attempt,
@@ -1224,7 +1238,7 @@ mod tests {
             &binding(),
             layout,
             RamWriteMode::Full,
-            RamOutputFiles::new(ram, record),
+            RamOutputFiles::new(ram, record, true),
             &mut RamIoScratch::new().unwrap(),
             deadline(),
         )
@@ -1354,10 +1368,12 @@ mod tests {
             RamOutputFiles::new(
                 files.readonly("ram-sentinel"),
                 files.writable("layout-sentinel"),
+                true,
             ),
             RamOutputFiles::new(
                 files.writable("ram-sentinel"),
                 files.readonly("layout-sentinel"),
+                true,
             ),
         ] {
             let failure = write_ram_image(
@@ -1428,9 +1444,9 @@ mod tests {
                 let sentinel_name = format!("out-{target}-{alias_is_ram}");
                 let sentinel = files.create(&sentinel_name, b"output-sentinel");
                 let mut output = if alias_is_ram {
-                    RamOutputFiles::new(files.writable(target), sentinel)
+                    RamOutputFiles::new(files.writable(target), sentinel, true)
                 } else {
-                    RamOutputFiles::new(sentinel, files.writable(target))
+                    RamOutputFiles::new(sentinel, files.writable(target), true)
                 };
                 output.protect_baseline(Some(baseline.clone()));
                 let failure = write_ram_image(
@@ -1467,7 +1483,7 @@ mod tests {
             &binding(),
             layout,
             RamWriteMode::Full,
-            RamOutputFiles::new(same, dup),
+            RamOutputFiles::new(same, dup, true),
             &mut RamIoScratch::new().unwrap(),
             deadline(),
         )
@@ -1823,6 +1839,7 @@ mod tests {
         let mut output = RamOutputFiles::new(
             files.writable("original-ram"),
             files.create("layout-output", b"layout-sentinel"),
+            true,
         );
         output.protect_baseline(Some(newer));
         assert!(matches!(

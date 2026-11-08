@@ -108,6 +108,8 @@ impl Eq for CaptureTicket {}
 pub struct ExecutionOutputs {
     pub execution: File,
     pub devices: File,
+    /// Synchronize execution and device state before closing their writers.
+    pub durable: bool,
 }
 #[derive(Debug)]
 pub struct MemoryOutputs {
@@ -124,12 +126,15 @@ pub struct BaselineImage {
 pub struct MemoryCaptureRequest {
     pub baseline: Option<BaselineToken>,
     pub full_at_dirty_percent: u8,
+    /// Synchronize RAM and layout before closing their writers.
+    pub durable: bool,
 }
 impl Default for MemoryCaptureRequest {
     fn default() -> Self {
         Self {
             baseline: None,
             full_at_dirty_percent: 60,
+            durable: true,
         }
     }
 }

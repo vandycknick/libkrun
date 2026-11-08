@@ -8,6 +8,7 @@ use std::time::Instant;
 use arch::guest_memory::{DirtyPageMap, MemoryCut};
 use nix::errno::Errno;
 use nix::unistd::{Whence, lseek};
+use sha2::{Digest, Sha256};
 use vm_memory::GuestAddress;
 
 use crate::vmm::control::BarrierKey;
@@ -46,6 +47,7 @@ pub fn write_ram_image(
         let preparation = preflight(cut, binding, &layout, &mode, &output, deadline)?;
         let mut chunks = allocate_chunks(&layout)?;
         mark_chunks(&mut chunks, &layout, &mode);
+        let mut digests = ChunkDigests::new(layout.packed_len(), &chunks)?;
         check_deadline(deadline)?;
         set_length(&output.ram, RamFileRole::OutputRam, 0, deadline)?;
         effects = RamImageEffects::Started;
@@ -65,10 +67,9 @@ pub fn write_ram_image(
                 granule: layout.granule() as usize,
             };
             match &mode {
-                RamWriteMode::Full => writer.full(cut, &layout)?,
+                RamWriteMode::Full => writer.full(cut, &layout, &mut digests)?,
                 RamWriteMode::Incremental { baseline, dirty } => {
-                    writer.materialize(&baseline.ram, dirty, layout.packed_len())?;
-                    writer.overlay(cut, &layout, dirty)?;
+                    writer.incremental(cut, &layout, &baseline.ram, dirty, &mut digests)?;
                 }
             }
         }
@@ -92,12 +93,22 @@ pub fn write_ram_image(
             layout.canonical_bytes().len() as u64,
             deadline,
         )?;
-        sync(&output.ram, RamFileRole::OutputRam, deadline)?;
-        sync(&output.layout, RamFileRole::OutputLayout, deadline)?;
+        sync(
+            &output.ram,
+            RamFileRole::OutputRam,
+            deadline,
+            output.durable,
+        )?;
+        sync(
+            &output.layout,
+            RamFileRole::OutputLayout,
+            deadline,
+            output.durable,
+        )?;
         check_deadline(deadline)?;
-        Ok((preparation, chunks))
+        Ok((preparation, digests.values, chunks))
     })();
-    let (preparation, chunks) = match result {
+    let (preparation, chunk_digests, chunks) = match result {
         Ok(prepared) => prepared,
         Err(error) => {
             return Err(RamImageFailure {
@@ -119,6 +130,7 @@ pub fn write_ram_image(
         output,
         stats.clone(),
         chunks,
+        chunk_digests,
         deadline,
     ) {
         Ok(receipt) => Ok(receipt),
@@ -152,6 +164,84 @@ fn mark_chunks(chunks: &mut [u64], layout: &ValidatedRamLayout, mode: &RamWriteM
     }
 }
 
+// Incremental clean and dirty runs must arrive in stream order so one hasher
+// can authenticate affected chunks without reading the output back. Leading
+// zeros stay implicit until a nonzero byte requires a digest.
+struct ChunkDigests<'a> {
+    values: Vec<Option<[u8; 32]>>,
+    affected: &'a [u64],
+    length: u64,
+    hasher: Option<Sha256>,
+}
+
+impl<'a> ChunkDigests<'a> {
+    fn new(length: u64, affected: &'a [u64]) -> Result<Self, RamImageError> {
+        let count = usize::try_from(length.div_ceil(RAM_IDENTITY_CHUNK_BYTES))
+            .map_err(|_| RamImageError::Geometry)?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|_| RamImageError::Allocation)?;
+        values.resize(count, None);
+        Ok(Self {
+            values,
+            affected,
+            length,
+            hasher: None,
+        })
+    }
+
+    fn update(&mut self, mut offset: u64, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let index = (offset / RAM_IDENTITY_CHUNK_BYTES) as usize;
+            let local = offset % RAM_IDENTITY_CHUNK_BYTES;
+            let len = bytes.len().min((RAM_IDENTITY_CHUNK_BYTES - local) as usize);
+            if self.affected[index / 64] & (1 << (index % 64)) != 0 {
+                if self.hasher.is_none() && !is_all_zero(&bytes[..len]) {
+                    let mut hasher = Sha256::new();
+                    Self::hash_zeros(&mut hasher, local);
+                    self.hasher = Some(hasher);
+                }
+                if let Some(hasher) = &mut self.hasher {
+                    hasher.update(&bytes[..len]);
+                }
+            }
+            offset += len as u64;
+            self.finish_chunk(index, offset);
+            bytes = &bytes[len..];
+        }
+    }
+
+    fn zeros(&mut self, range: Range<u64>) {
+        let mut offset = range.start;
+        while offset < range.end {
+            let index = (offset / RAM_IDENTITY_CHUNK_BYTES) as usize;
+            let len = (range.end - offset)
+                .min(RAM_IDENTITY_CHUNK_BYTES - offset % RAM_IDENTITY_CHUNK_BYTES);
+            if let Some(hasher) = &mut self.hasher {
+                Self::hash_zeros(hasher, len);
+            }
+            offset += len;
+            self.finish_chunk(index, offset);
+        }
+    }
+
+    fn hash_zeros(hasher: &mut Sha256, mut length: u64) {
+        let zeros = [0; 4096];
+        while length > 0 {
+            let len = length.min(zeros.len() as u64) as usize;
+            hasher.update(&zeros[..len]);
+            length -= len as u64;
+        }
+    }
+
+    fn finish_chunk(&mut self, index: usize, offset: u64) {
+        if offset.is_multiple_of(RAM_IDENTITY_CHUNK_BYTES) || offset == self.length {
+            self.values[index] = self.hasher.take().map(|hasher| hasher.finalize().into());
+        }
+    }
+}
+
 struct ImageWriter<'a> {
     ram: &'a File,
     buffer: &'a mut [u8],
@@ -161,12 +251,18 @@ struct ImageWriter<'a> {
 }
 
 impl ImageWriter<'_> {
-    fn full(&mut self, cut: &MemoryCut, layout: &ValidatedRamLayout) -> Result<(), RamImageError> {
+    fn full(
+        &mut self,
+        cut: &MemoryCut,
+        layout: &ValidatedRamLayout,
+        digests: &mut ChunkDigests<'_>,
+    ) -> Result<(), RamImageError> {
         for region in layout.regions() {
             let mut local = 0;
             while local < region.length {
                 let len = (region.length - local).min(self.buffer.len() as u64) as usize;
                 self.read_live(cut, region.guest_start + local, len)?;
+                digests.update(region.stream_offset + local, &self.buffer[..len]);
                 self.sparse(len, region.stream_offset + local, WriteKind::Full)?;
                 local += len as u64;
             }
@@ -197,39 +293,22 @@ impl ImageWriter<'_> {
         check_deadline(self.deadline)
     }
 
-    fn materialize(
-        &mut self,
-        baseline: &File,
-        dirty: &DirtyPageMap,
-        length: u64,
-    ) -> Result<(), RamImageError> {
-        let mut extents = Extents {
-            file: baseline,
-            length,
-            supported: true,
-        };
-        let mut clean_start = 0;
-        for page in dirty.iter_set() {
-            let dirty_start = page.index() as u64 * self.granule as u64;
-            self.clean_run(&mut extents, clean_start..dirty_start)?;
-            clean_start = dirty_start + self.granule as u64;
-        }
-        self.clean_run(&mut extents, clean_start..length)
-    }
-
     fn clean_run(
         &mut self,
         extents: &mut Extents<'_>,
         range: Range<u64>,
+        digests: &mut ChunkDigests<'_>,
     ) -> Result<(), RamImageError> {
         let mut cursor = range.start;
         while cursor < range.end {
             let Some(data) = extents.next(cursor, self.stats, self.deadline)? else {
                 self.stats.baseline_hole_bytes += range.end - cursor;
+                digests.zeros(cursor..range.end);
                 break;
             };
             let start = data.start.min(range.end);
             self.stats.baseline_hole_bytes += start - cursor;
+            digests.zeros(cursor..start);
             let end = data.end.min(range.end);
             cursor = start;
             while cursor < end {
@@ -241,6 +320,7 @@ impl ImageWriter<'_> {
                     self.stats,
                     self.deadline,
                 )?;
+                digests.update(cursor, &self.buffer[..len]);
                 self.sparse(len, cursor, WriteKind::Baseline)?;
                 cursor += len as u64;
             }
@@ -248,12 +328,20 @@ impl ImageWriter<'_> {
         Ok(())
     }
 
-    fn overlay(
+    fn incremental(
         &mut self,
         cut: &MemoryCut,
         layout: &ValidatedRamLayout,
+        baseline: &File,
         dirty: &DirtyPageMap,
+        digests: &mut ChunkDigests<'_>,
     ) -> Result<(), RamImageError> {
+        let mut extents = Extents {
+            file: baseline,
+            length: layout.packed_len(),
+            supported: true,
+        };
+        let mut clean_start = 0;
         let mut pages = dirty.iter_set().peekable();
         let mut regions = layout.regions().iter();
         let mut region = regions.next().ok_or(RamImageError::Geometry)?;
@@ -264,6 +352,8 @@ impl ImageWriter<'_> {
                 region = regions.next().ok_or(RamImageError::Bitmap)?;
             }
             let local = (first.index() - region.first_page) as u64 * self.granule as u64;
+            let stream_offset = region.stream_offset + local;
+            self.clean_run(&mut extents, clean_start..stream_offset, digests)?;
             let mut len = self.granule;
             while pages.peek().is_some_and(|page| {
                 page.index() == first.index() + len / self.granule
@@ -274,16 +364,18 @@ impl ImageWriter<'_> {
                 len += self.granule;
             }
             self.read_live(cut, region.guest_start + local, len)?;
+            digests.update(stream_offset, &self.buffer[..len]);
             write_exact_at(
                 self.ram,
                 &self.buffer[..len],
-                region.stream_offset + local,
+                stream_offset,
                 WriteKind::Overlay,
                 self.stats,
                 self.deadline,
             )?;
+            clean_start = stream_offset + len as u64;
         }
-        Ok(())
+        self.clean_run(&mut extents, clean_start..layout.packed_len(), digests)
     }
 
     fn sparse(&mut self, len: usize, offset: u64, kind: WriteKind) -> Result<(), RamImageError> {
@@ -527,10 +619,17 @@ fn set_length(
         .map_err(|error| io_error(RamIoOperation::SetLength, role, error))
 }
 
-fn sync(file: &File, role: RamFileRole, deadline: Instant) -> Result<(), RamImageError> {
+fn sync(
+    file: &File,
+    role: RamFileRole,
+    deadline: Instant,
+    durable: bool,
+) -> Result<(), RamImageError> {
     check_deadline(deadline)?;
-    file.sync_all()
-        .map_err(|error| io_error(RamIoOperation::Sync, role, error))?;
+    if durable {
+        file.sync_all()
+            .map_err(|error| io_error(RamIoOperation::Sync, role, error))?;
+    }
     check_deadline(deadline)
 }
 
@@ -546,19 +645,20 @@ mod tests {
     use arch::ArchMemoryInfo;
     use arch::guest_memory::{BackingKind, DirtyPageMap, DomainControl, MemoryCut, MemoryDomain};
     use polly::event_manager::{BarrierGeneration, BarrierKey, OperationId};
+    use sha2::{Digest, Sha256};
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
     use vmm_sys_util::tempfile::TempFile;
 
     use crate::vmm::execution::{ExecutionLane, StateBinding};
     use crate::vmm::memory::AttemptId;
     use crate::vmm::memory::image::writer::{
-        Extents, ImageWriter, WriteKind, account_write, is_all_zero, read_exact_at, sync,
-        write_exact_at, write_ram_image,
+        ChunkDigests, Extents, ImageWriter, WriteKind, account_write, is_all_zero, read_exact_at,
+        sync, write_exact_at, write_ram_image,
     };
     use crate::vmm::memory::image::{
-        AuthenticatedRamImage, RamCaptureReceipt, RamFileRole, RamImageAuthentication,
-        RamImageEffects, RamImageError, RamIoScratch, RamIoStats, RamOutputFiles, RamWriteMode,
-        ValidatedRamLayout, seal_completed,
+        AuthenticatedRamImage, RAM_IDENTITY_CHUNK_BYTES, RamCaptureReceipt, RamFileRole,
+        RamImageAuthentication, RamImageEffects, RamImageError, RamIoScratch, RamIoStats,
+        RamOutputFiles, RamWriteMode, ValidatedRamLayout, seal_completed,
     };
 
     fn deadline() -> Instant {
@@ -644,6 +744,7 @@ mod tests {
             RamOutputFiles::new(
                 self.ram.as_file().try_clone().unwrap(),
                 self.layout.as_file().try_clone().unwrap(),
+                true,
             )
         }
         fn bytes(&self) -> Vec<u8> {
@@ -683,6 +784,18 @@ mod tests {
             deadline(),
         )
         .unwrap_or_else(|failure| panic!("writer failed: {:?}", failure.error))
+    }
+
+    fn independent_digests(bytes: &[u8]) -> Vec<Option<[u8; 32]>> {
+        bytes
+            .chunks(RAM_IDENTITY_CHUNK_BYTES as usize)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .any(|byte| *byte != 0)
+                    .then(|| Sha256::digest(chunk).into())
+            })
+            .collect()
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -775,6 +888,12 @@ mod tests {
         assert_eq!(incremental.affected_chunks().collect::<Vec<_>>(), [0, 1]);
         assert_eq!(reference.stats().live_bytes_read, layout.packed_len());
         assert_eq!(baseline_files.bytes(), original);
+        assert_eq!(full.chunk_digests(), independent_digests(&original));
+        assert_eq!(
+            incremental.chunk_digests(),
+            independent_digests(&incremental_files.bytes())
+        );
+        assert_eq!(incremental.chunk_digests(), reference.chunk_digests());
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -861,6 +980,14 @@ mod tests {
                 if has_dirty { 4096 } else { 0 }
             );
             assert_eq!(receipt.affected_chunks().count(), usize::from(has_dirty));
+            assert_eq!(
+                receipt.chunk_digests(),
+                if has_dirty {
+                    independent_digests(&expected)
+                } else {
+                    vec![None]
+                }
+            );
         }
     }
 
@@ -881,6 +1008,7 @@ mod tests {
         let alias = RamOutputFiles::new(
             files.ram.as_file().try_clone().unwrap(),
             files.ram.as_file().try_clone().unwrap(),
+            true,
         );
         let failure = write_ram_image(
             AttemptId::for_test(),
@@ -973,8 +1101,13 @@ mod tests {
             deadline: deadline(),
             granule: 4096,
         };
-        writer.clean_run(&mut extents, 0..4096).unwrap();
-        writer.clean_run(&mut extents, 8192..12288).unwrap();
+        let mut digests = ChunkDigests::new(3 * 4096, &[1]).unwrap();
+        writer
+            .clean_run(&mut extents, 0..4096, &mut digests)
+            .unwrap();
+        writer
+            .clean_run(&mut extents, 8192..12288, &mut digests)
+            .unwrap();
         assert_eq!(stats.baseline_bytes_read, 8192);
         assert_eq!(stats.baseline_bytes_written, 0);
         assert_eq!(stats.zero_bytes_omitted, 8192);
@@ -1020,11 +1153,13 @@ mod tests {
                 RamOutputFiles::new(
                     scratch_files.ram.as_file().try_clone().unwrap(),
                     original_files.layout.as_file().try_clone().unwrap(),
+                    true,
                 )
             } else {
                 RamOutputFiles::new(
                     original_files.ram.as_file().try_clone().unwrap(),
                     scratch_files.layout.as_file().try_clone().unwrap(),
+                    true,
                 )
             };
             output.protect_baseline(Some(original_image.clone()));
@@ -1068,6 +1203,7 @@ mod tests {
         let mut output = RamOutputFiles::new(
             original_files.ram.as_file().try_clone().unwrap(),
             scratch_files.layout.as_file().try_clone().unwrap(),
+            true,
         );
         output.protect_baseline(Some(newer_image));
         let failure = write_ram_image(
@@ -1176,7 +1312,11 @@ mod tests {
         )
         .unwrap();
         let layout_inode = sealed_layout.metadata().unwrap().ino();
-        let output = RamOutputFiles::new(files.ram.as_file().try_clone().unwrap(), sealed_layout);
+        let output = RamOutputFiles::new(
+            files.ram.as_file().try_clone().unwrap(),
+            sealed_layout,
+            true,
+        );
         let failure = write_ram_image(
             AttemptId::for_test(),
             key(),
@@ -1326,7 +1466,8 @@ mod tests {
         let (read, _write) = nix::unistd::pipe().unwrap();
         let nonsyncable = File::from(read);
         for role in [RamFileRole::OutputRam, RamFileRole::OutputLayout] {
-            let error = sync(&nonsyncable, role, deadline()).unwrap_err();
+            sync(&nonsyncable, role, deadline(), false).unwrap();
+            let error = sync(&nonsyncable, role, deadline(), true).unwrap_err();
             assert!(matches!(error, RamImageError::Io { role: failed_role,
                 operation: crate::vmm::memory::image::RamIoOperation::Sync, .. } if failed_role == role));
         }
@@ -1390,6 +1531,7 @@ mod tests {
             output,
             finished.stats().clone(),
             allocate_chunks(&layout).unwrap(),
+            finished.chunk_digests().to_vec(),
             Instant::now(),
         )
         .expect_err("expiry at final completion must return owners, never a receipt");
@@ -1527,5 +1669,121 @@ mod tests {
                 assert_eq!(actual_stats, reference_stats);
             }
         }
+    }
+
+    #[test]
+    fn chunk_digests_preserve_zero_and_unaffected_chunks_across_regions() {
+        let chunk = RAM_IDENTITY_CHUNK_BYTES;
+        let raw = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), chunk as usize + 4096),
+            (GuestAddress(64 * 1024 * 1024), 3 * chunk as usize),
+        ])
+        .unwrap();
+        let address = |offset: u64| {
+            GuestAddress(if offset < chunk + 4096 {
+                offset
+            } else {
+                64 * 1024 * 1024 + offset - chunk - 4096
+            })
+        };
+        for offset in [chunk - 4096, 2 * chunk, 3 * chunk, 4 * chunk] {
+            raw.write_slice(&[0x5a; 4096], address(offset)).unwrap();
+        }
+        let (domain, mut control) = tracked(raw);
+        let layout = layout(&domain);
+        let first = cut(&mut control);
+        let baseline_files = Outputs::new();
+        let mut full = capture(
+            &first,
+            layout.clone(),
+            RamWriteMode::Full,
+            baseline_files.owned(),
+        );
+        let expected = independent_digests(&baseline_files.bytes());
+        assert_eq!(expected.len(), 5);
+        assert_eq!(expected[1], None);
+        assert!(expected[2].is_some());
+        assert_eq!(full.chunk_digests(), expected);
+        assert_eq!(full.affected_chunks().collect::<Vec<_>>(), [0, 1, 2, 3, 4]);
+        let baseline = baseline_files.seal(&mut full);
+        let epoch = first.issue_epoch(2).unwrap();
+        control.reopen(&first, &epoch).unwrap();
+        for (offset, byte) in [(chunk - 4096, 0), (3 * chunk + 4096, 0x91), (4 * chunk, 0)] {
+            domain
+                .write(address(offset), 4096)
+                .unwrap()
+                .write_view(0, 4096)
+                .unwrap()
+                .write_slice(&[byte; 4096], 0)
+                .unwrap();
+        }
+        let second = cut(&mut control);
+        let mut dirty = DirtyPageMap::new(domain.layout());
+        control.drain_host_dirty(&second, &mut dirty).unwrap();
+        let outputs = Outputs::new();
+        let mut output = outputs.owned();
+        output.protect_baseline(Some(baseline.clone()));
+        let incremental = capture(
+            &second,
+            layout.clone(),
+            RamWriteMode::Incremental {
+                baseline: &baseline,
+                dirty: &dirty,
+            },
+            output,
+        );
+        let affected = incremental.affected_chunks().collect::<Vec<_>>();
+        assert_eq!(affected, [0, 3, 4]);
+        let bytes = outputs.bytes();
+        let actual = independent_digests(&bytes);
+        for (index, digest) in incremental.chunk_digests().iter().enumerate() {
+            assert_eq!(
+                *digest,
+                if affected.contains(&index) {
+                    actual[index]
+                } else {
+                    None
+                }
+            );
+        }
+        assert_eq!(actual[0], None);
+        assert_eq!(actual[4], None);
+        assert!(actual[2].is_some());
+        assert_eq!(incremental.chunk_digests()[2], None);
+        let reference_files = Outputs::new();
+        let reference = capture(&second, layout, RamWriteMode::Full, reference_files.owned());
+        assert_eq!(bytes, reference_files.bytes());
+        assert_eq!(reference.chunk_digests(), actual);
+    }
+
+    #[test]
+    fn fork_cut_and_durable_capture_write_identical_bytes_and_digests() {
+        let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 3 * 4096)]).unwrap();
+        raw.write_slice(&[0x5a; 4096], GuestAddress(4096)).unwrap();
+        let (domain, mut control) = tracked(raw);
+        let layout = layout(&domain);
+        let current = cut(&mut control);
+        let sealed_files = Outputs::new();
+        let sealed = capture(
+            &current,
+            layout.clone(),
+            RamWriteMode::Full,
+            sealed_files.owned(),
+        );
+        let fork_files = Outputs::new();
+        let output = RamOutputFiles::new(
+            fork_files.ram.as_file().try_clone().unwrap(),
+            fork_files.layout.as_file().try_clone().unwrap(),
+            false,
+        );
+        let fork = capture(&current, layout, RamWriteMode::Full, output);
+        assert_eq!(fork_files.bytes(), sealed_files.bytes());
+        assert_eq!(
+            std::fs::read(fork_files.layout.as_path()).unwrap(),
+            std::fs::read(sealed_files.layout.as_path()).unwrap()
+        );
+        assert_eq!(fork.chunk_digests(), sealed.chunk_digests());
+        assert_eq!(fork.stats(), sealed.stats());
+        assert!(fork.writers_closed());
     }
 }

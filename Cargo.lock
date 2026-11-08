@@ -907,6 +907,7 @@ dependencies = [
  "once_cell",
  "serde",
  "serde_json",
+ "sha2",
  "tdx",
  "thiserror 2.0.18",
  "vm-memory",

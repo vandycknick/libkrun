@@ -578,7 +578,11 @@ impl Driver {
         } else {
             ram
         };
-        let output = RamOutputFiles::new(ram, image_output(&directory.join("memory-layout.json"))?);
+        let output = RamOutputFiles::new(
+            ram,
+            image_output(&directory.join("memory-layout.json"))?,
+            true,
+        );
         let result = if prepared {
             #[cfg(feature = "native-device-probe")]
             {
