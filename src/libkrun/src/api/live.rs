@@ -57,7 +57,7 @@ pub use crate::vmm::execution::{
 };
 pub use crate::vmm::memory::image::{
     AuthenticatedRamImage, RamCaptureMode, RamCaptureReceipt, RamImageAuthentication,
-    RamImageError, RamIoStats, ValidatedRamLayout,
+    RamImageError, RamIoStats, RamSeedMethod, ValidatedRamLayout,
 };
 pub use crate::vmm::memory::{
     BaselineToken, CaptureError, FullCaptureReason, RestoreInstallationEvidence,

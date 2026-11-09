@@ -138,8 +138,16 @@ pub(crate) fn check_deadline(deadline: Instant) -> Result<(), RamImageError> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RamSeedMethod {
+    Clone,
+    #[default]
+    Rebuild,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RamIoStats {
+    pub seed_method: RamSeedMethod,
     pub logical_bytes: u64,
     pub live_bytes_read: u64,
     pub baseline_bytes_read: u64,

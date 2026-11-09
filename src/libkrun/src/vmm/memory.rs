@@ -1256,7 +1256,7 @@ mod tests {
     use crate::vmm::execution::{ExecutionLane, StateBinding};
     use crate::vmm::memory::image::{
         AuthenticatedRamImage, RamCaptureMode, RamImageAuthentication, RamOutputFiles,
-        ValidatedRamLayout,
+        RamSeedMethod, ValidatedRamLayout,
     };
     use crate::vmm::memory::{
         BaselineToken, CaptureError, CompletedCandidate, DirtyCrossoverPercent, FullCaptureReason,
@@ -1624,7 +1624,14 @@ mod tests {
         };
         let (id, mut candidate, output) = capture(&mut coordinator, key(2), request);
         assert_eq!(candidate.receipt().mode(), RamCaptureMode::Incremental);
-        assert_eq!(candidate.receipt().stats().live_bytes_read, 4096);
+        assert_eq!(
+            candidate.receipt().stats().live_bytes_read,
+            if candidate.receipt().stats().seed_method == RamSeedMethod::Clone {
+                10 * 4096
+            } else {
+                4096
+            }
+        );
         assert_eq!(
             std::fs::read(output.ram.as_path()).unwrap(),
             vec![0; 10 * 4096]
@@ -1735,7 +1742,14 @@ mod tests {
                 crossover: DirtyCrossoverPercent::default(),
             },
         );
-        assert_eq!(candidate.receipt().stats().live_bytes_read, 4096);
+        assert_eq!(
+            candidate.receipt().stats().live_bytes_read,
+            if candidate.receipt().stats().seed_method == RamSeedMethod::Clone {
+                10 * 4096
+            } else {
+                4096
+            }
+        );
     }
 
     #[test]
@@ -1773,7 +1787,14 @@ mod tests {
         let (attempt, candidate, output) = capture(&mut coordinator, key(2), request);
         assert!(candidate.receipt().writers_closed());
         assert_eq!(candidate.receipt().mode(), RamCaptureMode::Incremental);
-        assert_eq!(candidate.receipt().stats().live_bytes_read, 4096);
+        assert_eq!(
+            candidate.receipt().stats().live_bytes_read,
+            if candidate.receipt().stats().seed_method == RamSeedMethod::Clone {
+                10 * 4096
+            } else {
+                4096
+            }
+        );
         let bytes = std::fs::read(output.ram.as_path()).unwrap();
         assert_eq!(bytes[0], 9);
         assert_eq!(bytes[4096], 7);
@@ -1930,5 +1951,133 @@ mod tests {
             assert!(coordinator.baseline.is_none());
             assert!(coordinator.scratch.is_none());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enospc_mid_overlay_requires_abandonment_and_retains_dirties() {
+        use crate::vmm::memory::image::{RamImageEffects, RamImageError};
+        use std::os::unix::fs::FileExt;
+        use std::process::Command;
+
+        const SELECTOR: &str =
+            "vmm::memory::tests::enospc_mid_overlay_requires_abandonment_and_retains_dirties";
+        let Some(directory) = std::env::var_os("LIBKRUN_RAM_ENOSPC_DIR") else {
+            let probe = Command::new("unshare")
+                .args(["--user", "--map-root-user", "--mount", "/bin/true"])
+                .output();
+            if !probe.as_ref().is_ok_and(|output| output.status.success()) {
+                eprintln!("isolated tmpfs ENOSPC test requires unshare user/mount namespaces");
+                return;
+            }
+            let result = Command::new("unshare")
+                .args(["--user", "--map-root-user", "--mount", "/bin/sh", "-c"])
+                .arg(
+                    "dir=$(mktemp -d) || exit 1; \
+                     trap 'umount \"$dir\" 2>/dev/null; rmdir \"$dir\"' EXIT; \
+                     mount -t tmpfs -o size=4096,nr_inodes=16 tmpfs \"$dir\" || exit 77; \
+                     LIBKRUN_RAM_ENOSPC_DIR=\"$dir\" \"$1\" \"$2\" --exact --test-threads=1 --nocapture",
+                )
+                .arg("ram-enospc")
+                .arg(std::env::current_exe().unwrap())
+                .arg(SELECTOR)
+                .output()
+                .unwrap();
+            if result.status.code() == Some(77) {
+                eprintln!("isolated tmpfs ENOSPC test requires permission to mount tmpfs");
+                return;
+            }
+            assert!(
+                result.status.success(),
+                "ENOSPC child failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        };
+        let mut coordinator = coordinator();
+        stop(&mut coordinator, key(1));
+        let (baseline_token, _baseline, baseline_files) = accept_full(&mut coordinator, key(1));
+        let original = std::fs::read(baseline_files.ram.as_path()).unwrap();
+        coordinator.reopen(key(1)).unwrap();
+        for address in [0, 8192] {
+            coordinator
+                .control
+                .domain()
+                .write(GuestAddress(address), 4096)
+                .unwrap()
+                .write_view(0, 4096)
+                .unwrap()
+                .write_slice(&[0x5a; 4096], 0)
+                .unwrap();
+        }
+        stop(&mut coordinator, key(2));
+        assert_eq!(coordinator.pending_dirty_count(), 2);
+        let attempt = begin(
+            &mut coordinator,
+            key(2),
+            RamCaptureRequest::Incremental {
+                baseline: Some(&baseline_token),
+                crossover: DirtyCrossoverPercent::default(),
+            },
+        );
+        let ram_path = std::path::PathBuf::from(directory).join("ram");
+        let ram = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&ram_path)
+            .unwrap();
+        let outputs = Outputs::new();
+        let output = RamOutputFiles::new(ram, outputs.layout.as_file().try_clone().unwrap());
+        let error = match coordinator.write_attempt(
+            key(2),
+            &attempt,
+            output,
+            Instant::now() + Duration::from_secs(5),
+        ) {
+            Ok(_) => panic!("ENOSPC mid-overlay must fail the attempt"),
+            Err(error) => error,
+        };
+        let CaptureError::Write(failure) = error else {
+            panic!("expected image write failure");
+        };
+        assert!(matches!(&failure.error, RamImageError::Io { source, .. }
+            if source.raw_os_error() == Some(nix::errno::Errno::ENOSPC as i32)));
+        assert_eq!(failure.effects, RamImageEffects::Started);
+        assert_eq!(failure.stats.seed_method, RamSeedMethod::Rebuild);
+        assert_eq!(failure.stats.overlay_bytes_written, 4096);
+        let mut first = [0; 4096];
+        File::open(&ram_path)
+            .unwrap()
+            .read_exact_at(&mut first, 0)
+            .unwrap();
+        assert_eq!(first, [0x5a; 4096]);
+        assert_eq!(coordinator.pending_dirty_count(), 2);
+        assert_eq!(coordinator.baseline_token(), Some(baseline_token.clone()));
+        assert_eq!(coordinator.reopen(key(2)), Err(ControlFailure::Busy));
+        assert!(coordinator.attempt.as_ref().unwrap().failure.is_some());
+        coordinator.abandon_attempt(key(2), &attempt).unwrap();
+        assert!(!coordinator.has_attempt());
+        assert_eq!(coordinator.pending_dirty_count(), 2);
+        assert_eq!(coordinator.baseline_token(), Some(baseline_token.clone()));
+        assert_eq!(
+            std::fs::read(baseline_files.ram.as_path()).unwrap(),
+            original
+        );
+        let (_, mut retry, files) = capture(
+            &mut coordinator,
+            key(2),
+            RamCaptureRequest::Incremental {
+                baseline: Some(&baseline_token),
+                crossover: DirtyCrossoverPercent::default(),
+            },
+        );
+        assert_eq!(retry.receipt().stats().overlay_bytes_written, 8192);
+        let image = files.seal(&mut retry, key(2));
+        coordinator.accept_attempt(key(2), retry, image).unwrap();
+        assert_eq!(coordinator.pending_dirty_count(), 0);
+        drop(failure);
+        std::fs::remove_file(ram_path).unwrap();
     }
 }
