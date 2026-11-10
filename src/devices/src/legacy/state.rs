@@ -2,6 +2,8 @@ use utils::state::{Error, Reader, Writer};
 
 pub const MAX_SERIAL_INPUT: usize = 64 * 1024;
 pub const MAX_LEGACY_DEVICES: usize = 32;
+const LEGACY_STATE_MAGIC: &[u8; 8] = b"KRUNLEGS";
+const LEGACY_STATE_SCHEMA: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UartState {
@@ -154,6 +156,7 @@ impl LegacyPayload {
 
 impl LegacyState {
     pub fn encode(&self, writer: &mut Writer) -> Result<(), Error> {
+        writer.header(LEGACY_STATE_MAGIC, LEGACY_STATE_SCHEMA)?;
         self.payload.validate()?;
         writer.u8(self.payload.tag())?;
         writer.u16(1)?;
@@ -240,6 +243,7 @@ impl LegacyState {
     }
 
     pub fn decode(reader: &mut Reader<'_>) -> Result<Self, Error> {
+        reader.header(LEGACY_STATE_MAGIC, LEGACY_STATE_SCHEMA)?;
         let tag = reader.u8()?;
         if reader.u16()? != 1 {
             return Err(Error::Invalid("legacy codec version"));
@@ -407,6 +411,20 @@ mod tests {
             let mut writer = Writer::new(4096);
             state.encode(&mut writer).unwrap();
             let bytes = writer.finish();
+            use utils::state::StateHeaderError;
+            assert_eq!(&bytes[..10], b"KRUNLEGS\x01\x00");
+            let mut wrong_magic = bytes.clone();
+            wrong_magic[0] ^= 1;
+            assert!(matches!(
+                LegacyState::decode(&mut Reader::new(&wrong_magic)),
+                Err(Error::Header(StateHeaderError::Magic { .. }))
+            ));
+            let mut wrong_schema = bytes.clone();
+            wrong_schema[8..10].copy_from_slice(&2u16.to_le_bytes());
+            assert_eq!(
+                LegacyState::decode(&mut Reader::new(&wrong_schema)),
+                Err(Error::Header(StateHeaderError::Schema { expected: 1, found: 2 }))
+            );
             for length in 0..bytes.len() {
                 assert!(LegacyState::decode(&mut Reader::new(&bytes[..length])).is_err());
             }

@@ -28,6 +28,8 @@ use crate::virtio::{
 pub const DEVICE_TYPE: u32 = 0x5347;
 pub const DEVICE_ID: &str = "silo-vmgenid";
 pub const STATE_LIMIT: u32 = 256;
+pub(crate) const GENERATION_STATE_MAGIC: &[u8; 8] = b"KRUNGENS";
+pub(crate) const GENERATION_STATE_SCHEMA: u16 = 1;
 const FEATURES: u64 = 1 << 32;
 const QUEUES: [QueueConfig; 1] = [QueueConfig::new(1)];
 const VERSION: u32 = 1;
@@ -534,6 +536,7 @@ impl Generation {
                 return Err(utils::state::Error::Limit);
             }
             let mut reader = Reader::new(payload);
+            reader.header(GENERATION_STATE_MAGIC, GENERATION_STATE_SCHEMA)?;
             if reader.u16()? != 1 || reader.u32()? != DEVICE_TYPE || reader.u64()? != FEATURES {
                 return Err(utils::state::Error::Invalid("generation profile"));
             }
@@ -601,7 +604,7 @@ impl Generation {
                 history,
             })
         }
-        decode(payload).map_err(|_| ProviderFault::DeviceState)
+        decode(payload).map_err(ProviderFault::from)
     }
 
     fn install_payload(&mut self, decoded: DecodedPayload) {
@@ -816,6 +819,7 @@ impl VirtioStateProvider for Generation {
         }
         let encode = || -> Result<Vec<u8>, utils::state::Error> {
             let mut writer = Writer::new(STATE_LIMIT as usize);
+            writer.header(GENERATION_STATE_MAGIC, GENERATION_STATE_SCHEMA)?;
             writer.u16(1)?;
             writer.u32(DEVICE_TYPE)?;
             writer.u64(FEATURES)?;
@@ -1461,8 +1465,23 @@ mod tests {
     fn generation_payload_is_bounded_canonical_and_validated_before_apply() {
         let mut source = stopped();
         let payload = source.capture_payload(barrier(1).key).unwrap();
-        assert_eq!(&payload[..6], &[1, 0, 0x47, 0x53, 0, 0]);
-        assert_eq!(payload.len(), 92);
+        assert_eq!(&payload[10..16], &[1, 0, 0x47, 0x53, 0, 0]);
+        assert_eq!(payload.len(), 102);
+        use utils::state::StateHeaderError;
+        assert_eq!(&payload[..10], b"KRUNGENS\x01\x00");
+        source.validate_payload(&payload).unwrap();
+        let mut wrong_magic = payload.clone();
+        wrong_magic[0] ^= 1;
+        assert!(matches!(
+            source.validate_payload(&wrong_magic),
+            Err(ProviderFault::StateHeader(StateHeaderError::Magic { .. }))
+        ));
+        let mut wrong_schema = payload.clone();
+        wrong_schema[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            source.validate_payload(&wrong_schema),
+            Err(ProviderFault::StateHeader(StateHeaderError::Schema { expected: 1, found: 2 }))
+        );
         for length in 0..payload.len() {
             assert!(source.validate_payload(&payload[..length]).is_err());
         }
@@ -1479,7 +1498,7 @@ mod tests {
             (91, 255),
         ] {
             let mut bytes = payload.clone();
-            bytes[offset] = value;
+            bytes[offset + 10] = value;
             malformed.push(bytes);
         }
         let mut trailing = payload.clone();

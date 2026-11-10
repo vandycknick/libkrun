@@ -29,8 +29,18 @@ pub enum ProviderFault {
     QueueIdentity,
     QueueState,
     DeviceState,
+    StateHeader(utils::state::StateHeaderError),
     Worker,
     Notification,
+}
+
+impl From<utils::state::Error> for ProviderFault {
+    fn from(error: utils::state::Error) -> Self {
+        match error {
+            utils::state::Error::Header(error) => Self::StateHeader(error),
+            _ => Self::DeviceState,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

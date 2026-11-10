@@ -7,6 +7,10 @@ pub const MAX_MSRS: usize = 4096;
 pub const MAX_ONE_REGS: usize = 4096;
 pub const MAX_XSAVE: usize = 65536;
 pub const MAX_CPUID: usize = 256;
+const KVM_CPU_STATE_MAGIC: &[u8; 8] = b"KRUNKCPU";
+const KVM_CPU_STATE_SCHEMA: u16 = 1;
+const KVM_VM_STATE_MAGIC: &[u8; 8] = b"KRUNKVMS";
+const KVM_VM_STATE_SCHEMA: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CpuidEntry {
@@ -520,6 +524,7 @@ impl KvmCpuState {
     pub fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         self.validate()
             .map_err(|_| Error::Invalid("kvm/cpu/state"))?;
+        w.header(KVM_CPU_STATE_MAGIC, KVM_CPU_STATE_SCHEMA)?;
         match self {
             Self::X86(s) => {
                 w.u8(1)?;
@@ -610,6 +615,7 @@ impl KvmCpuState {
         Ok(())
     }
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
+        r.header(KVM_CPU_STATE_MAGIC, KVM_CPU_STATE_SCHEMA)?;
         let tag = r.u8()?;
         let id = r.u8()?;
         let state = match tag {
@@ -827,6 +833,7 @@ impl KvmVmState {
     pub fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         self.validate()
             .map_err(|_| Error::Invalid("kvm/vm/state"))?;
+        w.header(KVM_VM_STATE_MAGIC, KVM_VM_STATE_SCHEMA)?;
         match self {
             Self::X86(s) => {
                 w.u8(1)?;
@@ -884,6 +891,7 @@ impl KvmVmState {
         Ok(())
     }
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
+        r.header(KVM_VM_STATE_MAGIC, KVM_VM_STATE_SCHEMA)?;
         let state = match r.u8()? {
             1 => {
                 let clock = r.u64()?;
@@ -1016,7 +1024,7 @@ mod tests {
         X86Special, X86VmState, XstateComponent, arm_register_class, common_tsc_offset,
     };
     use devices::legacy::kvm_state::{CPU, descriptors, sys};
-    use utils::state::{Reader, Writer};
+    use utils::state::{Error, Reader, StateHeaderError, Writer};
     #[test]
     fn kvm_execution_common_clock_preserves_offset_and_nanosecond_units() {
         assert_eq!(
@@ -1166,6 +1174,21 @@ mod tests {
         let mut writer = Writer::new(131072);
         state.encode(&mut writer).unwrap();
         let bytes = writer.finish();
+        for offset in [0, 8] {
+            let mut wrong = bytes.clone();
+            wrong[offset] ^= 1;
+            let result = KvmCpuState::decode(&mut Reader::new(&wrong));
+            match offset {
+                0 => assert!(matches!(
+                    result,
+                    Err(Error::Header(StateHeaderError::Magic { .. }))
+                )),
+                _ => assert!(matches!(
+                    result,
+                    Err(Error::Header(StateHeaderError::Schema { .. }))
+                )),
+            }
+        }
         for end in 0..bytes.len() {
             assert!(KvmCpuState::decode(&mut Reader::new(&bytes[..end])).is_err());
         }
@@ -1187,7 +1210,13 @@ mod tests {
         };
         s.inventory.push(s.inventory[0].clone());
         assert!(broken.validate().is_err());
-        assert!(KvmCpuState::decode(&mut Reader::new(&[1, 0, 255, 255, 255, 255])).is_err());
+        let mut writer = Writer::new(16);
+        writer.header(b"KRUNKCPU", 1).unwrap();
+        writer.fixed(&[1, 0, 255, 255, 255, 255]).unwrap();
+        assert_eq!(
+            KvmCpuState::decode(&mut Reader::new(&writer.finish())),
+            Err(Error::Limit)
+        );
     }
     #[test]
     fn kvm_execution_offline_and_active_count_mode_are_distinct() {
@@ -1273,6 +1302,21 @@ mod tests {
         let mut reader = Reader::new(&bytes);
         assert_eq!(KvmVmState::decode(&mut reader).unwrap(), state);
         reader.finish().unwrap();
+        for offset in [0, 8] {
+            let mut wrong = bytes.clone();
+            wrong[offset] ^= 1;
+            let result = KvmVmState::decode(&mut Reader::new(&wrong));
+            match offset {
+                0 => assert!(matches!(
+                    result,
+                    Err(Error::Header(StateHeaderError::Magic { .. }))
+                )),
+                _ => assert!(matches!(
+                    result,
+                    Err(Error::Header(StateHeaderError::Schema { .. }))
+                )),
+            }
+        }
         let mut broken = state.clone();
         let KvmVmState::Arm64(s) = &mut broken else {
             panic!()
@@ -1344,7 +1388,10 @@ mod tests {
     #[test]
     fn kvm_execution_arm_counter_model_rejects_missing_or_unknown_wire_tag() {
         for bytes in [&[2u8][..], &[2u8, 0][..], &[2u8, 2][..]] {
-            assert!(KvmVmState::decode(&mut Reader::new(bytes)).is_err());
+            let mut writer = Writer::new(16);
+            writer.header(b"KRUNKVMS", 1).unwrap();
+            writer.fixed(bytes).unwrap();
+            assert!(KvmVmState::decode(&mut Reader::new(&writer.finish())).is_err());
         }
     }
     #[test]
@@ -1406,8 +1453,8 @@ mod tests {
             ValidatedExecution, VmExecutionState,
         };
         let expected = StateBinding {
-            native_producer: "exact-native-codec-fixture".into(),
-            silo_producer: [1; 32],
+            live_state_schema: crate::api::capabilities::LIVE_STATE_SCHEMA.into(),
+            architecture: crate::api::capabilities::guest_architecture().into(),
             profile: [2; 32],
             topology: [3; 32],
             ram_layout: [4; 32],

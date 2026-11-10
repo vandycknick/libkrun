@@ -18,6 +18,9 @@ use hvf::remap::HostMemoryRemapper;
 use polly::event_manager::{BarrierKey, BarrierRequest};
 use utils::eventfd::EventFd;
 use utils::state::{Reader, Writer};
+
+pub(crate) const BALLOON_STATE_MAGIC: &[u8; 8] = b"KRUNBALL";
+pub(crate) const BALLOON_STATE_SCHEMA: u16 = 1;
 #[cfg(any(target_os = "macos", feature = "native-device-probe"))]
 use vm_memory::Address;
 use vm_memory::ByteValued;
@@ -998,6 +1001,7 @@ impl Balloon {
     ) -> Result<(u64, VirtioBalloonConfig), ProviderFault> {
         let mut reader = Reader::new(payload);
         let decoded = (|| {
+            reader.header(BALLOON_STATE_MAGIC, BALLOON_STATE_SCHEMA)?;
             if reader.u16()? != 1
                 || reader.u32()? != uapi::VIRTIO_ID_BALLOON
                 || reader.u64()? != available
@@ -1017,7 +1021,7 @@ impl Balloon {
             reader.finish()?;
             Ok((acked, config))
         })();
-        decoded.map_err(|_| ProviderFault::DeviceState)
+        decoded.map_err(ProviderFault::from)
     }
 }
 
@@ -1217,6 +1221,9 @@ impl VirtioStateProvider for Balloon {
         self.callbacks.require_cut(key)?;
         let mut writer = Writer::new(self.state_limit() as usize);
         writer
+            .header(BALLOON_STATE_MAGIC, BALLOON_STATE_SCHEMA)
+            .map_err(ProviderFault::from)?;
+        writer
             .u16(1)
             .and_then(|()| writer.u32(uapi::VIRTIO_ID_BALLOON))
             .and_then(|()| writer.u64(self.avail_features))
@@ -1383,10 +1390,37 @@ mod tests {
             Poll::Ready(_)
         ));
         let payload = balloon.capture_payload(request(1).key).unwrap();
-        assert_eq!(payload.len(), 38);
+        use crate::virtio::lifecycle::ProviderFault;
+        use utils::state::StateHeaderError;
+        assert_eq!(&payload[..10], b"KRUNBALL\x01\x00");
+        let mut wrong_magic = payload.clone();
+        wrong_magic[0] ^= 1;
+        assert!(matches!(
+            balloon.validate_payload(&wrong_magic),
+            Err(ProviderFault::StateHeader(StateHeaderError::Magic { .. }))
+        ));
+        let mut wrong_schema = payload.clone();
+        wrong_schema[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            balloon.validate_payload(&wrong_schema),
+            Err(ProviderFault::StateHeader(StateHeaderError::Schema { expected: 1, found: 2 }))
+        );
+        balloon.validate_payload(&payload).unwrap();
+        let (acked, decoded) = balloon.decode_payload(&payload).unwrap();
+        assert_eq!(acked, balloon.acked_features());
+        assert_eq!(
+            [
+                decoded.num_pages,
+                decoded.actual,
+                decoded.free_page_report_cmd_id,
+                decoded.poison_val,
+            ],
+            [17, 13, 0x12345678, 0x87654321]
+        );
+        assert_eq!(payload.len(), 48);
         let mut config = [0; 16];
         balloon.read_config(0, &mut config);
-        assert_eq!(&payload[22..], &config);
+        assert_eq!(&payload[32..], &config);
         for length in 0..payload.len() {
             assert!(balloon.validate_payload(&payload[..length]).is_err());
         }
@@ -1394,7 +1428,7 @@ mod tests {
         trailing.push(0);
         assert!(balloon.validate_payload(&trailing).is_err());
         let mut wrong_features = payload.clone();
-        wrong_features[14..22].copy_from_slice(&u64::MAX.to_le_bytes());
+        wrong_features[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(balloon.validate_payload(&wrong_features).is_err());
         assert!(balloon.capture_payload(request(2).key).is_err());
     }

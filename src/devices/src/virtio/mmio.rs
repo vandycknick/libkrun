@@ -80,6 +80,42 @@ impl MmioTransportState {
     pub fn validate_payload_binding(&self, payload: &[u8]) -> Result<(), ProviderFault> {
         let mut reader = utils::state::Reader::new(payload);
         let valid = (|| {
+            let (magic, schema) = match self.device_type {
+                #[cfg(not(feature = "tee"))]
+                TYPE_BALLOON => (
+                    crate::virtio::balloon::device::BALLOON_STATE_MAGIC,
+                    crate::virtio::balloon::device::BALLOON_STATE_SCHEMA,
+                ),
+                #[cfg(feature = "blk")]
+                TYPE_BLOCK => (
+                    crate::virtio::block::device::BLOCK_STATE_MAGIC,
+                    crate::virtio::block::device::BLOCK_STATE_SCHEMA,
+                ),
+                #[cfg(feature = "net")]
+                TYPE_NET => (
+                    crate::virtio::net::device::NET_STATE_MAGIC,
+                    crate::virtio::net::device::NET_STATE_SCHEMA,
+                ),
+                #[cfg(not(feature = "tee"))]
+                TYPE_RNG => (
+                    crate::virtio::rng::device::RNG_STATE_MAGIC,
+                    crate::virtio::rng::device::RNG_STATE_SCHEMA,
+                ),
+                TYPE_CONSOLE => (
+                    crate::virtio::console::state::CONSOLE_STATE_MAGIC,
+                    crate::virtio::console::state::CONSOLE_STATE_SCHEMA,
+                ),
+                TYPE_VSOCK => (
+                    crate::virtio::vsock::state::VSOCK_STATE_MAGIC,
+                    crate::virtio::vsock::state::VSOCK_STATE_SCHEMA,
+                ),
+                crate::virtio::generation::DEVICE_TYPE => (
+                    crate::virtio::generation::GENERATION_STATE_MAGIC,
+                    crate::virtio::generation::GENERATION_STATE_SCHEMA,
+                ),
+                _ => return Err(utils::state::Error::Invalid("device state kind")),
+            };
+            reader.header(magic, schema)?;
             Ok::<_, utils::state::Error>(
                 reader.u16()? == 1
                     && reader.u32()? == self.device_type
@@ -87,7 +123,7 @@ impl MmioTransportState {
                     && reader.u64()? == self.acked_features,
             )
         })()
-        .map_err(|_| ProviderFault::DeviceState)?;
+        .map_err(ProviderFault::from)?;
         if !valid || self.acked_features & !self.avail_features != 0 {
             return Err(ProviderFault::DeviceState);
         }
@@ -2623,6 +2659,25 @@ pub(crate) mod tests {
             transport.lifecycle_snapshot().stage,
             ProviderStage::Quiesced
         );
+        use utils::state::StateHeaderError;
+        let state = transport.capture_transport(request.key).unwrap();
+        let payload = transport.capture_device_state(request.key).unwrap();
+        state.validate_payload_binding(&payload).unwrap();
+        let mut wrong_magic = payload.clone();
+        wrong_magic[0] ^= 1;
+        assert!(matches!(
+            state.validate_payload_binding(&wrong_magic),
+            Err(ProviderFault::StateHeader(StateHeaderError::Magic { .. }))
+        ));
+        let mut wrong_schema = payload.clone();
+        wrong_schema[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            state.validate_payload_binding(&wrong_schema),
+            Err(ProviderFault::StateHeader(StateHeaderError::Schema { expected: 1, found: 2 }))
+        );
+        for length in 0..10 {
+            assert_eq!(state.validate_payload_binding(&payload[..length]), Err(ProviderFault::DeviceState));
+        }
         assert_eq!(transport.device_status, device_status::INIT);
         assert_eq!(
             transport.queues.as_ref().unwrap()[0]

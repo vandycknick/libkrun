@@ -1,4 +1,4 @@
-mod device;
+pub(crate) mod device;
 mod event_handler;
 
 pub use self::defs::uapi::VIRTIO_ID_RNG as TYPE_RNG;

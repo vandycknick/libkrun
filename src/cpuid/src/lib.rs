@@ -10,11 +10,6 @@
 
 #![cfg(target_arch = "x86_64")]
 
-/// Package-local compiled feature and build-input observations.
-pub mod build_facts {
-    include!(concat!(env!("OUT_DIR"), "/live_build.rs"));
-}
-
 use kvm_bindings::CpuId;
 
 mod common;

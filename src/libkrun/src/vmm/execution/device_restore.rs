@@ -8,6 +8,7 @@ use crate::vmm::device_manager::quiescence::AttachmentIdentity;
 use crate::vmm::execution::StateBinding;
 
 const DEVICE_MAGIC: &[u8; 8] = b"KRUNDEVS";
+const DEVICE_STATE_SCHEMA: u16 = 1;
 const MAX_DEVICE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DEVICE_PAYLOAD: usize = 262144;
 
@@ -16,7 +17,7 @@ fn payload_limit(device_type: u32) -> Result<usize, utils::state::Error> {
         1 => Ok(131072),
         2 | 5 => Ok(4096),
         3 => Ok(MAX_DEVICE_PAYLOAD),
-        4 => Ok(22),
+        4 => Ok(32),
         19 => Ok(65536),
         devices::virtio::generation::DEVICE_TYPE => {
             Ok(devices::virtio::generation::STATE_LIMIT as usize)
@@ -139,7 +140,12 @@ impl DeviceEnvelope {
             }
             state
                 .validate_payload_binding(&record.payload)
-                .map_err(|_| Error::Invalid("device payload transport binding"))?;
+                .map_err(|error| match error {
+                    devices::virtio::lifecycle::ProviderFault::StateHeader(header) => {
+                        Error::Header(header)
+                    }
+                    _ => Error::Invalid("device payload transport binding"),
+                })?;
             total = total
                 .checked_add(record.payload.len())
                 .ok_or(Error::Overflow)?;
@@ -155,8 +161,7 @@ impl DeviceEnvelope {
         use utils::state::Writer;
         self.validate()?;
         let mut writer = Writer::new(MAX_DEVICE_BYTES);
-        writer.fixed(DEVICE_MAGIC)?;
-        writer.u16(1)?;
+        writer.header(DEVICE_MAGIC, DEVICE_STATE_SCHEMA)?;
         self.binding.encode(&mut writer)?;
         writer.count(self.records.len(), 256)?;
         for record in &self.records {
@@ -204,9 +209,7 @@ impl DeviceEnvelope {
             return Err(Error::Limit);
         }
         let mut reader = Reader::new(bytes);
-        if &reader.fixed::<8>()? != DEVICE_MAGIC || reader.u16()? != 1 {
-            return Err(Error::Invalid("device envelope version"));
-        }
+        reader.header(DEVICE_MAGIC, DEVICE_STATE_SCHEMA)?;
         let binding = StateBinding::decode(&mut reader)?;
         let count = reader.count(256, 79)?;
         let mut records = Vec::with_capacity(count);
@@ -523,9 +526,6 @@ impl PreparedDeviceInstall {
         io_bus: devices::Bus,
         mmio_bus: devices::Bus,
     ) -> Result<Self, String> {
-        if !binding.native_producer.starts_with("diagnostic-only;") {
-            return Err("diagnostic producer required".into());
-        }
         let mut result = Self::empty(binding);
         result.diagnostic_buses = Some((io_bus, mmio_bus));
         Ok(result)
@@ -570,8 +570,8 @@ pub(crate) mod tests {
             irq: 5,
         };
         let binding = StateBinding {
-            native_producer: "exact-native-test-producer".into(),
-            silo_producer: [1; 32],
+            live_state_schema: crate::api::capabilities::LIVE_STATE_SCHEMA.into(),
+            architecture: crate::api::capabilities::guest_architecture().into(),
             profile: [2; 32],
             topology: [3; 32],
             ram_layout: [4; 32],
@@ -579,7 +579,8 @@ pub(crate) mod tests {
             pause_generation: 1,
             capture: [6; 16],
         };
-        let mut writer = utils::state::Writer::new(22);
+        let mut writer = utils::state::Writer::new(32);
+        writer.header(b"KRUNRNGS", 1).unwrap();
         writer.u16(1).unwrap();
         writer.u32(state.device_type).unwrap();
         writer.u64(state.avail_features).unwrap();
@@ -734,15 +735,34 @@ pub(crate) mod tests {
         };
         let bytes = envelope.encode().unwrap();
         assert_eq!(DeviceEnvelope::decode(&bytes).unwrap(), envelope);
+        for offset in [0, 8] {
+            let mut wrong = bytes.clone();
+            wrong[offset] ^= 1;
+            let result = DeviceEnvelope::decode(&wrong);
+            match offset {
+                0 => assert!(matches!(
+                    result,
+                    Err(utils::state::Error::Header(
+                        utils::state::StateHeaderError::Magic { .. }
+                    ))
+                )),
+                _ => assert!(matches!(
+                    result,
+                    Err(utils::state::Error::Header(
+                        utils::state::StateHeaderError::Schema { .. }
+                    ))
+                )),
+            }
+        }
         for end in 0..bytes.len() {
             assert!(DeviceEnvelope::decode(&bytes[..end]).is_err());
         }
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(DeviceEnvelope::decode(&trailing).is_err());
-        envelope.records[0].payload[0] = 2;
+        envelope.records[0].payload[8] = 2;
         assert!(envelope.encode().is_err());
-        envelope.records[0].payload[0] = 1;
+        envelope.records[0].payload[8] = 1;
         envelope.records[0].state.acked_features = 1;
         assert!(envelope.encode().is_err());
     }

@@ -1152,7 +1152,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].identity, identity);
         assert!(!records[0].state.activated);
-        assert_eq!(records[0].payload.len(), 22);
+        assert_eq!(records[0].payload.len(), 32);
         let transport = inventory.attachments[0].transport.clone();
         let device = inventory.attachments[0].device.clone();
         inventory.retain_transport(identity, transport, device);

@@ -13,7 +13,7 @@ use utils::eventfd::{EFD_NONBLOCK, EventFd};
 ))]
 use vm_memory::GuestMemoryMmap;
 
-use crate::api::capabilities::execution_state_producer;
+use crate::api::capabilities::{LIVE_STATE_SCHEMA, guest_architecture};
 use crate::vmm::Vmm;
 #[cfg(any(target_os = "macos", feature = "native-execution-probe"))]
 use crate::vmm::builder::setup_vm;
@@ -119,8 +119,12 @@ pub(crate) fn build_restore_prepared(
     {
         return Err(refusal("execution/device attachment identity mismatch"));
     }
-    if saved.binding.native_producer != execution_state_producer().map_err(refusal)? {
-        return Err(refusal("restore exact native producer mismatch"));
+    if saved.binding.live_state_schema != LIVE_STATE_SCHEMA
+        || saved.binding.architecture != guest_architecture()
+    {
+        return Err(refusal(
+            "restore live state schema or architecture mismatch",
+        ));
     }
     #[cfg(feature = "native-execution-probe")]
     let cpu_only_fixture = devices.diagnostic_buses.is_some();

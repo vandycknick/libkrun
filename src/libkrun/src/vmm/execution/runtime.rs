@@ -323,17 +323,18 @@ impl Vmm {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))] profile: &KvmCaptureProfile,
         cpu_only_fixture: bool,
     ) -> Result<(), String> {
-        use crate::api::capabilities::execution_state_producer;
+        use crate::api::capabilities::{LIVE_STATE_SCHEMA, guest_architecture};
         binding.validate().map_err(|error| error.to_string())?;
         if binding.pause_generation != barrier.key.generation.0 {
             return Err("capture pause generation mismatch".into());
         }
-        if binding.native_producer != execution_state_producer()? {
-            return Err("capture exact native producer mismatch".into());
+        if binding.live_state_schema != LIVE_STATE_SCHEMA
+            || binding.architecture != guest_architecture()
+        {
+            return Err("capture live state schema or architecture mismatch".into());
         }
         if cpu_only_fixture {
             if !cfg!(feature = "native-execution-probe")
-                || !binding.native_producer.starts_with("diagnostic-only;")
                 || self.mmio_device_manager.quiescence.has_transports()
                 || !self
                     .mmio_device_manager

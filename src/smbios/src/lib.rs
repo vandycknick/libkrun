@@ -1,8 +1,3 @@
-/// Package-local compiled feature and build-input observations.
-pub mod build_facts {
-    include!(concat!(env!("OUT_DIR"), "/live_build.rs"));
-}
-
 use crate::table::{BiosInfo, EndOfTable, Entrypoint30, OemStrings, SystemInfo};
 use std::fmt::Display;
 use std::{fmt, mem, result};

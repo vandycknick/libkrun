@@ -35,6 +35,21 @@ The probe reports a cleanup deadline as failure, never as successful reap.
 These ownership rules do not turn `memory.fixture` into a baseline or production
 RAM image, and grant no additional qualification.
 
+### Device state headers
+
+Each encoded device payload starts with an eight-byte magic and a little-endian
+`u16` schema, checked before the existing codec version and device binding fields.
+Schema 1 uses `KRUNBALL` (balloon), `KRUNBLKS` (block), `KRUNNETS` (network),
+`KRUNRNGS` (entropy), `KRUNVSKS` (vsock), `KRUNCONS` (console), `KRUNGENS`
+(generation), and `KRUNLEGS` (each legacy device record). Magic and schema
+mismatches retain typed expected/found errors through the provider boundary;
+truncated headers fail decoding. Queue and MMIO transport snapshots are
+sub-records of the independently versioned device envelope, not standalone codecs.
+The RNG payload is now 32 bytes; generation payloads retain their existing
+conditional receipt fields after the new ten-byte header. Older unheaded payloads
+are intentionally rejected, not migrated.
+
+
 ### Candidate-only integrated hardware IRQ witness
 
 Linux x86_64 builds with `native-device-probe`, `blk` and `net` expose the
@@ -65,15 +80,11 @@ never initialize, register source observers, replace the IDT, or reseed native
 state through this API. Generation, activation and thaw remain the normal owner
 barriers.
 
-The candidate-only capability helpers `diagnostic_execution_producer`,
-`diagnostic_lane` and `query_diagnostic_live_host` retain the actual diagnostic
-build identity. The producer is byte-identical to the native envelope producer.
-The lane still requires complete, clean package bindings and refuses TEE,
-Nitro, control-probe and other unsupported device profiles. The diagnostic host
-query reuses the real machine-less KVM observations and existing prerequisite
-reducers. Ordinary `query_live_host`, `binding_complete`, `execution_producer`
-and `NativeLane::from_build` continue to exclude diagnostic builds; none of
-these helpers changes production admission or qualifies the IRQ experiment.
+The diagnostic host query reuses the real machine-less KVM observations and
+prerequisite reducers. Capture and restore compatibility use the native
+`silo.live-state/1` schema and guest architecture, never source/build identity.
+Neither diagnostic query access nor schema compatibility grants live operations
+or qualifies the IRQ experiment.
 
 ## Required evidence, not a reduced production gate
 
@@ -425,7 +436,7 @@ must identify distinct source/destination processes.
 Each captured generation contains:
 
 - `execution.state`: actual production bounded canonical codec bytes, including
-  exact native package/source/build facts, ABI/profile/cut/topology/RAM bindings,
+  live-state schema and architecture, ABI/profile/cut/topology/RAM identities,
   effective CPUID, complete raw/classified MSR inventory and values, MCG_CAP,
   full dynamic XSAVE extent/component layout, GPR/special/debug/events/MP state,
   original deadlines, LAPIC, PIT, PIC/IOAPIC and common source clock tuple.
@@ -433,7 +444,7 @@ Each captured generation contains:
   state, not a second codec or substituted inventory.
 - `memory.fixture`: exactly the stopped fixture's bounded RAM, after native
   controller/CPU capture. This is not a production RAM-image format.
-- `capture.json`: scope, case, CPU count, strict malformed/profile/producer/
+- `capture.json`: scope, case, CPU count, strict malformed/profile/schema/
   missing-participant refusals, repeated capture equality and a real exclusive
   output failure followed by equality-preserving recapture.
   MSR batch counts are explicitly labelled **derived from successfully checked
@@ -702,9 +713,8 @@ Supply the actual Silo netd executable and ordinary production ELF kernel.
 There is no socketpair substitute for netd, external dependency installation,
 SDK build, PIT reset, guest CPUID reduction or reduced network feature mask.
 The offered network offloads match Silo's current production compatibility
-mask. The exact native producer binding must be available in the build; an
-incomplete/dirty producer observation is a refusal, not a diagnostic fallback.
-Follow Main's existing clean-source build/binding procedure.
+mask. Both binaries use the same declared state schema and guest architecture;
+checkout cleanliness and source-build identity are not restore criteria.
 
 The controller creates two new bounded 128 MiB raw files and runs
 `mkfs.ext4` on those new files only. They are mounted by the actual guest, never
@@ -965,25 +975,15 @@ target above for both baseline and execution-completeness controller runs;
 neither mode skips the negative gate. These diagnostic runs do not establish
 production qualification. The witness build explicitly enables
 `native-device-probe`, forwards only its diagnostic instrumentation to devices,
-and is excluded from native live-profile eligibility. It retains ordinary
-production execution, controller, legacy and device-provider implementations.
+and retains ordinary production execution, controller, legacy and
+device-provider implementations.
 It does not enable the CPU-only release path for attached production devices.
-Use Main's established exact source/build-binding procedure for both binaries.
-Both diagnostic drivers share the common metadata owner's existing
-`diagnostic-only;` canonical producer format. It records actual package,
-compiler, feature and clean/dirty/unknown source facts without claiming a
-production binding. Caller binding material includes the actual helper binary
-hash. The production `execution_producer`, `binding_complete` and live-profile
-eligibility checks remain strict; no dirty build or diagnostic feature is
-relabeled production-eligible.
-The same actual-build producer selector is used by both drivers, common capture
-admission and fresh restore admission; expected producer equality is exact at
-each consumer. Diagnostic build provenance is independent of CPU-only fixture
-scope. Only the explicit empty-inventory capture mode or actual prepared
-diagnostic buses select the CPU-only fixture path, never a producer-string
-prefix. A diagnostic build exercising real attached providers still requires
-the exact whole-machine pause, full device/legacy capture, attachment identity
-matching and all normal provider restore validation.
+Both diagnostic drivers use the same native live-state schema and architecture
+checks as common capture and fresh restore. CPU-only fixture scope remains
+independent of compatibility. Only the explicit empty-inventory capture mode or
+actual prepared diagnostic buses select that path. A diagnostic build exercising
+real attached providers still requires the exact whole-machine pause, full
+device/legacy capture, attachment identity matching and normal restore validation.
 
 `network-echo-<monotonic-ns>.json` and its transition log retain actual host datagram receive
 counts, accepted echo-send counts, owned netd peers and the last bounded packet
@@ -1899,11 +1899,10 @@ restore inputs, prepared restore tokens and explicit activation fences.
 The standalone diagnostic API above is not a substitute for exercising
 these production interfaces.
 
-Production execution identity requires complete, clean native build
-provenance. A dirty or unknown source tree cannot produce an authenticated
-production capture merely because it compiles. Rebuild after establishing
-the clean source revision; never relabel a diagnostic producer or bypass
-`execution_producer()` to run the production proof.
+Production execution compatibility requires matching native live-state schema
+and guest architecture. Source revision, compiler identity and checkout
+cleanliness are not compatibility criteria. State-object authentication and
+capture/profile/topology/RAM consistency checks still apply.
 
 Cold-boot kernel console replacement accepts `console=` as the last command-line
 argument, without requiring a trailing space or another boot option. The

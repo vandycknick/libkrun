@@ -65,7 +65,7 @@ class GenerationEvidenceTests(unittest.TestCase):
                   + struct.pack("<Q", native["processed_sequence"]) + bytes(native["processed_id"])
                   + struct.pack("<IQ", native["flags"], native["clock_latch"]))
         receipt = b"\x01" + struct.pack("<Q", prior["sequence"]) + bytes(prior["id"]) + struct.pack("<I", prior["flags"])
-        payload = prefix + config + receipt + b"\x01"
+        payload = b"KRUNGENS\x01\x00" + prefix + config + receipt + b"\x01"
         transport = {
             "bytes": len(payload), "config_generation": native["config_generation"],
             "interrupt_status": 0, "avail_features": 1 << 32, "acked_features": 1 << 32,
@@ -81,7 +81,9 @@ class GenerationEvidenceTests(unittest.TestCase):
     def test_pending_capture_reports_actual_serialized_tuple_raw_receipt_and_latch(self):
         native, prior, payload, transport = self.capture_case()
         evidence = validate_capture(payload, self.metadata(transport), native, native.copy(), prior)
-        self.assertEqual(evidence["payload_bytes"], 120)
+        self.assertEqual(evidence["payload_bytes"], 130)
+        self.assertEqual(evidence["serialized"]["schema"], 1)
+        self.assertEqual(evidence["serialized"]["codec_version"], 1)
         self.assertEqual(evidence["serialized"]["sequence"], native["sequence"])
         self.assertEqual(evidence["serialized"]["processed_sequence"], native["processed_sequence"])
         self.assertEqual(evidence["serialized"]["processed_id"], native["processed_id"])
@@ -95,7 +97,7 @@ class GenerationEvidenceTests(unittest.TestCase):
             with self.subTest(staged_id_words=words):
                 raw = bytes(native["id"][:words * 4] + prior["id"][words * 4:])
                 partial = {**native, "processed_id": list(raw)}
-                changed = payload[:62] + raw + payload[78:]
+                changed = payload[:72] + raw + payload[88:]
                 validate_capture(changed, self.metadata(transport), partial, partial.copy(), prior)
         asserted = {key: 2 if "interrupt_status" in key else value for key, value in transport.items()}
         validate_capture(payload, self.metadata(asserted), native, native.copy(), prior)
@@ -129,7 +131,7 @@ class GenerationEvidenceTests(unittest.TestCase):
             missing = {name: value for name, value in transport.items() if name != key}
             with self.subTest(missing=key), self.assertRaises(ValueError):
                 validate_capture(payload, self.metadata(missing), native, native.copy(), prior)
-        for metadata in (b"", b"bytes=120 bytes=120", b"bytes=invalid"):
+        for metadata in (b"", b"bytes=130 bytes=130", b"bytes=invalid"):
             with self.subTest(metadata=metadata), self.assertRaises(ValueError):
                 validate_capture(payload, metadata, native, native.copy(), prior)
         for key, value in (("deadline", "renewed"), ("outcome", "deadline"),

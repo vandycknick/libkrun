@@ -20,7 +20,7 @@ pub(crate) mod packet;
 pub mod pressure;
 mod proxy;
 mod reaper;
-mod state;
+pub(crate) mod state;
 #[cfg(target_os = "macos")]
 mod timesync;
 mod tsi_dgram;

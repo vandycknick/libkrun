@@ -6,6 +6,9 @@ use std::time::Instant;
 use polly::event_manager::{BarrierKey, BarrierRequest};
 use utils::state::{Reader, Writer};
 
+pub(crate) const VSOCK_STATE_MAGIC: &[u8; 8] = b"KRUNVSKS";
+pub(crate) const VSOCK_STATE_SCHEMA: u16 = 1;
+
 use crate::virtio::lifecycle::{
     ActivationExposure, DormantDeviceContext, LifecycleJournal, ProviderBeginError, ProviderFault,
     ProviderStage, QuiesceCompletion, ResumeAcceptance, VirtioStateProvider,
@@ -82,6 +85,7 @@ impl Saved {
     fn encode(&self) -> Result<Vec<u8>, ProviderFault> {
         let mut writer = Writer::new(LIMIT as usize);
         let result = (|| {
+            writer.header(VSOCK_STATE_MAGIC, VSOCK_STATE_SCHEMA)?;
             writer.u16(1)?;
             writer.u32(uapi::VIRTIO_ID_VSOCK)?;
             writer.u64(self.available)?;
@@ -109,6 +113,7 @@ impl Saved {
         }
         let mut reader = Reader::new(payload);
         let result = (|| {
+            reader.header(VSOCK_STATE_MAGIC, VSOCK_STATE_SCHEMA)?;
             if reader.u16()? != 1 || reader.u32()? != uapi::VIRTIO_ID_VSOCK {
                 return Err(utils::state::Error::Invalid("vsock payload kind"));
             }
@@ -155,7 +160,7 @@ impl Saved {
                 next_source_port,
             })
         })();
-        result.map_err(|_| ProviderFault::DeviceState)
+        result.map_err(ProviderFault::from)
     }
 }
 
@@ -1695,6 +1700,20 @@ mod tests {
         let completed = quiesce(&mut source, cut);
         assert!(completed.queues.is_empty());
         let payload = source.capture_payload(cut.key).unwrap();
+        use utils::state::StateHeaderError;
+        assert_eq!(&payload[..10], b"KRUNVSKS\x01\x00");
+        let mut wrong_magic = payload.clone();
+        wrong_magic[0] ^= 1;
+        assert!(matches!(
+            source.validate_payload(&wrong_magic),
+            Err(ProviderFault::StateHeader(StateHeaderError::Magic { .. }))
+        ));
+        let mut wrong_schema = payload.clone();
+        wrong_schema[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            source.validate_payload(&wrong_schema),
+            Err(ProviderFault::StateHeader(StateHeaderError::Schema { expected: 1, found: 2 }))
+        );
         let (mut destination, _destination_control, _) = bound();
         assert_eq!(
             destination.validate_restore(&payload),
@@ -1709,7 +1728,7 @@ mod tests {
         trailing.push(0);
         assert!(destination.validate_payload(&trailing).is_err());
         let mut wrong_cid = payload.clone();
-        wrong_cid[22] ^= 1;
+        wrong_cid[32] ^= 1;
         assert!(destination.validate_restore(&wrong_cid).is_err());
         let unsupported = Vsock::new(3, None, None, TsiFlags::HIJACK_INET).unwrap();
         assert_eq!(unsupported.preflight(), Err(ProviderFault::Unsupported));

@@ -980,8 +980,8 @@ mod tests {
 
     fn inputs(files: &[TempFile; 4]) -> RestoreInputs {
         let binding = crate::api::live::StateBinding {
-            native_producer: "test-native-producer".into(),
-            silo_producer: [1; 32],
+            live_state_schema: crate::api::capabilities::LIVE_STATE_SCHEMA.into(),
+            architecture: crate::api::capabilities::guest_architecture().into(),
             profile: [2; 32],
             topology: [3; 32],
             ram_layout: [4; 32],

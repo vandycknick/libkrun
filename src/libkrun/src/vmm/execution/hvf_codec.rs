@@ -1,6 +1,11 @@
 use crate::vmm::execution::{HvfVmState, hvf};
 use utils::state::{Error, Reader, Writer};
 
+const HVF_CPU_STATE_MAGIC: &[u8; 8] = b"KRUNHCPU";
+const HVF_CPU_STATE_SCHEMA: u16 = 1;
+const HVF_VM_STATE_MAGIC: &[u8; 8] = b"KRUNHVMS";
+const HVF_VM_STATE_SCHEMA: u16 = 1;
+
 fn put_registers(values: &[hvf::RegisterValue], w: &mut Writer) -> Result<(), Error> {
     w.count(values.len(), 128)?;
     for value in values {
@@ -26,6 +31,7 @@ pub fn encode_cpu(state: &hvf::CpuState, w: &mut Writer) -> Result<(), Error> {
     state
         .validate()
         .map_err(|_| Error::Invalid("HVF CPU inventory"))?;
+    w.header(HVF_CPU_STATE_MAGIC, HVF_CPU_STATE_SCHEMA)?;
     w.u8(state.logical_id)?;
     w.u64(state.mpidr)?;
     w.u64(state.frequency)?;
@@ -66,6 +72,7 @@ pub fn encode_cpu(state: &hvf::CpuState, w: &mut Writer) -> Result<(), Error> {
 }
 
 pub fn decode_cpu(r: &mut Reader<'_>) -> Result<hvf::CpuState, Error> {
+    r.header(HVF_CPU_STATE_MAGIC, HVF_CPU_STATE_SCHEMA)?;
     let logical_id = r.u8()?;
     let mpidr = r.u64()?;
     let frequency = r.u64()?;
@@ -146,6 +153,7 @@ pub fn encode_vm(state: &HvfVmState, w: &mut Writer) -> Result<(), Error> {
         .gic
         .validate()
         .map_err(|_| Error::Invalid("HVF GIC"))?;
+    w.header(HVF_VM_STATE_MAGIC, HVF_VM_STATE_SCHEMA)?;
     w.u64(state.clock.host_counter)?;
     w.u64(state.clock.frequency)?;
     w.u32(state.clock.timebase_numer)?;
@@ -158,6 +166,7 @@ pub fn encode_vm(state: &HvfVmState, w: &mut Writer) -> Result<(), Error> {
 }
 
 pub fn decode_vm(r: &mut Reader<'_>) -> Result<HvfVmState, Error> {
+    r.header(HVF_VM_STATE_MAGIC, HVF_VM_STATE_SCHEMA)?;
     let clock = hvf::ClockCut {
         host_counter: r.u64()?,
         frequency: r.u64()?,
@@ -177,4 +186,56 @@ pub fn decode_vm(r: &mut Reader<'_>) -> Result<HvfVmState, Error> {
     clock.validate().map_err(|_| Error::Invalid("HVF clock"))?;
     gic.validate().map_err(|_| Error::Invalid("HVF GIC"))?;
     Ok(HvfVmState { clock, gic })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::vmm::execution::hvf_codec::{decode_cpu, decode_vm, encode_cpu, encode_vm};
+    use crate::vmm::execution::{CpuExecutionState, VmExecutionState};
+    use utils::state::{Error, Reader, StateHeaderError, Writer};
+
+    #[test]
+    fn hvf_cpu_and_vm_codecs_roundtrip_and_reject_wrong_headers() {
+        let envelope = crate::vmm::execution::tests::envelope();
+        let CpuExecutionState::Hvf(cpu) = &envelope.cpus[0] else {
+            panic!("HVF fixture required");
+        };
+        let VmExecutionState::Hvf(vm) = &envelope.vm else {
+            panic!("HVF fixture required");
+        };
+        let mut writer = Writer::new(65536);
+        encode_cpu(cpu, &mut writer).unwrap();
+        let cpu_bytes = writer.finish();
+        let mut reader = Reader::new(&cpu_bytes);
+        assert_eq!(&decode_cpu(&mut reader).unwrap(), cpu);
+        reader.finish().unwrap();
+        let mut writer = Writer::new(65536);
+        encode_vm(vm, &mut writer).unwrap();
+        let vm_bytes = writer.finish();
+        let mut reader = Reader::new(&vm_bytes);
+        assert_eq!(&decode_vm(&mut reader).unwrap(), vm);
+        reader.finish().unwrap();
+        for (bytes, is_cpu) in [(cpu_bytes, true), (vm_bytes, false)] {
+            for offset in [0, 8] {
+                let mut wrong = bytes.clone();
+                wrong[offset] ^= 1;
+                let mut reader = Reader::new(&wrong);
+                let result = if is_cpu {
+                    decode_cpu(&mut reader).map(|_| ())
+                } else {
+                    decode_vm(&mut reader).map(|_| ())
+                };
+                match offset {
+                    0 => assert!(matches!(
+                        result,
+                        Err(Error::Header(StateHeaderError::Magic { .. }))
+                    )),
+                    _ => assert!(matches!(
+                        result,
+                        Err(Error::Header(StateHeaderError::Schema { .. }))
+                    )),
+                }
+            }
+        }
+    }
 }

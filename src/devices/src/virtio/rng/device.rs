@@ -5,6 +5,9 @@ use rand::{TryRng, rngs::SysRng};
 use utils::eventfd::EventFd;
 use utils::state::{Reader, Writer};
 
+pub(crate) const RNG_STATE_MAGIC: &[u8; 8] = b"KRUNRNGS";
+pub(crate) const RNG_STATE_SCHEMA: u16 = 1;
+
 use vm_memory::{GuestAddress, GuestMemoryError};
 
 use crate::virtio::InterruptTransport;
@@ -137,6 +140,7 @@ impl Rng {
     ) -> std::result::Result<u64, ProviderFault> {
         let mut reader = Reader::new(payload);
         let decoded = (|| {
+            reader.header(RNG_STATE_MAGIC, RNG_STATE_SCHEMA)?;
             if reader.u16()? != 1
                 || reader.u32()? != uapi::VIRTIO_ID_RNG
                 || reader.u64()? != available
@@ -150,7 +154,7 @@ impl Rng {
             reader.finish()?;
             Ok(acked)
         })();
-        decoded.map_err(|_| ProviderFault::DeviceState)
+        decoded.map_err(ProviderFault::from)
     }
 }
 
@@ -368,12 +372,15 @@ impl VirtioStateProvider for Rng {
     }
 
     fn state_limit(&self) -> u32 {
-        22
+        32
     }
 
     fn capture_payload(&self, key: BarrierKey) -> std::result::Result<Vec<u8>, ProviderFault> {
         self.callbacks.require_cut(key)?;
         let mut writer = Writer::new(self.state_limit() as usize);
+        writer
+            .header(RNG_STATE_MAGIC, RNG_STATE_SCHEMA)
+            .map_err(ProviderFault::from)?;
         writer
             .u16(1)
             .and_then(|()| writer.u32(uapi::VIRTIO_ID_RNG))
@@ -525,7 +532,24 @@ mod tests {
             Poll::Pending
         ));
         let payload = source.capture_payload(request(1).key).unwrap();
-        assert_eq!(payload.len(), 22);
+        assert_eq!(payload.len(), 32);
+        use utils::state::StateHeaderError;
+        assert_eq!(&payload[..10], b"KRUNRNGS\x01\x00");
+        let mut wrong_magic = payload.clone();
+        wrong_magic[0] ^= 1;
+        assert!(matches!(
+            source.validate_payload(&wrong_magic),
+            Err(ProviderFault::StateHeader(StateHeaderError::Magic { .. }))
+        ));
+        let mut wrong_schema = payload.clone();
+        wrong_schema[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            source.validate_payload(&wrong_schema),
+            Err(ProviderFault::StateHeader(StateHeaderError::Schema { expected: 1, found: 2 }))
+        );
+        for length in 0..10 {
+            assert_eq!(source.validate_payload(&payload[..length]), Err(ProviderFault::DeviceState));
+        }
         assert_eq!(
             source.validate_payload(&[]),
             Err(ProviderFault::DeviceState)
@@ -685,7 +709,7 @@ mod tests {
             panic!("pause lost queues");
         };
         assert_eq!(
-            &rng.capture_payload(request(1).key).unwrap()[14..22],
+            &rng.capture_payload(request(1).key).unwrap()[24..32],
             &negotiated.to_le_bytes()
         );
         assert!(matches!(
@@ -708,8 +732,8 @@ mod tests {
         };
         assert!(completion.queues.is_empty());
         let payload = rng.capture_payload(request(3).key).unwrap();
-        assert_eq!(payload.len(), 22);
-        assert_eq!(&payload[14..22], &[0; 8]);
+        assert_eq!(payload.len(), 32);
+        assert_eq!(&payload[24..32], &[0; 8]);
         assert!(matches!(
             rng.begin_resume(request(4), completion.queues),
             ResumeAcceptance::Accepted

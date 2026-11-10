@@ -7,11 +7,6 @@
 
 //! Emulates virtual and hardware devices.
 
-/// Package-local compiled feature and build-input observations.
-pub mod build_facts {
-    include!(concat!(env!("OUT_DIR"), "/live_build.rs"));
-}
-
 #[macro_use]
 extern crate log;
 

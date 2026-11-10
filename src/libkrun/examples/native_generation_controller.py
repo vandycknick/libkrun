@@ -75,9 +75,10 @@ def validate_capture(payload: bytes, metadata: bytes, before: dict, after: dict,
         raise ValueError("capture changed the stopped pending state or original deadline")
     if before["committed_sequence"] != prior["sequence"] or not 0 < prior["sequence"] < before["sequence"]:
         raise ValueError("capture lacks the independently observed prior committed receipt")
-    # Common binding prefix, all 17 config words, present committed tuple, history.
+    # State magic/schema, common binding prefix, config, committed tuple, history.
+    header = b"KRUNGENS\x01\x00"
     layout = struct.Struct("<HIQQIIQ16sQ16sIQBQ16sIB")
-    expected = layout.pack(
+    expected = header + layout.pack(
         1, 0x5347, 1 << 32, 1 << 32,
         1, before["driver_status"], before["sequence"], bytes(before["id"]),
         before["processed_sequence"], bytes(before["processed_id"]),
@@ -88,7 +89,7 @@ def validate_capture(payload: bytes, metadata: bytes, before: dict, after: dict,
         raise ValueError("serialized pending request/raw ACK/receipt/clock/history differs from native observations")
     transport = {key: int(value) for key, value in fields(metadata).items()}
     expected_transport = {
-        "bytes": layout.size, "config_generation": before["config_generation"],
+        "bytes": len(header) + layout.size, "config_generation": before["config_generation"],
         "interrupt_status": transport.get("before_interrupt_status"),
         "avail_features": 1 << 32, "acked_features": 1 << 32,
         "before_config_generation": before["config_generation"],
@@ -99,12 +100,12 @@ def validate_capture(payload: bytes, metadata: bytes, before: dict, after: dict,
     if (transport != expected_transport
             or transport["before_interrupt_status"] not in (0, 2)):
         raise ValueError("captured transport binding/counter/IRQ differs from stopped before/after observations")
-    decoded = layout.unpack(payload)
+    decoded = layout.unpack(payload[len(header):])
     return {
         "scope": "same-source-pending-capture, not fresh-process restore",
         "payload_bytes": len(payload), "payload_sha256": hashlib.sha256(payload).hexdigest(),
         "serialized": {
-            "schema": decoded[0], "device_type": decoded[1],
+            "schema": 1, "codec_version": decoded[0], "device_type": decoded[1],
             "avail_features": decoded[2], "acked_features": decoded[3],
             "version": decoded[4], "driver_status": decoded[5],
             "sequence": decoded[6], "id": list(decoded[7]),
@@ -308,19 +309,8 @@ def main() -> None:
     identity["fault_patch"] = digest(source / "native_generation_fault.patch")
     identity["fault_header"] = digest(source / "native_generation_fault.h")
     identity["production_patch"] = digest(args.production_patch)
-    root = source.parents[2]
-    source_paths = (
-        "Cargo.lock", "src/libkrun/src/vmm/control.rs",
-        "src/libkrun/src/api/vmm_builder/native_device_probe.rs",
-        "src/libkrun/src/api/device_builders.rs",
-        "src/libkrun/src/vmm/execution/device_restore.rs",
-        "src/devices/src/virtio/generation/mod.rs", "src/devices/src/virtio/mmio.rs",
-    )
-    source_hashes = {path: digest(root / path) for path in source_paths}
-    revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True,
-                              text=True, capture_output=True, timeout=5).stdout.strip()
     material = json.dumps(identity, sort_keys=True).encode()
-    for name in ("silo-producer", "profile", "topology", "ram-layout"):
+    for name in ("profile", "topology", "ram-layout"):
         (args.binding / name).write_bytes(hashlib.sha256(name.encode() + material).digest())
     for name in ("source-run", "capture"):
         (args.binding / name).write_bytes(os.urandom(16))
@@ -329,7 +319,6 @@ def main() -> None:
                          ("register-fixture", args.register_fixture.read_bytes(), 0o100755)])
     identity["initramfs"] = digest(args.initramfs)
     save(args.evidence / "inputs.json", {"argv": os.sys.argv, "sha256": identity,
-         "native_revision": revision, "native_source_sha256": source_hashes,
          "diagnostic_kernel_required": args.case != "positive", "vcpus": 2, "ram_mib": 512,
          "generation_deadline_seconds": 5, "controller_bound_seconds": 180,
          "production_guest_patch": "unchanged", "capability_grant": False})

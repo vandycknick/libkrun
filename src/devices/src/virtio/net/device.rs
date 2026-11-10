@@ -25,6 +25,8 @@ use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::ByteValued;
 
 const STATE_LIMIT: usize = 131072;
+pub(crate) const NET_STATE_MAGIC: &[u8; 8] = b"KRUNNETS";
+pub(crate) const NET_STATE_SCHEMA: u16 = 1;
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 #[repr(C, packed)]
@@ -61,6 +63,7 @@ impl NetPayload {
                 return Err(utils::state::Error::Limit);
             }
             let mut reader = Reader::new(payload);
+            reader.header(NET_STATE_MAGIC, NET_STATE_SCHEMA)?;
             if reader.u16()? != 1 || reader.u32()? != TYPE_NET {
                 return Err(utils::state::Error::Invalid("net framing"));
             }
@@ -84,7 +87,7 @@ impl NetPayload {
                 config,
             })
         };
-        decode().map_err(|_| ProviderFault::DeviceState)
+        decode().map_err(ProviderFault::from)
     }
 }
 
@@ -660,6 +663,7 @@ impl VirtioStateProvider for Net {
         self.preflight()?;
         let mut writer = Writer::new(STATE_LIMIT);
         let encode = || -> std::result::Result<Vec<u8>, utils::state::Error> {
+            writer.header(NET_STATE_MAGIC, NET_STATE_SCHEMA)?;
             writer.u16(1)?;
             writer.u32(TYPE_NET)?;
             writer.u64(self.avail_features)?;
@@ -1231,6 +1235,20 @@ mod tests {
         destination
             .validate_restore(&saved)
             .expect("only destination MAC differs");
+        use utils::state::StateHeaderError;
+        assert_eq!(&saved[..10], b"KRUNNETS\x01\x00");
+        let mut wrong_magic = saved.clone();
+        wrong_magic[0] ^= 1;
+        assert!(matches!(
+            destination.validate_restore(&wrong_magic),
+            Err(ProviderFault::StateHeader(StateHeaderError::Magic { .. }))
+        ));
+        let mut wrong_schema = saved.clone();
+        wrong_schema[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            destination.validate_restore(&wrong_schema),
+            Err(ProviderFault::StateHeader(StateHeaderError::Schema { expected: 1, found: 2 }))
+        );
         let (socket, _peer) = UnixDatagram::pair().expect("real source pair");
         let source_only = Net::new_managed("eth0".into(), socket.into(), [2, 0, 0, 0, 0, 1], 0)
             .expect("not a destination binding");
@@ -1245,10 +1263,10 @@ mod tests {
         trailing.push(0);
         assert!(destination.validate_restore(&trailing).is_err());
         let mut unknown = saved.clone();
-        unknown[22] = 2;
+        unknown[32] = 2;
         assert!(destination.validate_restore(&unknown).is_err());
         let mut features = saved;
-        features[6] ^= 1;
+        features[16] ^= 1;
         assert!(destination.validate_restore(&features).is_err());
         let (socket, _peer) = UnixDatagram::pair().expect("real bad MAC pair");
         assert!(

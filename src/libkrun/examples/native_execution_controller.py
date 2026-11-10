@@ -87,8 +87,8 @@ def receive_layout(channel: socket.socket, deadline: float) -> bytes:
 
 
 def send_binding(channel: socket.socket, material: bytes, deadline: float) -> None:
-    if len(material) != 160:
-        raise RuntimeError("layout binding must contain exactly 160 bytes")
+    if len(material) != 128:
+        raise RuntimeError("layout binding must contain exactly 128 bytes")
     pending = memoryview(material)
     while pending:
         channel.settimeout(remaining(deadline))
@@ -170,7 +170,7 @@ def invoke(
             if channel is not None and layout_binding is not None:
                 material, binding_path = layout_binding
                 prepared = receive_layout(channel, deadline)
-                material = material[:96] + layout_digest(prepared) + material[128:]
+                material = material[:64] + layout_digest(prepared) + material[96:]
                 with binding_path.open("xb") as output:
                     os.chmod(output.name, 0o600)
                     output.write(material)
@@ -329,7 +329,7 @@ def main() -> None:
             lane = args.evidence / name
             lane.mkdir(mode=0o700)
             binding = lane / "binding.bin"
-            material = (digest(args.probe) + hashlib.sha256(digest(args.fixture) + digest(args.symbols)).digest()
+            material = (hashlib.sha256(digest(args.fixture) + digest(args.symbols)).digest()
                         + hashlib.sha256(f"cpu-only:{cpus}".encode()).digest()
                         + bytes(32) + os.urandom(32))
             symbols_arg = ":".join(f"{symbols[key]:x}" for key in ("interrupt", "io_complete", "mmio_complete"))
@@ -342,7 +342,7 @@ def main() -> None:
             invoke([str(args.probe), "source", str(source), "LAYOUT_BINDING_FD", str(args.fixture), symbols_arg, str(cpus), case],
                    lane, "source", timeout=120, layout_binding=(material, binding))
             prepared = (lane / "prepared-memory-layout.json").read_bytes()
-            expected_layout = binding.read_bytes()[96:128]
+            expected_layout = binding.read_bytes()[64:96]
             save(lane / "generation-0.authentication.json", authenticate_checkpoint(source, expected_layout, prepared))
             manifest = capture_manifest(source)
             save(lane / "generation-0.manifest.json", manifest)
@@ -384,7 +384,7 @@ class LayoutBindingTests(unittest.TestCase):
     @staticmethod
     def canonical_layout() -> bytes:
         return (
-            b'{"architecture":"x86_64","kind":"ram-layout","packedLength":4096,'
+            b'{"architecture":"x86_64","kind":"ram-layout","magic":"KRUNRAML","packedLength":4096,'
             b'"pageGranule":4096,"regions":[{"guestPhysicalAddress":0,"length":4096,'
             b'"streamOffset":0}],"schema":1,"topology":{"firmwareAddress":0,'
             b'"initrdAddress":4096,"ramAboveGap":0,"ramBelowGap":4096,'
@@ -399,9 +399,9 @@ class LayoutBindingTests(unittest.TestCase):
             native.shutdown(socket.SHUT_WR)
             prepared = receive_layout(controller, time.monotonic() + 1)
             self.assertEqual(prepared, layout)
-            material = b"a" * 96 + layout_digest(prepared) + b"b" * 32
+            material = b"a" * 64 + layout_digest(prepared) + b"b" * 32
             send_binding(controller, material, time.monotonic() + 1)
-            self.assertEqual(socket_receive(native, 160, time.monotonic() + 1), material)
+            self.assertEqual(socket_receive(native, 128, time.monotonic() + 1), material)
             self.assertEqual(native.recv(1), b"")
 
     def test_layout_rejects_bounds_eof_noncanonical_and_extra(self) -> None:
@@ -430,7 +430,7 @@ class LayoutBindingTests(unittest.TestCase):
                 receive_layout(controller, time.monotonic() + .01)
             with self.assertRaises(TimeoutError):
                 socket_receive(controller, 1, time.monotonic() - 1)
-            for length in (0, 159, 161):
+            for length in (0, 127, 129):
                 with self.assertRaises(RuntimeError):
                     send_binding(controller, bytes(length), time.monotonic() + 1)
 

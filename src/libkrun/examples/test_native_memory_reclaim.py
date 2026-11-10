@@ -63,7 +63,7 @@ class ReclaimOracleTests(unittest.TestCase):
 
     @staticmethod
     def layout():
-        return {"schema": 1, "kind": "ram-layout", "architecture": "x86_64", "pageGranule": PAGE,
+        return {"schema": 1, "kind": "ram-layout", "magic": "KRUNRAML", "architecture": "x86_64", "pageGranule": PAGE,
                 "packedLength": 4 * PAGE, "regions": [
                     {"guestPhysicalAddress": 0, "length": 4 * PAGE, "streamOffset": 0}],
                 "topology": {key: 0 for key in ("firmwareAddress", "initrdAddress", "ramAboveGap",

@@ -1,8 +1,4 @@
-#[path = "../live_build.rs"]
-mod live_build;
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    live_build::emit()?;
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-lib=framework=Hypervisor");
     }

@@ -1121,7 +1121,7 @@ class DirtyOracleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             ram, layout = root / "ram", root / "layout"
-            record = {"architecture": "x86_64", "kind": "ram-layout", "packedLength": 4096,
+            record = {"architecture": "x86_64", "kind": "ram-layout", "magic": "KRUNRAML", "packedLength": 4096,
                       "pageGranule": 4096, "regions": [{"guestPhysicalAddress": 0,
                           "length": 4096, "streamOffset": 0}], "schema": 1,
                       "topology": {"firmwareAddress": 0, "initrdAddress": 4096,

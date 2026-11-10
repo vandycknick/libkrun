@@ -1032,6 +1032,8 @@ impl VirtioDevice for Block {
 }
 
 const BLOCK_STATE_LIMIT: usize = 4096;
+pub(crate) const BLOCK_STATE_MAGIC: &[u8; 8] = b"KRUNBLKS";
+pub(crate) const BLOCK_STATE_SCHEMA: u16 = 1;
 const BLOCK_ID_LIMIT: usize = 1024;
 
 impl VirtioBlkConfig {
@@ -1109,6 +1111,7 @@ impl<'a> BlockPayload<'a> {
                 return Err(utils::state::Error::Limit);
             }
             let mut reader = Reader::new(payload);
+            reader.header(BLOCK_STATE_MAGIC, BLOCK_STATE_SCHEMA)?;
             if reader.u16()? != 1 || reader.u32()? != TYPE_BLOCK {
                 return Err(utils::state::Error::Invalid("block framing"));
             }
@@ -1137,7 +1140,7 @@ impl<'a> BlockPayload<'a> {
             }
             Ok(state)
         };
-        decode().map_err(|_| ProviderFault::DeviceState)
+        decode().map_err(ProviderFault::from)
     }
 }
 
@@ -1437,6 +1440,7 @@ impl VirtioStateProvider for Block {
         self.preflight()?;
         let encode = || -> Result<Vec<u8>, utils::state::Error> {
             let mut writer = Writer::new(BLOCK_STATE_LIMIT);
+            writer.header(BLOCK_STATE_MAGIC, BLOCK_STATE_SCHEMA)?;
             writer.u16(1)?;
             writer.u32(TYPE_BLOCK)?;
             writer.u64(self.avail_features)?;
@@ -1926,7 +1930,7 @@ mod tests {
         );
 
         let mut writable = payload.clone();
-        writable[31] = 0;
+        writable[41] = 0;
         assert!(BlockPayload::decode(&writable).is_err());
         assert!(Block::inspect_restore_payload(&writable).is_err());
     }
@@ -2015,7 +2019,7 @@ mod tests {
         ));
         // A saved writable VMDK payload is not a valid payload at all.
         let mut writable = payload.clone();
-        writable[31] = 0;
+        writable[41] = 0;
         assert!(matches!(
             Block::new_restore_binding(
                 "lower".into(),
@@ -2082,6 +2086,20 @@ mod tests {
         assert!(!block.is_activated());
         block.flush_for_capture(pause.key).unwrap();
         let payload = block.capture_payload(pause.key).unwrap();
+        use utils::state::StateHeaderError;
+        assert_eq!(&payload[..10], b"KRUNBLKS\x01\x00");
+        let mut wrong_magic = payload.clone();
+        wrong_magic[0] ^= 1;
+        assert!(matches!(
+            block.validate_payload(&wrong_magic),
+            Err(ProviderFault::StateHeader(StateHeaderError::Magic { .. }))
+        ));
+        let mut wrong_schema = payload.clone();
+        wrong_schema[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            block.validate_payload(&wrong_schema),
+            Err(ProviderFault::StateHeader(StateHeaderError::Schema { expected: 1, found: 2 }))
+        );
         assert!(!payload.is_empty());
         assert!(payload.len() <= block.state_limit() as usize);
         block.validate_payload(&payload).unwrap();
@@ -2098,10 +2116,10 @@ mod tests {
         trailing.push(0);
         assert!(block.validate_payload(&trailing).is_err());
         let mut unknown = payload.clone();
-        unknown[0] = 2;
+        unknown[10] = 2;
         assert!(block.validate_payload(&unknown).is_err());
         let mut wrong_kind = payload.clone();
-        wrong_kind[2..6].copy_from_slice(&crate::virtio::TYPE_RNG.to_le_bytes());
+        wrong_kind[12..16].copy_from_slice(&crate::virtio::TYPE_RNG.to_le_bytes());
         assert!(block.validate_payload(&wrong_kind).is_err());
         assert!(
             block
@@ -2109,7 +2127,7 @@ mod tests {
                 .is_err()
         );
         let mut bad_features = payload;
-        bad_features[14..22].copy_from_slice(&u64::MAX.to_le_bytes());
+        bad_features[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(block.validate_payload(&bad_features).is_err());
     }
 

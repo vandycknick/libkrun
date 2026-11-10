@@ -14,8 +14,10 @@ pub(crate) mod runtime;
 
 pub const EXECUTION_ABI: u32 = 1;
 pub const MAX_EXECUTION_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_NATIVE_BINDING: usize = 64 * 1024;
-const MAGIC: &[u8; 8] = b"KRUNEXEC";
+pub const MAX_STATE_SCHEMA: usize = 256;
+pub const MAX_ARCHITECTURE: usize = 32;
+const EXECUTION_STATE_MAGIC: &[u8; 8] = b"KRUNEXEC";
+const EXECUTION_STATE_SCHEMA: u16 = 1;
 
 pub(crate) fn native_page_granule() -> Result<u32, Error> {
     let granule = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
@@ -137,8 +139,8 @@ impl ExecutionLane {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StateBinding {
-    pub native_producer: String,
-    pub silo_producer: [u8; 32],
+    pub live_state_schema: String,
+    pub architecture: String,
     pub profile: [u8; 32],
     pub topology: [u8; 32],
     pub ram_layout: [u8; 32],
@@ -149,9 +151,10 @@ pub struct StateBinding {
 
 impl StateBinding {
     pub fn validate(&self) -> Result<(), Error> {
-        if self.native_producer.is_empty()
-            || self.native_producer.len() > MAX_NATIVE_BINDING
-            || self.silo_producer == [0; 32]
+        if self.live_state_schema.is_empty()
+            || self.live_state_schema.len() > MAX_STATE_SCHEMA
+            || self.architecture.is_empty()
+            || self.architecture.len() > MAX_ARCHITECTURE
             || self.profile == [0; 32]
             || self.topology == [0; 32]
             || self.ram_layout == [0; 32]
@@ -166,13 +169,9 @@ impl StateBinding {
 
     fn encode(&self, w: &mut Writer) -> Result<(), Error> {
         self.validate()?;
-        w.bytes(self.native_producer.as_bytes(), MAX_NATIVE_BINDING)?;
-        for value in [
-            &self.silo_producer,
-            &self.profile,
-            &self.topology,
-            &self.ram_layout,
-        ] {
+        w.bytes(self.live_state_schema.as_bytes(), MAX_STATE_SCHEMA)?;
+        w.bytes(self.architecture.as_bytes(), MAX_ARCHITECTURE)?;
+        for value in [&self.profile, &self.topology, &self.ram_layout] {
             w.fixed(value)?;
         }
         w.fixed(&self.source_run)?;
@@ -181,12 +180,15 @@ impl StateBinding {
     }
 
     fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
-        let native_producer = std::str::from_utf8(r.bytes(MAX_NATIVE_BINDING)?)
-            .map_err(|_| Error::Invalid("native producer UTF-8"))?
+        let live_state_schema = std::str::from_utf8(r.bytes(MAX_STATE_SCHEMA)?)
+            .map_err(|_| Error::Invalid("live state schema UTF-8"))?
+            .to_owned();
+        let architecture = std::str::from_utf8(r.bytes(MAX_ARCHITECTURE)?)
+            .map_err(|_| Error::Invalid("architecture UTF-8"))?
             .to_owned();
         let binding = Self {
-            native_producer,
-            silo_producer: r.fixed()?,
+            live_state_schema,
+            architecture,
             profile: r.fixed()?,
             topology: r.fixed()?,
             ram_layout: r.fixed()?,
@@ -258,7 +260,9 @@ impl ValidatedExecution {
     ) -> Result<Self, Error> {
         let envelope = ExecutionEnvelope::decode(bytes)?;
         if &envelope.binding != expected {
-            return Err(Error::Invalid("exact producer/profile/cut/layout binding"));
+            return Err(Error::Invalid(
+                "schema/architecture/profile/cut/layout mismatch",
+            ));
         }
         if envelope.lane != lane || envelope.topology != topology {
             return Err(Error::Invalid("destination CPU topology"));
@@ -550,8 +554,7 @@ impl ExecutionEnvelope {
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         self.validate()?;
         let mut w = Writer::new(MAX_EXECUTION_BYTES);
-        w.fixed(MAGIC)?;
-        w.u16(1)?;
+        w.header(EXECUTION_STATE_MAGIC, EXECUTION_STATE_SCHEMA)?;
         w.u32(EXECUTION_ABI)?;
         w.u8(self.lane.tag())?;
         self.binding.encode(&mut w)?;
@@ -616,8 +619,9 @@ impl ExecutionEnvelope {
             return Err(Error::Limit);
         }
         let mut r = Reader::new(bytes);
-        if &r.fixed::<8>()? != MAGIC || r.u16()? != 1 || r.u32()? != EXECUTION_ABI {
-            return Err(Error::Invalid("execution magic/version/ABI"));
+        r.header(EXECUTION_STATE_MAGIC, EXECUTION_STATE_SCHEMA)?;
+        if r.u32()? != EXECUTION_ABI {
+            return Err(Error::Invalid("execution ABI"));
         }
         let lane = ExecutionLane::decode(r.u8()?)?;
         let binding = StateBinding::decode(&mut r)?;
@@ -741,8 +745,8 @@ pub(crate) mod tests {
         };
         ExecutionEnvelope {
             binding: StateBinding {
-                native_producer: "exact-native-test-producer".into(),
-                silo_producer: [1; 32],
+                live_state_schema: crate::api::capabilities::LIVE_STATE_SCHEMA.into(),
+                architecture: crate::api::capabilities::guest_architecture().into(),
                 profile: [2; 32],
                 topology: [3; 32],
                 ram_layout: [4; 32],
@@ -805,6 +809,21 @@ pub(crate) mod tests {
         let restored = ExecutionEnvelope::decode(&bytes).unwrap();
         assert_eq!(restored, original);
         assert_eq!(restored.encode().unwrap(), bytes);
+        let mut wrong_magic = bytes.clone();
+        wrong_magic[0] ^= 1;
+        assert!(matches!(
+            ExecutionEnvelope::decode(&wrong_magic),
+            Err(Error::Header(utils::state::StateHeaderError::Magic { .. }))
+        ));
+        let mut wrong_schema = bytes.clone();
+        wrong_schema[8..10].copy_from_slice(&2_u16.to_le_bytes());
+        assert!(matches!(
+            ExecutionEnvelope::decode(&wrong_schema),
+            Err(Error::Header(utils::state::StateHeaderError::Schema {
+                expected: 1,
+                found: 2
+            }))
+        ));
         let validated = ValidatedExecution::decode(
             &bytes,
             &original.binding,
@@ -839,13 +858,13 @@ pub(crate) mod tests {
         let original = envelope();
         let bytes = original.encode().unwrap();
         let mut wrong = original.binding.clone();
-        wrong.silo_producer[0] ^= 1;
+        wrong.architecture.push('x');
         assert!(
             ValidatedExecution::decode(&bytes, &wrong, original.lane, &original.topology, &[])
                 .is_err()
         );
         wrong = original.binding.clone();
-        wrong.native_producer.push('x');
+        wrong.live_state_schema.push('x');
         assert!(
             ValidatedExecution::decode(&bytes, &wrong, original.lane, &original.topology, &[])
                 .is_err()

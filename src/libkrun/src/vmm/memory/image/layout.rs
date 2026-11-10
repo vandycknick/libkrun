@@ -1,6 +1,6 @@
 use arch::ArchMemoryInfo;
 use arch::guest_memory::RegisteredRamLayout;
-use utils::state::{Error, Reader, Writer};
+use utils::state::{Error, Reader, StateHeaderError, Writer};
 
 use crate::vmm::execution::{ExecutionLane, ValidatedExecution, host_page_granule};
 use crate::vmm::memory::image::{RamImageError, RamRegion, ValidatedRamLayout};
@@ -9,6 +9,8 @@ pub const MAX_RAM_LAYOUT_BYTES: usize = 64 * 1024;
 pub const MAX_RAM_REGIONS: usize = 512;
 pub const MAX_PACKED_RAM_BYTES: u64 = 1 << 40;
 pub const MAX_JSON_INTEGER: u64 = (1 << 53) - 1;
+const RAM_LAYOUT_MAGIC: &[u8; 8] = b"KRUNRAML";
+const RAM_LAYOUT_SCHEMA: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RamTopology {
@@ -128,7 +130,19 @@ impl ValidatedRamLayout {
             }
             _ => return Err(Error::Invalid("RAM architecture").into()),
         };
-        p.literal(b",\"kind\":\"ram-layout\",\"packedLength\":")?;
+        p.literal(b",\"kind\":\"ram-layout\",\"magic\":\"")?;
+        let mut found = [0; 8];
+        for byte in &mut found {
+            *byte = p.byte()?;
+        }
+        if found != *RAM_LAYOUT_MAGIC {
+            return Err(Error::Header(StateHeaderError::Magic {
+                expected: *RAM_LAYOUT_MAGIC,
+                found,
+            })
+            .into());
+        }
+        p.literal(b"\",\"packedLength\":")?;
         let packed_len = p.integer()?;
         p.literal(b",\"pageGranule\":")?;
         let granule = u32::try_from(p.integer()?).map_err(|_| Error::Overflow)?;
@@ -171,7 +185,16 @@ impl ValidatedRamLayout {
                 p.byte()?;
             }
         }
-        p.literal(b"],\"schema\":1,\"topology\":{")?;
+        p.literal(b"],\"schema\":")?;
+        let found = u16::try_from(p.integer()?).map_err(|_| Error::Invalid("RAM layout schema"))?;
+        if found != RAM_LAYOUT_SCHEMA {
+            return Err(Error::Header(StateHeaderError::Schema {
+                expected: RAM_LAYOUT_SCHEMA,
+                found,
+            })
+            .into());
+        }
+        p.literal(b",\"topology\":{")?;
         let topology = if architecture {
             p.literal(b"\"firmwareAddress\":")?;
             let firmware = p.integer()?;
@@ -578,7 +601,9 @@ impl ValidatedRamLayout {
             RamTopology::X86 { .. } => b"{\"architecture\":\"x86_64\"",
             RamTopology::Arm { .. } => b"{\"architecture\":\"aarch64\"",
         })?;
-        w.fixed(b",\"kind\":\"ram-layout\",\"packedLength\":")?;
+        w.fixed(b",\"kind\":\"ram-layout\",\"magic\":\"")?;
+        w.fixed(RAM_LAYOUT_MAGIC)?;
+        w.fixed(b"\",\"packedLength\":")?;
         integer(&mut w, self.packed_len)?;
         w.fixed(b",\"pageGranule\":")?;
         integer(&mut w, u64::from(self.granule))?;
@@ -595,7 +620,9 @@ impl ValidatedRamLayout {
             integer(&mut w, r.stream_offset)?;
             w.fixed(b"}")?;
         }
-        w.fixed(b"],\"schema\":1,\"topology\":{")?;
+        w.fixed(b"],\"schema\":")?;
+        integer(&mut w, u64::from(RAM_LAYOUT_SCHEMA))?;
+        w.fixed(b",\"topology\":{")?;
         let fields = match self.topology {
             RamTopology::X86 {
                 firmware,
@@ -717,8 +744,30 @@ pub(crate) mod tests {
     use crate::vmm::memory::image::layout::{MAX_RAM_LAYOUT_BYTES, RamTopology};
     use crate::vmm::memory::image::{RamImageError, RamRegion, ValidatedRamLayout};
 
-    pub(crate) const X86: &str = "{\"architecture\":\"x86_64\",\"kind\":\"ram-layout\",\"packedLength\":12288,\"pageGranule\":4096,\"regions\":[{\"guestPhysicalAddress\":0,\"length\":4096,\"streamOffset\":0},{\"guestPhysicalAddress\":4096,\"length\":8192,\"streamOffset\":4096}],\"schema\":1,\"topology\":{\"firmwareAddress\":0,\"initrdAddress\":12288,\"ramAboveGap\":0,\"ramBelowGap\":12288,\"ramLastAddress\":12288,\"shmStartAddress\":4294967296}}";
-    const ARM: &str = "{\"architecture\":\"aarch64\",\"kind\":\"ram-layout\",\"packedLength\":4194304,\"pageGranule\":4096,\"regions\":[{\"guestPhysicalAddress\":2147483648,\"length\":4194304,\"streamOffset\":0}],\"schema\":1,\"topology\":{\"fdtAddress\":2149580800,\"firmwareAddress\":0,\"initrdAddress\":2149580799,\"ramLastAddress\":2151677952,\"ramStartAddress\":2147483648,\"shmStartAddress\":3221225472}}";
+    pub(crate) const X86: &str = "{\"architecture\":\"x86_64\",\"kind\":\"ram-layout\",\"magic\":\"KRUNRAML\",\"packedLength\":12288,\"pageGranule\":4096,\"regions\":[{\"guestPhysicalAddress\":0,\"length\":4096,\"streamOffset\":0},{\"guestPhysicalAddress\":4096,\"length\":8192,\"streamOffset\":4096}],\"schema\":1,\"topology\":{\"firmwareAddress\":0,\"initrdAddress\":12288,\"ramAboveGap\":0,\"ramBelowGap\":12288,\"ramLastAddress\":12288,\"shmStartAddress\":4294967296}}";
+    const ARM: &str = "{\"architecture\":\"aarch64\",\"kind\":\"ram-layout\",\"magic\":\"KRUNRAML\",\"packedLength\":4194304,\"pageGranule\":4096,\"regions\":[{\"guestPhysicalAddress\":2147483648,\"length\":4194304,\"streamOffset\":0}],\"schema\":1,\"topology\":{\"fdtAddress\":2149580800,\"firmwareAddress\":0,\"initrdAddress\":2149580799,\"ramLastAddress\":2151677952,\"ramStartAddress\":2147483648,\"shmStartAddress\":3221225472}}";
+
+    #[test]
+    fn ram_layout_rejects_wrong_magic_and_schema_with_typed_errors() {
+        use utils::state::{Error, StateHeaderError};
+        let wrong_magic = X86.replace("KRUNRAML", "WRONGMAG");
+        assert!(matches!(
+            ValidatedRamLayout::decode_record(wrong_magic.as_bytes()),
+            Err(RamImageError::Codec(Error::Header(
+                StateHeaderError::Magic { .. }
+            )))
+        ));
+        let wrong_schema = X86.replace("\"schema\":1", "\"schema\":2");
+        assert!(matches!(
+            ValidatedRamLayout::decode_record(wrong_schema.as_bytes()),
+            Err(RamImageError::Codec(Error::Header(
+                StateHeaderError::Schema {
+                    expected: 1,
+                    found: 2
+                }
+            )))
+        ));
+    }
 
     #[test]
     fn exact_architecture_goldens_preserve_segmentation_and_unaligned_arm_initrd() {
@@ -863,7 +912,7 @@ pub(crate) mod tests {
 
     #[test]
     fn arm_firmware_requires_efi_main_start_and_fdt_reservation() {
-        let text = "{\"architecture\":\"aarch64\",\"kind\":\"ram-layout\",\"packedLength\":4259840,\"pageGranule\":4096,\"regions\":[{\"guestPhysicalAddress\":0,\"length\":65536,\"streamOffset\":0},{\"guestPhysicalAddress\":1073741824,\"length\":4194304,\"streamOffset\":65536}],\"schema\":1,\"topology\":{\"fdtAddress\":1073741824,\"firmwareAddress\":0,\"initrdAddress\":1073741824,\"ramLastAddress\":1077936128,\"ramStartAddress\":1073741824,\"shmStartAddress\":2147483648}}";
+        let text = "{\"architecture\":\"aarch64\",\"kind\":\"ram-layout\",\"magic\":\"KRUNRAML\",\"packedLength\":4259840,\"pageGranule\":4096,\"regions\":[{\"guestPhysicalAddress\":0,\"length\":65536,\"streamOffset\":0},{\"guestPhysicalAddress\":1073741824,\"length\":4194304,\"streamOffset\":65536}],\"schema\":1,\"topology\":{\"fdtAddress\":1073741824,\"firmwareAddress\":0,\"initrdAddress\":1073741824,\"ramLastAddress\":1077936128,\"ramStartAddress\":1073741824,\"shmStartAddress\":2147483648}}";
         assert!(ValidatedRamLayout::decode_record(text.as_bytes()).is_ok());
         for (from, to) in [
             ("\"fdtAddress\":1073741824", "\"fdtAddress\":1073745920"),
@@ -883,7 +932,7 @@ pub(crate) mod tests {
 
     #[test]
     fn high_ram_and_firmware_do_not_replace_main_endpoint_or_cmos_metadata() {
-        let text = "{\"architecture\":\"x86_64\",\"kind\":\"ram-layout\",\"packedLength\":3489730560,\"pageGranule\":4096,\"regions\":[{\"guestPhysicalAddress\":0,\"length\":3489660928,\"streamOffset\":0},{\"guestPhysicalAddress\":4294901760,\"length\":65536,\"streamOffset\":3489660928},{\"guestPhysicalAddress\":4294967296,\"length\":4096,\"streamOffset\":3489726464}],\"schema\":1,\"topology\":{\"firmwareAddress\":4294901760,\"initrdAddress\":3489660928,\"ramAboveGap\":4096,\"ramBelowGap\":3489660928,\"ramLastAddress\":4294971392,\"shmStartAddress\":5368709120}}";
+        let text = "{\"architecture\":\"x86_64\",\"kind\":\"ram-layout\",\"magic\":\"KRUNRAML\",\"packedLength\":3489730560,\"pageGranule\":4096,\"regions\":[{\"guestPhysicalAddress\":0,\"length\":3489660928,\"streamOffset\":0},{\"guestPhysicalAddress\":4294901760,\"length\":65536,\"streamOffset\":3489660928},{\"guestPhysicalAddress\":4294967296,\"length\":4096,\"streamOffset\":3489726464}],\"schema\":1,\"topology\":{\"firmwareAddress\":4294901760,\"initrdAddress\":3489660928,\"ramAboveGap\":4096,\"ramBelowGap\":3489660928,\"ramLastAddress\":4294971392,\"shmStartAddress\":5368709120}}";
         assert!(ValidatedRamLayout::decode_record(text.as_bytes()).is_ok());
         assert!(
             ValidatedRamLayout::decode_record(

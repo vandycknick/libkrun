@@ -8,7 +8,7 @@
 use std::fs::File;
 use std::time::Instant;
 
-use crate::api::capabilities::execution_state_producer;
+use crate::api::capabilities::{LIVE_STATE_SCHEMA, guest_architecture};
 use crate::api::live::restore::{
     RestoreAttachment, RestoreError, RestoreIdentity, RestoreRole, StateObjectIdentity,
 };
@@ -148,8 +148,16 @@ pub enum InspectionError {
     },
     #[error("inspection exact state binding mismatch")]
     Binding,
-    #[error("inspection exact native producer mismatch: {0}")]
-    Producer(String),
+    #[error("inspection live state schema mismatch: expected {expected}, found {found}")]
+    Schema {
+        expected: &'static str,
+        found: String,
+    },
+    #[error("inspection architecture mismatch: expected {expected}, found {found}")]
+    Architecture {
+        expected: &'static str,
+        found: String,
+    },
     #[error("inspection backend/ISA mismatch")]
     Lane,
     #[error("inspection unsupported execution profile: {0}")]
@@ -194,9 +202,17 @@ pub(crate) fn validate_execution_profile(
     if saved.lane != native_lane() {
         return Err(InspectionError::Lane);
     }
-    let producer = execution_state_producer().map_err(InspectionError::Producer)?;
-    if saved.binding.native_producer != producer {
-        return Err(InspectionError::Producer("exact build identity".into()));
+    if saved.binding.live_state_schema != LIVE_STATE_SCHEMA {
+        return Err(InspectionError::Schema {
+            expected: LIVE_STATE_SCHEMA,
+            found: saved.binding.live_state_schema.clone(),
+        });
+    }
+    if saved.binding.architecture != guest_architecture() {
+        return Err(InspectionError::Architecture {
+            expected: guest_architecture(),
+            found: saved.binding.architecture.clone(),
+        });
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
@@ -599,8 +615,9 @@ mod tests {
         ));
     }
     #[test]
-    fn authenticated_execution_fixture_rejects_wrong_lane_or_exact_producer_without_host_probe() {
-        let envelope = crate::vmm::execution::tests::envelope();
+    fn authenticated_execution_fixture_rejects_wrong_lane_or_schema_without_host_probe() {
+        let mut envelope = crate::vmm::execution::tests::envelope();
+        envelope.binding.live_state_schema = "silo.live-state/unsupported".into();
         let bytes = envelope.encode().unwrap();
         let temp = TempFile::new().unwrap();
         temp.as_file().write_all(&bytes).unwrap();
@@ -620,7 +637,9 @@ mod tests {
         };
         assert!(matches!(
             authenticate_execution(&file, &expected),
-            Err(InspectionError::Lane | InspectionError::Producer(_))
+            Err(InspectionError::Lane
+                | InspectionError::Schema { .. }
+                | InspectionError::Architecture { .. })
         ));
         expected.ram_image.state.capture = [99; 16];
         assert!(matches!(

@@ -703,14 +703,19 @@ pub(crate) fn preflight(
             return Err(RamImageError::Authority(MemoryError::CoverageLost));
         }
     }
-    let mut native_producer = String::new();
-    native_producer
-        .try_reserve_exact(binding.native_producer.len())
+    let mut live_state_schema = String::new();
+    live_state_schema
+        .try_reserve_exact(binding.live_state_schema.len())
         .map_err(|_| RamImageError::Allocation)?;
-    native_producer.push_str(&binding.native_producer);
+    live_state_schema.push_str(&binding.live_state_schema);
+    let mut architecture = String::new();
+    architecture
+        .try_reserve_exact(binding.architecture.len())
+        .map_err(|_| RamImageError::Allocation)?;
+    architecture.push_str(&binding.architecture);
     let retained_binding = StateBinding {
-        native_producer,
-        silo_producer: binding.silo_producer,
+        live_state_schema,
+        architecture,
         profile: binding.profile,
         topology: binding.topology,
         ram_layout: binding.ram_layout,
@@ -959,8 +964,8 @@ mod tests {
 
     fn binding() -> StateBinding {
         StateBinding {
-            native_producer: "ram-image-unit-record".into(),
-            silo_producer: [1; 32],
+            live_state_schema: crate::api::capabilities::LIVE_STATE_SCHEMA.into(),
+            architecture: crate::api::capabilities::guest_architecture().into(),
             profile: [2; 32],
             topology: [3; 32],
             ram_layout: [4; 32],

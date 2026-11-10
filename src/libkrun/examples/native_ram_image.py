@@ -24,15 +24,15 @@ def validate_layout(data: bytes) -> dict:
         raise ValueError("RAM layout byte bound")
     record = json.loads(data, object_pairs_hook=_unique_object)
     if not isinstance(record, dict) or set(record) != {
-            "architecture", "kind", "packedLength", "pageGranule", "regions", "schema", "topology"}:
+            "architecture", "kind", "magic", "packedLength", "pageGranule", "regions", "schema", "topology"}:
         raise ValueError("RAM layout fields")
     architecture = record["architecture"]
     topology_fields = {
         "x86_64": {"firmwareAddress", "initrdAddress", "ramAboveGap", "ramBelowGap", "ramLastAddress", "shmStartAddress"},
         "aarch64": {"fdtAddress", "firmwareAddress", "initrdAddress", "ramLastAddress", "ramStartAddress", "shmStartAddress"},
     }
-    if architecture not in topology_fields or record["kind"] != "ram-layout" or type(record["schema"]) is not int or record["schema"] != 1:
-        raise ValueError("RAM layout schema/kind/architecture")
+    if architecture not in topology_fields or record["kind"] != "ram-layout" or record["magic"] != "KRUNRAML" or type(record["schema"]) is not int or record["schema"] != 1:
+        raise ValueError("RAM layout magic/schema/kind/architecture")
     def integer(value):
         if type(value) is not int or not 0 <= value <= MAX_INTEGER:
             raise ValueError("RAM layout integer")

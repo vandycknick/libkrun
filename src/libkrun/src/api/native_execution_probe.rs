@@ -20,7 +20,7 @@ use devices::{Bus, BusDevice};
 use polly::event_manager::{BarrierGeneration, BarrierKey, BarrierRequest, OperationId};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
-use crate::api::capabilities::execution_state_producer;
+use crate::api::capabilities::{LIVE_STATE_SCHEMA, guest_architecture};
 use crate::vmm::Vmm;
 use crate::vmm::builder::restore::{
     PreparedDeviceInstall, build_execution_fixture, build_restore_prepared,
@@ -198,11 +198,11 @@ fn key(generation: u64) -> BarrierKey {
     }
 }
 fn binding(path: &Path, generation: u64) -> Result<StateBinding, String> {
-    decode_binding(&bounded_read(path, 160)?, generation)
+    decode_binding(&bounded_read(path, 128)?, generation)
 }
 fn decode_binding(bytes: &[u8], generation: u64) -> Result<StateBinding, String> {
-    if bytes.len() != 160 {
-        return Err("fixture binding must contain exactly 160 bytes".into());
+    if bytes.len() != 128 {
+        return Err("fixture binding must contain exactly 128 bytes".into());
     }
     let mut chunks = bytes.chunks_exact(32);
     let mut next = || -> Result<[u8; 32], String> {
@@ -212,7 +212,6 @@ fn decode_binding(bytes: &[u8], generation: u64) -> Result<StateBinding, String>
             .try_into()
             .map_err(|_| "binding width".into())
     };
-    let silo_producer = next()?;
     let profile = next()?;
     let topology = next()?;
     let ram_layout = next()?;
@@ -224,8 +223,8 @@ fn decode_binding(bytes: &[u8], generation: u64) -> Result<StateBinding, String>
         .try_into()
         .map_err(|_| "capture identity width")?;
     let binding = StateBinding {
-        native_producer: execution_state_producer()?,
-        silo_producer,
+        live_state_schema: LIVE_STATE_SCHEMA.into(),
+        architecture: guest_architecture().into(),
         profile,
         topology,
         ram_layout,
@@ -296,7 +295,7 @@ fn exchange_binding(
     stream
         .shutdown(Shutdown::Write)
         .map_err(|error| error.to_string())?;
-    let mut bytes = [0; 160];
+    let mut bytes = [0; 128];
     socket_read(stream, &mut bytes, deadline)?;
     let mut extra = [0];
     loop {
@@ -581,11 +580,11 @@ fn malformed_cases(bytes: &[u8], expected: &StateBinding, count: u8) -> Result<u
     }
     cases += 1;
     let mut wrong = expected.clone();
-    wrong.native_producer.push_str("different");
+    wrong.live_state_schema.push_str("different");
     if ValidatedExecution::decode(bytes, &wrong, ExecutionLane::KvmX86, &topology(count), &[])
         .is_ok()
     {
-        return Err("wrong producer accepted".into());
+        return Err("wrong live state schema accepted".into());
     }
     if ValidatedExecution::decode(
         bytes,
@@ -1669,9 +1668,9 @@ mod tests {
         std::fs::remove_dir(directory).unwrap();
     }
 
-    fn binding_material() -> [u8; 160] {
-        let mut material = [1; 160];
-        material[96..128].fill(4);
+    fn binding_material() -> [u8; 128] {
+        let mut material = [1; 128];
+        material[64..96].fill(4);
         material
     }
 
@@ -1710,7 +1709,7 @@ mod tests {
         use std::time::{Duration, Instant};
         let mut extra = binding_material().to_vec();
         extra.push(1);
-        for reply in [vec![], vec![1; 159], extra, vec![0; 160]] {
+        for reply in [vec![], vec![1; 127], extra, vec![0; 128]] {
             let (mut native, mut controller) = UnixStream::pair().unwrap();
             let peer = std::thread::spawn(move || {
                 let mut layout = Vec::new();
@@ -1760,7 +1759,7 @@ mod tests {
         auth[0] ^= 1;
         assert!(decode_ram_authentication(&auth, &binding).is_err());
         assert!(decode_ram_authentication(&auth[..63], &binding).is_err());
-        assert!(decode_binding(&[1; 159], 1).is_err());
+        assert!(decode_binding(&[1; 127], 1).is_err());
         assert!(decode_binding(&binding_material(), 0).is_err());
     }
 

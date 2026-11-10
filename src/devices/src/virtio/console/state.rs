@@ -12,6 +12,8 @@ use std::task::Poll;
 use std::time::Instant;
 use utils::state::{Error, Reader, Writer};
 const LIMIT: usize = 262_144;
+pub(crate) const CONSOLE_STATE_MAGIC: &[u8; 8] = b"KRUNCONS";
+pub(crate) const CONSOLE_STATE_SCHEMA: u16 = 1;
 struct SavedPort {
     name: String,
     shape: u8,
@@ -32,6 +34,7 @@ fn decode(payload: &[u8]) -> Result<SavedConsole, Error> {
         return Err(Error::Limit);
     }
     let mut reader = Reader::new(payload);
+    reader.header(CONSOLE_STATE_MAGIC, CONSOLE_STATE_SCHEMA)?;
     if reader.u16()? != 1
         || reader.u32()? != uapi::VIRTIO_ID_CONSOLE
         || reader.u64()? != AVAIL_FEATURES
@@ -140,7 +143,7 @@ impl Console {
     pub fn inspect_restore_payload(
         payload: &[u8],
     ) -> Result<Vec<(String, bool, bool, bool)>, ProviderFault> {
-        let saved = decode(payload).map_err(|_| ProviderFault::DeviceState)?;
+        let saved = decode(payload).map_err(ProviderFault::from)?;
         Ok(saved
             .ports
             .into_iter()
@@ -156,7 +159,7 @@ impl Console {
     }
 
     fn checked_saved(&self, payload: &[u8]) -> Result<SavedConsole, ProviderFault> {
-        let saved = decode(payload).map_err(|_| ProviderFault::DeviceState)?;
+        let saved = decode(payload).map_err(ProviderFault::from)?;
         if saved.ports.len() != self.ports.len() || self.avail_features != AVAIL_FEATURES {
             return Err(ProviderFault::DeviceState);
         }
@@ -457,6 +460,7 @@ impl VirtioStateProvider for Console {
         let messages = self.control.snapshot()?;
         let result = (|| -> Result<Vec<u8>, Error> {
             let mut writer = Writer::new(LIMIT);
+            writer.header(CONSOLE_STATE_MAGIC, CONSOLE_STATE_SCHEMA)?;
             writer.u16(1)?;
             writer.u32(uapi::VIRTIO_ID_CONSOLE)?;
             writer.u64(self.avail_features)?;
@@ -676,6 +680,20 @@ mod tests {
         source.begin_quiesce(cut).unwrap();
         assert!(finish_pause(&mut source, cut).is_empty());
         let payload = source.capture_payload(cut.key).unwrap();
+        use utils::state::StateHeaderError;
+        assert_eq!(&payload[..10], b"KRUNCONS\x01\x00");
+        let mut wrong_magic = payload.clone();
+        wrong_magic[0] ^= 1;
+        assert!(matches!(
+            source.validate_payload(&wrong_magic),
+            Err(ProviderFault::StateHeader(StateHeaderError::Magic { .. }))
+        ));
+        let mut wrong_schema = payload.clone();
+        wrong_schema[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            source.validate_payload(&wrong_schema),
+            Err(ProviderFault::StateHeader(StateHeaderError::Schema { expected: 1, found: 2 }))
+        );
         assert_eq!(source.capture_payload(cut.key).unwrap(), payload);
         source.update_console_size(0, 1, 1);
         assert_eq!(source.control.snapshot().unwrap(), expected);

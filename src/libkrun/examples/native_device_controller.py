@@ -132,8 +132,8 @@ class Session:
         shutil.copytree(restore / "binding" if restore else args.binding, self.binding)
         if restore:
             self.inherited_binding = {name: (self.binding / name).read_bytes() for name in
-                                      ("silo-producer", "profile", "topology", "ram-layout", "source-run", "capture")}
-        for name in ("silo-producer", "profile", "topology", "ram-layout", "source-run", "capture"):
+                                      ("profile", "topology", "ram-layout", "source-run", "capture")}
+        for name in ("profile", "topology", "ram-layout", "source-run", "capture"):
             (self.binding / name).chmod(0o600)
         self.log = (directory / "driver.log").open("wb")
         self.guest_log = (directory / "guest.log").open("wb")
@@ -894,7 +894,7 @@ class Session:
 def seal_cut(directory):
     manifest = {}
     names = ["execution.state", "devices.state", "memory.ram", "memory-layout.json", "memory-authentication.bin", "disk0.raw", "disk1.raw"]
-    names.extend(f"binding/{name}" for name in ("silo-producer", "profile", "topology", "ram-layout", "source-run", "capture"))
+    names.extend(f"binding/{name}" for name in ("profile", "topology", "ram-layout", "source-run", "capture"))
     for name in names:
         path = directory / name
         manifest[name] = {"bytes": path.stat().st_size, "sha256": digest(path)}
@@ -1102,7 +1102,7 @@ def main():
                         witness_code=digest(args.witness_dir / "witness.bin"),
                         witness_symbols=digest(args.witness_dir / "witness.nm"))
     material = json.dumps(identity, sort_keys=True).encode()
-    for name in ("silo-producer", "profile", "topology", "ram-layout"):
+    for name in ("profile", "topology", "ram-layout"):
         (args.binding / name).write_bytes(hashlib.sha256(name.encode() + material).digest())
     for name in ("source-run", "capture"):
         (args.binding / name).write_bytes(os.urandom(16))

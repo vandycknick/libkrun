@@ -11,7 +11,7 @@ from native_ram_image import (CHUNK_SIZE, authenticate_image, authentication_byt
 
 
 def layout_bytes(length=4096):
-    return json.dumps({"architecture": "x86_64", "kind": "ram-layout", "packedLength": length,
+    return json.dumps({"architecture": "x86_64", "kind": "ram-layout", "magic": "KRUNRAML", "packedLength": length,
                        "pageGranule": 4096,
                        "regions": [{"guestPhysicalAddress": 0, "length": length, "streamOffset": 0}],
                        "schema": 1, "topology": {"firmwareAddress": 0, "initrdAddress": length,
@@ -65,6 +65,8 @@ class RamImageAuthenticationTests(unittest.TestCase):
         invalid = (b"", data + b"\n", data.replace(b'"schema":1', b'"schema":1,"schema":1'),
                    data.replace(b'"schema":1', b'"schema":1,"extra":0'),
                    data.replace(b'"schema":1', b'"schema":true'),
+                   data.replace(b'"magic":"KRUNRAML"', b'"magic":"WRONGMAG"'),
+                   data.replace(b'"schema":1', b'"schema":2'),
                    data.replace(b'"length":4096', b'"length":4095'),
                    data.replace(b'"streamOffset":0', b'"streamOffset":4096'),
                    data.replace(b'"pageGranule":4096', b'"pageGranule":4096.0'))

@@ -119,9 +119,8 @@ granting whole-machine support:
 cargo run --locked -p libkrun --features native-control-probe --example native-control-probe
 ```
 
-That diagnostic feature is recorded in actual package build facts and excluded
-from production qualification. CPU-only evidence is not device-barrier or
-macOS/arm64 qualification.
+The diagnostic feature does not grant public live operations. CPU-only evidence
+is not device-barrier or macOS/arm64 qualification.
 
 ## Native live-state observations (Rust)
 
@@ -129,40 +128,21 @@ The Silo fork exposes a Rust-only, machine-less query in
 `krun::api::capabilities`, outside generated FFI:
 
 ```rust
-pub fn compiled_live_build() -> &'static NativeBuildFacts;
+pub const LIVE_STATE_SCHEMA: &str = "silo.live-state/1";
+pub fn live_state_schema() -> &'static str;
+pub fn guest_architecture() -> &'static str;
 pub fn query_live_host() -> NativeHostReport;
 ```
 
-Query ABI `LIVE_QUERY_ABI = 1` is distinct from the package/C ABI and the
-scratch checkpoint format. The compiled `control_abi` is `Some(1)`, describing
-the Rust control protocol, not granting live operation support.
+Query ABI `LIVE_QUERY_ABI = 1` is distinct from the package/C ABI and state
+encoding schemas. The Rust native API used by Silo exposes the schema accessor
+without generated FFI or build-time source inspection.
 The adapter-facing types are:
 
 ```rust
-NativeBuildFacts {
-    query_abi: u32,
-    control_abi: Option<u32>,
-    backend: NativeBackend,
-    architecture: NativeArchitecture,
-    packages: &'static [PackageBuildFacts],
-}
-PackageBuildFacts {
-    name: &'static str,
-    version: &'static str,
-    target: Option<&'static str>,
-    features: Option<&'static [&'static str]>,
-    settings: &'static [(&'static str, Option<&'static str>)],
-    settings_observed: bool,
-    rustc_version: Option<&'static str>,
-    source: SourceProvenance,
-}
-SourceProvenance {
-    root: Option<&'static str>,
-    revision: Option<&'static str>,
-    worktree: WorktreeState, // Clean | Dirty | Unknown
-}
 NativeHostReport {
-    build: &'static NativeBuildFacts,
+    live_state_schema: &'static str,
+    architecture: &'static str,
     lane: NativeLane,
     kvm: KvmHostFacts,
     kvm_prerequisites: KvmPrerequisites,
@@ -171,58 +151,23 @@ NativeHostReport {
 }
 ```
 
-All fields above are public. Backends are `Kvm`, `Hvf`, or `Unsupported`;
-architectures are `X86_64`, `Aarch64`, `Riscv64`, or `Unsupported`.
-`NativeLane` distinguishes `KvmX86_64`, `KvmArm64GicV3`, `HvfArm64GicV3`,
-and `Unsupported`. A lane is a **candidate**, not admission of a VM or GIC.
-Lane selection consumes the observed package feature inventories as well as
-backend/architecture. TEE, AMD SEV, TDX and AWS Nitro builds are excluded,
-including when a dependency independently enables their features. Their
-actual compiled backend remains recorded, but they receive `Unsupported`,
-incomplete live binding and no KVM/HVF host probing. Unknown feature
-inventories also cannot select a live lane. Nested virtualization is a
-per-VM runtime setting, not a Cargo feature; this host query does not admit
-nested VMs or probe nested virtualization.
+All fields above are public. `NativeLane` distinguishes `KvmX86_64`,
+`KvmArm64GicV3`, `HvfArm64GicV3`, and `Unsupported`. A lane is a candidate,
+not admission of a VM or GIC. TEE, AWS Nitro and control-probe profiles receive
+`Unsupported` without KVM/HVF host probing. Nested virtualization remains a
+per-VM runtime setting, not a host-query compatibility decision.
 
-Each instrumented package records its own Cargo-normalized
-`CARGO_FEATURE_*` identifiers in sorted order, including implicit features
-and independently unified dependency features. It records `TARGET`, `HOST`,
-`OPT_LEVEL`, `DEBUG`, `PROFILE`, target architecture/OS/environment/ABI,
-endianness, pointer width, CPU features, `CARGO_ENCODED_RUSTFLAGS`, compiler
-path/version, wrapper paths and Apple SDK/deployment inputs. Missing values
-remain `None`, distinct from an observed empty string. `settings_observed`
-is false if an environment value was not representable as UTF-8, so malformed
-optional inputs cannot look like known absence. These are observed
-inputs, not a claim to reconstruct every effective rustc option or native
-third-party build. The allocation-free borrowed inventory covers libkrun,
-arch, arch-gen, devices, kernel, polly, utils, SMBIOS, x86 CPUID and macOS HVF
-when linked. Optional display/input/Nitro packages are not instrumented;
-activation of their associated features in **any** recorded package keeps
-`NativeBuildFacts::binding_complete()` false. This is partial evidence, not
-permission to bind an unobserved package to its parent's settings.
+Live-state compatibility depends only on `LIVE_STATE_SCHEMA` and guest
+architecture. Bump the summary schema whenever an execution, CPU, RAM-layout,
+device or legacy encoding changes. Every native binary state codec owns an
+eight-byte magic and `u16` schema checked before reading its body; RAM layout
+retains canonical JSON, with `magic: "KRUNRAML"` and its existing numeric schema.
+Magic/schema errors retain typed expected and found values. Capture/run,
+profile, topology and RAM-layout digests still prevent mixing objects from
+different cuts; they are not source-build compatibility gates.
 
-Source observations are dependency-local at build time: Git root, full HEAD
-and clean/dirty/unknown worktree, including nonignored untracked files and
-submodule changes. Source files/directories and Git HEAD/index/ref metadata
-are Cargo rebuild inputs. A dirty or unknown checkout, missing required
-package/settings/features/compiler, inconsistent target or malformed revision
-cannot yield a complete recorded binding. `clean_revision()` returns a full
-revision only for a Git-clean observation. Ignored/generated assets,
-external build inputs, wrapper contents and changes concurrent with
-compilation still need consumer-side content/evidence binding. Neither
-`clean_revision()` nor `binding_complete()` is qualification. No declared
-parent dependency revision is substituted for an unknown native revision.
-
-`PackageBuildFacts::write_canonical(&mut impl std::fmt::Write)` emits
-`native-package-v1;`, then length-delimited name, version, target, counted
-feature/settings inventories, an `observed;`/`partial;` settings-observation
-marker, compiler version, source root/revision and worktree state.
-A field is `<UTF-8-byte-length>:<bytes>;`; unknown is `?;`.
-Feature/settings counts are `<count>;`, or `?;` for an unknown feature set.
-Settings retain their recorded order. Worktree terminates with `clean;`,
-`dirty;` or `unknown;`. Consumers may hash this without native allocations
-or a native hashing dependency, and must also bind the query/control ABI,
-backend, architecture and complete package inventory.
+No Git command, source hashing, compiler inventory or checkout cleanliness
+observation participates in compilation or restore compatibility.
 
 Host values use `Observation<T>`:
 `Observed(T)`, `Unavailable(NativeQueryError)`, `NotEvaluated`, or
@@ -286,8 +231,8 @@ qualification or delivery of public Silo live operations. Pause still requires
 the actual host APIs, admitted execution/controller profile and complete
 providers for every attached device. KVM arm64 and HVF runtime qualification
 remain pending; public qualification remains false and all public Silo live
-operations remain not delivered. API presence, a clean source revision and
-accessible host APIs alone grant neither VM admission nor public operations.
+operations remain not delivered. API presence and accessible host APIs alone
+grant neither VM admission nor public operations.
 
 Run the standalone query explicitly (not as a Cargo test):
 
@@ -303,8 +248,8 @@ The audited hypervisor-free unit selection is:
 cargo test --locked -p libkrun --features blk,net --lib api::capabilities::tests::native_live_
 ```
 
-Those tests exercise real pure provenance/binding/serialization/capability
-reducers and immutable compiled inventories, never the runtime host query.
+Those tests exercise real schema accessors and pure capability reducers,
+never the runtime host query.
 Do not replace this filter with wholesale fork tests: existing unrelated
 tests construct real VMs.
 

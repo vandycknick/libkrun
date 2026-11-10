@@ -1,7 +1,29 @@
 use std::fmt;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StateHeaderError {
+    Magic { expected: [u8; 8], found: [u8; 8] },
+    Schema { expected: u16, found: u16 },
+}
+
+impl fmt::Display for StateHeaderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Magic { expected, found } => {
+                write!(f, "state magic mismatch: expected {expected:?}, found {found:?}")
+            }
+            Self::Schema { expected, found } => {
+                write!(f, "state schema mismatch: expected {expected}, found {found}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StateHeaderError {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
+    Header(StateHeaderError),
     Truncated,
     Limit,
     Overflow,
@@ -12,6 +34,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Header(error) => error.fmt(f),
             Self::Truncated => f.write_str("truncated state"),
             Self::Limit => f.write_str("state exceeds bound"),
             Self::Overflow => f.write_str("state length overflow"),
@@ -21,7 +44,14 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Header(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 pub struct Reader<'a> {
     bytes: &'a [u8],
@@ -30,6 +60,24 @@ pub struct Reader<'a> {
 impl<'a> Reader<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
         Self { bytes }
+    }
+
+    pub fn header(&mut self, magic: &[u8; 8], schema: u16) -> Result<(), Error> {
+        let found = self.fixed::<8>()?;
+        if found != *magic {
+            return Err(Error::Header(StateHeaderError::Magic {
+                expected: *magic,
+                found,
+            }));
+        }
+        let found = self.u16()?;
+        if found != schema {
+            return Err(Error::Header(StateHeaderError::Schema {
+                expected: schema,
+                found,
+            }));
+        }
+        Ok(())
     }
 
     pub fn remaining(&self) -> usize {
@@ -113,6 +161,11 @@ impl Writer {
         }
     }
 
+    pub fn header(&mut self, magic: &[u8; 8], schema: u16) -> Result<(), Error> {
+        self.fixed(magic)?;
+        self.u16(schema)
+    }
+
     pub fn fixed(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let length = self
             .bytes
@@ -164,8 +217,42 @@ impl Writer {
 
 #[cfg(test)]
 mod tests {
-    use crate::state::{Error, Reader, Writer};
+    use crate::state::{Error, Reader, StateHeaderError, Writer};
 
+
+    #[test]
+    fn state_header_roundtrip_and_rejections() {
+        let magic = b"TESTSTAT";
+        let mut writer = Writer::new(10);
+        writer.header(magic, 7).unwrap();
+        let bytes = writer.finish();
+        assert_eq!(&bytes[..8], magic);
+        assert_eq!(&bytes[8..], &7u16.to_le_bytes());
+        let mut reader = Reader::new(&bytes);
+        reader.header(magic, 7).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(
+            Reader::new(&bytes).header(b"BADMAGIC", 7),
+            Err(Error::Header(StateHeaderError::Magic {
+                expected: *b"BADMAGIC",
+                found: *magic,
+            }))
+        );
+        assert_eq!(
+            Reader::new(&bytes).header(magic, 8),
+            Err(Error::Header(StateHeaderError::Schema {
+                expected: 8,
+                found: 7,
+            }))
+        );
+        for length in 0..bytes.len() {
+            assert_eq!(
+                Reader::new(&bytes[..length]).header(magic, 7),
+                Err(Error::Truncated)
+            );
+        }
+        assert_eq!(Writer::new(9).header(magic, 7), Err(Error::Limit));
+    }
     #[test]
     fn checked_state_primitives_roundtrip() {
         let mut writer = Writer::new(64);

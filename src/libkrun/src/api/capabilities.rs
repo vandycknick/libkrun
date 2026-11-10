@@ -1,26 +1,16 @@
-//! Machine-less native observations. Neither build evidence nor system API access grants live operations.
-
-use std::fmt::{self, Write};
-
-mod current {
-    include!(concat!(env!("OUT_DIR"), "/live_build.rs"));
-}
+//! Machine-less native observations and versioned live-state compatibility.
 
 pub const LIVE_QUERY_ABI: u32 = 1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NativeBackend {
-    Kvm,
-    Hvf,
-    Unsupported,
+/// Bump whenever any execution, CPU, RAM-layout, device or legacy state encoding changes.
+pub const LIVE_STATE_SCHEMA: &str = "silo.live-state/1";
+
+pub const fn live_state_schema() -> &'static str {
+    LIVE_STATE_SCHEMA
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NativeArchitecture {
-    X86_64,
-    Aarch64,
-    Riscv64,
-    Unsupported,
+pub const fn guest_architecture() -> &'static str {
+    std::env::consts::ARCH
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,418 +21,19 @@ pub enum NativeLane {
     Unsupported,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorktreeState {
-    Clean,
-    Dirty,
-    Unknown,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SourceProvenance {
-    pub root: Option<&'static str>,
-    pub revision: Option<&'static str>,
-    pub worktree: WorktreeState,
-}
-
-impl SourceProvenance {
-    const fn observed(
-        root: Option<&'static str>,
-        revision: Option<&'static str>,
-        clean: Option<bool>,
-    ) -> Self {
-        Self {
-            root,
-            revision,
-            worktree: match clean {
-                Some(true) => WorktreeState::Clean,
-                Some(false) => WorktreeState::Dirty,
-                None => WorktreeState::Unknown,
-            },
-        }
-    }
-
-    /// A Git-clean observation, not a qualification or content attestation of ignored build inputs.
-    pub fn clean_revision(&self) -> Option<&'static str> {
-        let revision = self.revision?;
-        if self.worktree != WorktreeState::Clean
-            || self.root.is_none_or(str::is_empty)
-            || !matches!(revision.len(), 40 | 64)
-            || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return None;
-        }
-        Some(revision)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PackageBuildFacts {
-    pub name: &'static str,
-    pub version: &'static str,
-    pub target: Option<&'static str>,
-    /// Cargo's normalized CARGO_FEATURE_* identifiers, not inferred parent features.
-    pub features: Option<&'static [&'static str]>,
-    pub settings: &'static [(&'static str, Option<&'static str>)],
-    pub settings_observed: bool,
-    pub rustc_version: Option<&'static str>,
-    pub source: SourceProvenance,
-}
-
-impl PackageBuildFacts {
-    pub fn setting(&self, name: &str) -> Option<&'static str> {
-        self.settings
-            .iter()
-            .find(|(key, _)| *key == name)
-            .and_then(|(_, value)| *value)
-    }
-
-    /// Completeness of recorded binding inputs only. This never qualifies an operation.
-    pub fn binding_complete(&self) -> bool {
-        let Some(features) = self.features else {
-            return false;
-        };
-        !self.name.is_empty()
-            && !self.version.is_empty()
-            && self.settings_observed
-            && self.target.is_some_and(|target| !target.is_empty())
-            && self
-                .rustc_version
-                .is_some_and(|version| !version.is_empty())
-            && self.source.clean_revision().is_some()
-            && features.iter().all(|feature| {
-                feature.strip_prefix("CARGO_FEATURE_").is_some_and(|name| {
-                    !name.is_empty()
-                        && name.bytes().all(|byte| {
-                            byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
-                        })
-                })
-            })
-            && features.windows(2).all(|pair| pair[0] < pair[1])
-            && [
-                "TARGET",
-                "HOST",
-                "OPT_LEVEL",
-                "DEBUG",
-                "PROFILE",
-                "CARGO_CFG_TARGET_ARCH",
-                "CARGO_CFG_TARGET_OS",
-                "CARGO_CFG_TARGET_ENDIAN",
-                "CARGO_CFG_TARGET_POINTER_WIDTH",
-            ]
-            .iter()
-            .all(|name| self.setting(name).is_some_and(|value| !value.is_empty()))
-            && [
-                "CARGO_CFG_TARGET_ENV",
-                "CARGO_CFG_TARGET_FEATURE",
-                "CARGO_ENCODED_RUSTFLAGS",
-            ]
-            .iter()
-            .all(|name| self.setting(name).is_some())
-            && self.setting("TARGET") == self.target
-            && self.settings.iter().enumerate().all(|(index, (key, _))| {
-                self.settings[..index]
-                    .iter()
-                    .all(|(previous, _)| previous != key)
-            })
-    }
-
-    /// Length-delimited observations for consumer-side hashing. Missing and empty differ.
-    pub fn write_canonical(&self, output: &mut impl Write) -> fmt::Result {
-        output.write_str("native-package-v1;")?;
-        write_field(output, Some(self.name))?;
-        write_field(output, Some(self.version))?;
-        write_field(output, self.target)?;
-        match self.features {
-            Some(features) => {
-                write!(output, "{};", features.len())?;
-                for feature in features {
-                    write_field(output, Some(feature))?;
-                }
-            }
-            None => output.write_str("?;")?,
-        }
-        write!(output, "{};", self.settings.len())?;
-        for (key, value) in self.settings {
-            write_field(output, Some(key))?;
-            write_field(output, *value)?;
-        }
-        output.write_str(if self.settings_observed {
-            "observed;"
-        } else {
-            "partial;"
-        })?;
-        write_field(output, self.rustc_version)?;
-        write_field(output, self.source.root)?;
-        write_field(output, self.source.revision)?;
-        output.write_str(match self.source.worktree {
-            WorktreeState::Clean => "clean;",
-            WorktreeState::Dirty => "dirty;",
-            WorktreeState::Unknown => "unknown;",
-        })
-    }
-}
-
-fn write_field(output: &mut impl Write, value: Option<&str>) -> fmt::Result {
-    match value {
-        Some(value) => write!(output, "{}:{value};", value.len()),
-        None => output.write_str("?;"),
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct NativeBuildFacts {
-    pub query_abi: u32,
-    pub control_abi: Option<u32>,
-    pub backend: NativeBackend,
-    pub architecture: NativeArchitecture,
-    pub packages: &'static [PackageBuildFacts],
-}
-
-impl NativeBuildFacts {
-    pub fn execution_producer(&self) -> Result<String, &'static str> {
-        if !self.binding_complete() || self.control_abi != Some(1) {
-            return Err("native producer binding incomplete");
-        }
-        let mut value = String::new();
-        write!(
-            &mut value,
-            "execution-producer-v1;{};{:?};{:?};{:?};",
-            self.query_abi, self.control_abi, self.backend, self.architecture
-        )
-        .map_err(|_| "native producer formatting")?;
-        for package in self.packages {
-            package
-                .write_canonical(&mut value)
-                .map_err(|_| "native producer formatting")?;
-        }
-        if value.len() > crate::vmm::execution::MAX_NATIVE_BINDING {
-            return Err("native producer binding too large");
-        }
-        Ok(value)
-    }
-
-    /// Optional native packages not yet instrumented cannot yield a complete binding.
-    pub fn binding_complete(&self) -> bool {
-        self.binding_complete_for_profile(self.live_profile_included())
-    }
-
-    fn binding_complete_for_profile(&self, profile_included: bool) -> bool {
-        let required = [
-            "libkrun",
-            "krun-arch",
-            "krun-arch-gen",
-            "krun-devices",
-            "krun-kernel",
-            "krun-polly",
-            "krun-utils",
-            "krun-smbios",
-        ];
-        self.query_abi == LIVE_QUERY_ABI
-            && self.backend != NativeBackend::Unsupported
-            && self.architecture != NativeArchitecture::Unsupported
-            && profile_included
-            && required.iter().all(|name| self.has_one_package(name))
-            && (self.architecture != NativeArchitecture::X86_64
-                || self.has_one_package("krun-cpuid"))
-            && (self.backend != NativeBackend::Hvf || self.has_one_package("krun-hvf"))
-            && self.packages.iter().enumerate().all(|(index, package)| {
-                self.packages[..index]
-                    .iter()
-                    .all(|previous| previous.name != package.name)
-            })
-            && self
-                .packages
-                .iter()
-                .all(PackageBuildFacts::binding_complete)
-            && !self.packages.iter().any(|package| {
-                package.features.is_some_and(|features| {
-                    features.iter().any(|feature| {
-                        matches!(
-                            *feature,
-                            "CARGO_FEATURE_GPU"
-                                | "CARGO_FEATURE_INPUT"
-                                | "CARGO_FEATURE_VHOST_USER"
-                                | "CARGO_FEATURE_AWS_NITRO"
-                                | "CARGO_FEATURE_KRUN_DISPLAY"
-                                | "CARGO_FEATURE_KRUN_INPUT"
-                        )
-                    })
-                })
-            })
-            && self.packages.iter().all(|package| {
-                package.target == self.packages.first().and_then(|package| package.target)
-            })
-    }
-
-    fn live_profile_included(&self) -> bool {
-        self.profile_included(false)
-    }
-
-    fn profile_included(&self, diagnostic: bool) -> bool {
-        !self.packages.is_empty()
-            && self.packages.iter().all(|package| {
-                package.features.is_some_and(|features| {
-                    !features.iter().any(|feature| match *feature {
-                        "CARGO_FEATURE_TEE"
-                        | "CARGO_FEATURE_AMD_SEV"
-                        | "CARGO_FEATURE_TDX"
-                        | "CARGO_FEATURE_AWS_NITRO"
-                        | "CARGO_FEATURE_NATIVE_CONTROL_PROBE" => true,
-                        "CARGO_FEATURE_NATIVE_EXECUTION_PROBE"
-                        | "CARGO_FEATURE_NATIVE_DEVICE_PROBE" => !diagnostic,
-                        _ => false,
-                    })
-                })
-            })
-    }
-
-    fn has_one_package(&self, name: &str) -> bool {
-        self.packages
-            .iter()
-            .filter(|package| package.name == name)
-            .count()
-            == 1
-    }
-}
-
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    any(feature = "native-execution-probe", feature = "native-device-probe")
-))]
-pub fn diagnostic_execution_producer() -> Result<String, String> {
-    let mut value = String::from("diagnostic-only;");
-    let build = compiled_live_build();
-    write!(
-        value,
-        "{};{:?};{:?};{:?};",
-        build.query_abi, build.control_abi, build.backend, build.architecture
-    )
-    .map_err(|e| e.to_string())?;
-    for package in build.packages {
-        package
-            .write_canonical(&mut value)
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(value)
-}
-
-#[cfg(all(
-    feature = "native-device-probe",
-    target_os = "linux",
-    target_arch = "x86_64"
-))]
-pub fn diagnostic_lane(build: &NativeBuildFacts) -> Option<NativeLane> {
-    (build.backend == NativeBackend::Kvm
-        && build.architecture == NativeArchitecture::X86_64
-        && build.control_abi == Some(1)
-        && build.binding_complete_for_profile(build.profile_included(true)))
-    .then_some(NativeLane::KvmX86_64)
-}
-
-#[cfg(any(
-    all(
-        not(feature = "tee"),
-        any(
-            all(
-                target_os = "linux",
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ),
-            all(target_os = "macos", target_arch = "aarch64")
-        )
-    ),
-    all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        any(feature = "native-execution-probe", feature = "native-device-probe")
-    )
-))]
-pub(crate) fn execution_state_producer() -> Result<String, String> {
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        any(feature = "native-execution-probe", feature = "native-device-probe")
-    ))]
-    {
-        diagnostic_execution_producer()
-    }
-    #[cfg(not(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        any(feature = "native-execution-probe", feature = "native-device-probe")
-    )))]
-    {
-        compiled_live_build()
-            .execution_producer()
-            .map_err(str::to_owned)
-    }
-}
-macro_rules! package {
-    ($module:path) => {{
-        use $module as facts;
-        PackageBuildFacts {
-            name: facts::NAME,
-            version: facts::VERSION,
-            target: facts::TARGET,
-            features: facts::FEATURES,
-            settings: facts::SETTINGS,
-            settings_observed: facts::SETTINGS_OBSERVED,
-            rustc_version: facts::RUSTC_VERSION,
-            source: SourceProvenance::observed(facts::SOURCE_ROOT, facts::REVISION, facts::CLEAN),
-        }
-    }};
-}
-
-static BUILD: NativeBuildFacts = NativeBuildFacts {
-    query_abi: LIVE_QUERY_ABI,
-    control_abi: Some(1),
-    backend: if cfg!(target_os = "linux") {
-        NativeBackend::Kvm
-    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        NativeBackend::Hvf
-    } else {
-        NativeBackend::Unsupported
-    },
-    architecture: if cfg!(target_arch = "x86_64") {
-        NativeArchitecture::X86_64
-    } else if cfg!(target_arch = "aarch64") {
-        NativeArchitecture::Aarch64
-    } else if cfg!(target_arch = "riscv64") {
-        NativeArchitecture::Riscv64
-    } else {
-        NativeArchitecture::Unsupported
-    },
-    packages: &[
-        package!(current),
-        package!(arch::build_facts),
-        package!(arch::build_facts::arch_gen),
-        #[cfg(not(target_os = "windows"))]
-        package!(arch::build_facts::smbios),
-        #[cfg(target_arch = "x86_64")]
-        package!(cpuid::build_facts),
-        package!(devices::build_facts),
-        #[cfg(target_os = "macos")]
-        package!(hvf::build_facts),
-        package!(kernel::build_facts),
-        package!(polly::build_facts),
-        package!(utils::build_facts),
-    ],
-};
-
-pub fn compiled_live_build() -> &'static NativeBuildFacts {
-    &BUILD
-}
-
 impl NativeLane {
-    pub fn from_build(build: &NativeBuildFacts) -> Self {
-        if !build.live_profile_included() {
+    pub fn current() -> Self {
+        if cfg!(any(
+            feature = "tee",
+            feature = "aws-nitro",
+            feature = "native-control-probe"
+        )) {
             return Self::Unsupported;
         }
-        match (build.backend, build.architecture) {
-            (NativeBackend::Kvm, NativeArchitecture::X86_64) => Self::KvmX86_64,
-            (NativeBackend::Kvm, NativeArchitecture::Aarch64) => Self::KvmArm64GicV3,
-            (NativeBackend::Hvf, NativeArchitecture::Aarch64) => Self::HvfArm64GicV3,
+        match (std::env::consts::OS, guest_architecture()) {
+            ("linux", "x86_64") => Self::KvmX86_64,
+            ("linux", "aarch64") => Self::KvmArm64GicV3,
+            ("macos", "aarch64") => Self::HvfArm64GicV3,
             _ => Self::Unsupported,
         }
     }
@@ -860,7 +451,8 @@ impl NativeLiveOperations {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct NativeHostReport {
-    pub build: &'static NativeBuildFacts,
+    pub live_state_schema: &'static str,
+    pub architecture: &'static str,
     pub lane: NativeLane,
     pub kvm: KvmHostFacts,
     pub kvm_prerequisites: KvmPrerequisites,
@@ -870,9 +462,7 @@ pub struct NativeHostReport {
 
 /// Observes system APIs only, never constructing a VM, vCPU, GIC or guest workload.
 pub fn query_live_host() -> NativeHostReport {
-    let build = compiled_live_build();
-    let lane = NativeLane::from_build(build);
-    query_host_for_lane(build, lane)
+    query_host_for_lane(NativeLane::current())
 }
 
 #[cfg(all(
@@ -881,15 +471,10 @@ pub fn query_live_host() -> NativeHostReport {
     target_arch = "x86_64"
 ))]
 pub fn query_diagnostic_live_host() -> NativeHostReport {
-    let build = compiled_live_build();
-    let lane = match diagnostic_lane(build) {
-        Some(lane) => lane,
-        None => NativeLane::Unsupported,
-    };
-    query_host_for_lane(build, lane)
+    query_live_host()
 }
 
-fn query_host_for_lane(build: &'static NativeBuildFacts, lane: NativeLane) -> NativeHostReport {
+fn query_host_for_lane(lane: NativeLane) -> NativeHostReport {
     let kvm = if lane.queries_kvm() {
         query_kvm()
     } else {
@@ -901,7 +486,8 @@ fn query_host_for_lane(build: &'static NativeBuildFacts, lane: NativeLane) -> Na
         HvfHostFacts::not_queried(false)
     };
     NativeHostReport {
-        build,
+        live_state_schema: LIVE_STATE_SCHEMA,
+        architecture: guest_architecture(),
         lane,
         kvm_prerequisites: reduce_kvm_prerequisites(lane, &kvm),
         kvm,
@@ -1003,62 +589,17 @@ fn query_kvm() -> KvmHostFacts {
 mod tests {
     use crate::api::capabilities::{
         KVM_CAPABILITIES, KvmCapability, KvmCapabilityFact, KvmHostFacts, KvmPrerequisites,
-        LIVE_QUERY_ABI, NativeArchitecture, NativeBackend, NativeBuildFacts, NativeLane,
-        NativeLiveOperations, NativeOperationSupport, NativeQueryError, NativeUnsupportedReason,
-        Observation, PackageBuildFacts, QueryOperation, SourceProvenance, WorktreeState,
-        compiled_live_build, reduce_kvm_prerequisites,
+        LIVE_STATE_SCHEMA, NativeLane, NativeLiveOperations, NativeOperationSupport,
+        NativeQueryError, NativeUnsupportedReason, Observation, QueryOperation, live_state_schema,
+        reduce_kvm_prerequisites,
     };
     use std::io::ErrorKind;
 
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        any(feature = "native-execution-probe", feature = "native-device-probe")
-    ))]
     #[test]
-    fn native_diagnostic_producer_preserves_facts_without_qualification() {
-        use crate::api::capabilities::execution_state_producer;
-        let build = compiled_live_build();
-        let producer = execution_state_producer().expect("actual diagnostic build observations");
-        assert!(producer.starts_with("diagnostic-only;"));
-        assert_eq!(
-            producer,
-            crate::api::capabilities::diagnostic_execution_producer().expect("same native encoder")
-        );
-        assert!(build.execution_producer().is_err());
-        assert!(!build.binding_complete());
-        assert_eq!(NativeLane::from_build(build), NativeLane::Unsupported);
+    fn native_live_schema_is_exposed() {
+        assert_eq!(live_state_schema(), LIVE_STATE_SCHEMA);
+        assert_eq!(live_state_schema(), "silo.live-state/1");
     }
-
-    const REVISION: &str = "58253c00580bda34f5ea9fc4e0fccaf1e09a83d4";
-    const SOURCE: SourceProvenance = SourceProvenance {
-        root: Some("/native"),
-        revision: Some(REVISION),
-        worktree: WorktreeState::Clean,
-    };
-    const COMPLETE_PACKAGE: PackageBuildFacts = PackageBuildFacts {
-        name: "p",
-        version: "v",
-        target: Some("t"),
-        features: Some(&[]),
-        settings_observed: true,
-        settings: &[
-            ("TARGET", Some("t")),
-            ("HOST", Some("h")),
-            ("OPT_LEVEL", Some("2")),
-            ("DEBUG", Some("false")),
-            ("PROFILE", Some("release")),
-            ("CARGO_CFG_TARGET_ARCH", Some("aarch64")),
-            ("CARGO_CFG_TARGET_OS", Some("linux")),
-            ("CARGO_CFG_TARGET_ENDIAN", Some("little")),
-            ("CARGO_CFG_TARGET_POINTER_WIDTH", Some("64")),
-            ("CARGO_CFG_TARGET_ENV", Some("")),
-            ("CARGO_CFG_TARGET_FEATURE", Some("")),
-            ("CARGO_ENCODED_RUSTFLAGS", Some("")),
-        ],
-        rustc_version: Some("rustc observed"),
-        source: SOURCE,
-    };
 
     fn observed_kvm() -> KvmHostFacts {
         KvmHostFacts {
@@ -1070,310 +611,6 @@ mod tests {
             }),
             gic_model: Observation::NotEvaluated,
         }
-    }
-
-    #[test]
-    fn native_live_source_provenance_refuses_dirty_partial_and_unknown() {
-        assert_eq!(SOURCE.clean_revision(), Some(REVISION));
-        for worktree in [WorktreeState::Dirty, WorktreeState::Unknown] {
-            assert_eq!(
-                SourceProvenance { worktree, ..SOURCE }.clean_revision(),
-                None
-            );
-        }
-        for revision in [
-            None,
-            Some(""),
-            Some("58253c0"),
-            Some("gggggggggggggggggggggggggggggggggggggggg"),
-        ] {
-            assert_eq!(
-                SourceProvenance { revision, ..SOURCE }.clean_revision(),
-                None
-            );
-        }
-        assert_eq!(
-            SourceProvenance {
-                root: None,
-                ..SOURCE
-            }
-            .clean_revision(),
-            None
-        );
-        assert_eq!(
-            SourceProvenance {
-                root: Some(""),
-                ..SOURCE
-            }
-            .clean_revision(),
-            None
-        );
-    }
-
-    #[test]
-    fn native_live_package_serialization_preserves_exact_and_missing_facts() {
-        let mut package = PackageBuildFacts {
-            name: "p",
-            version: "v",
-            target: Some("t"),
-            features: Some(&["CARGO_FEATURE_A"]),
-            settings: &[
-                ("flags", Some("a\u{1f}b")),
-                ("unset", None),
-                ("empty", Some("")),
-            ],
-            settings_observed: true,
-            rustc_version: None,
-            source: SourceProvenance {
-                root: None,
-                revision: None,
-                worktree: WorktreeState::Unknown,
-            },
-        };
-        let mut output = String::new();
-        package.write_canonical(&mut output).unwrap();
-        assert_eq!(
-            output,
-            "native-package-v1;1:p;1:v;1:t;1;15:CARGO_FEATURE_A;3;5:flags;3:a\u{1f}b;5:unset;?;5:empty;0:;observed;?;?;?;unknown;"
-        );
-        package.features = None;
-        let mut unknown = String::new();
-        package.write_canonical(&mut unknown).unwrap();
-        package.features = Some(&[]);
-        let mut empty = String::new();
-        package.write_canonical(&mut empty).unwrap();
-        assert_ne!(unknown, empty);
-        assert!(!package.binding_complete());
-    }
-
-    #[test]
-    fn native_live_package_binding_requires_every_recorded_prerequisite() {
-        let complete = COMPLETE_PACKAGE;
-        assert!(complete.binding_complete());
-        for package in [
-            PackageBuildFacts {
-                target: None,
-                ..complete
-            },
-            PackageBuildFacts {
-                features: None,
-                ..complete
-            },
-            PackageBuildFacts {
-                rustc_version: None,
-                ..complete
-            },
-            PackageBuildFacts {
-                settings_observed: false,
-                ..complete
-            },
-            PackageBuildFacts {
-                settings: &[],
-                ..complete
-            },
-            PackageBuildFacts {
-                features: Some(&["CARGO_FEATURE_Z", "CARGO_FEATURE_A"]),
-                ..complete
-            },
-            PackageBuildFacts {
-                features: Some(&["CARGO_FEATURE_A", "CARGO_FEATURE_A"]),
-                ..complete
-            },
-            PackageBuildFacts {
-                features: Some(&[""]),
-                ..complete
-            },
-            PackageBuildFacts {
-                source: SourceProvenance {
-                    worktree: WorktreeState::Dirty,
-                    ..SOURCE
-                },
-                ..complete
-            },
-        ] {
-            assert!(!package.binding_complete());
-        }
-    }
-
-    const COMPLETE_PACKAGES: &[PackageBuildFacts] = &[
-        PackageBuildFacts {
-            name: "libkrun",
-            ..COMPLETE_PACKAGE
-        },
-        PackageBuildFacts {
-            name: "krun-arch",
-            ..COMPLETE_PACKAGE
-        },
-        PackageBuildFacts {
-            name: "krun-arch-gen",
-            ..COMPLETE_PACKAGE
-        },
-        PackageBuildFacts {
-            name: "krun-devices",
-            ..COMPLETE_PACKAGE
-        },
-        PackageBuildFacts {
-            name: "krun-kernel",
-            ..COMPLETE_PACKAGE
-        },
-        PackageBuildFacts {
-            name: "krun-polly",
-            ..COMPLETE_PACKAGE
-        },
-        PackageBuildFacts {
-            name: "krun-utils",
-            ..COMPLETE_PACKAGE
-        },
-        PackageBuildFacts {
-            name: "krun-smbios",
-            ..COMPLETE_PACKAGE
-        },
-    ];
-
-    #[cfg(all(
-        feature = "native-device-probe",
-        target_os = "linux",
-        target_arch = "x86_64"
-    ))]
-    #[test]
-    fn diagnostic_irq_lane_requires_complete_identity_without_production_admission() {
-        use crate::api::capabilities::diagnostic_lane;
-        macro_rules! packages {
-            ($features:expr) => {
-                &[
-                    PackageBuildFacts {
-                        features: $features,
-                        ..COMPLETE_PACKAGES[0]
-                    },
-                    COMPLETE_PACKAGES[1],
-                    COMPLETE_PACKAGES[2],
-                    COMPLETE_PACKAGES[3],
-                    COMPLETE_PACKAGES[4],
-                    COMPLETE_PACKAGES[5],
-                    COMPLETE_PACKAGES[6],
-                    COMPLETE_PACKAGES[7],
-                    PackageBuildFacts {
-                        name: "krun-cpuid",
-                        ..COMPLETE_PACKAGE
-                    },
-                ]
-            };
-        }
-        const PROBE: &[PackageBuildFacts] = packages!(Some(&[
-            "CARGO_FEATURE_NATIVE_DEVICE_PROBE",
-            "CARGO_FEATURE_NATIVE_EXECUTION_PROBE",
-        ]));
-        let mut build = NativeBuildFacts {
-            query_abi: LIVE_QUERY_ABI,
-            control_abi: Some(1),
-            backend: NativeBackend::Kvm,
-            architecture: NativeArchitecture::X86_64,
-            packages: PROBE,
-        };
-        assert_eq!(diagnostic_lane(&build), Some(NativeLane::KvmX86_64));
-        assert!(!build.binding_complete());
-        assert!(build.execution_producer().is_err());
-        assert_eq!(NativeLane::from_build(&build), NativeLane::Unsupported);
-        const REFUSED: &[&[PackageBuildFacts]] = &[
-            packages!(Some(&["CARGO_FEATURE_TEE"])),
-            packages!(Some(&["CARGO_FEATURE_AMD_SEV"])),
-            packages!(Some(&["CARGO_FEATURE_TDX"])),
-            packages!(Some(&["CARGO_FEATURE_AWS_NITRO"])),
-            packages!(Some(&["CARGO_FEATURE_NATIVE_CONTROL_PROBE"])),
-            packages!(Some(&["CARGO_FEATURE_GPU"])),
-            packages!(None),
-            COMPLETE_PACKAGES,
-        ];
-        for packages in REFUSED {
-            build.packages = packages;
-            assert_eq!(diagnostic_lane(&build), None);
-        }
-        build.packages = PROBE;
-        build.control_abi = None;
-        assert_eq!(diagnostic_lane(&build), None);
-        build.control_abi = Some(1);
-        build.backend = NativeBackend::Hvf;
-        assert_eq!(diagnostic_lane(&build), None);
-        build.backend = NativeBackend::Kvm;
-        build.architecture = NativeArchitecture::Aarch64;
-        assert_eq!(diagnostic_lane(&build), None);
-    }
-
-    #[test]
-    fn native_live_build_binding_refuses_missing_packages_and_unobserved_optional_packages() {
-        const PACKAGES: &[PackageBuildFacts] = COMPLETE_PACKAGES;
-        let mut build = NativeBuildFacts {
-            query_abi: LIVE_QUERY_ABI,
-            control_abi: None,
-            backend: NativeBackend::Kvm,
-            architecture: NativeArchitecture::Aarch64,
-            packages: PACKAGES,
-        };
-        assert!(build.binding_complete());
-        build.query_abi = 0;
-        assert!(!build.binding_complete());
-        build.query_abi = LIVE_QUERY_ABI;
-        build.packages = &[];
-        assert!(!build.binding_complete());
-        build.packages = &PACKAGES[..7];
-        assert!(!build.binding_complete());
-        build.packages = PACKAGES;
-        build.architecture = NativeArchitecture::X86_64;
-        assert!(!build.binding_complete());
-        build.architecture = NativeArchitecture::Aarch64;
-        build.backend = NativeBackend::Hvf;
-        assert!(!build.binding_complete());
-        build.backend = NativeBackend::Kvm;
-        const GPU_PACKAGES: &[PackageBuildFacts] = &[
-            PackageBuildFacts {
-                features: Some(&["CARGO_FEATURE_GPU"]),
-                ..PACKAGES[0]
-            },
-            PACKAGES[1],
-            PACKAGES[2],
-            PACKAGES[3],
-            PACKAGES[4],
-            PACKAGES[5],
-            PACKAGES[6],
-            PACKAGES[7],
-        ];
-        build.packages = GPU_PACKAGES;
-        assert!(!build.binding_complete());
-    }
-
-    #[test]
-    fn native_live_compiled_facts_are_static_and_package_local() {
-        let build = compiled_live_build();
-        assert!(std::ptr::eq(build, compiled_live_build()));
-        assert_eq!(build.query_abi, LIVE_QUERY_ABI);
-        assert_eq!(build.query_abi, 1);
-        assert_eq!(build.control_abi, Some(1));
-        assert_eq!(
-            build.packages.first().map(|package| package.name),
-            Some("libkrun")
-        );
-        for package in build.packages {
-            if let Some(features) = package.features {
-                assert!(features.windows(2).all(|pair| pair[0] < pair[1]));
-            }
-        }
-        let devices = build
-            .packages
-            .iter()
-            .find(|package| package.name == "krun-devices")
-            .unwrap();
-        assert!(
-            devices
-                .features
-                .unwrap()
-                .contains(&"CARGO_FEATURE_TEST_UTILS")
-        );
-        assert!(
-            !build.packages[0]
-                .features
-                .unwrap()
-                .contains(&"CARGO_FEATURE_TEST_UTILS")
-        );
     }
 
     #[test]
@@ -1414,92 +651,6 @@ mod tests {
                 );
             }
         }
-        let mut build = NativeBuildFacts {
-            query_abi: LIVE_QUERY_ABI,
-            control_abi: None,
-            backend: NativeBackend::Hvf,
-            architecture: NativeArchitecture::X86_64,
-            packages: &[COMPLETE_PACKAGE],
-        };
-        assert_eq!(NativeLane::from_build(&build), NativeLane::Unsupported);
-        build.backend = NativeBackend::Kvm;
-        build.architecture = NativeArchitecture::Riscv64;
-        assert_eq!(NativeLane::from_build(&build), NativeLane::Unsupported);
-    }
-
-    #[test]
-    fn native_live_compiled_profiles_exclude_tee_nitro_and_unknown_features_without_host_queries() {
-        macro_rules! profile_packages {
-            ($features:expr) => {
-                &[
-                    COMPLETE_PACKAGES[0],
-                    COMPLETE_PACKAGES[1],
-                    COMPLETE_PACKAGES[2],
-                    PackageBuildFacts {
-                        features: $features,
-                        ..COMPLETE_PACKAGES[3]
-                    },
-                    COMPLETE_PACKAGES[4],
-                    COMPLETE_PACKAGES[5],
-                    COMPLETE_PACKAGES[6],
-                    COMPLETE_PACKAGES[7],
-                ]
-            };
-        }
-        const PROFILES: &[&[PackageBuildFacts]] = &[
-            profile_packages!(Some(&["CARGO_FEATURE_TEE"])),
-            profile_packages!(Some(&["CARGO_FEATURE_AMD_SEV"])),
-            profile_packages!(Some(&["CARGO_FEATURE_TDX"])),
-            profile_packages!(Some(&["CARGO_FEATURE_AWS_NITRO"])),
-            profile_packages!(Some(&["CARGO_FEATURE_NATIVE_CONTROL_PROBE"])),
-            profile_packages!(Some(&["CARGO_FEATURE_NATIVE_EXECUTION_PROBE"])),
-            profile_packages!(Some(&["CARGO_FEATURE_NATIVE_DEVICE_PROBE"])),
-            profile_packages!(None),
-        ];
-        for packages in PROFILES {
-            for (backend, architecture) in [
-                (NativeBackend::Kvm, NativeArchitecture::X86_64),
-                (NativeBackend::Kvm, NativeArchitecture::Aarch64),
-                (NativeBackend::Hvf, NativeArchitecture::Aarch64),
-            ] {
-                let build = NativeBuildFacts {
-                    query_abi: LIVE_QUERY_ABI,
-                    control_abi: None,
-                    backend,
-                    architecture,
-                    packages,
-                };
-                assert!(!build.live_profile_included());
-                assert!(!build.binding_complete());
-                let lane = NativeLane::from_build(&build);
-                assert_eq!(lane, NativeLane::Unsupported);
-                assert!(!lane.queries_kvm());
-                let operations = NativeLiveOperations::for_lane(lane);
-                for operation in [
-                    operations.pause,
-                    operations.capture,
-                    operations.restore,
-                    operations.fork,
-                    operations.incremental,
-                ] {
-                    assert_eq!(
-                        operation,
-                        NativeOperationSupport::Unsupported(NativeUnsupportedReason::BuildExcluded)
-                    );
-                    assert!(!operation.is_supported());
-                }
-            }
-        }
-        let build = NativeBuildFacts {
-            query_abi: LIVE_QUERY_ABI,
-            control_abi: None,
-            backend: NativeBackend::Kvm,
-            architecture: NativeArchitecture::Aarch64,
-            packages: COMPLETE_PACKAGES,
-        };
-        assert!(build.live_profile_included());
-        assert!(build.binding_complete());
-        assert_eq!(NativeLane::from_build(&build), NativeLane::KvmArm64GicV3);
     }
 
     #[test]

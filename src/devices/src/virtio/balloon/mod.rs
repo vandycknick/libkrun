@@ -1,5 +1,5 @@
 #[cfg(not(feature = "tee"))]
-mod device;
+pub(crate) mod device;
 #[cfg(not(feature = "tee"))]
 mod event_handler;
 

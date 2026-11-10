@@ -26,7 +26,6 @@ use utils::eventfd::{EFD_NONBLOCK, EventFd};
 #[cfg(feature = "native-device-probe")]
 use vm_memory::GuestAddress;
 
-use crate::api::capabilities::execution_state_producer;
 use crate::api::device_builders::{
     AttachContext, AttachDevice, BalloonBinding, GenerationBinding, MmioDeviceManager,
 };
@@ -1036,8 +1035,8 @@ fn fixed<const N: usize>(directory: &Path, name: &str) -> Result<[u8; N], String
 }
 fn binding(directory: &Path, generation: u64) -> Result<StateBinding, String> {
     Ok(StateBinding {
-        native_producer: execution_state_producer()?,
-        silo_producer: fixed(directory, "silo-producer")?,
+        live_state_schema: crate::api::capabilities::LIVE_STATE_SCHEMA.into(),
+        architecture: crate::api::capabilities::guest_architecture().into(),
         profile: fixed(directory, "profile")?,
         topology: fixed(directory, "topology")?,
         ram_layout: fixed(directory, "ram-layout")?,
