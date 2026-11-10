@@ -179,6 +179,18 @@ Magic/schema errors retain typed expected and found values. Capture/run,
 profile, topology and RAM-layout digests still prevent mixing objects from
 different cuts; they are not source-build compatibility gates.
 
+Paused RAM capture uses three reusable 32 MiB packs and two scoped workers.
+The reader copies every selected live range and classifies pages with the
+existing word-wise zero scan. Workers hash independent 8 MiB identity chunks
+and write nonzero page runs at their packed stream offsets. Whole-zero packs
+stay on the reader, without hashing or writing; dirty incremental overlays
+are always written, including changed-to-zero pages over a retained baseline.
+The bounded queues apply back-pressure without allocating more RAM packs.
+Completion places digests by chunk index, preserving the raw RAM bytes,
+canonical layout, zero sentinels and identity order regardless of worker order.
+The first reader/worker error cancels remaining work; every worker is joined
+before capture returns, including deadline, write and thread-creation failures.
+
 No Git command, source hashing, compiler inventory or checkout cleanliness
 observation participates in compilation or restore compatibility.
 

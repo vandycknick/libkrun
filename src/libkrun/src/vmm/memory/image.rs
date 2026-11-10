@@ -21,7 +21,8 @@ use crate::vmm::memory::image::layout::{MAX_RAM_LAYOUT_BYTES, RamTopology};
 pub mod layout;
 pub mod writer;
 
-pub const RAM_IO_BUFFER_BYTES: usize = 1024 * 1024;
+pub const RAM_IO_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const RAM_IO_BUFFER_COUNT: usize = 3;
 pub const RAM_IDENTITY_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,6 +108,8 @@ pub enum RamImageError {
     Deadline,
     #[error("RAM image allocation failed")]
     Allocation,
+    #[error("RAM capture pipeline: {0}")]
+    Pipeline(io::Error),
     #[error("RAM {operation:?} on {role:?}: {source}")]
     Io {
         operation: RamIoOperation,
@@ -209,17 +212,20 @@ impl fmt::Display for RamImageFailure {
 impl std::error::Error for RamImageFailure {}
 
 pub struct RamIoScratch {
-    buffer: Box<[u8]>,
+    buffers: [Box<[u8]>; RAM_IO_BUFFER_COUNT],
 }
 impl RamIoScratch {
     pub fn new() -> Result<Self, RamImageError> {
-        let mut buffer = Vec::new();
-        buffer
-            .try_reserve_exact(RAM_IO_BUFFER_BYTES)
-            .map_err(|_| RamImageError::Allocation)?;
-        buffer.resize(RAM_IO_BUFFER_BYTES, 0);
+        fn allocate() -> Result<Box<[u8]>, RamImageError> {
+            let mut buffer = Vec::new();
+            buffer
+                .try_reserve_exact(RAM_IO_BUFFER_BYTES)
+                .map_err(|_| RamImageError::Allocation)?;
+            buffer.resize(RAM_IO_BUFFER_BYTES, 0);
+            Ok(buffer.into_boxed_slice())
+        }
         Ok(Self {
-            buffer: buffer.into_boxed_slice(),
+            buffers: [allocate()?, allocate()?, allocate()?],
         })
     }
 }
