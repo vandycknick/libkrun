@@ -8,9 +8,9 @@ use std::task::Poll;
 #[cfg(feature = "native-device-probe")]
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "macos")]
-use arch::guest_memory::GuestRange;
-use arch::guest_memory::{BackingKind, MemoryDomain, TrackingMode};
+#[cfg(any(not(target_os = "linux"), feature = "native-device-probe"))]
+use arch::guest_memory::TrackingMode;
+use arch::guest_memory::{BackingKind, GuestRange, MemoryDomain};
 #[cfg(target_os = "macos")]
 use hvf::reclaim::{ReclaimState, ReleaseOutcome};
 #[cfg(target_os = "macos")]
@@ -21,7 +21,12 @@ use utils::state::{Reader, Writer};
 
 pub(crate) const BALLOON_STATE_MAGIC: &[u8; 8] = b"KRUNBALL";
 pub(crate) const BALLOON_STATE_SCHEMA: u16 = 1;
-#[cfg(any(target_os = "macos", feature = "native-device-probe"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows",
+    feature = "native-device-probe"
+))]
 use vm_memory::Address;
 use vm_memory::ByteValued;
 
@@ -138,6 +143,97 @@ impl ReportHold {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct ReplacedMappings {
+    islands: Vec<(usize, usize)>,
+    island_limit: Option<usize>,
+}
+
+#[cfg(target_os = "linux")]
+impl ReplacedMappings {
+    const VMM_MAPPING_RESERVE: usize = 1024;
+
+    fn new() -> Self {
+        Self {
+            islands: Vec::new(),
+            island_limit: None,
+        }
+    }
+
+    fn host_island_limit() -> std::io::Result<usize> {
+        let maximum = std::fs::read_to_string("/proc/sys/vm/max_map_count")?
+            .trim()
+            .parse::<usize>()
+            .map_err(std::io::Error::other)?;
+        let current = std::fs::read_to_string("/proc/self/maps")?.lines().count();
+        Ok(maximum
+            .saturating_sub(current)
+            .saturating_sub(Self::VMM_MAPPING_RESERVE)
+            / 2)
+    }
+
+    fn discard(&mut self, host: *mut u8, len: usize) -> Result<bool, vm_memory::GuestMemoryError> {
+        let start = host as usize;
+        let end = start.checked_add(len).ok_or_else(|| {
+            vm_memory::GuestMemoryError::IOError(std::io::Error::other("discard address overflow"))
+        })?;
+        let first = self.islands.partition_point(|&(_, end)| end < start);
+        let last = self.islands.partition_point(|&(start, _)| start <= end);
+        let count = self.islands.len() - (last - first) + 1;
+        let limit = *self
+            .island_limit
+            .get_or_insert_with(|| match Self::host_island_limit() {
+                Ok(limit) => limit,
+                Err(error) => {
+                    log::warn!("balloon: cannot determine replacement mapping budget: {error}");
+                    0
+                }
+            });
+        if count > limit && count > self.islands.len() {
+            return Ok(false);
+        }
+        if count > self.islands.len() && self.islands.try_reserve(1).is_err() {
+            return Ok(false);
+        }
+        // nix::sys::mman is not enabled in this crate. File-private advice would resurrect bytes.
+        let mapped = unsafe {
+            libc::mmap(
+                host.cast(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOMEM) {
+                return Ok(false);
+            }
+            return Err(vm_memory::GuestMemoryError::IOError(error));
+        }
+        if mapped != host.cast() {
+            return Err(vm_memory::GuestMemoryError::IOError(std::io::Error::other(
+                "fixed discard mapping returned a different address",
+            )));
+        }
+        let merged_start = self
+            .islands
+            .get(first)
+            .filter(|_| first < last)
+            .map_or(start, |&(previous, _)| previous.min(start));
+        let merged_end = self
+            .islands
+            .get(last.wrapping_sub(1))
+            .filter(|_| first < last)
+            .map_or(end, |&(_, previous)| previous.max(end));
+        self.islands.drain(first..last);
+        self.islands.insert(first, (merged_start, merged_end));
+        Ok(true)
+    }
+}
+
 pub struct Balloon {
     pub(crate) queues: Option<Vec<DeviceQueue>>,
     pub(crate) avail_features: u64,
@@ -150,6 +246,8 @@ pub struct Balloon {
     memory_policy: Option<BalloonMemoryPolicy>,
     restored_offer: bool,
     reclaim_observer: ReclaimObserver,
+    #[cfg(target_os = "linux")]
+    replaced_mappings: ReplacedMappings,
     #[cfg(feature = "native-device-probe")]
     report_hold: ReportHold,
     descriptors: DescriptorChainSnapshot,
@@ -174,6 +272,8 @@ impl Balloon {
             memory_policy: None,
             restored_offer: false,
             reclaim_observer: ReclaimObserver::new(),
+            #[cfg(target_os = "linux")]
+            replaced_mappings: ReplacedMappings::new(),
             #[cfg(feature = "native-device-probe")]
             report_hold: ReportHold::new(),
             descriptors: DescriptorChainSnapshot::new(defs::QUEUE_SIZE),
@@ -184,8 +284,7 @@ impl Balloon {
         })
     }
 
-    /// Binds the exact source offer without granting destructive reclaim on
-    /// destination RAM, including when reporting was negotiated on the source.
+    /// Preserves the exact negotiated source offer on destination RAM.
     pub fn new_restore_binding(avail_features: u64) -> crate::virtio::balloon::Result<Balloon> {
         if avail_features != reporting_features(true) && avail_features != reporting_features(false)
         {
@@ -193,7 +292,7 @@ impl Balloon {
         }
         let mut balloon = Self::new()?;
         balloon.avail_features = avail_features;
-        balloon.host_reclaim_enabled = false;
+        balloon.host_reclaim_enabled = cfg!(target_os = "linux");
         balloon.restored_offer = true;
         Ok(balloon)
     }
@@ -210,8 +309,8 @@ impl Balloon {
             return Err(BalloonError::InvalidMemoryPolicy);
         }
         self.memory_policy = Some(policy);
-        self.host_reclaim_enabled =
-            policy == BalloonMemoryPolicy::Untracked && !self.restored_offer;
+        self.host_reclaim_enabled = cfg!(target_os = "linux")
+            || (policy == BalloonMemoryPolicy::Untracked && !self.restored_offer);
         if !self.restored_offer {
             #[cfg(target_os = "macos")]
             let reporting = policy != BalloonMemoryPolicy::Untracked
@@ -229,6 +328,9 @@ impl Balloon {
         if !self.host_reclaim_enabled {
             self.host_memory_remapper = None;
         }
+        #[cfg(target_os = "linux")]
+        let reason = 0;
+        #[cfg(not(target_os = "linux"))]
         let reason = match policy {
             BalloonMemoryPolicy::Untracked => 0,
             BalloonMemoryPolicy::TrackedCapture => 1,
@@ -277,6 +379,7 @@ impl Balloon {
     }
 
     pub fn bind_reclaim_domain(&mut self, domain: &MemoryDomain) {
+        #[cfg(not(target_os = "linux"))]
         if domain.backing_kind() == BackingKind::RestoredPrivate
             || domain.tracking_mode() != Some(TrackingMode::Disabled)
         {
@@ -614,13 +717,13 @@ impl Balloon {
                 (seed, false)
             }
             ReportAction::Child { source_seed, seed } => {
-                if self.reclaim_status().reason != ReclaimReason::RestoredPrivateMapping
-                    || memory.domain().backing_kind() != BackingKind::RestoredPrivate
+                if memory.domain().backing_kind() != BackingKind::RestoredPrivate
                     || self.pressure_remapper_present()
+                    || (cfg!(target_os = "macos")
+                        && self.reclaim_status().reason != ReclaimReason::RestoredPrivateMapping)
                 {
                     return Err(
-                        "child report witness requires inhibited private memory without remapper"
-                            .into(),
+                        "child report witness requires private memory without remapper".into(),
                     );
                 }
                 let mut before = [0; 4096];
@@ -682,8 +785,13 @@ impl Balloon {
         memory
             .read_slice(&mut after, vm_memory::GuestAddress(report.gpa))
             .map_err(|error| error.to_string())?;
-        if after != [seed; 4096] {
-            return Err("complete report page changed after seed or used publication".into());
+        let expected = if child && cfg!(target_os = "linux") {
+            0
+        } else {
+            seed
+        };
+        if after != [expected; 4096] {
+            return Err("complete report page differs after seed or used publication".into());
         }
         self.report_hold.witness.verified_bytes = after.len();
         self.report_hold.witness.state = if child {
@@ -815,6 +923,7 @@ impl Balloon {
         let DeviceState::Activated(mem, _) = &self.device_state else {
             return Ok(false);
         };
+        #[cfg(not(target_os = "linux"))]
         let reporting_enabled = reporting_enabled
             && mem.domain().backing_kind() == BackingKind::Boot
             && mem.domain().tracking_mode() == Some(TrackingMode::Disabled);
@@ -901,37 +1010,73 @@ impl Balloon {
                 }
 
                 #[cfg(not(target_os = "macos"))]
-                for descriptor in snapshot.descriptors() {
-                    mem.try_write_access(
-                        descriptor.len as usize,
-                        vm_memory::GuestAddress(descriptor.addr),
-                        |_, len, _, slice| {
-                            let host = slice.as_mut_ptr();
-                            #[cfg(target_os = "linux")]
-                            {
-                                // nix::sys::mman is not enabled in this crate's existing feature set.
-                                let result =
-                                    unsafe { libc::madvise(host.cast(), len, libc::MADV_DONTNEED) };
-                                if result != 0 {
-                                    return Err(vm_memory::GuestMemoryError::IOError(
-                                        std::io::Error::last_os_error(),
-                                    ));
+                {
+                    let coalesce = cfg!(target_os = "linux")
+                        && mem.domain().backing_kind() == BackingKind::RestoredPrivate;
+                    let coalesced = if coalesce {
+                        coalesce_free_page_ranges(snapshot.descriptors().iter().map(|descriptor| {
+                            (vm_memory::GuestAddress(descriptor.addr), descriptor.len)
+                        }))
+                    } else {
+                        Vec::new()
+                    };
+                    let ranges = coalesced.into_iter().chain(
+                        snapshot
+                            .descriptors()
+                            .iter()
+                            .filter(|_| !coalesce)
+                            .filter_map(|descriptor| {
+                                GuestRange::new(descriptor.addr, u64::from(descriptor.len)).ok()
+                            }),
+                    );
+                    for range in ranges {
+                        let len = usize::try_from(range.byte_len())
+                            .map_err(|_| "reported range exceeds host address space".to_string())?;
+                        mem.try_write_access(
+                            len,
+                            vm_memory::GuestAddress(range.start()),
+                            |_, len, _, slice| {
+                                let host = slice.as_mut_ptr();
+                                #[cfg(target_os = "linux")]
+                                {
+                                    match mem.domain().backing_kind() {
+                                        BackingKind::Boot => {
+                                            // nix::sys::mman is not enabled in this crate.
+                                            if unsafe {
+                                                libc::madvise(host.cast(), len, libc::MADV_DONTNEED)
+                                            } != 0
+                                            {
+                                                return Err(vm_memory::GuestMemoryError::IOError(
+                                                    std::io::Error::last_os_error(),
+                                                ));
+                                            }
+                                        }
+                                        BackingKind::RestoredPrivate => {
+                                            if !self.replaced_mappings.discard(host, len)? {
+                                                self.reclaim_observer.record_mapping_limit_skip();
+                                                return Ok(len);
+                                            }
+                                            self.reclaim_observer.set_replaced_islands(
+                                                self.replaced_mappings.islands.len(),
+                                            );
+                                        }
+                                    }
                                 }
-                            }
-                            #[cfg(target_os = "windows")]
-                            {
-                                let result = unsafe { DiscardVirtualMemory(host.cast(), len) };
-                                if result != 0 {
-                                    return Err(vm_memory::GuestMemoryError::IOError(
-                                        std::io::Error::from_raw_os_error(result as i32),
-                                    ));
+                                #[cfg(target_os = "windows")]
+                                {
+                                    let result = unsafe { DiscardVirtualMemory(host.cast(), len) };
+                                    if result != 0 {
+                                        return Err(vm_memory::GuestMemoryError::IOError(
+                                            std::io::Error::from_raw_os_error(result as i32),
+                                        ));
+                                    }
                                 }
-                            }
-                            self.reclaim_observer.record_release(len);
-                            Ok(len)
-                        },
-                    )
-                    .map_err(|error| format!("failed report discard: {error}"))?;
+                                self.reclaim_observer.record_release(len);
+                                Ok(len)
+                            },
+                        )
+                        .map_err(|error| format!("failed report discard: {error}"))?;
+                    }
                 }
             }
             queue
@@ -1027,7 +1172,7 @@ impl Balloon {
 
 /// Merges the descriptors of one free-page report into maximal contiguous
 /// guest ranges, dropping descriptors that are empty or overflow.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn coalesce_free_page_ranges(
     descriptors: impl IntoIterator<Item = (vm_memory::GuestAddress, u32)>,
 ) -> Vec<GuestRange> {
@@ -1265,7 +1410,9 @@ impl VirtioStateProvider for Balloon {
         let (acked, config) = self.decode_payload(payload)?;
         self.callbacks.prepare_restore(request)?;
         match context.reclaim_policy {
-            RestoredReclaimPolicy::Disabled => self.host_reclaim_enabled = false,
+            RestoredReclaimPolicy::Disabled => {
+                self.host_reclaim_enabled = cfg!(target_os = "linux");
+            }
         }
         self.acked_features = acked;
         self.bind_reclaim_domain(context.memory.domain());
@@ -1403,7 +1550,10 @@ mod tests {
         wrong_schema[8..10].copy_from_slice(&2u16.to_le_bytes());
         assert_eq!(
             balloon.validate_payload(&wrong_schema),
-            Err(ProviderFault::StateHeader(StateHeaderError::Schema { expected: 1, found: 2 }))
+            Err(ProviderFault::StateHeader(StateHeaderError::Schema {
+                expected: 1,
+                found: 2
+            }))
         );
         balloon.validate_payload(&payload).unwrap();
         let (acked, decoded) = balloon.decode_payload(&payload).unwrap();
@@ -1435,7 +1585,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn provider_balloon_real_report_cut_keeps_stats_and_restored_reclaim_disabled() {
+    fn provider_balloon_real_report_cut_keeps_stats_and_restored_reclaim_enabled() {
         use crate::legacy::DummyIrqChip;
         use crate::virtio::balloon::device::{FRQ_INDEX, STQ_INDEX};
         use crate::virtio::lifecycle::{
@@ -1548,7 +1698,7 @@ mod tests {
             .unwrap();
         assert_eq!(destination.avail_features(), source.avail_features());
         assert_eq!(destination.acked_features(), source.acked_features());
-        assert!(!destination.host_reclaim_enabled);
+        assert!(destination.host_reclaim_enabled);
         assert_eq!(
             destination.activate_evt.read().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
@@ -1577,7 +1727,7 @@ mod tests {
         child_memory
             .read_slice(&mut contents, child_report_address)
             .unwrap();
-        assert_eq!(contents, vec![0xa5; page_size]);
+        assert_eq!(contents, vec![0; page_size]);
         assert_eq!(child_rings[STQ_INDEX].used.idx.get(), 0);
         assert!(matches!(
             source.begin_resume(request(2), completion.queues),
@@ -1705,7 +1855,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_balloon_restore_binding_preserves_offer_without_reclaim_grant() {
+    fn provider_balloon_restore_binding_preserves_offer_and_platform_reclaim_policy() {
         use crate::virtio::balloon::device::reporting_features;
         for reporting in [false, true] {
             let features = reporting_features(reporting);
@@ -1722,7 +1872,7 @@ mod tests {
                     .finalize_memory_policy(crate::virtio::balloon::BalloonMemoryPolicy::Untracked,)
                     .is_err()
             );
-            assert!(!balloon.host_reclaim_enabled);
+            assert_eq!(balloon.host_reclaim_enabled, cfg!(target_os = "linux"));
             balloon.set_acked_features(features);
             assert_eq!(balloon.acked_features(), features);
             #[cfg(target_os = "macos")]
@@ -1746,7 +1896,7 @@ mod tests {
         ] {
             let mut balloon = Balloon::new().unwrap();
             balloon.finalize_memory_policy(policy).unwrap();
-            assert!(!balloon.host_reclaim_enabled);
+            assert_eq!(balloon.host_reclaim_enabled, cfg!(target_os = "linux"));
             assert_ne!(
                 balloon.avail_features() & (1 << uapi::VIRTIO_BALLOON_F_REPORTING),
                 0
@@ -1756,7 +1906,7 @@ mod tests {
                     .finalize_memory_policy(BalloonMemoryPolicy::Untracked)
                     .is_err()
             );
-            assert!(!balloon.host_reclaim_enabled);
+            assert_eq!(balloon.host_reclaim_enabled, cfg!(target_os = "linux"));
         }
         let mut ordinary = Balloon::new().unwrap();
         ordinary
@@ -1896,7 +2046,7 @@ mod tests {
             assert_eq!(rings[FRQ_INDEX].used.idx.get(), 1);
             let mut contents = vec![0; page_size];
             memory.read_slice(&mut contents, report_address).unwrap();
-            assert_eq!(contents, vec![0xa5; page_size]);
+            assert_eq!(contents, vec![0; page_size]);
             baseline
                 .read_exact_at(&mut contents, report_address.0)
                 .unwrap();
@@ -1909,7 +2059,7 @@ mod tests {
             assert!(balloon.process_frq().unwrap());
             assert_eq!(rings[FRQ_INDEX].used.idx.get(), 2);
             memory.read_slice(&mut contents, report_address).unwrap();
-            assert_eq!(contents, vec![0x3c; page_size]);
+            assert_eq!(contents, vec![0; page_size]);
             use vm_memory::Bytes;
             sibling.read_slice(&mut contents, report_address).unwrap();
             assert_eq!(contents, vec![0x6b; page_size]);
@@ -1922,26 +2072,25 @@ mod tests {
                 status.backing,
                 crate::virtio::balloon::ReclaimBacking::RestoredPrivate
             );
-            assert_eq!(
-                status.reason,
-                crate::virtio::balloon::ReclaimReason::RestoredPrivateMapping
-            );
+            assert_eq!(status.reason, crate::virtio::balloon::ReclaimReason::None);
             assert_eq!(
                 status.qualification,
                 crate::virtio::balloon::ReclaimQualification::NotRun
             );
-            assert!(!status.requested);
-            assert!(!status.effective);
-            assert_eq!(status.released_bytes, 0);
-            assert_eq!(status.released_extents, 0);
-            assert_eq!(status.skipped_reports, 2);
+            assert!(status.requested);
+            assert!(status.effective);
+            assert_eq!(status.released_bytes, 2 * page_size as u64);
+            assert_eq!(status.released_extents, 2);
+            assert_eq!(status.skipped_reports, 0);
+            assert_eq!(status.replaced_islands, 1);
+            assert_eq!(status.mapping_limit_skips, 0);
             assert_eq!(status.failed_operations, 0);
         }
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn tracked_source_reports_keep_bytes_and_dirty_only_queue_completion() {
+    fn tracked_source_reports_discard_and_dirty_exact_pages_and_queue_completion() {
         use crate::legacy::DummyIrqChip;
         use crate::virtio::balloon::BalloonMemoryPolicy;
         use crate::virtio::balloon::device::FRQ_INDEX;
@@ -2020,7 +2169,7 @@ mod tests {
         }
         let mut contents = vec![0; page_size];
         memory.read_slice(&mut contents, report_address).unwrap();
-        assert_eq!(contents, vec![0x5a; page_size]);
+        assert_eq!(contents, vec![0; page_size]);
         let closing = control.close().unwrap();
         let Poll::Ready(Ok(drained)) = control.poll_drained(&closing) else {
             panic!("report completion retained a writer");
@@ -2028,20 +2177,18 @@ mod tests {
         let cut = control.seal(&drained).unwrap();
         let mut dirty = DirtyPageMap::new(domain.layout());
         control.drain_host_dirty(&cut, &mut dirty).unwrap();
-        assert_eq!(dirty.count(), 1);
+        assert_eq!(dirty.count(), 3);
         assert!(dirty.contains(PageIndex::new(0x4000 / page_size)));
-        assert!(!dirty.contains(PageIndex::new(8)));
+        assert!(dirty.contains(PageIndex::new(8)));
+        assert!(dirty.contains(PageIndex::new(9)));
         let status = balloon.reclaim_status();
         assert_eq!(status.backing, crate::virtio::balloon::ReclaimBacking::Boot);
-        assert_eq!(
-            status.reason,
-            crate::virtio::balloon::ReclaimReason::TrackedCapture
-        );
-        assert!(!status.requested);
-        assert!(!status.effective);
-        assert_eq!(status.skipped_reports, 1);
-        assert_eq!(status.released_bytes, 0);
-        assert_eq!(status.released_extents, 0);
+        assert_eq!(status.reason, crate::virtio::balloon::ReclaimReason::None);
+        assert!(status.requested);
+        assert!(status.effective);
+        assert_eq!(status.skipped_reports, 0);
+        assert_eq!(status.released_bytes, 2 * page_size as u64);
+        assert_eq!(status.released_extents, 2);
     }
 
     #[cfg(target_os = "linux")]
@@ -2404,8 +2551,7 @@ mod tests {
         use vm_memory::GuestAddress;
 
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        // Nonwritable, unaligned actual discard, advice then failed publication,
-        // and inhibited processing with failed publication are distinct failures.
+        // Invalid reports and tracked/untracked discard followed by failed publication.
         for case in 0..7 {
             let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 16 * page)]).unwrap();
             let rings: Vec<_> = (0..5)
@@ -2458,14 +2604,25 @@ mod tests {
             assert_eq!(status.skipped_reports, 0, "case {case}");
             assert_eq!(
                 status.released_bytes,
-                if case == 2 { page as u64 } else { 0 },
+                if (2..=3).contains(&case) {
+                    page as u64
+                } else {
+                    0
+                },
                 "case {case}"
             );
-            assert_eq!(status.released_extents, u64::from(case == 2), "case {case}");
+            assert_eq!(
+                status.released_extents,
+                u64::from((2..=3).contains(&case)),
+                "case {case}"
+            );
             assert_eq!(rings[FRQ_INDEX].used.idx.get(), 0);
             let mut payload = vec![0; page];
             memory.read_slice(&mut payload, address).unwrap();
-            assert_eq!(payload, vec![if case == 2 { 0 } else { 0xa5 }; page]);
+            assert_eq!(
+                payload,
+                vec![if (2..=3).contains(&case) { 0 } else { 0xa5 }; page]
+            );
             // Retained failure is not another attempted syscall or publication.
             let _ = balloon.process_frq();
             assert_eq!(balloon.reclaim_status().failed_operations, 1);
@@ -2639,7 +2796,8 @@ mod tests {
         balloon.pressure_release_reports().unwrap();
         assert_eq!(rings[FRQ_INDEX].used.idx.get(), 1);
         assert_eq!(rings[FRQ_INDEX].used.ring[0].get().id, 0);
-        assert_eq!(balloon.reclaim_status().skipped_reports, 1);
+        assert_eq!(balloon.reclaim_status().skipped_reports, 0);
+        assert_eq!(balloon.reclaim_status().released_bytes, 4096);
         // A late hold cannot undo a consumed head or claim another report.
         balloon.pressure_hold_reports().unwrap();
         assert!(balloon.pressure_report_witness().report.is_none());
@@ -2985,7 +3143,7 @@ mod tests {
         child_memory
             .read_slice(&mut page, GuestAddress(held.gpa))
             .unwrap();
-        assert_eq!(page, [0x3c; 4096]);
+        assert_eq!(page, [0; 4096]);
         sibling_memory
             .read_slice(&mut page, GuestAddress(held.gpa))
             .unwrap();
@@ -2993,9 +3151,10 @@ mod tests {
         baseline.read_exact_at(&mut page, held.gpa).unwrap();
         assert_eq!(page, [0xa5; 4096]);
         let status = child.reclaim_status();
-        assert_eq!(status.released_bytes, 0);
-        assert_eq!(status.released_extents, 0);
-        assert_eq!(status.skipped_reports, 1);
+        assert_eq!(status.released_bytes, 4096);
+        assert_eq!(status.released_extents, 1);
+        assert_eq!(status.skipped_reports, 0);
+        assert_eq!(status.replaced_islands, 1);
         assert!(!child.pressure_remapper_present());
         let closing = child_control.close().unwrap();
         let Poll::Ready(Ok(drained)) = child_control.poll_drained(&closing) else {
@@ -3011,6 +3170,238 @@ mod tests {
         assert!(child.pressure_release_reports().is_err());
         source.pressure_release_reports().unwrap();
         assert_eq!(rings[FRQ_INDEX].used.idx.get(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_report_islands_coalesce_and_mapping_limit_skips_acknowledge() {
+        use crate::virtio::balloon::device::FRQ_INDEX;
+        use crate::virtio::balloon::{BalloonMemoryPolicy, ReclaimReason};
+        use crate::virtio::queue::tests::VirtQueue;
+        use crate::virtio::{DeviceQueue, RuntimeGuestMemory};
+        use arch::guest_memory::{BackingKind, MemoryDomain, PageIndex};
+        use nix::sys::memfd::{MFdFlags, memfd_create};
+        use std::fs::File;
+        use std::os::unix::fs::FileExt;
+        use std::sync::Arc;
+        use utils::eventfd::EventFd;
+        use vm_memory::{
+            Bytes, FileOffset, GuestAddress, GuestMemoryMmap, GuestRegionMmap, MmapRegion,
+        };
+
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let len = 16 * page;
+        let file = Arc::new(File::from(
+            memfd_create("reclaim-islands", MFdFlags::MFD_CLOEXEC).unwrap(),
+        ));
+        let original = vec![0x6b; len];
+        file.write_all_at(&original, 0).unwrap();
+        let private = || {
+            GuestMemoryMmap::from_regions(vec![
+                GuestRegionMmap::new(
+                    MmapRegion::<()>::build(
+                        Some(FileOffset::from_arc(file.clone(), 0)),
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE,
+                    )
+                    .unwrap(),
+                    GuestAddress(0),
+                )
+                .unwrap(),
+            ])
+            .unwrap()
+        };
+        let sibling = private();
+        let (domain, authority, mut control) =
+            MemoryDomain::construct(private(), page as u32, BackingKind::RestoredPrivate).unwrap();
+        let epoch = authority.issue_epoch(1).unwrap();
+        control.finish_tracked(authority, epoch).unwrap();
+        let memory = RuntimeGuestMemory::new(domain);
+        let rings: Vec<_> = (0..5)
+            .map(|i| VirtQueue::new(GuestAddress(i * 0x1000), &memory, 8))
+            .collect();
+        let mut balloon = Balloon::new().unwrap();
+        balloon
+            .finalize_memory_policy(BalloonMemoryPolicy::RestoredPrivate)
+            .unwrap();
+        balloon.replaced_mappings.island_limit = Some(2);
+        activate_report_fixture(
+            &mut balloon,
+            &memory,
+            rings
+                .iter()
+                .map(|ring| {
+                    DeviceQueue::new(ring.create_queue(), Arc::new(EventFd::new(0).unwrap()))
+                })
+                .collect(),
+        );
+        let mut host = 0usize;
+        memory
+            .try_read_access(len, GuestAddress(0), |_, size, _, view| {
+                host = view.as_ptr() as usize;
+                Ok(size)
+            })
+            .unwrap();
+        let covering_maps = |start: usize, end: usize| {
+            std::fs::read_to_string("/proc/self/maps")
+                .unwrap()
+                .lines()
+                .filter(|line| {
+                    let (left, right) = line
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .split_once('-')
+                        .unwrap();
+                    let left = usize::from_str_radix(left, 16).unwrap();
+                    let right = usize::from_str_radix(right, 16).unwrap();
+                    left < end && right > start
+                })
+                .count()
+        };
+        // Two adjacent descriptors become one replacement operation, despite reverse order.
+        rings[FRQ_INDEX].dtable[0].set((9 * page) as u64, page as u32, 3, 1);
+        rings[FRQ_INDEX].dtable[1].set((8 * page) as u64, page as u32, 2, 0);
+        rings[FRQ_INDEX].avail.ring[0].set(0);
+        rings[FRQ_INDEX].avail.idx.set(1);
+        for index in 7..=12 {
+            assert!(
+                !memory
+                    .domain()
+                    .host_page_dirty(PageIndex::new(index))
+                    .unwrap()
+            );
+        }
+        assert!(balloon.process_frq().unwrap());
+        assert_eq!(balloon.reclaim_status().released_extents, 1);
+        assert_eq!(balloon.reclaim_status().replaced_islands, 1);
+        for index in 7..=12 {
+            assert_eq!(
+                memory
+                    .domain()
+                    .host_page_dirty(PageIndex::new(index))
+                    .unwrap(),
+                (8..=9).contains(&index)
+            );
+        }
+        for (slot, report_page) in [(1, 11), (2, 13), (3, 10)] {
+            rings[FRQ_INDEX].dtable[0].set((report_page * page) as u64, page as u32, 2, 0);
+            rings[FRQ_INDEX].avail.ring[slot].set(0);
+            rings[FRQ_INDEX].avail.idx.set(slot as u16 + 1);
+            assert!(balloon.process_frq().unwrap());
+            assert_eq!(rings[FRQ_INDEX].used.idx.get(), slot as u16 + 1);
+            if slot == 1 {
+                assert_eq!(balloon.reclaim_status().replaced_islands, 2);
+                assert_eq!(covering_maps(host + 8 * page, host + 12 * page), 3);
+            }
+        }
+        let status = balloon.reclaim_status();
+        assert_eq!(status.reason, ReclaimReason::None);
+        assert!(status.effective);
+        assert_eq!(status.mapping_limit_skips, 1);
+        assert_eq!(status.skipped_reports, 1);
+        assert_eq!(status.released_extents, 3);
+        assert_eq!(status.released_bytes, 4 * page as u64);
+        assert_eq!(status.replaced_islands, 1);
+        assert_eq!(status.failed_operations, 0);
+        assert_eq!(covering_maps(host + 8 * page, host + 12 * page), 1);
+        let mut contents = vec![0xff; 8 * page];
+        memory
+            .read_slice(&mut contents, GuestAddress((8 * page) as u64))
+            .unwrap();
+        assert_eq!(&contents[..4 * page], vec![0; 4 * page]);
+        assert_eq!(&contents[4 * page..], vec![0x6b; 4 * page]);
+        let mut unchanged = vec![0; len];
+        file.read_exact_at(&mut unchanged, 0).unwrap();
+        assert_eq!(unchanged, original);
+        sibling.read_slice(&mut unchanged, GuestAddress(0)).unwrap();
+        assert_eq!(unchanged, original);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn report_queue_quiescence_blocks_discard_until_memory_cut_reopens() {
+        use crate::virtio::balloon::BalloonMemoryPolicy;
+        use crate::virtio::balloon::device::FRQ_INDEX;
+        use crate::virtio::lifecycle::{ResumeAcceptance, VirtioStateProvider};
+        use crate::virtio::queue::tests::VirtQueue;
+        use crate::virtio::{DeviceQueue, RuntimeGuestMemory};
+        use arch::guest_memory::{BackingKind, DirtyPageMap, MemoryDomain};
+        use std::sync::Arc;
+        use std::task::Poll;
+        use utils::eventfd::EventFd;
+        use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let (domain, authority, mut control) = MemoryDomain::construct(
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 16 * page)]).unwrap(),
+            page as u32,
+            BackingKind::Boot,
+        )
+        .unwrap();
+        let memory = RuntimeGuestMemory::new(domain.clone());
+        let rings: Vec<_> = (0..5)
+            .map(|i| VirtQueue::new(GuestAddress(i * 0x1000), &memory, 8))
+            .collect();
+        rings[FRQ_INDEX].dtable[0].set((8 * page) as u64, page as u32, 2, 0);
+        rings[FRQ_INDEX].avail.ring[0].set(0);
+        rings[FRQ_INDEX].avail.idx.set(1);
+        memory
+            .write_slice(&vec![0x5a; page], GuestAddress((8 * page) as u64))
+            .unwrap();
+        let epoch = authority.issue_epoch(1).unwrap();
+        control.finish_tracked(authority, epoch).unwrap();
+        let mut balloon = Balloon::new().unwrap();
+        balloon
+            .finalize_memory_policy(BalloonMemoryPolicy::TrackedCapture)
+            .unwrap();
+        activate_report_fixture(
+            &mut balloon,
+            &memory,
+            rings
+                .iter()
+                .map(|ring| {
+                    DeviceQueue::new(ring.create_queue(), Arc::new(EventFd::new(0).unwrap()))
+                })
+                .collect(),
+        );
+        balloon.begin_quiesce(request(1)).unwrap();
+        assert!(!balloon.process_frq().unwrap());
+        let Poll::Ready(completion) = balloon.poll_quiesce(request(1).key).unwrap() else {
+            panic!("report queue did not quiesce");
+        };
+        balloon.validate_terminal_drain(request(1).key).unwrap();
+        let closing = control.close().unwrap();
+        assert!(memory.write(GuestAddress((8 * page) as u64), page).is_err());
+        assert!(!balloon.process_frq().unwrap());
+        let Poll::Ready(Ok(drained)) = control.poll_drained(&closing) else {
+            panic!("report queue retained a writer");
+        };
+        let cut = control.seal(&drained).unwrap();
+        assert!(!balloon.process_frq().unwrap());
+        balloon.capture_payload(request(1).key).unwrap();
+        let mut dirty = DirtyPageMap::new(domain.layout());
+        control.drain_host_dirty(&cut, &mut dirty).unwrap();
+        assert_eq!(dirty.count(), 0);
+        assert_eq!(rings[FRQ_INDEX].used.idx.get(), 0);
+        assert_eq!(balloon.reclaim_status().released_bytes, 0);
+        let mut contents = vec![0; page];
+        memory
+            .read_slice(&mut contents, GuestAddress((8 * page) as u64))
+            .unwrap();
+        assert_eq!(contents, vec![0x5a; page]);
+        let epoch = cut.issue_epoch(2).unwrap();
+        control.reopen(&cut, &epoch).unwrap();
+        assert!(matches!(
+            balloon.begin_resume(request(2), completion.queues),
+            ResumeAcceptance::Accepted
+        ));
+        memory
+            .read_slice(&mut contents, GuestAddress((8 * page) as u64))
+            .unwrap();
+        assert_eq!(contents, vec![0; page]);
+        assert_eq!(rings[FRQ_INDEX].used.idx.get(), 1);
     }
 
     #[cfg(target_os = "macos")]

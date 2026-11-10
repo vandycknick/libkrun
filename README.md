@@ -62,6 +62,19 @@ Each variant generates a dynamic library with a different name (and ```soname```
 * virtio-balloon (only free-page reporting)
 * virtio-rng
 
+On Linux, free-page reporting reclaims boot RAM (including capture-tracked RAM)
+with `MADV_DONTNEED`. Restored file-private RAM is replaced with anonymous
+private zero pages at the same addresses, leaving the checkpoint and sibling
+VMs unchanged. Both paths mark the host dirty bitmap before discarding, so an
+incremental image writes explicit zeros over any nonzero baseline.
+Adjacent restored report ranges are coalesced. Replaced islands are bounded by
+half the remaining `vm.max_map_count` budget after existing mappings and a
+fixed 1024-mapping VMM reserve. Mapping-budget skips and `mmap` `ENOMEM` are
+acknowledged without discarding; status exposes `mapping_limit_skips` and
+`replaced_islands` alongside released bytes and operations. These counters are
+process-local and do not change persisted balloon state. macOS tracked and
+restored reclaim is unchanged and remains inhibited.
+
 The Silo fork completes successful virtio-block DISCARD and WRITE_ZEROES requests
 with the entire requested range reading as zero, including partial host blocks
 and the device tail, without changing logical length or capacity. DISCARD uses

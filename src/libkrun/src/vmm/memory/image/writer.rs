@@ -1048,6 +1048,68 @@ mod tests {
         assert_eq!(incremental.chunk_digests(), reference.chunk_digests());
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn incremental_discard_writes_explicit_zeros_over_nonzero_baseline() {
+        use arch::guest_memory::PageIndex;
+        use devices::virtio::RuntimeGuestMemory;
+
+        let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 4096)]).unwrap();
+        raw.write_slice(&[0x6b; 4 * 4096], GuestAddress(0)).unwrap();
+        let (domain, mut control) = tracked(raw);
+        let layout = layout(&domain);
+        let first = cut(&mut control);
+        let baseline_files = Outputs::new();
+        let mut receipt = capture(
+            &first,
+            layout.clone(),
+            RamWriteMode::Full,
+            baseline_files.owned(),
+        );
+        let original = baseline_files.bytes();
+        let baseline = baseline_files.seal(&mut receipt);
+        let epoch = first.issue_epoch(2).unwrap();
+        control.reopen(&first, &epoch).unwrap();
+        let memory = RuntimeGuestMemory::new(domain.clone());
+        memory
+            .try_write_access(2 * 4096, GuestAddress(4096), |_, len, _, view| {
+                assert!(domain.host_page_dirty(PageIndex::new(1)).unwrap());
+                assert!(domain.host_page_dirty(PageIndex::new(2)).unwrap());
+                assert!(!domain.host_page_dirty(PageIndex::new(0)).unwrap());
+                assert!(!domain.host_page_dirty(PageIndex::new(3)).unwrap());
+                // nix's mman feature is not enabled for this crate.
+                assert_eq!(
+                    unsafe { libc::madvise(view.as_mut_ptr().cast(), len, libc::MADV_DONTNEED) },
+                    0
+                );
+                Ok(len)
+            })
+            .unwrap();
+        let second = cut(&mut control);
+        let mut dirty = DirtyPageMap::new(domain.layout());
+        control.drain_host_dirty(&second, &mut dirty).unwrap();
+        assert_eq!(dirty.count(), 2);
+        let incremental_files = Outputs::new();
+        let mut output = incremental_files.owned();
+        output.protect_baseline(Some(baseline.clone()));
+        let incremental = capture(
+            &second,
+            layout.clone(),
+            RamWriteMode::Incremental {
+                baseline: &baseline,
+                dirty: &dirty,
+            },
+            output,
+        );
+        assert_eq!(incremental.stats().explicit_zero_bytes_written, 2 * 4096);
+        assert_eq!(incremental.stats().overlay_bytes_written, 2 * 4096);
+        let reference_files = Outputs::new();
+        capture(&second, layout, RamWriteMode::Full, reference_files.owned());
+        assert_eq!(incremental_files.bytes(), reference_files.bytes());
+        assert_eq!(&incremental_files.bytes()[4096..3 * 4096], &[0; 2 * 4096]);
+        assert_eq!(baseline_files.bytes(), original);
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn rebuild_never_reads_inaccessible_clean_ram_even_with_no_dirties() {

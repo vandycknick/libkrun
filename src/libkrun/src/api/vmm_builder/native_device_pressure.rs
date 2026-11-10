@@ -111,7 +111,8 @@ pub(in crate::api::vmm_builder::native_device_probe) fn reclaim_status_json(
     format!(
         concat!(
             "{{\"backing\":\"{}\",\"reason\":\"{}\",\"requested\":{},\"qualification\":\"{}\",\"effective\":{},",
-            "\"released_bytes\":{},\"released_extents\":{},\"retried_faults\":{},\"skipped_reports\":{},\"failed_operations\":{}}}"
+            "\"released_bytes\":{},\"released_extents\":{},\"retried_faults\":{},\"skipped_reports\":{},\"failed_operations\":{},",
+            "\"mapping_limit_skips\":{},\"replaced_islands\":{}}}"
         ),
         backing,
         reason,
@@ -123,6 +124,8 @@ pub(in crate::api::vmm_builder::native_device_probe) fn reclaim_status_json(
         status.retried_faults,
         status.skipped_reports,
         status.failed_operations,
+        status.mapping_limit_skips,
+        status.replaced_islands,
     )
 }
 

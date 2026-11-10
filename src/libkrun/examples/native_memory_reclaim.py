@@ -1,8 +1,8 @@
 """Explicit owned-disposable-page actual-report diagnostic.
 
 --memory-reclaim requires the diagnostic balloon sysfs ABI, never an allocator
-fallback. This does not qualify production allocator reacquisition or private
-discard-to-zero. Failed samples and cleanup diagnostics remain retained.
+fallback. Linux validates private discard-to-zero before allocator reacquisition.
+Failed samples and cleanup diagnostics remain retained.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import signal
 import time
 
 from native_device_controller import digest, save
-from native_device_pressure import inhibited_reclaim
+from native_device_pressure import validate_reclaim_status
 from native_memory_controller import (
     LEDGER_SCOPE, SCOPE, MemorySession, accept_image, bounded_file,
     compare_and_accept, fixture_page, load_cut, marked, native_capture,
@@ -134,9 +134,9 @@ def guest_observation(session: MemorySession, command: str, gpa: int | None = No
 
 
 def validate_status(status: dict, restored: bool) -> None:
-    inhibited_reclaim(status, "restored-private" if restored else "boot")
+    validate_reclaim_status(status, "restored-private" if restored else "boot")
     if status["failed_operations"]:
-        raise ValueError("inhibited reclaim recorded failed operations")
+        raise ValueError("reclaim recorded failed operations")
 
 
 def status_snapshot(session: MemorySession, label: str, restored: bool) -> dict:
@@ -267,7 +267,7 @@ def validate_witness(record: dict, pid: int, state: str, restored: bool,
         raise ValueError("actual offered-report witness owner/state/failure differs")
     validate_status(record["reclaim"], restored)
     if record["remapper_present"] is not False:
-        raise ValueError("inhibited report mapping admitted a periodic remapper")
+        raise ValueError("report mapping admitted a periodic remapper")
     validate_report(record["report"])
     barrier = record["barrier"]
     if (not isinstance(barrier, dict) or set(barrier) != {"operation", "generation"}
@@ -285,7 +285,11 @@ def validate_witness(record: dict, pid: int, state: str, restored: bool,
         if (type(record["used_after"]) is not int or not 0 <= record["used_after"] < 1 << 16
                 or not 1 <= (record["used_after"] - record["report"]["used_idx"]) & 0xffff <= 256
                 or barrier["generation"] <= source["barrier"]["generation"]
-                or record["reclaim"]["skipped_reports"] < 1):
+                or (os.uname().sysname == "Linux" and (
+                    record["reclaim"]["released_bytes"] < PAGE
+                    or record["reclaim"]["replaced_islands"] < 1
+                    or record["reclaim"]["mapping_limit_skips"] != 0))
+                or (os.uname().sysname != "Linux" and record["reclaim"]["skipped_reports"] < 1)):
             raise ValueError("fabricated/missing actual used publication or stale Park generation")
 
 
@@ -356,8 +360,8 @@ def sibling_check(session: MemorySession, root: Path, label: str, baseline: int,
 
 def run(args, echo) -> dict:
     report = {"schema": 1, "scope": "commit9-owned-disposable-page-actual-report-diagnostic",
-              "verdict": "diagnostic acknowledge-only restored-private safety", "status": "running",
-              "private_discard_zero_qualification": "not-run", "public_capability_granted": False,
+              "verdict": "diagnostic restored-private discard-to-zero safety", "status": "running",
+              "private_discard_zero_qualification": "diagnostic", "public_capability_granted": False,
               "production_allocator_reacquisition": "not-qualified",
               "ownership": "kernel-order0-retained",
               "B_origin": "host write through production facade at reconciled all-CPU Park",
@@ -466,7 +470,7 @@ def run(args, echo) -> dict:
         report["B_status"] = b_status
         current, comparison = compare_and_accept(primary, args.evidence, "reclaim-B", 1, accept_incremental=True)
         report["B_comparison"] = comparison
-        report["B_page"] = check_page(current, layout, gpa, bytes([B_BYTE]) * PAGE)
+        report["B_page"] = check_page(current, layout, gpa, bytes(PAGE))
         report["B_publication"] = check_publication(current, b, b_status)
         report["B_dirty_coverage"] = compare_coverage(baseline, current)
         report["baseline_after_B"] = unchanged_baseline(baseline, authentication)
@@ -480,7 +484,7 @@ def run(args, echo) -> dict:
             primary, args.evidence, "reclaim-pressure-B", comparison["accepted_generation"],
             accept_incremental=True)
         report["pressure_B_comparison"] = pressure_compare
-        report["pressure_B_page"] = check_page(pressure_current, layout, gpa, bytes([B_BYTE]) * PAGE, dirty=False)
+        report["pressure_B_page"] = check_page(pressure_current, layout, gpa, bytes(PAGE), dirty=False)
         if digest(pressure_current / "memory.ram") != digest(current / "memory.ram"):
             raise ValueError("host pressure changed paused B or any byte of primary RAM")
         report["pressure_B_dirty_coverage"] = compare_coverage(current, pressure_current)

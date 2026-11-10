@@ -2115,8 +2115,16 @@ mod tests {
                 .unwrap();
             let status = observer.status();
             assert_eq!(status.backing, ReclaimBacking::RestoredPrivate);
-            assert_eq!(status.reason, ReclaimReason::RestoredPrivateMapping);
-            assert!(!status.requested && !status.effective);
+            #[cfg(target_os = "linux")]
+            {
+                assert_eq!(status.reason, ReclaimReason::None);
+                assert!(status.requested && status.effective);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                assert_eq!(status.reason, ReclaimReason::RestoredPrivateMapping);
+                assert!(!status.requested && !status.effective);
+            }
             match balloon.lock() {
                 Ok(device) => assert_eq!(device.avail_features(), offer),
                 Err(error) => panic!("balloon lock poisoned: {error}"),

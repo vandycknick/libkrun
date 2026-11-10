@@ -4,6 +4,7 @@ Main runs: python3 -m unittest discover -s src/libkrun/examples -p test_native_m
 """
 import copy
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -21,11 +22,15 @@ class ReclaimOracleTests(unittest.TestCase):
 
     @staticmethod
     def status(restored=True):
+        linux = os.uname().sysname == "Linux"
         return {"backing": "restored-private" if restored else "boot",
-                "reason": "restored-private-mapping" if restored else "tracked-capture",
-                "requested": False, "qualification": "not-run", "effective": False,
-                "released_bytes": 0, "released_extents": 0, "retried_faults": 0,
-                "skipped_reports": 1 if restored else 0, "failed_operations": 0}
+                "reason": "none" if linux else (
+                    "restored-private-mapping" if restored else "tracked-capture"),
+                "requested": linux, "qualification": "not-run", "effective": linux,
+                "released_bytes": PAGE if linux and restored else 0,
+                "released_extents": 1 if linux and restored else 0, "retried_faults": 0,
+                "skipped_reports": 1 if not linux and restored else 0, "failed_operations": 0,
+                "mapping_limit_skips": 0, "replaced_islands": 1 if linux and restored else 0}
 
     @staticmethod
     def identity():
@@ -162,10 +167,14 @@ class ReclaimOracleTests(unittest.TestCase):
             bad["report"][field] += PAGE if field in ("gpa", "used_ring") else 1
             with self.subTest(identity=field), self.assertRaises(ValueError):
                 validate_witness(bad, 100, "child-completed", True, source)
-        for field in ("requested", "effective", "released_bytes", "released_extents", "failed_operations"):
+        linux = os.uname().sysname == "Linux"
+        changes = ({"requested": not linux}, {"effective": not linux}, {"failed_operations": 1})
+        changes += (({"released_bytes": 0}, {"replaced_islands": 0}, {"mapping_limit_skips": 1})
+                    if linux else ({"released_bytes": 1}, {"released_extents": 1}))
+        for change in changes:
             bad = copy.deepcopy(child)
-            bad["reclaim"][field] = True if field in ("requested", "effective") else 1
-            with self.subTest(status=field), self.assertRaises(ValueError):
+            bad["reclaim"].update(change)
+            with self.subTest(status=change), self.assertRaises(ValueError):
                 validate_witness(bad, 100, "child-completed", True, source)
         bad = copy.deepcopy(child)
         del bad["reclaim"]["reason"]

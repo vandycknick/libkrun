@@ -48,7 +48,7 @@ import time
 
 from native_device_controller import Session, digest, save, seal_cut
 from native_memory_controller import image_record, prepared_observation, source_identity, unique_fields
-from native_device_pressure import inhibited_reclaim
+from native_device_pressure import validate_reclaim_status
 from native_ram_image import authenticate_image, validate_layout
 
 MIB = 1024 * 1024
@@ -282,7 +282,7 @@ def snapshot(session: Session, label: str, timeout: float = 30) -> dict:
     record = json.loads(bounded_text(path, 2 * MIB), object_pairs_hook=unique_fields)
     if record["pid"] != session.process.pid:
         raise ValueError("actual tracked/restored native owner identity")
-    inhibited_reclaim(record["balloon"]["reclaim"])
+    validate_reclaim_status(record["balloon"]["reclaim"])
     balloons = [device for device in record["devices"] if device["id"] == "balloon0"]
     if len(balloons) != 1 or len(balloons[0]["queues"]) != 5:
         raise ValueError("actual reporting queue absent")
@@ -299,7 +299,7 @@ def reporting_advanced(record: dict, native_pid: int, baseline_used: int) -> boo
             or type(record["reporting_negotiated"]) is not bool or type(record["ready"]) is not bool
             or type(baseline_used) is not int or not 0 <= baseline_used <= 0xffff):
         raise ValueError("actual reporting readiness schema/identity/policy")
-    inhibited_reclaim(record["reclaim"], "restored-private")
+    validate_reclaim_status(record["reclaim"], "restored-private")
     if not record["ready"]:
         if any(record[field] is not None for field in ("next_used", "used_idx", "used_ring")):
             raise ValueError("unready reporting queue exposed completion state")

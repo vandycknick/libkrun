@@ -623,8 +623,9 @@ not that a real filesystem `fsync` failure has been exercised.
   regenerate the initial guest handshake during dormant install.
 - Balloon preserves all five queue/configuration states, leaves unpopped stats
   work queued and invents neither a held stats owner nor a polling timer.
-  Restored host reclaim stays permanently disabled without altering negotiated
-  features. RNG has explicit bounded framing, fresh host entropy and
+  Linux restores retain reporting and replace reported file-private pages with
+  anonymous zero pages. macOS restored reclaim stays disabled. RNG has explicit
+  bounded framing, fresh host entropy and
   chunked partial DMA accounting; it cannot rewind a partially written head and
   also publish its completion.
 
@@ -736,8 +737,7 @@ Linux otherwise defaults to pageblock-order reporting and skips smaller free
 blocks; ordinary 32 MiB mmap/touch/munmap churn does not guarantee such blocks.
 The `report` counter counts completed allocation/free iterations, not reports.
 Actual source reporting and new destination used entries remain mandatory;
-no allocation counter substitutes for queue progress, and restored private RAM
-host reclaim remains disabled.
+no allocation counter substitutes for queue progress or successful host discard.
 
 `/dev/hwrng` multiplexes the kernel's selected provider; its pathname and growing
 read counter do not prove `rng0` queue progress. The controlled guest cycles every
@@ -770,8 +770,8 @@ Destination descriptors, netd processes, sockets and endpoint names are new;
 artifact bytes never select host paths or descriptors. Console input and output
 directions have separate real endpoints. The controller retains endpoint
 ownership through activation release, including an inactive/unready endpoint.
-The destination uses the explicit network MAC binding and vsock service 1027;
-host reclaim is disabled independently of saved balloon feature bits.
+The destination uses the explicit network MAC binding and vsock service 1027.
+Linux host reclaim preserves the source's negotiated balloon features.
 
 The controller exercises a completed source pause, repeated capture under
 continued endpoint/SIGWINCH stimulation, checked raw flush/sync and private
@@ -1620,11 +1620,11 @@ reproducible-build attestation. No capability is granted by this mode.
 Preserve text reports, manifests and required inputs before removing
 successful generated RAM/disk payloads; retain failed samples for diagnosis.
 
-Capture-tracked source VMs disable destructive balloon reclaim from
-construction, not only after accepting a baseline or restoring RAM. Reporting
-queues still complete normally. The pressure gate checks the disabled reclaim
-policy separately from actual reporting used-ring progress; reporting
-acknowledgements do not establish discarded bytes or reclaim qualification.
+Linux capture-tracked source VMs mark reported ranges dirty before anonymous
+`MADV_DONTNEED`. Restored file-private RAM instead uses fixed anonymous private
+replacement mappings, so freed pages read zero without changing the RAM file.
+Reporting acknowledgements alone do not establish discarded bytes or measured
+host-memory return. macOS tracked and restored reclaim remains inhibited.
 
 Pause admission performs read-only device preflight before checking the
 construction-time memory tracking mode. An unsupported attached provider
@@ -1687,8 +1687,8 @@ fresh restore generations.
 accounting, failure/recovery records, child results and process-reaping evidence.
 A successful report proves only its exercised accepted-generation behavior.
 Physical-sharing measurements, pressure/lifetime checks and restored-reclaim
-qualification are separate gates. Destructive reclaim remains disabled for
-capture-tracked sources and restored private mappings.
+qualification are separate gates. Linux tracks successful discards in the host
+dirty bitmap; macOS tracked and restored reclaim remains disabled.
 
 ### Private RAM sharing and mapping lifetime
 

@@ -20,7 +20,9 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use arch::guest_memory::{BackingKind, MemoryDomain, TrackingMode};
+#[cfg(not(target_os = "linux"))]
+use arch::guest_memory::TrackingMode;
+use arch::guest_memory::{BackingKind, MemoryDomain};
 #[cfg(target_os = "macos")]
 use hvf::reclaim::{ReclaimInhibition, ReclaimState};
 
@@ -59,6 +61,8 @@ pub struct ReclaimStatus {
     /// Skipped operations, including backend range skips, not physical pages.
     pub skipped_reports: u64,
     pub failed_operations: u64,
+    pub mapping_limit_skips: u64,
+    pub replaced_islands: u64,
 }
 
 struct ReclaimObservation {
@@ -68,6 +72,8 @@ struct ReclaimObservation {
     released_extents: AtomicU64,
     skipped_reports: AtomicU64,
     failed_operations: AtomicU64,
+    mapping_limit_skips: AtomicU64,
+    replaced_islands: AtomicU64,
     #[cfg(target_os = "macos")]
     backend: OnceLock<Arc<ReclaimState>>,
 }
@@ -90,6 +96,8 @@ impl ReclaimObserver {
             released_extents: AtomicU64::new(0),
             skipped_reports: AtomicU64::new(0),
             failed_operations: AtomicU64::new(0),
+            mapping_limit_skips: AtomicU64::new(0),
+            replaced_islands: AtomicU64::new(0),
             #[cfg(target_os = "macos")]
             backend: OnceLock::new(),
         }))
@@ -108,6 +116,9 @@ impl ReclaimObserver {
 
     fn bind(&self, domain: &MemoryDomain, enabled: bool, policy: Option<BalloonMemoryPolicy>) {
         let restored = domain.backing_kind() == BackingKind::RestoredPrivate;
+        #[cfg(target_os = "linux")]
+        let reason = 0;
+        #[cfg(not(target_os = "linux"))]
         let reason = if restored {
             2
         } else if domain.tracking_mode() != Some(TrackingMode::Disabled) {
@@ -146,6 +157,8 @@ impl ReclaimObserver {
             retried_faults: 0,
             skipped_reports: self.0.skipped_reports.load(Ordering::Relaxed),
             failed_operations: self.0.failed_operations.load(Ordering::Relaxed),
+            mapping_limit_skips: self.0.mapping_limit_skips.load(Ordering::Relaxed),
+            replaced_islands: self.0.replaced_islands.load(Ordering::Relaxed),
         };
         #[cfg(target_os = "macos")]
         if let Some(state) = self.0.backend.get() {
@@ -195,6 +208,19 @@ impl ReclaimObserver {
     pub(crate) fn record_release(&self, bytes: usize) {
         saturating_add(&self.0.released_bytes, bytes as u64);
         saturating_add(&self.0.released_extents, 1);
+    }
+
+    #[cfg(all(not(feature = "tee"), target_os = "linux"))]
+    pub(crate) fn record_mapping_limit_skip(&self) {
+        self.record_skip();
+        saturating_add(&self.0.mapping_limit_skips, 1);
+    }
+
+    #[cfg(all(not(feature = "tee"), target_os = "linux"))]
+    pub(crate) fn set_replaced_islands(&self, count: usize) {
+        self.0
+            .replaced_islands
+            .store(count as u64, Ordering::Relaxed);
     }
 
     #[cfg(not(feature = "tee"))]
@@ -333,6 +359,11 @@ mod tests {
                 ReclaimReason::RestoredPrivateMapping,
             ),
         ] {
+            let expected_reason = if cfg!(target_os = "linux") {
+                ReclaimReason::None
+            } else {
+                expected_reason
+            };
             let domain = domain(backing, tracked);
             #[cfg(target_os = "macos")]
             let backend = Arc::new(hvf::reclaim::ReclaimState::new());
@@ -351,6 +382,8 @@ mod tests {
             assert_eq!(status.released_extents, 0);
             assert_eq!(status.skipped_reports, 0);
             assert_eq!(status.failed_operations, 0);
+            assert_eq!(status.mapping_limit_skips, 0);
+            assert_eq!(status.replaced_islands, 0);
             #[cfg(target_os = "macos")]
             {
                 backend.set_policy_enabled(true);
@@ -366,8 +399,7 @@ mod tests {
                 balloon
                     .finalize_memory_policy(BalloonMemoryPolicy::Untracked)
                     .unwrap();
-                // Publishing a permissive local policy cannot transiently erase
-                // immutable inhibition already installed by the actual domain.
+                // Finalization must preserve the backing published by the domain.
                 assert_eq!(observer.status().backing, expected_backing);
                 assert_eq!(observer.status().reason, expected_reason);
                 balloon.bind_reclaim_domain(&domain);
@@ -376,8 +408,8 @@ mod tests {
                 assert_eq!(bound.reason, expected_reason);
                 #[cfg(target_os = "linux")]
                 {
-                    assert_eq!(bound.requested, !tracked);
-                    assert_eq!(bound.effective, !tracked);
+                    assert!(bound.requested);
+                    assert!(bound.effective);
                 }
                 assert!(
                     balloon
@@ -406,14 +438,20 @@ mod tests {
         observer.record_release(4096);
         observer.record_skip();
         observer.record_failure();
+        observer.record_mapping_limit_skip();
+        observer.set_replaced_islands(3);
         assert_eq!(clone.status().released_bytes, u64::MAX);
         assert_eq!(clone.status().released_extents, u64::MAX);
-        assert_eq!(clone.status().skipped_reports, 1);
+        assert_eq!(clone.status().skipped_reports, 2);
         assert_eq!(clone.status().failed_operations, 1);
+        assert_eq!(clone.status().mapping_limit_skips, 1);
+        assert_eq!(clone.status().replaced_islands, 3);
         let fresh = ReclaimObserver::for_domain(&domain).status();
         assert_eq!(fresh.released_bytes, 0);
         assert_eq!(fresh.released_extents, 0);
         assert_eq!(fresh.skipped_reports, 0);
         assert_eq!(fresh.failed_operations, 0);
+        assert_eq!(fresh.mapping_limit_skips, 0);
+        assert_eq!(fresh.replaced_islands, 0);
     }
 }

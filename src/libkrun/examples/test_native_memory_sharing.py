@@ -220,11 +220,14 @@ class ActualRamMappingTests(unittest.TestCase):
 class ReportingPublicationTests(unittest.TestCase):
     @staticmethod
     def observation():
+        linux = os.uname().sysname == "Linux"
         return {"schema": 1, "native_pid": 17, "reporting_negotiated": True,
-                "reclaim": {"backing": "restored-private", "reason": "restored-private-mapping",
-                            "requested": False, "qualification": "not-run", "effective": False,
+                "reclaim": {"backing": "restored-private",
+                            "reason": "none" if linux else "restored-private-mapping",
+                            "requested": linux, "qualification": "not-run", "effective": linux,
                             "released_bytes": 0, "released_extents": 0, "retried_faults": 0,
-                            "skipped_reports": 0, "failed_operations": 0},
+                            "skipped_reports": 0, "failed_operations": 0,
+                            "mapping_limit_skips": 0, "replaced_islands": 0},
                 "ready": True, "next_used": 0, "used_idx": 0, "used_ring": 0x4000}
 
     def test_actual_used_publication_not_attempt_or_guest_churn_is_required(self):
@@ -258,12 +261,13 @@ class ReportingPublicationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reporting_advanced(zero, 17, True)
 
-    def test_inhibited_reporting_rejects_advice_and_contradictory_policy(self):
+    def test_reporting_rejects_contradictory_policy_and_malformed_counters(self):
         zero = self.observation()
-        for changed in ({"released_bytes": 4096}, {"released_extents": 1},
-                        {"requested": True}, {"effective": True}, {"qualification": "passed"},
-                        {"reason": "none"}, {"backing": "boot"}, {"skipped_reports": -1},
-                        {"failed_operations": True}):
+        linux = os.uname().sysname == "Linux"
+        for changed in ({"requested": not linux}, {"effective": not linux}, {"qualification": "passed"},
+                        {"reason": "restored-private-mapping" if linux else "none"},
+                        {"backing": "boot"}, {"skipped_reports": -1}, {"mapping_limit_skips": -1},
+                        {"replaced_islands": True}, {"failed_operations": True}):
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 reporting_advanced({**zero, "reclaim": {**zero["reclaim"], **changed}}, 17, 0)
         published = {**zero, "next_used": 1, "used_idx": 1,
