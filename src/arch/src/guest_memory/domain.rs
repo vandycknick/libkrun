@@ -1,4 +1,8 @@
 use std::fmt::{Display, Formatter};
+#[cfg(target_os = "linux")]
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -729,6 +733,119 @@ pub struct MemoryCut {
     domain: Arc<MemoryDomain>,
     generation: u64,
 }
+
+/// Read decisions are valid only while the originating memory cut remains held.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CutReadKind {
+    Read,
+    KnownZero,
+}
+
+/// Bounded pagemap metadata reader for zero-origin private anonymous boot RAM.
+/// Every other backing, and unavailable pagemap metadata, uses ordinary reads.
+pub struct CutReader<'a> {
+    cut: &'a MemoryCut,
+    #[cfg(target_os = "linux")]
+    pagemap: Option<File>,
+    #[cfg(target_os = "linux")]
+    page_size: usize,
+    #[cfg(target_os = "linux")]
+    entries: [u8; 4096 * 8],
+    #[cfg(target_os = "linux")]
+    cached_start: usize,
+    #[cfg(target_os = "linux")]
+    cached_pages: usize,
+}
+
+impl CutReader<'_> {
+    pub fn next_range(
+        &mut self,
+        address: GuestAddress,
+        length: usize,
+    ) -> Result<(CutReadKind, usize), MemoryError> {
+        self.cut.validate_domain(&self.cut.domain)?;
+        self.cut
+            .domain
+            .validate_range(address, length)
+            .map_err(|_| MemoryError::Bounds)?;
+        if length == 0 {
+            return Ok((CutReadKind::Read, 0));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let region = self
+                .cut
+                .domain
+                .memory
+                .find_region(address)
+                .ok_or(MemoryError::Bounds)?;
+            let length = length.min((region.len() - (address.0 - region.start_addr().0)) as usize);
+            let flags = region.flags();
+            if self.pagemap.is_none()
+                || self.cut.domain.backing != BackingKind::Boot
+                || !region.owned()
+                || region.file_offset().is_some()
+                || flags & libc::MAP_TYPE != libc::MAP_PRIVATE
+                || flags & libc::MAP_ANONYMOUS == 0
+                || flags & libc::MAP_HUGETLB != 0
+            {
+                return Ok((CutReadKind::Read, length));
+            }
+            let host = region
+                .get_host_address(vm_memory::MemoryRegionAddress(
+                    address.0 - region.start_addr().0,
+                ))
+                .map_err(|_| MemoryError::Bounds)? as usize;
+            if !host.is_multiple_of(self.page_size) || !length.is_multiple_of(self.page_size) {
+                return Ok((CutReadKind::Read, length));
+            }
+            let page = host / self.page_size;
+            if page < self.cached_start || page >= self.cached_start + self.cached_pages {
+                let count = (length / self.page_size).min(self.entries.len() / 8);
+                let offset = u64::try_from(page)
+                    .ok()
+                    .and_then(|page| page.checked_mul(8));
+                let read = self
+                    .pagemap
+                    .as_ref()
+                    .zip(offset)
+                    .is_some_and(|(file, offset)| {
+                        file.read_exact_at(&mut self.entries[..count * 8], offset)
+                            .is_ok()
+                    });
+                if !read {
+                    self.pagemap = None;
+                    return Ok((CutReadKind::Read, length));
+                }
+                self.cached_start = page;
+                self.cached_pages = count;
+            }
+            self.cut.validate_domain(&self.cut.domain)?;
+            let first = page - self.cached_start;
+            let limit = self.cached_pages.min(first + length / self.page_size);
+            let kind = self.entry_kind(first);
+            let mut end = first + 1;
+            while end < limit && self.entry_kind(end) == kind {
+                end += 1;
+            }
+            Ok((kind, (end - first) * self.page_size))
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok((CutReadKind::Read, length))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn entry_kind(&self, index: usize) -> CutReadKind {
+        let offset = index * 8;
+        let mut entry = [0; 8];
+        entry.copy_from_slice(&self.entries[offset..offset + 8]);
+        if u64::from_ne_bytes(entry) & ((1u64 << 63) | (1u64 << 62)) == 0 {
+            CutReadKind::KnownZero
+        } else {
+            CutReadKind::Read
+        }
+    }
+}
 pub struct NativeEffectsPermit {
     domain: Arc<MemoryDomain>,
     generation: u64,
@@ -968,6 +1085,27 @@ impl DomainControl {
     }
 }
 impl MemoryCut {
+    pub fn reader(&self) -> Result<CutReader<'_>, MemoryError> {
+        self.validate_domain(&self.domain)?;
+        #[cfg(target_os = "linux")]
+        // The arch crate has no nix dependency for sysconf.
+        let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok();
+        Ok(CutReader {
+            cut: self,
+            #[cfg(target_os = "linux")]
+            pagemap: page_size
+                .filter(|size| size.is_power_of_two())
+                .and_then(|_| File::open("/proc/self/pagemap").ok()),
+            #[cfg(target_os = "linux")]
+            page_size: page_size.map_or(4096, |size| size),
+            #[cfg(target_os = "linux")]
+            entries: [0; 4096 * 8],
+            #[cfg(target_os = "linux")]
+            cached_start: 0,
+            #[cfg(target_os = "linux")]
+            cached_pages: 0,
+        })
+    }
     pub fn domain(&self) -> &Arc<MemoryDomain> {
         &self.domain
     }
@@ -1810,5 +1948,119 @@ mod tests {
                 inode: metadata.ino(),
             }]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cut_reader_coalesces_absent_pages_but_reads_present_zero_pages_and_batches() {
+        use crate::guest_memory::CutReadKind;
+        use vm_memory::Bytes;
+
+        // The arch crate has no nix dependency for sysconf.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let length = 8192 * page;
+        let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), length)]).unwrap();
+        raw.write_slice(&vec![0; page], GuestAddress(page as u64))
+            .unwrap();
+        raw.write_slice(&vec![0x73; page], GuestAddress((5000 * page) as u64))
+            .unwrap();
+        let (_, authority, mut control) =
+            MemoryDomain::construct(raw, 4096, BackingKind::Boot).unwrap();
+        let epoch = authority.issue_epoch(1).unwrap();
+        control.finish_tracked(authority, epoch).unwrap();
+        let cut = seal(&mut control);
+        let mut reader = cut.reader().unwrap();
+        assert_eq!(
+            reader.next_range(GuestAddress(page as u64), page).unwrap(),
+            (CutReadKind::Read, page)
+        );
+        let mut offset = 0;
+        let mut skipped = 0;
+        let mut read = 0;
+        while offset < length {
+            let (kind, count) = reader
+                .next_range(GuestAddress(offset as u64), length - offset)
+                .unwrap();
+            assert!(count > 0);
+            match kind {
+                CutReadKind::KnownZero => skipped += count,
+                CutReadKind::Read => read += count,
+            }
+            offset += count;
+        }
+        assert!(skipped > 0);
+        assert!(read >= 2 * page);
+        assert_eq!(skipped + read, length);
+        assert_eq!(
+            reader.next_range(GuestAddress(u64::MAX), 0).unwrap(),
+            (CutReadKind::Read, 0)
+        );
+        assert_eq!(
+            reader.next_range(GuestAddress(length as u64), page),
+            Err(MemoryError::Bounds)
+        );
+        let next = cut.issue_epoch(2).unwrap();
+        control.reopen(&cut, &next).unwrap();
+        assert_eq!(
+            reader.next_range(GuestAddress(0), page),
+            Err(MemoryError::Authority)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cut_reader_short_pagemap_read_disables_skipping_without_losing_coverage() {
+        use crate::guest_memory::CutReadKind;
+        use utils::tempfile::TempFile;
+
+        let (_, mut control) = tracked(&[(GuestAddress(0), 65536)]);
+        let cut = seal(&mut control);
+        let mut reader = cut.reader().unwrap();
+        let empty = TempFile::new().unwrap();
+        reader.pagemap = Some(empty.as_file().try_clone().unwrap());
+        assert_eq!(
+            reader.next_range(GuestAddress(0), 65536).unwrap(),
+            (CutReadKind::Read, 65536)
+        );
+        assert!(reader.pagemap.is_none());
+        assert_eq!(
+            reader.next_range(GuestAddress(0), 65536).unwrap(),
+            (CutReadKind::Read, 65536)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cut_reader_rejects_shared_anonymous_and_restored_anonymous_zero_inference() {
+        use crate::guest_memory::CutReadKind;
+        use vm_memory::{GuestRegionMmap, MmapRegion};
+
+        for (backing, sharing) in [
+            (BackingKind::Boot, libc::MAP_SHARED),
+            (BackingKind::RestoredPrivate, libc::MAP_PRIVATE),
+        ] {
+            let mapping = MmapRegion::<()>::build(
+                None,
+                65536,
+                libc::PROT_READ | libc::PROT_WRITE,
+                sharing | libc::MAP_ANONYMOUS,
+            )
+            .unwrap();
+            let raw = GuestMemoryMmap::from_regions(vec![
+                GuestRegionMmap::new(mapping, GuestAddress(0)).unwrap(),
+            ])
+            .unwrap();
+            let (_, authority, mut control) = MemoryDomain::construct(raw, 4096, backing).unwrap();
+            let epoch = authority.issue_epoch(1).unwrap();
+            control.finish_tracked(authority, epoch).unwrap();
+            let cut = seal(&mut control);
+            assert_eq!(
+                cut.reader()
+                    .unwrap()
+                    .next_range(GuestAddress(0), 65536)
+                    .unwrap(),
+                (CutReadKind::Read, 65536)
+            );
+        }
     }
 }

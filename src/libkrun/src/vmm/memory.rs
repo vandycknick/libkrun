@@ -2080,4 +2080,127 @@ mod tests {
         drop(failure);
         std::fs::remove_file(ram_path).unwrap();
     }
+
+    #[test]
+    fn accepted_baseline_survives_publication_release_and_next_incremental_matches_full() {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut coordinator = coordinator();
+        for (address, byte) in [(0, 0x91), (8192, 0x22), (8 * 4096, 0x43)] {
+            coordinator
+                .control
+                .domain()
+                .write(GuestAddress(address), 4096)
+                .unwrap()
+                .write_view(0, 4096)
+                .unwrap()
+                .write_slice(&[byte; 4096], 0)
+                .unwrap();
+        }
+        stop(&mut coordinator, key(1));
+        let (_, mut candidate, retained_staging) =
+            capture(&mut coordinator, key(1), RamCaptureRequest::Full);
+        let baseline_map = candidate.receipt().chunk_digests().to_vec();
+        let image = retained_staging.seal(&mut candidate, key(1));
+        let retained = Arc::downgrade(&image);
+        let token = coordinator
+            .accept_attempt(key(1), candidate, image.clone())
+            .unwrap();
+        let original = std::fs::read(retained_staging.ram.as_path()).unwrap();
+        let original_layout = std::fs::read(retained_staging.layout.as_path()).unwrap();
+        let metadata = retained_staging.ram.as_file().metadata().unwrap();
+        let fingerprint = (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        );
+        coordinator.reopen(key(1)).unwrap();
+        drop(image);
+        assert_eq!(retained.strong_count(), 1);
+        assert_eq!(coordinator.baseline_token(), Some(token.clone()));
+
+        for (generation, changed) in [(2, false), (3, true)] {
+            if changed {
+                for (address, byte) in [(0, 0), (4096, 0x87)] {
+                    coordinator
+                        .control
+                        .domain()
+                        .write(GuestAddress(address), 4096)
+                        .unwrap()
+                        .write_view(0, 4096)
+                        .unwrap()
+                        .write_slice(&[byte; 4096], 0)
+                        .unwrap();
+                }
+            }
+            let key = key(generation);
+            stop(&mut coordinator, key);
+            let (attempt, incremental, output) = capture(
+                &mut coordinator,
+                key,
+                RamCaptureRequest::Incremental {
+                    baseline: Some(&token),
+                    crossover: DirtyCrossoverPercent::default(),
+                },
+            );
+            assert_eq!(incremental.receipt().mode(), RamCaptureMode::Incremental);
+            assert_eq!(incremental.receipt().stats().known_zero_bytes_skipped, 0);
+            if !changed {
+                assert_eq!(incremental.receipt().stats().live_bytes_read, 0);
+                assert_eq!(incremental.receipt().affected_chunks().count(), 0);
+            } else {
+                assert_eq!(incremental.receipt().stats().zero_run_bytes_covered, 4096);
+            }
+            let mut resolved_map = baseline_map.clone();
+            for chunk in incremental.receipt().affected_chunks() {
+                resolved_map[chunk] = incremental.receipt().chunk_digests()[chunk];
+            }
+            coordinator.abandon_attempt(key, &attempt).unwrap();
+            let (full_attempt, full, full_files) =
+                capture(&mut coordinator, key, RamCaptureRequest::Full);
+            assert_eq!(
+                std::fs::read(output.ram.as_path()).unwrap(),
+                std::fs::read(full_files.ram.as_path()).unwrap()
+            );
+            assert_eq!(resolved_map, full.receipt().chunk_digests());
+            assert_eq!(
+                std::fs::read(output.layout.as_path()).unwrap(),
+                std::fs::read(full_files.layout.as_path()).unwrap()
+            );
+            assert_eq!(coordinator.baseline_token(), Some(token.clone()));
+            assert!(
+                retained
+                    .upgrade()
+                    .unwrap()
+                    .aliases(fingerprint.0, fingerprint.1)
+            );
+            assert_eq!(
+                std::fs::read(retained_staging.ram.as_path()).unwrap(),
+                original
+            );
+            assert_eq!(
+                std::fs::read(retained_staging.layout.as_path()).unwrap(),
+                original_layout
+            );
+            let metadata = retained_staging.ram.as_file().metadata().unwrap();
+            assert_eq!(
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.len(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec()
+                ),
+                fingerprint
+            );
+            coordinator.abandon_attempt(key, &full_attempt).unwrap();
+            coordinator.reopen(key).unwrap();
+        }
+    }
 }

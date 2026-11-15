@@ -9,6 +9,8 @@ use std::time::Instant;
 
 use arch::guest_memory::MemoryCut;
 use nix::errno::Errno;
+#[cfg(target_os = "linux")]
+use nix::fcntl::{FallocateFlags, fallocate};
 use nix::unistd::{Whence, lseek};
 
 use crate::vmm::control::BarrierKey;
@@ -351,6 +353,72 @@ enum WriteKind {
     Layout,
 }
 
+fn cover_zero(
+    file: &File,
+    range: Range<u64>,
+    seeded: bool,
+    stats: &mut RamIoStats,
+    deadline: Instant,
+) -> Result<(), RamImageError> {
+    check_deadline(deadline)?;
+    let length = range.end - range.start;
+    if seeded {
+        if punch_zero(file, range.clone(), deadline)? {
+            stats.zero_bytes_punched += length;
+        } else {
+            let zeros = [0; 65536];
+            let mut offset = range.start;
+            while offset < range.end {
+                let count = (range.end - offset).min(zeros.len() as u64) as usize;
+                write_exact_at(
+                    file,
+                    &zeros[..count],
+                    offset,
+                    WriteKind::Overlay,
+                    stats,
+                    deadline,
+                )?;
+                offset += count as u64;
+            }
+        }
+    } else {
+        stats.zero_bytes_omitted += length;
+    }
+    stats.zero_run_bytes_covered += length;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn punch_zero(file: &File, range: Range<u64>, deadline: Instant) -> Result<bool, RamImageError> {
+    let offset = i64::try_from(range.start).map_err(|_| RamImageError::Geometry)?;
+    let length = i64::try_from(range.end - range.start).map_err(|_| RamImageError::Geometry)?;
+    loop {
+        check_deadline(deadline)?;
+        match fallocate(
+            file,
+            FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
+            offset,
+            length,
+        ) {
+            Ok(()) => return Ok(true),
+            Err(Errno::EINTR) => continue,
+            Err(Errno::EOPNOTSUPP | Errno::ENOSYS | Errno::EINVAL) => return Ok(false),
+            Err(error) => {
+                return Err(io_error(
+                    RamIoOperation::Write,
+                    RamFileRole::OutputRam,
+                    error.into(),
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn punch_zero(_file: &File, _range: Range<u64>, _deadline: Instant) -> Result<bool, RamImageError> {
+    Ok(false)
+}
+
 fn read_exact_at(
     file: &File,
     mut bytes: &mut [u8],
@@ -486,8 +554,8 @@ mod tests {
     use crate::vmm::memory::image::writer::pipeline;
     use crate::vmm::memory::image::writer::{
         Extents, WriteKind, Writeback, account_write, check_deadline, clone_baseline,
-        count_zero_bytes, io_error, is_all_zero, mark_chunks, read_exact_at, seed_incremental,
-        write_exact_at, write_ram_image,
+        count_zero_bytes, cover_zero, io_error, is_all_zero, mark_chunks, read_exact_at,
+        seed_incremental, write_exact_at, write_ram_image,
     };
     use crate::vmm::memory::image::{
         AuthenticatedRamImage, RAM_IDENTITY_CHUNK_BYTES, RamCaptureReceipt, RamFileRole,
@@ -972,7 +1040,10 @@ mod tests {
             RamWriteMode::Full,
             baseline_files.owned(),
         );
-        assert_eq!(full.stats().live_bytes_read, layout.packed_len());
+        assert_eq!(
+            full.stats().live_bytes_read + full.stats().known_zero_bytes_skipped,
+            layout.packed_len()
+        );
         assert_eq!(full.stats().full_bytes_written, 6 * 4096);
         assert_eq!(full.affected_chunks().collect::<Vec<_>>(), [0, 1]);
         assert_eq!(
@@ -1030,8 +1101,12 @@ mod tests {
                 4 * 4096
             }
         );
-        assert_eq!(incremental.stats().overlay_bytes_written, 4 * 4096);
-        assert_eq!(incremental.stats().explicit_zero_bytes_written, 3 * 4096);
+        assert_eq!(incremental.stats().zero_run_bytes_covered, 3 * 4096);
+        assert_eq!(
+            incremental.stats().overlay_bytes_written,
+            4096 + incremental.stats().explicit_zero_bytes_written
+        );
+        assert!(incremental.stats().explicit_zero_bytes_written <= 3 * 4096);
         if incremental.stats().seed_method == RamSeedMethod::Clone {
             assert_eq!(incremental.stats().baseline_bytes_read, 0);
             assert_eq!(incremental.stats().baseline_bytes_written, 0);
@@ -1044,7 +1119,10 @@ mod tests {
             assert_eq!(incremental.stats().baseline_bytes_written, 3 * 4096);
         }
         assert_eq!(incremental.affected_chunks().collect::<Vec<_>>(), [0, 1]);
-        assert_eq!(reference.stats().live_bytes_read, layout.packed_len());
+        assert_eq!(
+            reference.stats().live_bytes_read + reference.stats().known_zero_bytes_skipped,
+            layout.packed_len()
+        );
         assert_eq!(baseline_files.bytes(), original);
         assert_eq!(full.chunk_digests(), independent_digests(&original));
         assert_eq!(
@@ -1056,7 +1134,7 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn incremental_discard_writes_explicit_zeros_over_nonzero_baseline() {
+    fn incremental_discard_covers_zero_runs_over_nonzero_baseline() {
         use arch::guest_memory::PageIndex;
         use devices::virtio::RuntimeGuestMemory;
 
@@ -1107,8 +1185,12 @@ mod tests {
             },
             output,
         );
-        assert_eq!(incremental.stats().explicit_zero_bytes_written, 2 * 4096);
-        assert_eq!(incremental.stats().overlay_bytes_written, 2 * 4096);
+        assert_eq!(incremental.stats().zero_run_bytes_covered, 2 * 4096);
+        assert_eq!(
+            incremental.stats().overlay_bytes_written,
+            incremental.stats().explicit_zero_bytes_written
+        );
+        assert!(incremental.stats().explicit_zero_bytes_written <= 2 * 4096);
         let reference_files = Outputs::new();
         capture(&second, layout, RamWriteMode::Full, reference_files.owned());
         assert_eq!(incremental_files.bytes(), reference_files.bytes());
@@ -1203,10 +1285,14 @@ mod tests {
             }
             assert_eq!(outputs.bytes(), expected);
             assert_eq!(stats.live_bytes_read, if has_dirty { 4096 } else { 0 });
+            assert_eq!(stats.overlay_bytes_written, 0);
+            assert_eq!(stats.explicit_zero_bytes_written, 0);
             assert_eq!(
-                stats.overlay_bytes_written,
+                stats.zero_run_bytes_covered,
                 if has_dirty { 4096 } else { 0 }
             );
+            assert_eq!(stats.zero_bytes_omitted, if has_dirty { 4096 } else { 0 });
+            assert_eq!(stats.zero_bytes_punched, 0);
             assert_eq!(
                 digests,
                 if has_dirty {
@@ -1476,7 +1562,11 @@ mod tests {
             RamWriteMode::Full,
             baseline_files.owned(),
         );
-        assert_eq!(initial_receipt.stats().live_bytes_read, length as u64);
+        assert_eq!(
+            initial_receipt.stats().live_bytes_read
+                + initial_receipt.stats().known_zero_bytes_skipped,
+            length as u64
+        );
         assert_eq!(initial_receipt.stats().full_bytes_written, 0);
         assert_eq!(initial_receipt.stats().zero_bytes_omitted, length as u64);
         assert_eq!(baseline_files.bytes(), vec![0; length]);
@@ -2233,8 +2323,9 @@ mod tests {
         assert_eq!(receipt.stats().seed_method, RamSeedMethod::Rebuild);
         assert_eq!(receipt.stats().live_bytes_read, 4096);
         assert_eq!(receipt.stats().baseline_bytes_written, 4096);
-        assert_eq!(receipt.stats().overlay_bytes_written, 4096);
-        assert_eq!(receipt.stats().explicit_zero_bytes_written, 4096);
+        assert_eq!(receipt.stats().overlay_bytes_written, 0);
+        assert_eq!(receipt.stats().explicit_zero_bytes_written, 0);
+        assert_eq!(receipt.stats().zero_run_bytes_covered, 4096);
         assert_eq!(receipt.chunk_digests(), independent_digests(&expected));
         assert_eq!(baseline_files.bytes(), original);
     }
@@ -2275,7 +2366,16 @@ mod tests {
             std::fs::read(source.as_path()).unwrap(),
             std::fs::read(output.as_path()).unwrap()
         );
-        output.as_file().write_all_at(&[0; 4096], 4096).unwrap();
+        let allocated = output.as_file().metadata().unwrap().blocks();
+        let mut stats = RamIoStats::default();
+        cover_zero(output.as_file(), 4096..8192, true, &mut stats, deadline()).unwrap();
+        assert_eq!(stats.zero_run_bytes_covered, 4096);
+        if stats.zero_bytes_punched != 0 {
+            assert_eq!(stats.explicit_zero_bytes_written, 0);
+            assert!(output.as_file().metadata().unwrap().blocks() < allocated);
+        } else {
+            assert_eq!(stats.explicit_zero_bytes_written, 4096);
+        }
         let mut expected = vec![0; 3 * 4096];
         expected[4096..8192].fill(0x5a);
         assert_eq!(std::fs::read(source.as_path()).unwrap(), expected);
@@ -2395,20 +2495,17 @@ mod tests {
             }
         }
         assert_eq!(digests, independent);
-        assert_eq!(stats.live_bytes_read, serial_stats.live_bytes_read);
+        assert_eq!(
+            stats.live_bytes_read + stats.known_zero_bytes_skipped,
+            serial_stats.live_bytes_read
+        );
         assert_eq!(stats.full_bytes_written, serial_stats.full_bytes_written);
         assert_eq!(
             stats.baseline_bytes_written,
             serial_stats.baseline_bytes_written
         );
-        assert_eq!(
-            stats.overlay_bytes_written,
-            serial_stats.overlay_bytes_written
-        );
-        assert_eq!(
-            stats.explicit_zero_bytes_written,
-            serial_stats.explicit_zero_bytes_written
-        );
+        assert!(stats.overlay_bytes_written <= serial_stats.overlay_bytes_written);
+        assert!(stats.explicit_zero_bytes_written <= serial_stats.explicit_zero_bytes_written);
         stats
     }
 
@@ -2471,7 +2568,10 @@ mod tests {
                 false,
                 &expected,
             );
-            assert_eq!(stats.live_bytes_read, layout.packed_len());
+            assert_eq!(
+                stats.live_bytes_read + stats.known_zero_bytes_skipped,
+                layout.packed_len()
+            );
             if !dense && !sparse {
                 assert_eq!(stats.zero_bytes_omitted, layout.packed_len());
                 assert_eq!(stats.full_bytes_written, 0);
@@ -2541,8 +2641,12 @@ mod tests {
         };
         for seeded in [false, true] {
             let stats = compare_pipeline_with_serial(&current, &layout, &mode, seeded, &expected);
-            assert_eq!(stats.overlay_bytes_written, 5 * 4096);
-            assert_eq!(stats.explicit_zero_bytes_written, 4 * 4096);
+            assert_eq!(stats.zero_run_bytes_covered, 4 * 4096);
+            assert_eq!(
+                stats.overlay_bytes_written,
+                4096 + stats.explicit_zero_bytes_written
+            );
+            assert!(stats.explicit_zero_bytes_written <= 4 * 4096);
             if !seeded {
                 assert_eq!(stats.live_bytes_read, 5 * 4096);
             }
@@ -2637,5 +2741,157 @@ mod tests {
         assert!(matches!(error, RamImageError::Deadline));
         assert_eq!(stats.live_bytes_read, 0);
         assert_eq!(output.as_file().metadata().unwrap().len(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_pagemap_capture_matches_full_read_oracle_before_faulting_untouched_ram() {
+        let pack = crate::vmm::memory::image::RAM_IO_BUFFER_BYTES;
+        let second = (4 * pack) as u64;
+        let raw = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 2 * pack + 4096),
+            (GuestAddress(second), 3 * 4096),
+        ])
+        .unwrap();
+        raw.write_slice(&[0x57; 4096], GuestAddress(4096)).unwrap();
+        raw.write_slice(&[0; 4096], GuestAddress(8192)).unwrap();
+        raw.write_slice(&[0x93; 4096], GuestAddress((2 * pack) as u64))
+            .unwrap();
+        raw.write_slice(&[0x41; 4096], GuestAddress(second + 8192))
+            .unwrap();
+        let (domain, mut control) = tracked(raw);
+        let layout = layout(&domain);
+        let current = cut(&mut control);
+        let optimized = Outputs::new();
+        let receipt = capture(
+            &current,
+            layout.clone(),
+            RamWriteMode::Full,
+            optimized.owned(),
+        );
+        assert!(receipt.stats().known_zero_bytes_skipped > 0);
+        assert!(receipt.stats().live_bytes_read >= 4 * 4096);
+        assert_eq!(
+            receipt.stats().live_bytes_read + receipt.stats().known_zero_bytes_skipped,
+            layout.packed_len()
+        );
+        let oracle = Outputs::new();
+        oracle.ram.as_file().set_len(layout.packed_len()).unwrap();
+        let mut affected = allocate_chunks(&layout).unwrap();
+        mark_chunks(&mut affected, &layout, &RamWriteMode::Full);
+        let mut digests = ChunkDigests::new(layout.packed_len(), &affected).unwrap();
+        let mut stats = RamIoStats::default();
+        let mut buffer = vec![0; 1024 * 1024];
+        ImageWriter {
+            ram: oracle.ram.as_file(),
+            buffer: &mut buffer,
+            stats: &mut stats,
+            deadline: deadline(),
+            granule: 4096,
+            writeback: Writeback::default(),
+        }
+        .full(&current, &layout, &mut digests)
+        .unwrap();
+        assert_eq!(stats.live_bytes_read, layout.packed_len());
+        assert_eq!(optimized.bytes(), oracle.bytes());
+        assert_eq!(receipt.chunk_digests(), digests.values);
+        assert_eq!(
+            receipt.chunk_digests(),
+            independent_digests(&oracle.bytes())
+        );
+        assert_eq!(
+            std::fs::read(optimized.layout.as_path()).unwrap(),
+            layout.canonical_bytes()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_file_backed_private_capture_reads_nonresident_baseline_for_both_backing_kinds() {
+        use vm_memory::{FileOffset, GuestRegionMmap, MmapRegion};
+
+        let expected = vec![0x79; 2 * 1024 * 1024 + 4096];
+        let file = TempFile::new().unwrap();
+        file.as_file().write_all_at(&expected, 0).unwrap();
+        for backing in [BackingKind::Boot, BackingKind::RestoredPrivate] {
+            let mapping = MmapRegion::<()>::build(
+                Some(FileOffset::new(file.as_file().try_clone().unwrap(), 0)),
+                expected.len(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+            )
+            .unwrap();
+            let raw = GuestMemoryMmap::from_regions(vec![
+                GuestRegionMmap::new(mapping, GuestAddress(0)).unwrap(),
+            ])
+            .unwrap();
+            let (domain, authority, mut control) =
+                MemoryDomain::construct(raw, 4096, backing).unwrap();
+            let epoch = authority.issue_epoch(1).unwrap();
+            control.finish_tracked(authority, epoch).unwrap();
+            let layout = layout(&domain);
+            let current = cut(&mut control);
+            let files = Outputs::new();
+            let receipt = capture(&current, layout, RamWriteMode::Full, files.owned());
+            assert_eq!(receipt.stats().live_bytes_read, expected.len() as u64);
+            assert_eq!(receipt.stats().known_zero_bytes_skipped, 0);
+            assert_eq!(files.bytes(), expected);
+            assert_eq!(receipt.chunk_digests(), independent_digests(&expected));
+        }
+    }
+
+    #[test]
+    fn fresh_zero_coverage_keeps_sparse_output_and_real_errors_preserve_baseline() {
+        let output = TempFile::new().unwrap();
+        let length = 2 * RAM_IDENTITY_CHUNK_BYTES + 4096;
+        output.as_file().set_len(length).unwrap();
+        let allocated = output.as_file().metadata().unwrap().blocks();
+        let mut stats = RamIoStats::default();
+        cover_zero(output.as_file(), 0..length, false, &mut stats, deadline()).unwrap();
+        assert_eq!(stats.zero_run_bytes_covered, length);
+        assert_eq!(stats.zero_bytes_omitted, length);
+        assert_eq!(stats.explicit_zero_bytes_written, 0);
+        assert_eq!(output.as_file().metadata().unwrap().blocks(), allocated);
+        assert_eq!(
+            std::fs::read(output.as_path()).unwrap(),
+            vec![0; length as usize]
+        );
+
+        output.as_file().write_all_at(&[0x73; 4096], 0).unwrap();
+        let read_only = File::open(output.as_path()).unwrap();
+        let mut failed_stats = RamIoStats::default();
+        assert!(cover_zero(&read_only, 0..4096, true, &mut failed_stats, deadline()).is_err());
+        assert_eq!(failed_stats.zero_run_bytes_covered, 0);
+        assert_eq!(
+            &std::fs::read(output.as_path()).unwrap()[..4096],
+            &[0x73; 4096]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zero_run_unsupported_punch_overwrites_baseline_on_real_filesystem() {
+        let Some(directory) = std::env::var_os("LIBKRUN_NO_PUNCH_TMPDIR") else {
+            eprintln!("set LIBKRUN_NO_PUNCH_TMPDIR to a writable filesystem without hole punching");
+            return;
+        };
+        let file = TempFile::new_in(std::path::Path::new(&directory)).unwrap();
+        file.as_file().write_all_at(&[0x79; 3 * 4096], 0).unwrap();
+        let mut stats = RamIoStats::default();
+        cover_zero(file.as_file(), 4096..8192, true, &mut stats, deadline()).unwrap();
+        assert_eq!(
+            stats.zero_bytes_punched, 0,
+            "test filesystem supports punching"
+        );
+        assert_eq!(stats.zero_run_bytes_covered, 4096);
+        assert_eq!(stats.explicit_zero_bytes_written, 4096);
+        assert_eq!(stats.overlay_bytes_written, 4096);
+        let mut expected = vec![0x79; 3 * 4096];
+        expected[4096..8192].fill(0);
+        assert_eq!(std::fs::read(file.as_path()).unwrap(), expected);
+        assert_eq!(
+            independent_digests(&std::fs::read(file.as_path()).unwrap()),
+            independent_digests(&expected)
+        );
     }
 }

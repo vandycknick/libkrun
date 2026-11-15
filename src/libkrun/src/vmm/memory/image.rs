@@ -160,7 +160,14 @@ pub struct RamIoStats {
     pub layout_bytes_written: u64,
     pub baseline_hole_bytes: u64,
     pub zero_bytes_omitted: u64,
+    /// Zero-valued bytes physically written by overlay writes, including mixed data.
     pub explicit_zero_bytes_written: u64,
+    /// Complete zero runs successfully covered, whether omitted, punched, or written.
+    pub zero_run_bytes_covered: u64,
+    /// Covered zero bytes deallocated from a seeded output, never the baseline.
+    pub zero_bytes_punched: u64,
+    /// Live RAM bytes not read because cut-bound pagemap metadata proves zero origin.
+    pub known_zero_bytes_skipped: u64,
     pub extent_queries: u64,
 }
 

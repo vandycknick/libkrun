@@ -8,12 +8,12 @@ use std::sync::{Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::Instant;
 
-use arch::guest_memory::{MemoryCut, PageIndex};
+use arch::guest_memory::{CutReadKind, CutReader, MemoryCut, PageIndex};
 use sha2::{Digest, Sha256};
 use vm_memory::GuestAddress;
 
 use crate::vmm::memory::image::writer::{
-    Extents, WriteKind, Writeback, is_all_zero, read_exact_at, write_exact_at,
+    Extents, WriteKind, Writeback, cover_zero, is_all_zero, read_exact_at, write_exact_at,
 };
 use crate::vmm::memory::image::{
     RAM_IDENTITY_CHUNK_BYTES, RAM_IO_BUFFER_BYTES, RAM_IO_BUFFER_COUNT, RamFileRole, RamImageError,
@@ -77,31 +77,49 @@ fn pipeline_error(message: &'static str) -> RamImageError {
     RamImageError::Pipeline(io::Error::other(message))
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WriteAction {
+    Data,
+    Zero,
+}
+
 struct WriteRun {
     range: Range<usize>,
     kind: WriteKind,
+    action: WriteAction,
 }
 
 struct Pack<'a> {
     bytes: &'a mut [u8],
     offset: u64,
     length: usize,
+    seeded: bool,
     writes: Vec<WriteRun>,
+    zero_granules: Vec<bool>,
     nonzero: [bool; CHUNKS_PER_PACK],
     digests: [Option<[u8; 32]>; CHUNKS_PER_PACK],
 }
 
 impl<'a> Pack<'a> {
-    fn new(bytes: &'a mut [u8], granule: usize) -> Result<Self, RamImageError> {
+    fn new(bytes: &'a mut [u8], granule: usize, seeded: bool) -> Result<Self, RamImageError> {
         let mut writes = Vec::new();
         writes
-            .try_reserve_exact(bytes.len() / granule)
+            .try_reserve_exact(bytes.len() / granule.min(4096))
             .map_err(|_| RamImageError::Allocation)?;
+        let mut zero_granules = Vec::new();
+        if seeded {
+            zero_granules
+                .try_reserve_exact(bytes.len() / granule)
+                .map_err(|_| RamImageError::Allocation)?;
+            zero_granules.resize(bytes.len() / granule, false);
+        }
         Ok(Self {
             bytes,
             offset: 0,
             length: 0,
+            seeded,
             writes,
+            zero_granules,
             nonzero: [false; CHUNKS_PER_PACK],
             digests: [None; CHUNKS_PER_PACK],
         })
@@ -115,24 +133,23 @@ impl<'a> Pack<'a> {
         self.digests.fill(None);
     }
 
-    fn write_run(&mut self, range: Range<usize>, kind: WriteKind) {
+    fn write_run(&mut self, range: Range<usize>, kind: WriteKind, action: WriteAction) {
         if let Some(last) = self.writes.last_mut()
             && last.kind == kind
+            && last.action == action
             && last.range.end == range.start
         {
             last.range.end = range.end;
             return;
         }
-        self.writes.push(WriteRun { range, kind });
+        self.writes.push(WriteRun {
+            range,
+            kind,
+            action,
+        });
     }
 
-    fn classify(
-        &mut self,
-        range: Range<usize>,
-        kind: Option<WriteKind>,
-        granule: usize,
-        stats: &mut RamIoStats,
-    ) {
+    fn classify(&mut self, range: Range<usize>, kind: Option<WriteKind>, granule: usize) {
         for start in (range.start..range.end).step_by(granule) {
             let end = (start + granule).min(range.end);
             let mut cursor = start;
@@ -145,13 +162,29 @@ impl<'a> Pack<'a> {
                 nonzero |= data;
                 cursor = limit;
             }
-            if let Some(kind) = kind {
-                if nonzero || kind == WriteKind::Overlay {
-                    self.write_run(start..end, kind);
-                } else {
-                    stats.zero_bytes_omitted += (end - start) as u64;
-                }
+            if self.seeded {
+                self.zero_granules[start / granule] = !nonzero;
             }
+            if let Some(kind) = kind {
+                let action = if nonzero {
+                    WriteAction::Data
+                } else {
+                    WriteAction::Zero
+                };
+                self.write_run(start..end, kind, action);
+            }
+        }
+    }
+
+    fn overlay(&mut self, range: Range<usize>, granule: usize) {
+        for start in (range.start..range.end).step_by(granule) {
+            let end = (start + granule).min(range.end);
+            let action = if self.zero_granules[start / granule] {
+                WriteAction::Zero
+            } else {
+                WriteAction::Data
+            };
+            self.write_run(start..end, WriteKind::Overlay, action);
         }
     }
 
@@ -165,6 +198,23 @@ impl<'a> Pack<'a> {
         deadline: Instant,
     ) -> Result<(), RamImageError> {
         let first = (self.offset / RAM_IDENTITY_CHUNK_BYTES) as usize;
+        for run in &self.writes {
+            failure.check(deadline)?;
+            if run.action == WriteAction::Zero {
+                let mut start = run.range.start;
+                while start < run.range.end {
+                    let chunk = start / RAM_IDENTITY_CHUNK_BYTES as usize;
+                    let end = run
+                        .range
+                        .end
+                        .min((chunk + 1) * RAM_IDENTITY_CHUNK_BYTES as usize);
+                    if self.nonzero[chunk] {
+                        self.bytes[start..end].fill(0);
+                    }
+                    start = end;
+                }
+            }
+        }
         for (local, bytes) in self.bytes[..self.length]
             .chunks(RAM_IDENTITY_CHUNK_BYTES as usize)
             .enumerate()
@@ -178,15 +228,26 @@ impl<'a> Pack<'a> {
         for run in &self.writes {
             failure.check(deadline)?;
             let offset = self.offset + run.range.start as u64;
-            write_exact_at(
-                file,
-                &self.bytes[run.range.clone()],
-                offset,
-                run.kind,
-                stats,
-                deadline,
-            )?;
-            writeback.completed(file, offset, run.range.len() as u64);
+            match run.action {
+                WriteAction::Data => {
+                    write_exact_at(
+                        file,
+                        &self.bytes[run.range.clone()],
+                        offset,
+                        run.kind,
+                        stats,
+                        deadline,
+                    )?;
+                    writeback.completed(file, offset, run.range.len() as u64);
+                }
+                WriteAction::Zero => cover_zero(
+                    file,
+                    offset..offset + run.range.len() as u64,
+                    self.seeded,
+                    stats,
+                    deadline,
+                )?,
+            }
         }
         Ok(())
     }
@@ -201,10 +262,60 @@ impl<'a> Pack<'a> {
 struct Reader<'a> {
     input: Input<'a>,
     region_index: usize,
+    cut_reader: Option<CutReader<'a>>,
     extents: Option<Extents<'a>>,
 }
 
 impl Reader<'_> {
+    fn full(
+        &mut self,
+        pack: &mut Pack<'_>,
+        stats: &mut RamIoStats,
+        failure: &Failure,
+    ) -> Result<(), RamImageError> {
+        let mut offset = pack.offset;
+        let end = offset + pack.length as u64;
+        while offset < end {
+            failure.check(self.input.deadline)?;
+            let region = self
+                .input
+                .layout
+                .regions()
+                .get(self.region_index)
+                .ok_or(RamImageError::Geometry)?;
+            if offset >= region.stream_offset + region.length {
+                self.region_index += 1;
+                continue;
+            }
+            let local = offset - region.stream_offset;
+            let length = (end - offset).min(region.length - local) as usize;
+            let (kind, length) = self
+                .cut_reader
+                .as_mut()
+                .ok_or(RamImageError::Geometry)?
+                .next_range(GuestAddress(region.guest_start + local), length)
+                .map_err(RamImageError::Authority)?;
+            let start = (offset - pack.offset) as usize;
+            let range = start..start + length;
+            match kind {
+                CutReadKind::Read => {
+                    self.live(pack, offset..offset + length as u64, stats, failure)?;
+                    pack.classify(
+                        range,
+                        Some(WriteKind::Full),
+                        self.input.layout.granule() as usize,
+                    );
+                }
+                CutReadKind::KnownZero => {
+                    stats.known_zero_bytes_skipped += length as u64;
+                    pack.write_run(range, WriteKind::Full, WriteAction::Zero);
+                }
+            }
+            offset += length as u64;
+        }
+        Ok(())
+    }
+
     fn live(
         &mut self,
         pack: &mut Pack<'_>,
@@ -287,7 +398,6 @@ impl Reader<'_> {
                 local,
                 Some(WriteKind::Baseline),
                 self.input.layout.granule() as usize,
-                stats,
             );
             offset = end;
         }
@@ -305,9 +415,7 @@ impl Reader<'_> {
         let end = pack.offset + pack.length as u64;
         let granule = self.input.layout.granule() as usize;
         if matches!(self.input.mode, RamWriteMode::Full) {
-            self.live(pack, pack.offset..end, stats, failure)?;
-            pack.classify(0..pack.length, Some(WriteKind::Full), granule, stats);
-            return Ok(());
+            return self.full(pack, stats, failure);
         }
         if self.input.seeded {
             let first = (pack.offset / RAM_IDENTITY_CHUNK_BYTES) as usize;
@@ -324,7 +432,7 @@ impl Reader<'_> {
                     stats,
                     failure,
                 )?;
-                pack.classify(start..limit, None, granule, stats);
+                pack.classify(start..limit, None, granule);
             }
         }
         let mut clean_start = pack.offset;
@@ -345,11 +453,11 @@ impl Reader<'_> {
             }
             let local = (start - pack.offset) as usize..(stop - pack.offset) as usize;
             if self.input.seeded {
-                pack.write_run(local, WriteKind::Overlay);
+                pack.overlay(local, granule);
             } else {
                 self.clean(pack, clean_start..start, stats, failure)?;
                 self.live(pack, start..stop, stats, failure)?;
-                pack.classify(local, Some(WriteKind::Overlay), granule, stats);
+                pack.classify(local, Some(WriteKind::Overlay), granule);
             }
             clean_start = stop;
         }
@@ -372,9 +480,18 @@ pub(crate) fn write(
     free.try_reserve_exact(RAM_IO_BUFFER_COUNT)
         .map_err(|_| RamImageError::Allocation)?;
     for bytes in &mut scratch.buffers {
-        free.push(Pack::new(bytes, input.layout.granule() as usize)?);
+        free.push(Pack::new(
+            bytes,
+            input.layout.granule() as usize,
+            input.seeded,
+        )?);
     }
     let mut reader = Reader {
+        cut_reader: if matches!(input.mode, RamWriteMode::Full) {
+            Some(input.cut.reader().map_err(RamImageError::Authority)?)
+        } else {
+            None
+        },
         extents: match input.mode {
             RamWriteMode::Full => None,
             RamWriteMode::Incremental { baseline, .. } => Some(Extents {
@@ -486,6 +603,9 @@ pub(crate) fn write(
                     stats.baseline_bytes_written += worker_stats.baseline_bytes_written;
                     stats.overlay_bytes_written += worker_stats.overlay_bytes_written;
                     stats.explicit_zero_bytes_written += worker_stats.explicit_zero_bytes_written;
+                    stats.zero_run_bytes_covered += worker_stats.zero_run_bytes_covered;
+                    stats.zero_bytes_punched += worker_stats.zero_bytes_punched;
+                    stats.zero_bytes_omitted += worker_stats.zero_bytes_omitted;
                 }
                 Err(_) => failure.record(pipeline_error("RAM writer panicked")),
             }
