@@ -55,6 +55,7 @@ pub use crate::vmm::execution::{
     CpuExecutionState, CpuTimePlan, ExecutionEnvelope, ExecutionLane, StateBinding,
     VmExecutionState,
 };
+pub use crate::vmm::device_manager::quiescence::AttachmentIdentity;
 pub use crate::vmm::memory::image::{
     AuthenticatedRamImage, RamCaptureMode, RamCaptureReceipt, RamImageAuthentication,
     RamImageError, RamIoStats, RamSeedMethod, ValidatedRamLayout,
