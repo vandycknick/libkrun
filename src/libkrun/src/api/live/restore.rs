@@ -45,12 +45,21 @@ pub struct RestoreAttachment {
 pub struct RestoreBlock {
     pub attachment: RestoreAttachment,
     pub backing: RestoreBlockBacking,
+    pub tracking_seed: Option<crate::api::live::DiskTrackingSeed>,
 }
 impl RestoreBlock {
+    /// Bind the destination inode and a fresh tracking epoch before dormant
+    /// construction. This never imports a source dirty set or source epoch.
+    pub fn with_tracking_seed(mut self, seed: crate::api::live::DiskTrackingSeed) -> Self {
+        self.tracking_seed = Some(seed);
+        self
+    }
+
     pub fn raw(attachment: RestoreAttachment, file: File, read_only: bool) -> Self {
         Self {
             attachment,
             backing: RestoreBlockBacking::Raw { file, read_only },
+            tracking_seed: None,
         }
     }
 
@@ -67,6 +76,7 @@ impl RestoreBlock {
                 descriptor,
                 extents,
             }),
+            tracking_seed: None,
         }
     }
 }

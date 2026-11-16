@@ -19,7 +19,7 @@ use crate::vmm::device_manager::shm::ShmManager;
 use devices::display::{DisplayInfo, DisplayInfoEdid, PhysicalSize};
 use devices::legacy::IrqChip;
 #[cfg(feature = "blk")]
-use devices::virtio::block::{DiskFormat, SyncMode};
+use devices::virtio::block::{DiskFormat, DiskTrackingSeed, SyncMode};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -1414,6 +1414,7 @@ pub struct BlockDevice {
     is_read_only: bool,
     direct_io: bool,
     sync_mode: SyncMode,
+    disk_tracking_seed: Option<DiskTrackingSeed>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
@@ -1431,6 +1432,7 @@ impl BlockDevice {
             is_read_only: false,
             direct_io: false,
             sync_mode: SyncMode::default(),
+            disk_tracking_seed: None,
         })
     }
 
@@ -1453,6 +1455,15 @@ impl BlockDevice {
     }
 }
 
+#[cfg(feature = "blk")]
+impl BlockDevice {
+    /// Adopt a local baseline binding during construction, before registration
+    /// can expose a queue. Omission explicitly leaves baseline validity unknown.
+    pub fn set_disk_tracking_seed(&mut self, seed: DiskTrackingSeed) {
+        self.disk_tracking_seed = Some(seed);
+    }
+}
+
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
 #[cfg_attr(not(feature = "ffi"), cfg(feature = "blk"))]
 impl<'a> AttachDevice<'a> for BlockDevice {
@@ -1460,7 +1471,7 @@ impl<'a> AttachDevice<'a> for BlockDevice {
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         use devices::virtio::CacheType;
 
-        let block = devices::virtio::Block::new(
+        let mut block = devices::virtio::Block::new(
             self.id,
             None,
             CacheType::auto(&self.disk_image_path),
@@ -1471,6 +1482,11 @@ impl<'a> AttachDevice<'a> for BlockDevice {
             self.sync_mode,
         )
         .map_err(|e| VmmError::Internal(format!("block: {e}")))?;
+        if let Some(seed) = self.disk_tracking_seed {
+            block
+                .set_disk_tracking_seed(seed)
+                .map_err(|error| VmmError::Internal(format!("block tracking: {error}")))?;
+        }
 
         let inner = Arc::new(Mutex::new(block));
         let id = inner.lock().unwrap().id().to_string();

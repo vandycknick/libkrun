@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::task::Poll;
 use std::time::Instant;
 
+use crate::virtio::block::{DiskGenerationSettlement, DiskGenerationToken, DiskTrackingReceipt};
 use crate::virtio::lifecycle::{
     LifecycleError, LifecycleJournal, LifecycleSnapshot, ProviderFault, ProviderStage,
     QueueBinding, QueueEscrow, ResumeAcceptance,
@@ -1349,6 +1350,37 @@ impl MmioTransport {
         Ok(())
     }
 
+    pub fn freeze_disk_tracking(
+        &self,
+        key: BarrierKey,
+        capture_id: [u8; 16],
+    ) -> Result<Option<DiskTrackingReceipt>, ProviderFault> {
+        self.capture_transport(key).map_err(|error| error.fault)?;
+        let device = self
+            .device
+            .try_lock()
+            .map_err(|_| ProviderFault::DeviceLock)?;
+        device
+            .state_provider()
+            .ok_or(ProviderFault::Unsupported)?
+            .freeze_disk_tracking(key, capture_id)
+    }
+
+    pub fn settle_disk_tracking(
+        &self,
+        token: DiskGenerationToken,
+        settlement: DiskGenerationSettlement,
+    ) -> Result<(), ProviderFault> {
+        let device = self
+            .device
+            .try_lock()
+            .map_err(|_| ProviderFault::DeviceLock)?;
+        device
+            .state_provider()
+            .ok_or(ProviderFault::Unsupported)?
+            .settle_disk_tracking(token, settlement)
+    }
+
     pub fn flush_for_capture(&self, key: BarrierKey) -> Result<(), LifecycleError> {
         self.capture_transport(key)?;
         let device = self
@@ -2673,10 +2705,16 @@ pub(crate) mod tests {
         wrong_schema[8..10].copy_from_slice(&2u16.to_le_bytes());
         assert_eq!(
             state.validate_payload_binding(&wrong_schema),
-            Err(ProviderFault::StateHeader(StateHeaderError::Schema { expected: 1, found: 2 }))
+            Err(ProviderFault::StateHeader(StateHeaderError::Schema {
+                expected: 1,
+                found: 2
+            }))
         );
         for length in 0..10 {
-            assert_eq!(state.validate_payload_binding(&payload[..length]), Err(ProviderFault::DeviceState));
+            assert_eq!(
+                state.validate_payload_binding(&payload[..length]),
+                Err(ProviderFault::DeviceState)
+            );
         }
         assert_eq!(transport.device_status, device_status::INIT);
         assert_eq!(

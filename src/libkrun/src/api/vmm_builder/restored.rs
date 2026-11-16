@@ -420,14 +420,18 @@ fn reconstruct(
             #[cfg(feature = "blk")]
             2 => {
                 let block = take_binding(&mut resources.blocks, &record, |item| &item.attachment)?;
-                Arc::new(Mutex::new(
-                    devices::virtio::Block::new_restore_binding(
-                        block.attachment.configured_id,
-                        block.backing,
-                        &record.payload,
-                    )
-                    .map_err(block_binding)?,
-                ))
+                let mut device = devices::virtio::Block::new_restore_binding(
+                    block.attachment.configured_id,
+                    block.backing,
+                    &record.payload,
+                )
+                .map_err(block_binding)?;
+                if let Some(seed) = block.tracking_seed {
+                    device
+                        .set_disk_tracking_seed(seed)
+                        .map_err(|error| io(RestoreRole::Block, error))?;
+                }
+                Arc::new(Mutex::new(device))
             }
             #[cfg(feature = "net")]
             1 => {

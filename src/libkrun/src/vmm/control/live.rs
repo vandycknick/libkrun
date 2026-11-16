@@ -45,6 +45,7 @@ use crate::api::live::{
     LiveSnapshot, LiveStage, LiveSubject, MemoryCaptureRequest, MemoryOutputs, OutputProblem,
     OutputRole,
 };
+use crate::api::live::{DiskGenerationSettlement, DiskGenerationToken, DiskTrackingCut};
 use crate::vmm::Vmm;
 use crate::vmm::control::{
     BarrierKey, BarrierRequest, ControlFailure, ControlOwner, ControlReply, ControlState,
@@ -60,6 +61,15 @@ type Reply = Sender<Result<ControlReply, ControlFailure>>;
 #[derive(Debug)]
 pub(crate) enum LiveRequest {
     Flush(PauseToken),
+    FreezeDisks {
+        pause: PauseToken,
+        capture: CaptureId,
+    },
+    SettleDisk {
+        attachment: crate::vmm::device_manager::quiescence::AttachmentIdentity,
+        token: DiskGenerationToken,
+        settlement: DiskGenerationSettlement,
+    },
     Execution {
         pause: PauseToken,
         binding: Box<StateBinding>,
@@ -105,6 +115,16 @@ impl LiveRequest {
     pub(crate) fn context(&self) -> (LiveStage, LiveSubject) {
         match self {
             Self::Flush(pause) => (LiveStage::Flush, LiveSubject::Pause(pause.clone())),
+            Self::FreezeDisks { capture, .. } => (LiveStage::Flush, LiveSubject::Capture(*capture)),
+            Self::SettleDisk {
+                token, settlement, ..
+            } => (
+                match settlement {
+                    DiskGenerationSettlement::Commit { .. } => LiveStage::Accept,
+                    DiskGenerationSettlement::Abort => LiveStage::Abandon,
+                },
+                LiveSubject::Capture(CaptureId::new(token.capture_id)),
+            ),
             Self::Execution { binding, .. } => (
                 LiveStage::Execution,
                 LiveSubject::Capture(CaptureId::new(binding.capture)),
@@ -146,6 +166,7 @@ impl LiveRequest {
 #[derive(Clone, Debug)]
 pub enum LiveReply {
     Flush(FlushReceipt),
+    DiskTracking(DiskTrackingCut),
     Execution(Arc<ExecutionCaptureReceipt>),
     Memory(CompletedCapture),
     Status(CaptureStatus),
@@ -787,6 +808,21 @@ impl Vmm {
                     .into());
                 }
             }
+            LiveRequest::FreezeDisks { pause, capture } => {
+                let key = self.live_pause_key(&pause)?;
+                LiveReply::DiskTracking(self.freeze_live_disks(pause, capture, key)?)
+            }
+            LiveRequest::SettleDisk {
+                attachment,
+                token,
+                settlement,
+            } => {
+                self.mmio_device_manager
+                    .quiescence
+                    .settle_disk_tracking(&attachment, token, settlement)
+                    .map_err(LiveError::Execution)?;
+                LiveReply::Complete
+            }
             LiveRequest::Flush(pause) => {
                 let key = self.live_pause_key(&pause)?;
                 self.flush_live_native(key)?;
@@ -1309,6 +1345,23 @@ impl Vmm {
         self.flush_devices_for_capture(key)
             .map_err(LiveError::Execution)
     }
+    fn freeze_live_disks(
+        &self,
+        pause: PauseToken,
+        capture: CaptureId,
+        key: BarrierKey,
+    ) -> Result<DiskTrackingCut, LiveError> {
+        let disks = self
+            .mmio_device_manager
+            .quiescence
+            .freeze_disk_tracking(key, capture.bytes())
+            .map_err(LiveError::Execution)?;
+        Ok(DiskTrackingCut {
+            capture,
+            pause,
+            disks,
+        })
+    }
 }
 #[cfg(not(all(
     not(feature = "tee"),
@@ -1343,6 +1396,14 @@ impl Vmm {
         Err(ControlFailure::Unsupported("execution capture lane".into()).into())
     }
     fn flush_live_native(&self, _: BarrierKey) -> Result<(), LiveError> {
+        Err(ControlFailure::Unsupported("execution capture lane".into()).into())
+    }
+    fn freeze_live_disks(
+        &self,
+        _: PauseToken,
+        _: CaptureId,
+        _: BarrierKey,
+    ) -> Result<DiskTrackingCut, LiveError> {
         Err(ControlFailure::Unsupported("execution capture lane".into()).into())
     }
 }

@@ -13,6 +13,7 @@ use polly::event_manager::{BarrierKey, BarrierRequest};
 use utils::eventfd::EventFd;
 
 use crate::virtio::RuntimeGuestMemory;
+use crate::virtio::block::{DiskGenerationSettlement, DiskGenerationToken, DiskTrackingReceipt};
 use crate::virtio::device::DeviceQueue;
 use crate::virtio::queue::QueueState;
 
@@ -255,6 +256,22 @@ pub trait VirtioStateProvider: Send {
     fn validate_terminal_drain(&self, _key: BarrierKey) -> Result<(), ProviderFault> {
         Err(ProviderFault::Unsupported)
     }
+    fn freeze_disk_tracking(
+        &self,
+        _key: BarrierKey,
+        _capture_id: [u8; 16],
+    ) -> Result<Option<DiskTrackingReceipt>, ProviderFault> {
+        Ok(None)
+    }
+
+    fn settle_disk_tracking(
+        &self,
+        _token: DiskGenerationToken,
+        _settlement: DiskGenerationSettlement,
+    ) -> Result<(), ProviderFault> {
+        Err(ProviderFault::Unsupported)
+    }
+
     /// Device payloads are explicit and bounded, never an implicit empty state.
     fn state_limit(&self) -> u32;
     fn capture_payload(&self, key: BarrierKey) -> Result<Vec<u8>, ProviderFault>;

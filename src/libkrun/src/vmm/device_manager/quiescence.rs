@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use devices::DeviceType;
 use devices::virtio::MmioTransport;
+use devices::virtio::block::{DiskGenerationSettlement, DiskGenerationToken, DiskTrackingReceipt};
 use devices::virtio::lifecycle::{LifecycleError, LifecycleSnapshot, ProviderFault, ProviderStage};
 use polly::event_manager::{BarrierKey, BarrierRequest};
 
@@ -316,6 +317,7 @@ pub struct DeviceQuiescence {
     /// Original cut authority while a bounded resume begin is still progressing.
     resume_fenced: Option<BarrierKey>,
     transition: Transition,
+    disk_freeze_rollback: Mutex<Vec<(usize, DiskGenerationToken)>>,
 }
 
 impl Default for DeviceQuiescence {
@@ -326,6 +328,7 @@ impl Default for DeviceQuiescence {
             request: None,
             resume_fenced: None,
             transition: Transition::Quiesce,
+            disk_freeze_rollback: Mutex::new(Vec::new()),
         }
     }
 }
@@ -492,6 +495,103 @@ impl DeviceQuiescence {
             }
         }
         Ok(())
+    }
+
+    pub fn freeze_disk_tracking(
+        &self,
+        key: BarrierKey,
+        capture_id: [u8; 16],
+    ) -> Result<Vec<(AttachmentIdentity, DiskTrackingReceipt)>, String> {
+        if !self
+            .fully_quiesced(key)
+            .map_err(|error| error.to_string())?
+        {
+            return Err("disk freeze requires a completed device cut".into());
+        }
+        let devices = self
+            .attachments
+            .iter()
+            .map(|attachment| {
+                attachment
+                    .device
+                    .try_lock()
+                    .map_err(|_| "disk freeze device lock unavailable".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for device in &devices {
+            if device.state_provider().is_none() {
+                return Err("disk freeze provider unavailable".into());
+            }
+        }
+        let mut rollback = self
+            .disk_freeze_rollback
+            .lock()
+            .map_err(|_| "disk rollback lock poisoned")?;
+        rollback.retain(|(index, token)| {
+            devices
+                .get(*index)
+                .and_then(|device| device.state_provider())
+                .is_none_or(|provider| {
+                    provider
+                        .settle_disk_tracking(*token, DiskGenerationSettlement::Abort)
+                        .is_err()
+                })
+        });
+        if !rollback.is_empty() {
+            return Err("prior disk freeze rollback remains unresolved".into());
+        }
+        let mut frozen: Vec<(usize, DiskTrackingReceipt)> = Vec::new();
+        for (index, device) in devices.iter().enumerate() {
+            let provider = device
+                .state_provider()
+                .ok_or("disk freeze provider unavailable")?;
+            match provider.freeze_disk_tracking(key, capture_id) {
+                Ok(Some(receipt)) => frozen.push((index, receipt)),
+                Ok(None) => {}
+                Err(fault) => {
+                    for (previous, receipt) in &frozen {
+                        let aborted = devices[*previous].state_provider().is_some_and(|provider| {
+                            provider
+                                .settle_disk_tracking(
+                                    receipt.token,
+                                    DiskGenerationSettlement::Abort,
+                                )
+                                .is_ok()
+                        });
+                        if !aborted {
+                            rollback.push((*previous, receipt.token));
+                        }
+                    }
+                    return Err(format!("disk freeze: {fault:?}"));
+                }
+            }
+        }
+        Ok(frozen
+            .into_iter()
+            .map(|(index, receipt)| (self.attachments[index].identity.clone(), receipt))
+            .collect())
+    }
+
+    pub fn settle_disk_tracking(
+        &self,
+        attachment: &AttachmentIdentity,
+        token: DiskGenerationToken,
+        settlement: DiskGenerationSettlement,
+    ) -> Result<(), String> {
+        let attachment = self
+            .attachments
+            .iter()
+            .find(|entry| &entry.identity == attachment)
+            .ok_or("disk settlement attachment differs")?;
+        let device = attachment
+            .device
+            .try_lock()
+            .map_err(|_| "disk settlement device lock unavailable")?;
+        device
+            .state_provider()
+            .ok_or("disk settlement provider unavailable")?
+            .settle_disk_tracking(token, settlement)
+            .map_err(|error| format!("disk settlement: {error:?}"))
     }
 
     pub fn flush_for_capture(&self, key: BarrierKey) -> Result<(), ManagerError> {
@@ -1035,6 +1135,128 @@ mod tests {
     use crate::vmm::device_manager::quiescence::{
         DeviceQuiescence, LegacyAttachment, LegacyKind, ManagerFault,
     };
+
+    #[test]
+    #[cfg(all(feature = "blk", not(feature = "tee"), unix))]
+    fn disk_tracking_multidisk_freeze_failure_aborts_prior_generations() {
+        use crate::vmm::device_manager::quiescence::AttachmentIdentity;
+        use devices::DeviceType;
+        use devices::legacy::DummyIrqChip;
+        use devices::virtio::block::{
+            Block, CacheType, DiskFormat, DiskGenerationSettlement, SyncMode,
+        };
+        use devices::virtio::{MmioTransport, VirtioDevice};
+        use polly::event_manager::{BarrierGeneration, BarrierKey, BarrierRequest, OperationId};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        use utils::tempfile::TempFile;
+        use vm_memory::{GuestAddress, GuestMemoryMmap};
+        let files = [TempFile::new().unwrap(), TempFile::new().unwrap()];
+        let mut inventory = DeviceQuiescence::default();
+        for (index, file) in files.iter().enumerate() {
+            file.as_file().set_len(4096).unwrap();
+            let id = format!("data-{index}");
+            let device: Arc<Mutex<dyn VirtioDevice>> = Arc::new(Mutex::new(
+                Block::new(
+                    id.clone(),
+                    None,
+                    CacheType::Writeback,
+                    file.as_path().to_str().unwrap().into(),
+                    DiskFormat::Raw,
+                    false,
+                    false,
+                    SyncMode::Relaxed,
+                )
+                .unwrap(),
+            ));
+            let mut transport = MmioTransport::new(
+                crate::vmm::memory::runtime_memory_for_test(
+                    GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+                ),
+                DummyIrqChip::new().into(),
+                device.clone(),
+                None,
+            )
+            .unwrap();
+            let address = 0xd000_0000 + index as u64 * 4096;
+            let irq = 5 + index as u32;
+            transport.set_attachment_address(address).unwrap();
+            transport.set_irq_line(irq);
+            inventory.retain_transport(
+                AttachmentIdentity {
+                    device_type: DeviceType::Virtio(2),
+                    configured_id: id,
+                    address,
+                    irq,
+                },
+                Arc::new(Mutex::new(transport)),
+                device,
+            );
+        }
+        let request = BarrierRequest {
+            key: BarrierKey {
+                operation: OperationId(1),
+                generation: BarrierGeneration(1),
+            },
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        assert!(inventory.begin_quiesce(request).unwrap().is_ready());
+        assert!(inventory.poll_quiesce(request.key).unwrap().is_ready());
+        let second = inventory.attachments[1]
+            .device
+            .lock()
+            .unwrap()
+            .state_provider()
+            .unwrap()
+            .freeze_disk_tracking(request.key, [9; 16])
+            .unwrap()
+            .unwrap();
+        assert!(
+            inventory
+                .freeze_disk_tracking(request.key, [1; 16])
+                .is_err()
+        );
+        assert!(inventory.disk_freeze_rollback.lock().unwrap().is_empty());
+        inventory
+            .settle_disk_tracking(
+                &inventory.attachments[1].identity,
+                second.token,
+                DiskGenerationSettlement::Abort,
+            )
+            .unwrap();
+        let cut = inventory
+            .freeze_disk_tracking(request.key, [2; 16])
+            .unwrap();
+        assert_eq!(cut.len(), 2);
+        assert_eq!(cut[0].1.token.generation, 2);
+        assert_eq!(cut[1].1.token.generation, 2);
+        assert!(
+            inventory
+                .settle_disk_tracking(&cut[1].0, cut[0].1.token, DiskGenerationSettlement::Abort)
+                .is_err()
+        );
+        for (attachment, receipt) in cut {
+            inventory
+                .settle_disk_tracking(&attachment, receipt.token, DiskGenerationSettlement::Abort)
+                .unwrap();
+            assert!(
+                inventory
+                    .settle_disk_tracking(
+                        &attachment,
+                        receipt.token,
+                        DiskGenerationSettlement::Abort
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            inventory
+                .freeze_disk_tracking(request.key, [3; 16])
+                .unwrap()
+                .len(),
+            2
+        );
+    }
 
     #[test]
     #[cfg(not(feature = "tee"))]

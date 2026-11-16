@@ -509,6 +509,9 @@ impl BlockWorker {
                     Err(RequestError::InvalidDataLength)
                 } else {
                     let mut offset = self.checked_range(request_header.sector, data_len)?;
+                    self.disk
+                        .mark_dirty(offset, data_len as u64)
+                        .map_err(RequestError::WritingToBackend)?;
                     let mut remaining = data_len;
                     while remaining != 0 {
                         match reader.read_to_at(&self.disk, remaining, offset) {
@@ -563,6 +566,9 @@ impl BlockWorker {
                     return Err(RequestError::InvalidDataLength);
                 }
                 self.disk
+                    .mark_dirty(offset, length as u64)
+                    .map_err(RequestError::Discarding)?;
+                self.disk
                     .file
                     .lock()
                     .map_err(|_| {
@@ -585,6 +591,9 @@ impl BlockWorker {
                 {
                     return Err(RequestError::InvalidDataLength);
                 }
+                self.disk
+                    .mark_dirty(offset, length as u64)
+                    .map_err(RequestError::WritingZeroes)?;
                 let mut disk = self.disk.file.lock().map_err(|_| {
                     RequestError::WritingZeroes(io::Error::other("block backend lock poisoned"))
                 })?;
@@ -639,6 +648,310 @@ mod tests {
     use crate::virtio::block::worker::{BlockWorker, DiscardWriteData, RequestHeader};
     use crate::virtio::queue::tests::VirtQueue;
     use crate::virtio::{DeviceQueue, InterruptTransport, RuntimeGuestMemory};
+
+    fn tracked_request(
+        disk: DiskProperties,
+        request_type: u32,
+        offset: u64,
+        length: usize,
+        flags: u32,
+    ) -> (crate::virtio::block::DiskTrackingReceipt, u8) {
+        use virtio_bindings::virtio_blk::{VIRTIO_BLK_T_GET_ID, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
+        let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0), &memory, 8);
+        let range = matches!(
+            request_type,
+            VIRTIO_BLK_T_DISCARD | VIRTIO_BLK_T_WRITE_ZEROES
+        );
+        let data_length = if range { 16 } else { length as u32 };
+        ring.dtable[0].set(0x1000, 16, 1, 1);
+        ring.dtable[1].set(
+            0x2000,
+            data_length,
+            if matches!(request_type, VIRTIO_BLK_T_IN | VIRTIO_BLK_T_GET_ID) {
+                3
+            } else {
+                1
+            },
+            2,
+        );
+        ring.dtable[2].set(0xf000, 1, 2, 0);
+        memory
+            .write_obj(
+                RequestHeader {
+                    request_type,
+                    _reserved: 0,
+                    sector: offset / 512,
+                },
+                GuestAddress(0x1000),
+            )
+            .unwrap();
+        if range {
+            memory
+                .write_obj(
+                    DiscardWriteData {
+                        sector: offset / 512,
+                        num_sectors: (length / 512) as u32,
+                        flags,
+                    },
+                    GuestAddress(0x2000),
+                )
+                .unwrap();
+        } else if request_type == VIRTIO_BLK_T_OUT {
+            memory
+                .write_slice(&vec![0xa7; length], GuestAddress(0x2000))
+                .unwrap();
+        }
+        memory.write_obj(0xffu8, GuestAddress(0xf000)).unwrap();
+        ring.avail.ring[0].set(0);
+        ring.avail.idx.set(1);
+        let (mut worker, _) = request_worker(&memory, &ring, disk);
+        worker.device_queue.event.write(1).unwrap();
+        worker.process_queue_event();
+        assert_eq!(ring.used.idx.get(), 1);
+        let status = memory.read_obj(GuestAddress(0xf000)).unwrap();
+        let receipt = worker
+            .disk
+            .tracking
+            .lock()
+            .unwrap()
+            .freeze([1; 16], 1)
+            .unwrap();
+        (receipt, status)
+    }
+
+    #[test]
+    fn disk_tracking_every_opcode_marks_boundaries_tail_and_empty_ranges() {
+        use crate::virtio::block::{DISK_IDENTITY_CHUNK_SIZE, DiskDirtyRun};
+        use virtio_bindings::virtio_blk::{VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
+        let chunk = DISK_IDENTITY_CHUNK_SIZE;
+        use virtio_bindings::virtio_blk::VIRTIO_BLK_T_GET_ID;
+        let backing = TempFile::new().unwrap();
+        backing.as_file().set_len(2 * chunk + 512).unwrap();
+        for (request_type, flags) in [
+            (VIRTIO_BLK_T_OUT, 0),
+            (VIRTIO_BLK_T_DISCARD, 0),
+            (VIRTIO_BLK_T_WRITE_ZEROES, 0),
+            (
+                VIRTIO_BLK_T_WRITE_ZEROES,
+                VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP,
+            ),
+        ] {
+            for (offset, length, expected) in [
+                (
+                    0,
+                    512,
+                    vec![DiskDirtyRun {
+                        first_chunk: 0,
+                        chunk_count: 1,
+                    }],
+                ),
+                (
+                    chunk,
+                    512,
+                    vec![DiskDirtyRun {
+                        first_chunk: 1,
+                        chunk_count: 1,
+                    }],
+                ),
+                (
+                    chunk - 512,
+                    1024,
+                    vec![DiskDirtyRun {
+                        first_chunk: 0,
+                        chunk_count: 2,
+                    }],
+                ),
+                (
+                    2 * chunk,
+                    512,
+                    vec![DiskDirtyRun {
+                        first_chunk: 2,
+                        chunk_count: 1,
+                    }],
+                ),
+                (2 * chunk + 512, 0, vec![]),
+            ] {
+                let (disk, _) = open_raw(backing.as_path());
+                let (receipt, status) = tracked_request(disk, request_type, offset, length, flags);
+                assert_eq!(
+                    u32::from(status),
+                    VIRTIO_BLK_S_OK,
+                    "opcode {request_type}, range {offset}+{length}"
+                );
+                assert_eq!(receipt.runs, expected);
+                assert_eq!(receipt.total_chunks, 3);
+            }
+        }
+        for (opcode, length) in [
+            (VIRTIO_BLK_T_IN, 512),
+            (VIRTIO_BLK_T_FLUSH, 0),
+            (VIRTIO_BLK_T_GET_ID, 20),
+        ] {
+            let (disk, _) = open_raw(backing.as_path());
+            let (receipt, status) = tracked_request(disk, opcode, 0, length, 0);
+            assert_eq!(u32::from(status), VIRTIO_BLK_S_OK);
+            assert!(receipt.runs.is_empty());
+        }
+    }
+
+    #[test]
+    fn disk_tracking_invalid_requests_have_no_backend_effect_or_dirties() {
+        use crate::virtio::block::DISK_IDENTITY_CHUNK_SIZE;
+        use virtio_bindings::virtio_blk::VIRTIO_BLK_T_OUT;
+        let backing = TempFile::new().unwrap();
+        backing
+            .as_file()
+            .set_len(DISK_IDENTITY_CHUNK_SIZE + 512)
+            .unwrap();
+        for (opcode, offset, length, flags) in [
+            (VIRTIO_BLK_T_OUT, 0, 513, 0),
+            (VIRTIO_BLK_T_OUT, DISK_IDENTITY_CHUNK_SIZE, 1024, 0),
+            (VIRTIO_BLK_T_DISCARD, 0, 512, 1),
+            (VIRTIO_BLK_T_WRITE_ZEROES, 0, 512, 2),
+            (VIRTIO_BLK_T_DISCARD, u64::MAX - 511, 512, 0),
+        ] {
+            let (disk, _) = open_raw(backing.as_path());
+            let (receipt, status) = tracked_request(disk, opcode, offset, length, flags);
+            assert_ne!(u32::from(status), VIRTIO_BLK_S_OK);
+            assert!(receipt.runs.is_empty());
+        }
+    }
+
+    #[test]
+    fn disk_tracking_failed_real_backend_requests_remain_dirty() {
+        use crate::virtio::block::DiskDirtyRun;
+        use virtio_bindings::virtio_blk::VIRTIO_BLK_T_OUT;
+        let backing = TempFile::new().unwrap();
+        backing.as_file().set_len(4096).unwrap();
+        for opcode in [
+            VIRTIO_BLK_T_OUT,
+            VIRTIO_BLK_T_DISCARD,
+            VIRTIO_BLK_T_WRITE_ZEROES,
+        ] {
+            let file = ImagoFile::try_from(fs::File::open(backing.as_path()).unwrap()).unwrap();
+            let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), true).unwrap();
+            let disk = DiskProperties::new(
+                Arc::new(Mutex::new(FormatAccess::new(raw))),
+                b"read-only-fd".to_vec(),
+                CacheType::Writeback,
+            )
+            .unwrap();
+            let (receipt, status) = tracked_request(disk, opcode, 0, 512, 0);
+            assert_ne!(u32::from(status), VIRTIO_BLK_S_OK);
+            assert_eq!(
+                receipt.runs,
+                vec![DiskDirtyRun {
+                    first_chunk: 0,
+                    chunk_count: 1
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn disk_tracking_partial_real_out_keeps_entire_attempted_range() {
+        use crate::virtio::block::{DISK_IDENTITY_CHUNK_SIZE, DiskDirtyRun};
+        use std::os::unix::fs::FileExt;
+        use std::process::Command;
+        use virtio_bindings::virtio_blk::VIRTIO_BLK_T_OUT;
+        if let Some(path) = std::env::var_os("SILO_TRACKING_PARTIAL_BACKING") {
+            let path = Path::new(&path);
+            let (disk, _) = open_raw(path);
+            let (receipt, status) = tracked_request(
+                disk,
+                VIRTIO_BLK_T_OUT,
+                DISK_IDENTITY_CHUNK_SIZE - 512,
+                1024,
+                0,
+            );
+            assert_ne!(u32::from(status), VIRTIO_BLK_S_OK);
+            assert_eq!(
+                receipt.runs,
+                vec![DiskDirtyRun {
+                    first_chunk: 0,
+                    chunk_count: 2
+                }]
+            );
+            let file = fs::File::open(path).unwrap();
+            let mut bytes = [0; 1024];
+            file.read_exact_at(&mut bytes, DISK_IDENTITY_CHUNK_SIZE - 512)
+                .unwrap();
+            assert_eq!(&bytes[..512], &[0xa7; 512]);
+            assert_eq!(&bytes[512..], &[0; 512]);
+            return;
+        }
+        let backing = TempFile::new().unwrap();
+        backing
+            .as_file()
+            .set_len(2 * DISK_IDENTITY_CHUNK_SIZE)
+            .unwrap();
+        let child = Command::new("prlimit")
+            .arg(format!("--fsize={}:{}", DISK_IDENTITY_CHUNK_SIZE, DISK_IDENTITY_CHUNK_SIZE))
+            .args(["--", "sh", "-c", "trap '' XFSZ; exec \"$@\"", "tracking-partial"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "virtio::block::worker::tests::disk_tracking_partial_real_out_keeps_entire_attempted_range", "--nocapture"])
+            .env("SILO_TRACKING_PARTIAL_BACKING", backing.as_path()).output();
+        match child {
+            Ok(output) => assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("SKIP partial backend test: util-linux prlimit is unavailable")
+            }
+            Err(error) => panic!("launch real quota-limited backend test: {error}"),
+        }
+    }
+
+    #[test]
+    fn disk_tracking_reflink_discard_and_zeroes_preserve_clone() {
+        use std::os::unix::fs::FileExt;
+        use std::process::Command;
+        let directory = std::env::var_os("SILO_TEST_COPY_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let backing = TempFile::new_in(&directory).unwrap();
+        backing.as_file().set_len(16 << 20).unwrap();
+        backing.as_file().write_all_at(&[0x69; 4096], 0).unwrap();
+        for (opcode, flags) in [
+            (VIRTIO_BLK_T_DISCARD, 0),
+            (VIRTIO_BLK_T_WRITE_ZEROES, 0),
+            (
+                VIRTIO_BLK_T_WRITE_ZEROES,
+                VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP,
+            ),
+        ] {
+            let clone = TempFile::new_in(&directory).unwrap();
+            let output = Command::new("cp")
+                .args(["--reflink=always", "--"])
+                .arg(backing.as_path())
+                .arg(clone.as_path())
+                .output()
+                .unwrap();
+            if !output.status.success() {
+                let error = String::from_utf8_lossy(&output.stderr);
+                if error.contains("Operation not supported") || error.contains("Invalid argument") {
+                    eprintln!("SKIP reflink tracking test: {error}");
+                    return;
+                }
+                panic!("reflink clone: {error}");
+            }
+            let (disk, _) = open_raw(clone.as_path());
+            let (receipt, status) = tracked_request(disk, opcode, 0, 4096, flags);
+            assert_eq!(u32::from(status), VIRTIO_BLK_S_OK);
+            assert_eq!(receipt.dirty_chunks, 1);
+            let mut bytes = [0; 4096];
+            backing.as_file().read_exact_at(&mut bytes, 0).unwrap();
+            assert_eq!(bytes, [0x69; 4096]);
+            fs::File::open(clone.as_path())
+                .unwrap()
+                .read_exact_at(&mut bytes, 0)
+                .unwrap();
+            assert_eq!(bytes, [0; 4096]);
+        }
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum ZeroRange {
@@ -1430,16 +1743,25 @@ mod tests {
 
     #[test]
     fn block_provider_closure_finishes_owned_write_and_leaves_next_head_unpopped() {
+        use crate::virtio::block::{
+            DISK_IDENTITY_CHUNK_SIZE, DiskDirtyRun, DiskGenerationSettlement,
+        };
         use polly::event_manager::{BarrierGeneration, BarrierKey, OperationId};
         use std::time::Duration;
 
         let backing = TempFile::new().unwrap();
-        backing.as_file().set_len(4096).unwrap();
+        backing
+            .as_file()
+            .set_len(2 * DISK_IDENTITY_CHUNK_SIZE)
+            .unwrap();
         let (disk, _) = open_raw(backing.as_path());
         let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
         let ring = VirtQueue::new(GuestAddress(0), &memory, 8);
         write_request(&memory, &ring, 0, 0x61);
         write_request(&memory, &ring, 1, 0x62);
+        memory
+            .write_obj(DISK_IDENTITY_CHUNK_SIZE / 512, GuestAddress(0x2008))
+            .unwrap();
         let (mut worker, completion) = request_worker(&memory, &ring, disk);
         let (owned_tx, owned_rx) = crossbeam_channel::bounded(1);
         let (proceed_tx, proceed_rx) = crossbeam_channel::bounded(1);
@@ -1456,7 +1778,7 @@ mod tests {
         assert_eq!(ring.used.idx.get(), 0);
         assert_eq!(&fs::read(backing.as_path()).unwrap()[..1024], &[0; 1024]);
         proceed_tx.send(()).unwrap();
-        let worker = thread.join().unwrap();
+        let mut worker = thread.join().unwrap();
         assert_eq!(worker.fault, None);
         let state = worker.device_queue.queue.capture_state().unwrap();
         assert_eq!((state.next_avail, state.next_used), (1, 1));
@@ -1470,5 +1792,46 @@ mod tests {
         let bytes = fs::read(backing.as_path()).unwrap();
         assert_eq!(&bytes[..512], &[0x61; 512]);
         assert_eq!(&bytes[512..1024], &[0; 512]);
+        let tracking = worker.disk.tracking.clone();
+        let first = tracking
+            .lock()
+            .unwrap()
+            .freeze([1; 16], key.generation.0)
+            .unwrap();
+        assert_eq!(
+            first.runs,
+            vec![DiskDirtyRun {
+                first_chunk: 0,
+                chunk_count: 1
+            }]
+        );
+        worker.acquired = None;
+        worker.device_queue.queue.reopen_admission(key).unwrap();
+        admission.lock().unwrap().barrier = None;
+        let resumed_memory = memory.clone();
+        let resumed = std::thread::spawn(move || {
+            worker.process_queue(&resumed_memory);
+            worker
+        });
+        tracking
+            .lock()
+            .unwrap()
+            .settle(
+                first.token,
+                DiskGenerationSettlement::Commit { baseline: [2; 32] },
+            )
+            .unwrap();
+        let worker = resumed.join().unwrap();
+        assert_eq!(worker.fault, None);
+        assert_eq!(ring.used.idx.get(), 2);
+        let second = tracking.lock().unwrap().freeze([2; 16], 8).unwrap();
+        assert_eq!(
+            second.runs,
+            vec![DiskDirtyRun {
+                first_chunk: 1,
+                chunk_count: 1
+            }]
+        );
+        assert_eq!(second.seed.baseline, Some([2; 32]));
     }
 }

@@ -43,6 +43,66 @@ pub enum RestoreBlockBacking {
     ReadonlyVmdk(ReadonlyVmdk),
 }
 
+pub const DISK_TRACKING_VERSION: u32 = 1;
+pub const DISK_IDENTITY_CHUNK_SIZE: u64 = 8 << 20;
+pub const MAX_TRACKED_DISK_SIZE: u64 = 4 << 40;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiskTrackingInvalidReason {
+    NeverArmed,
+    Lost,
+    Overflow,
+    OutOfDeviceMutationSuspected,
+}
+
+/// A baseline asserts exclusive backing ownership from construction onwards.
+/// The role is opaque to native code; the caller validates attachment coverage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiskTrackingSeed {
+    pub version: u32,
+    pub role: String,
+    pub attachment_index: u32,
+    pub file_device: u64,
+    pub file_inode: u64,
+    pub length: u64,
+    pub chunk_size: u64,
+    pub epoch: [u8; 16],
+    pub baseline: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiskDirtyRun {
+    pub first_chunk: u64,
+    pub chunk_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiskGenerationToken {
+    pub capture_id: [u8; 16],
+    pub pause_generation: u64,
+    pub epoch: [u8; 16],
+    pub generation: u64,
+    pub file_device: u64,
+    pub file_inode: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiskTrackingReceipt {
+    pub version: u32,
+    pub seed: DiskTrackingSeed,
+    pub token: DiskGenerationToken,
+    pub runs: Vec<DiskDirtyRun>,
+    pub dirty_chunks: u64,
+    pub total_chunks: u64,
+    pub invalid_reason: Option<DiskTrackingInvalidReason>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiskGenerationSettlement {
+    Commit { baseline: [u8; 32] },
+    Abort,
+}
+
 pub const CONFIG_SPACE_SIZE: usize = 8;
 pub const SECTOR_SHIFT: u8 = 9;
 pub const SECTOR_SIZE: u64 = (0x01_u64) << SECTOR_SHIFT;

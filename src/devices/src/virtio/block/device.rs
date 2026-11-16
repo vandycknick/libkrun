@@ -51,7 +51,13 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::virtio::block::worker::{BlockWorker, WorkerAdmission};
+use crate::virtio::block::{
+    DISK_IDENTITY_CHUNK_SIZE, DISK_TRACKING_VERSION, DiskDirtyRun, DiskGenerationSettlement,
+    DiskGenerationToken, DiskTrackingInvalidReason, DiskTrackingReceipt, DiskTrackingSeed,
+    MAX_TRACKED_DISK_SIZE,
+};
 use crate::virtio::block::{Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE};
+
 use crate::virtio::{
     ActivateResult, DeviceQueue, DeviceState, QueueConfig, TYPE_BLOCK, VirtioDevice,
 };
@@ -86,12 +92,198 @@ impl CacheType {
     }
 }
 
+struct DirtySet {
+    words: Box<[u64]>,
+    touched: Vec<u16>,
+}
+
+impl DirtySet {
+    fn new(chunks: u64) -> Self {
+        let words = chunks.div_ceil(64) as usize;
+        Self {
+            words: vec![0; words].into_boxed_slice(),
+            touched: Vec::with_capacity(words),
+        }
+    }
+
+    fn mark_word(&mut self, index: usize, bits: u64) {
+        if self.words[index] == 0 {
+            self.touched.push(index as u16);
+        }
+        self.words[index] |= bits;
+    }
+
+    fn mark(&mut self, first: u64, last: u64) {
+        for word in first / 64..=last / 64 {
+            let low = if word == first / 64 { first % 64 } else { 0 };
+            let high = if word == last / 64 { last % 64 } else { 63 };
+            self.mark_word(word as usize, (u64::MAX << low) & (u64::MAX >> (63 - high)));
+        }
+    }
+
+    fn clear(&mut self) {
+        for word in self.touched.drain(..) {
+            self.words[word as usize] = 0;
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        for word in &other.touched {
+            self.mark_word(*word as usize, other.words[*word as usize]);
+        }
+    }
+
+    fn runs(&mut self) -> Vec<DiskDirtyRun> {
+        self.touched.sort_unstable();
+        let mut runs: Vec<DiskDirtyRun> = Vec::new();
+        for word in &self.touched {
+            let mut bits = self.words[*word as usize];
+            while bits != 0 {
+                let chunk = u64::from(*word) * 64 + u64::from(bits.trailing_zeros());
+                bits &= bits - 1;
+                if let Some(last) = runs.last_mut()
+                    && last.first_chunk + last.chunk_count == chunk
+                {
+                    last.chunk_count += 1;
+                } else {
+                    runs.push(DiskDirtyRun {
+                        first_chunk: chunk,
+                        chunk_count: 1,
+                    });
+                }
+            }
+        }
+        runs
+    }
+}
+
+/// Two bitsets and bounded touched-word lists cost 40 KiB for 1 TiB at 8 MiB
+/// granularity. Lists avoid a capacity-wide scan or clear at capture/settlement.
+pub(crate) struct DiskTracker {
+    seed: DiskTrackingSeed,
+    active: DirtySet,
+    frozen: DirtySet,
+    pending: Option<DiskGenerationToken>,
+    generation: u64,
+    started: bool,
+    invalid: Option<DiskTrackingInvalidReason>,
+}
+
+impl DiskTracker {
+    fn new(length: u64) -> Self {
+        let chunks = length
+            .min(MAX_TRACKED_DISK_SIZE)
+            .div_ceil(DISK_IDENTITY_CHUNK_SIZE);
+        Self {
+            seed: DiskTrackingSeed {
+                version: DISK_TRACKING_VERSION,
+                role: String::new(),
+                attachment_index: 0,
+                file_device: 0,
+                file_inode: 0,
+                length,
+                chunk_size: DISK_IDENTITY_CHUNK_SIZE,
+                epoch: [0; 16],
+                baseline: None,
+            },
+            active: DirtySet::new(chunks),
+            frozen: DirtySet::new(chunks),
+            pending: None,
+            generation: 0,
+            started: false,
+            invalid: Some(if length > MAX_TRACKED_DISK_SIZE {
+                DiskTrackingInvalidReason::Overflow
+            } else {
+                DiskTrackingInvalidReason::NeverArmed
+            }),
+        }
+    }
+
+    pub(crate) fn mark(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        if length == 0 {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| io::Error::other("dirty range overflow"))?;
+        if end > self.seed.length || end > MAX_TRACKED_DISK_SIZE {
+            self.invalid = Some(DiskTrackingInvalidReason::Overflow);
+            return Ok(());
+        }
+        self.active.mark(
+            offset / self.seed.chunk_size,
+            (end - 1) / self.seed.chunk_size,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn freeze(
+        &mut self,
+        capture_id: [u8; 16],
+        pause_generation: u64,
+    ) -> Result<DiskTrackingReceipt, ProviderFault> {
+        if self.pending.is_some() || pause_generation == 0 {
+            return Err(ProviderFault::InvalidTransition);
+        }
+        self.generation = self.generation.checked_add(1).ok_or_else(|| {
+            self.invalid = Some(DiskTrackingInvalidReason::Overflow);
+            ProviderFault::InvalidTransition
+        })?;
+        let token = DiskGenerationToken {
+            capture_id,
+            pause_generation,
+            epoch: self.seed.epoch,
+            generation: self.generation,
+            file_device: self.seed.file_device,
+            file_inode: self.seed.file_inode,
+        };
+        std::mem::swap(&mut self.active, &mut self.frozen);
+        self.pending = Some(token);
+        let runs = self.frozen.runs();
+        let dirty_chunks = runs.iter().map(|run| run.chunk_count).sum();
+        Ok(DiskTrackingReceipt {
+            version: DISK_TRACKING_VERSION,
+            seed: self.seed.clone(),
+            token,
+            runs,
+            dirty_chunks,
+            total_chunks: self.seed.length.div_ceil(self.seed.chunk_size),
+            invalid_reason: self.invalid,
+        })
+    }
+
+    pub(crate) fn settle(
+        &mut self,
+        token: DiskGenerationToken,
+        settlement: DiskGenerationSettlement,
+    ) -> Result<(), ProviderFault> {
+        if self.pending != Some(token) {
+            return Err(ProviderFault::InvalidTransition);
+        }
+        match settlement {
+            DiskGenerationSettlement::Abort => self.active.merge(&self.frozen),
+            DiskGenerationSettlement::Commit { baseline } => {
+                self.seed.baseline = Some(baseline);
+                if self.invalid == Some(DiskTrackingInvalidReason::NeverArmed)
+                    && self.seed.epoch != [0; 16]
+                {
+                    self.invalid = None;
+                }
+            }
+        }
+        self.frozen.clear();
+        self.pending = None;
+        Ok(())
+    }
+}
+
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
     cache_type: CacheType,
     pub(crate) file: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     nsectors: u64,
     image_id: Vec<u8>,
+    pub(crate) tracking: Arc<Mutex<DiskTracker>>,
     #[cfg(target_os = "macos")]
     relaxed_sync_file: Option<File>,
 }
@@ -120,10 +312,18 @@ impl DiskProperties {
             cache_type,
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id: disk_image_id,
+            tracking: Arc::new(Mutex::new(DiskTracker::new(disk_size))),
             file: disk_image,
             #[cfg(target_os = "macos")]
             relaxed_sync_file: None,
         })
+    }
+
+    pub(crate) fn mark_dirty(&self, offset: u64, length: u64) -> io::Result<()> {
+        self.tracking
+            .lock()
+            .map_err(|_| io::Error::other("disk tracking lock poisoned"))?
+            .mark(offset, length)
     }
 
     pub fn nsectors(&self) -> u64 {
@@ -352,6 +552,8 @@ pub struct Block {
     sync_mode: SyncMode,
     /// Every host file the backend reads or writes, as `(device, inode)`.
     backing_identities: Box<[(u64, u64)]>,
+    tracking: Arc<Mutex<DiskTracker>>,
+    tracking_file: Option<File>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -367,6 +569,42 @@ pub struct Block {
 }
 
 impl Block {
+    /// Must be called during construction, before attachment or activation.
+    /// A supplied baseline asserts that no other component can mutate the file.
+    pub fn set_disk_tracking_seed(&mut self, seed: DiskTrackingSeed) -> io::Result<()> {
+        let mut tracker = self
+            .tracking
+            .lock()
+            .map_err(|_| io::Error::other("disk tracking lock poisoned"))?;
+        if tracker.started || self.is_activated() || tracker.pending.is_some() {
+            tracker.invalid = Some(DiskTrackingInvalidReason::Lost);
+            return Err(io::Error::other(
+                "disk tracking seed arrived after activation",
+            ));
+        }
+        if self.is_read_only()
+            || self.disk_format != DiskFormat::Raw
+            || seed.version != DISK_TRACKING_VERSION
+            || seed.length != self.byte_length
+            || seed.length == 0
+            || seed.length > MAX_TRACKED_DISK_SIZE
+            || !seed.length.is_multiple_of(SECTOR_SIZE)
+            || seed.chunk_size != DISK_IDENTITY_CHUNK_SIZE
+            || seed.epoch == [0; 16]
+            || seed.role.is_empty()
+            || seed.role.len() > 256
+            || self.backing_identities.as_ref() != [(seed.file_device, seed.file_inode)]
+        {
+            return Err(io::Error::other("disk tracking seed differs from backing"));
+        }
+        tracker.invalid = seed
+            .baseline
+            .is_none()
+            .then_some(DiskTrackingInvalidReason::NeverArmed);
+        tracker.seed = seed;
+        Ok(())
+    }
+
     /// Create a new virtio block device that operates on the given file.
     ///
     /// The given file must be seekable and sizable.
@@ -389,6 +627,11 @@ impl Block {
             open.custom_flags(nix::fcntl::OFlag::O_DIRECT.bits());
         }
         let disk_image = open.open(PathBuf::from(&disk_image_path))?;
+        let tracking_file = if disk_image_format == DiskFormat::Raw {
+            Some(disk_image.try_clone()?)
+        } else {
+            None
+        };
 
         let disk_image_id = DiskProperties::build_disk_image_id(&disk_image, &id);
         // Every host file the backend reads, so live capture can refuse output
@@ -477,6 +720,7 @@ impl Block {
             sync_mode,
             disk_image_id,
             backing_identities,
+            tracking_file,
             #[cfg(target_os = "macos")]
             relaxed_sync_file,
         )
@@ -590,6 +834,7 @@ impl Block {
         let relaxed_sync_file =
             Self::prepare_owned_raw_file(&file, saved.direct_io, saved.sync_mode)
                 .map_err(RestoreBindingError::Io)?;
+        let tracking_file = Some(file.try_clone().map_err(RestoreBindingError::Io)?);
         let file = ImagoFile::try_from(file).map_err(RestoreBindingError::Io)?;
         let discard_alignment = file.discard_align();
         let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), !read_only)
@@ -606,6 +851,7 @@ impl Block {
             saved.sync_mode,
             disk_image_id,
             backing_identities,
+            tracking_file,
             #[cfg(target_os = "macos")]
             relaxed_sync_file,
         )
@@ -640,6 +886,7 @@ impl Block {
             saved.sync_mode,
             disk_image_id,
             opened.identities,
+            None,
             #[cfg(target_os = "macos")]
             None,
         )
@@ -659,6 +906,7 @@ impl Block {
         sync_mode: SyncMode,
         disk_image_id: Vec<u8>,
         backing_identities: Vec<(u64, u64)>,
+        tracking_file: Option<File>,
         #[cfg(target_os = "macos")] relaxed_sync_file: Option<File>,
     ) -> io::Result<Self> {
         let disk_image = Arc::new(Mutex::new(disk_image));
@@ -669,6 +917,16 @@ impl Block {
 
         let disk_properties =
             DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
+        let tracking = disk_properties.tracking.clone();
+        {
+            let mut tracker = tracking
+                .lock()
+                .map_err(|_| io::Error::other("disk tracking lock poisoned"))?;
+            if let Some(&(device, inode)) = backing_identities.first() {
+                tracker.seed.file_device = device;
+                tracker.seed.file_inode = inode;
+            }
+        }
         #[cfg(target_os = "macos")]
         let disk_properties = {
             let mut disk_properties = disk_properties;
@@ -730,6 +988,8 @@ impl Block {
             direct_io,
             sync_mode,
             backing_identities: backing_identities.into_boxed_slice(),
+            tracking,
+            tracking_file,
         })
     }
 
@@ -844,6 +1104,10 @@ impl Block {
         memory: RuntimeGuestMemory,
         interrupt: InterruptTransport,
     ) -> Result<(), ProviderFault> {
+        self.tracking
+            .lock()
+            .map_err(|_| ProviderFault::Worker)?
+            .started = true;
         // A failed thread spawn leaves the complete worker in this retained slot.
         let _ = self.worker_stopfd.read();
         match self.worker_admission.lock() {
@@ -991,15 +1255,7 @@ impl VirtioDevice for Block {
             ActivateError::BadActivate
         })?;
 
-        let disk = match self.disk.take() {
-            Some(d) => d,
-            None => DiskProperties::new(
-                Arc::clone(&self.disk_image),
-                self.disk_image_id.clone(),
-                self.cache_type,
-            )
-            .map_err(|_| ActivateError::BadActivate)?,
-        };
+        let disk = self.disk.take().ok_or(ActivateError::BadActivate)?;
 
         self.device_state = DeviceState::Activated(mem.clone(), interrupt.clone());
         self.start_worker(blk_q, disk, mem, interrupt)
@@ -1435,6 +1691,45 @@ impl VirtioStateProvider for Block {
             .map_err(|_| ProviderFault::Worker)
     }
 
+    fn freeze_disk_tracking(
+        &self,
+        key: BarrierKey,
+        capture_id: [u8; 16],
+    ) -> Result<Option<DiskTrackingReceipt>, ProviderFault> {
+        self.flush_for_capture(key)?;
+        if self.is_read_only() {
+            return Ok(None);
+        }
+        let mut tracker = self.tracking.lock().map_err(|_| ProviderFault::Worker)?;
+        let metadata = self
+            .tracking_file
+            .as_ref()
+            .map(File::metadata)
+            .transpose()
+            .map_err(|_| ProviderFault::Worker)?;
+        if metadata
+            .as_ref()
+            .is_none_or(|metadata| metadata.len() != self.byte_length)
+        {
+            tracker.invalid = Some(DiskTrackingInvalidReason::OutOfDeviceMutationSuspected);
+        }
+        if self.provider_fault.is_some() {
+            tracker.invalid = Some(DiskTrackingInvalidReason::Lost);
+        }
+        tracker.freeze(capture_id, key.generation.0).map(Some)
+    }
+
+    fn settle_disk_tracking(
+        &self,
+        token: DiskGenerationToken,
+        settlement: DiskGenerationSettlement,
+    ) -> Result<(), ProviderFault> {
+        self.tracking
+            .lock()
+            .map_err(|_| ProviderFault::Worker)?
+            .settle(token, settlement)
+    }
+
     fn capture_payload(&self, key: BarrierKey) -> Result<Vec<u8>, ProviderFault> {
         self.check_cut(key)?;
         self.preflight()?;
@@ -1512,6 +1807,316 @@ mod tests {
     use crate::virtio::block::device::*;
 
     use utils::tempfile::TempFile;
+
+    #[cfg(unix)]
+    fn tracking_seed(backing: &TempFile) -> DiskTrackingSeed {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = backing.as_file().metadata().unwrap();
+        DiskTrackingSeed {
+            version: DISK_TRACKING_VERSION,
+            role: "root-upper".into(),
+            attachment_index: 1,
+            file_device: metadata.dev(),
+            file_inode: metadata.ino(),
+            length: metadata.len(),
+            chunk_size: DISK_IDENTITY_CHUNK_SIZE,
+            epoch: [7; 16],
+            baseline: Some([3; 32]),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_tracking_seed_admission_and_generation_overflow_never_assert_empty_coverage() {
+        let backing = TempFile::new().unwrap();
+        backing.as_file().set_len(4096).unwrap();
+        let mut block = raw_block(&backing, "data", false);
+        for mutation in 0..7 {
+            let mut seed = tracking_seed(&backing);
+            match mutation {
+                0 => seed.version += 1,
+                1 => seed.file_device += 1,
+                2 => seed.file_inode += 1,
+                3 => seed.length += 512,
+                4 => seed.chunk_size /= 2,
+                5 => seed.epoch = [0; 16],
+                _ => seed.role.clear(),
+            }
+            assert!(
+                block.set_disk_tracking_seed(seed).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        let mut seed = tracking_seed(&backing);
+        seed.baseline = None;
+        block.set_disk_tracking_seed(seed).unwrap();
+        let mut tracker = block.tracking.lock().unwrap();
+        tracker.mark(0, 512).unwrap();
+        let first = tracker.freeze([1; 16], 1).unwrap();
+        assert_eq!(
+            first.invalid_reason,
+            Some(DiskTrackingInvalidReason::NeverArmed)
+        );
+        tracker
+            .settle(
+                first.token,
+                DiskGenerationSettlement::Commit { baseline: [5; 32] },
+            )
+            .unwrap();
+        tracker.mark(512, 512).unwrap();
+        tracker.generation = u64::MAX;
+        assert!(tracker.freeze([2; 16], 2).is_err());
+        assert_eq!(tracker.invalid, Some(DiskTrackingInvalidReason::Overflow));
+        assert_eq!(
+            tracker.active.runs(),
+            vec![DiskDirtyRun {
+                first_chunk: 0,
+                chunk_count: 1
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_tracking_freeze_abort_commit_and_token_replay_preserve_coverage() {
+        let backing = TempFile::new().unwrap();
+        backing
+            .as_file()
+            .set_len(4 * DISK_IDENTITY_CHUNK_SIZE)
+            .unwrap();
+        let mut block = raw_block(&backing, "data", false);
+        block
+            .set_disk_tracking_seed(tracking_seed(&backing))
+            .unwrap();
+        let mut tracker = block.tracking.lock().unwrap();
+        tracker.mark(512, 512).unwrap();
+        tracker.mark(3 * DISK_IDENTITY_CHUNK_SIZE, 512).unwrap();
+        let first = tracker.freeze([1; 16], 1).unwrap();
+        assert_eq!(first.invalid_reason, None);
+        assert_eq!(first.dirty_chunks, 2);
+        assert!(tracker.freeze([2; 16], 2).is_err());
+        tracker.mark(DISK_IDENTITY_CHUNK_SIZE, 512).unwrap();
+        tracker.mark(512, 512).unwrap();
+        for bad in [
+            DiskGenerationToken {
+                capture_id: [2; 16],
+                ..first.token
+            },
+            DiskGenerationToken {
+                file_inode: first.token.file_inode + 1,
+                ..first.token
+            },
+            DiskGenerationToken {
+                generation: 2,
+                ..first.token
+            },
+            DiskGenerationToken {
+                pause_generation: 2,
+                ..first.token
+            },
+            DiskGenerationToken {
+                epoch: [8; 16],
+                ..first.token
+            },
+        ] {
+            assert!(
+                tracker
+                    .settle(bad, DiskGenerationSettlement::Abort)
+                    .is_err()
+            );
+        }
+        tracker
+            .settle(first.token, DiskGenerationSettlement::Abort)
+            .unwrap();
+        assert!(
+            tracker
+                .settle(first.token, DiskGenerationSettlement::Abort)
+                .is_err()
+        );
+        let second = tracker.freeze([2; 16], 2).unwrap();
+        assert_eq!(
+            second.runs,
+            vec![
+                DiskDirtyRun {
+                    first_chunk: 0,
+                    chunk_count: 2
+                },
+                DiskDirtyRun {
+                    first_chunk: 3,
+                    chunk_count: 1
+                }
+            ]
+        );
+        tracker.mark(0, 512).unwrap();
+        tracker
+            .settle(
+                second.token,
+                DiskGenerationSettlement::Commit { baseline: [4; 32] },
+            )
+            .unwrap();
+        assert!(
+            tracker
+                .settle(second.token, DiskGenerationSettlement::Abort)
+                .is_err()
+        );
+        assert!(
+            tracker
+                .settle(
+                    second.token,
+                    DiskGenerationSettlement::Commit { baseline: [4; 32] }
+                )
+                .is_err()
+        );
+        let third = tracker.freeze([3; 16], 3).unwrap();
+        assert_eq!(third.seed.baseline, Some([4; 32]));
+        assert_eq!(
+            third.runs,
+            vec![DiskDirtyRun {
+                first_chunk: 0,
+                chunk_count: 1
+            }]
+        );
+        tracker
+            .settle(
+                third.token,
+                DiskGenerationSettlement::Commit { baseline: [5; 32] },
+            )
+            .unwrap();
+        assert!(tracker.freeze([4; 16], 4).unwrap().runs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_tracking_sparse_terabyte_clears_only_touched_words() {
+        let backing = TempFile::new().unwrap();
+        backing.as_file().set_len(1 << 40).unwrap();
+        let mut block = raw_block(&backing, "large", false);
+        block
+            .set_disk_tracking_seed(tracking_seed(&backing))
+            .unwrap();
+        let mut tracker = block.tracking.lock().unwrap();
+        assert_eq!(tracker.active.words.len(), 2048);
+        assert_eq!(tracker.active.touched.capacity(), 2048);
+        tracker.mark((1 << 40) - 512, 512).unwrap();
+        assert_eq!(tracker.active.touched.len(), 1);
+        let receipt = tracker.freeze([1; 16], 1).unwrap();
+        assert_eq!(receipt.dirty_chunks, 1);
+        assert_eq!(tracker.frozen.touched.len(), 1);
+        assert!(tracker.active.touched.is_empty());
+        tracker
+            .settle(receipt.token, DiskGenerationSettlement::Abort)
+            .unwrap();
+        assert!(tracker.frozen.touched.is_empty());
+        assert_eq!(tracker.active.touched.len(), 1);
+        assert_eq!(backing.as_file().metadata().unwrap().len(), 1 << 40);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_tracking_unknown_readonly_mutated_and_restore_bindings_are_honest() {
+        let source = TempFile::new().unwrap();
+        source.as_file().set_len(4096).unwrap();
+        let mut unknown = raw_block(&source, "data", false);
+        let pause = request(1, 1);
+        quiesce(&mut unknown, pause);
+        let receipt = unknown
+            .freeze_disk_tracking(pause.key, [1; 16])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt.invalid_reason,
+            Some(DiskTrackingInvalidReason::NeverArmed)
+        );
+        let mut readonly = raw_block(&source, "data", true);
+        quiesce(&mut readonly, pause);
+        assert!(
+            readonly
+                .freeze_disk_tracking(pause.key, [1; 16])
+                .unwrap()
+                .is_none()
+        );
+        let mut parent = raw_block(&source, "data", false);
+        parent
+            .set_disk_tracking_seed(tracking_seed(&source))
+            .unwrap();
+        parent.disk.as_ref().unwrap().mark_dirty(0, 512).unwrap();
+        quiesce(&mut parent, pause);
+        let payload = parent.capture_payload(pause.key).unwrap();
+        let destination = TempFile::new().unwrap();
+        destination.as_file().set_len(4096).unwrap();
+        let mut child = Block::new_restore_binding(
+            "data".into(),
+            RestoreBlockBacking::Raw {
+                file: destination.as_file().try_clone().unwrap(),
+                read_only: false,
+            },
+            &payload,
+        )
+        .unwrap();
+        assert!(
+            child
+                .set_disk_tracking_seed(tracking_seed(&source))
+                .is_err()
+        );
+        let mut seed = tracking_seed(&destination);
+        seed.epoch = [9; 16];
+        child.set_disk_tracking_seed(seed).unwrap();
+        quiesce(&mut child, pause);
+        let receipt = child
+            .freeze_disk_tracking(pause.key, [2; 16])
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.invalid_reason, None);
+        assert_eq!(receipt.token.epoch, [9; 16]);
+        assert!(receipt.runs.is_empty());
+        child
+            .settle_disk_tracking(receipt.token, DiskGenerationSettlement::Abort)
+            .unwrap();
+        destination.as_file().set_len(8192).unwrap();
+        let receipt = child
+            .freeze_disk_tracking(pause.key, [3; 16])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt.invalid_reason,
+            Some(DiskTrackingInvalidReason::OutOfDeviceMutationSuspected)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_tracking_reset_preserves_owner_and_refuses_late_seeding() {
+        let backing = TempFile::new().unwrap();
+        backing.as_file().set_len(4096).unwrap();
+        let mut block = raw_block(&backing, "data", false);
+        block
+            .set_disk_tracking_seed(tracking_seed(&backing))
+            .unwrap();
+        block.disk.as_ref().unwrap().mark_dirty(0, 512).unwrap();
+        let tracker = block.tracking.clone();
+        assert!(block.reset());
+        assert!(Arc::ptr_eq(&tracker, &block.tracking));
+        let pause = request(1, 1);
+        quiesce(&mut block, pause);
+        let receipt = block
+            .freeze_disk_tracking(pause.key, [1; 16])
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.dirty_chunks, 1);
+        block
+            .settle_disk_tracking(receipt.token, DiskGenerationSettlement::Abort)
+            .unwrap();
+        block.tracking.lock().unwrap().started = true;
+        assert!(
+            block
+                .set_disk_tracking_seed(tracking_seed(&backing))
+                .is_err()
+        );
+        assert_eq!(
+            block.tracking.lock().unwrap().invalid,
+            Some(DiskTrackingInvalidReason::Lost)
+        );
+    }
 
     #[test]
     fn disk_image_id_prefers_supplied_block_id() {
@@ -2098,7 +2703,10 @@ mod tests {
         wrong_schema[8..10].copy_from_slice(&2u16.to_le_bytes());
         assert_eq!(
             block.validate_payload(&wrong_schema),
-            Err(ProviderFault::StateHeader(StateHeaderError::Schema { expected: 1, found: 2 }))
+            Err(ProviderFault::StateHeader(StateHeaderError::Schema {
+                expected: 1,
+                found: 2
+            }))
         );
         assert!(!payload.is_empty());
         assert!(payload.len() <= block.state_limit() as usize);
@@ -2242,6 +2850,9 @@ mod tests {
         let backing = TempFile::new().unwrap();
         backing.as_file().set_len(4096).unwrap();
         let mut block = raw_block(&backing, "data", false);
+        block
+            .set_disk_tracking_seed(tracking_seed(&backing))
+            .unwrap();
         let memory = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
         let ring = VirtQueue::new(GuestAddress(0), &memory, 8);
         let queue = ring.create_queue();
@@ -2260,6 +2871,12 @@ mod tests {
         let completed = quiesce(&mut block, pause);
         assert_eq!(completed.fault, None);
         assert_eq!(completed.queues.len(), 1);
+        let frozen = block
+            .freeze_disk_tracking(pause.key, [1; 16])
+            .unwrap()
+            .unwrap();
+        assert_eq!(frozen.invalid_reason, None);
+        assert!(frozen.runs.is_empty());
         assert!(Arc::ptr_eq(
             &completed.queues[0].queue.identity(),
             &identity
@@ -2306,6 +2923,12 @@ mod tests {
             &std::fs::read(backing.as_path()).unwrap()[..512],
             &[0x75; 512]
         );
+        block
+            .settle_disk_tracking(
+                frozen.token,
+                DiskGenerationSettlement::Commit { baseline: [4; 32] },
+            )
+            .unwrap();
         let next_pause = request(3, 2);
         let completed = quiesce(&mut block, next_pause);
         assert_eq!(completed.fault, None);
@@ -2314,6 +2937,19 @@ mod tests {
         assert!(Arc::ptr_eq(&completed.queues[0].event, &event));
         assert!(Arc::ptr_eq(&block.disk.as_ref().unwrap().file, &backend));
         block.flush_for_capture(next_pause.key).unwrap();
+        let next = block
+            .freeze_disk_tracking(next_pause.key, [2; 16])
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.seed.baseline, Some([4; 32]));
+        assert_eq!(next.invalid_reason, None);
+        assert_eq!(
+            next.runs,
+            vec![DiskDirtyRun {
+                first_chunk: 0,
+                chunk_count: 1
+            }]
+        );
     }
 
     #[cfg(all(

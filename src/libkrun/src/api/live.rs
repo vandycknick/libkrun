@@ -62,6 +62,10 @@ pub use crate::vmm::memory::image::{
 pub use crate::vmm::memory::{
     BaselineToken, CaptureError, FullCaptureReason, RestoreInstallationEvidence,
 };
+pub use devices::virtio::block::{
+    DiskDirtyRun, DiskGenerationSettlement, DiskGenerationToken, DiskTrackingInvalidReason,
+    DiskTrackingReceipt, DiskTrackingSeed,
+};
 pub use devices::virtio::generation::{GenerationObservation, GenerationSnapshot};
 
 use crate::api::vmm_builder::VmmHandle;
@@ -161,6 +165,19 @@ pub struct OutputReceipt {
     pub length: u64,
     pub binding: StateBinding,
 }
+/// Every writable attachment at one drained, flushed cut. Read-only attachments
+/// are not applicable and have no generation. Guest device payloads carry none
+/// of this host-local authority.
+#[derive(Clone, Debug)]
+pub struct DiskTrackingCut {
+    pub capture: CaptureId,
+    pub pause: PauseToken,
+    pub disks: Vec<(
+        crate::vmm::device_manager::quiescence::AttachmentIdentity,
+        DiskTrackingReceipt,
+    )>,
+}
+
 #[derive(Clone, Debug)]
 pub struct FlushReceipt {
     pub pause: PauseToken,
@@ -397,6 +414,49 @@ impl VmmHandle {
             _ => Err(ControlFailure::OwnerUnavailable.into()),
         }
     }
+    /// Freeze before cloning, then settle independently of RAM acceptance.
+    /// Resumed writes enter a separate accumulator while these runs are consumed.
+    pub fn freeze_disk_generations(
+        &self,
+        pause: &PauseToken,
+        capture: CaptureId,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<DiskTrackingCut, LiveError> {
+        match self.live_call(
+            operation,
+            deadline,
+            LiveRequest::FreezeDisks {
+                pause: pause.clone(),
+                capture,
+            },
+        )? {
+            LiveReply::DiskTracking(cut) => Ok(cut),
+            _ => Err(ControlFailure::OwnerUnavailable.into()),
+        }
+    }
+
+    /// Commit retains post-cut writes; abort unions frozen coverage back into
+    /// them. Foreign, already-settled and opposite-outcome tokens are refused.
+    pub fn settle_disk_generation(
+        &self,
+        attachment: crate::vmm::device_manager::quiescence::AttachmentIdentity,
+        token: DiskGenerationToken,
+        settlement: DiskGenerationSettlement,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<(), LiveError> {
+        self.live_complete(
+            operation,
+            deadline,
+            LiveRequest::SettleDisk {
+                attachment,
+                token,
+                settlement,
+            },
+        )
+    }
+
     pub fn flush_writable_disks(
         &self,
         pause: &PauseToken,
