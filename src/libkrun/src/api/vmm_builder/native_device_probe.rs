@@ -577,7 +577,11 @@ impl Driver {
         } else {
             ram
         };
-        let output = RamOutputFiles::new(ram, image_output(&directory.join("memory-layout.json"))?);
+        let output = RamOutputFiles::new(
+            ram,
+            image_output(&directory.join("memory-layout.json"))?,
+            image_output(&directory.join("memory.changes"))?,
+        );
         let result = if prepared {
             #[cfg(feature = "native-device-probe")]
             {
@@ -617,7 +621,7 @@ impl Driver {
                             .map_or("null".into(), |generation| generation.to_string());
                         let stats = &failure.stats;
                         let evidence = format!(
-                            "{{\"schema\":1,\"kind\":\"ram-image-failure\",\"role\":\"output-ram\",\"problem\":\"wrong-access\",\"effects\":\"{effects}\",\"baseline_generation\":{baseline},\"attempt_sequence\":{},\"stats\":{{\"logical_bytes\":{},\"live_bytes_read\":{},\"baseline_bytes_read\":{},\"baseline_bytes_written\":{},\"overlay_bytes_written\":{},\"full_bytes_written\":{},\"layout_bytes_written\":{},\"baseline_hole_bytes\":{},\"zero_bytes_omitted\":{},\"explicit_zero_bytes_written\":{},\"extent_queries\":{}}}}}\n",
+                            "{{\"schema\":1,\"kind\":\"ram-image-failure\",\"role\":\"output-ram\",\"problem\":\"wrong-access\",\"effects\":\"{effects}\",\"baseline_generation\":{baseline},\"attempt_sequence\":{},\"stats\":{{\"logical_bytes\":{},\"live_bytes_read\":{},\"baseline_bytes_read\":{},\"baseline_bytes_written\":{},\"overlay_bytes_written\":{},\"full_bytes_written\":{},\"layout_bytes_written\":{},\"baseline_hole_bytes\":{},\"zero_bytes_omitted\":{},\"explicit_zero_bytes_written\":{},\"extent_queries\":{},\"identity_bytes_hashed\":{},\"zero_run_bytes_covered\":{},\"zero_bytes_punched\":{},\"known_zero_bytes_skipped\":{}}}}}\n",
                             attempt.sequence(),
                             stats.logical_bytes,
                             stats.live_bytes_read,
@@ -630,6 +634,10 @@ impl Driver {
                             stats.zero_bytes_omitted,
                             stats.explicit_zero_bytes_written,
                             stats.extent_queries,
+                            stats.identity_bytes_hashed,
+                            stats.zero_run_bytes_covered,
+                            stats.zero_bytes_punched,
+                            stats.known_zero_bytes_skipped,
                         );
                         write_new(&directory.join("memory-failure.json"), evidence.as_bytes())
                             .map_err(|evidence_error| {
@@ -660,11 +668,24 @@ impl Driver {
             Some(crate::vmm::memory::FullCaptureReason::CoverageLost) => "\"coverage-lost\"",
             Some(crate::vmm::memory::FullCaptureReason::DirtyCrossover) => "\"dirty-crossover\"",
         };
-        let chunks = receipt
-            .affected_chunks()
-            .map(|chunk| chunk.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+        let changes = receipt.changes();
+        use std::fmt::Write as _;
+        let mut change_digest = String::with_capacity(64);
+        for byte in changes.sha256() {
+            write!(change_digest, "{byte:02x}").map_err(|error| error.to_string())?;
+        }
+        let baseline_stream = match changes.baseline_stream() {
+            Some(digest) => {
+                let mut encoded = String::with_capacity(66);
+                encoded.push('"');
+                for byte in digest {
+                    write!(encoded, "{byte:02x}").map_err(|error| error.to_string())?;
+                }
+                encoded.push('"');
+                encoded
+            }
+            None => "null".into(),
+        };
         let dirty_pages = if prepared {
             #[cfg(feature = "native-device-probe")]
             {
@@ -681,11 +702,14 @@ impl Driver {
                 .count()
         };
         let metadata = format!(
-            "{{\"schema\":1,\"scope\":\"accepted-baseline-ledger\",\"mode\":\"{mode}\",\"fallback\":{fallback},\"baseline_generation\":{baseline_json},\"candidate_generation\":{},\"attempt_sequence\":{},\"pause_generation\":{},\"dirty_pages\":{dirty_pages},\"stats\":{{\"logical_bytes\":{},\"live_bytes_read\":{},\"baseline_bytes_read\":{},\"baseline_bytes_written\":{},\"overlay_bytes_written\":{},\"full_bytes_written\":{},\"layout_bytes_written\":{},\"baseline_hole_bytes\":{},\"zero_bytes_omitted\":{},\"explicit_zero_bytes_written\":{},\"extent_queries\":{}}},\"affected_chunks\":[{chunks}]}}\n",
+            "{{\"schema\":2,\"scope\":\"accepted-baseline-ledger\",\"mode\":\"{mode}\",\"fallback\":{fallback},\"baseline_generation\":{baseline_json},\"candidate_generation\":{},\"attempt_sequence\":{},\"pause_generation\":{},\"dirty_pages\":{dirty_pages},\"identity_chunk_bytes\":{},\"changes\":{{\"byte_len\":{},\"sha256\":\"{change_digest}\",\"record_count\":{},\"coverage\":\"{mode}\",\"baseline_stream\":{baseline_stream}}},\"stats\":{{\"logical_bytes\":{},\"live_bytes_read\":{},\"baseline_bytes_read\":{},\"baseline_bytes_written\":{},\"overlay_bytes_written\":{},\"full_bytes_written\":{},\"layout_bytes_written\":{},\"baseline_hole_bytes\":{},\"zero_bytes_omitted\":{},\"explicit_zero_bytes_written\":{},\"extent_queries\":{},\"identity_bytes_hashed\":{},\"zero_run_bytes_covered\":{},\"zero_bytes_punched\":{},\"known_zero_bytes_skipped\":{}}}}}\n",
             candidate.memory_generation(), attempt.sequence(), execution.binding.pause_generation,
+            receipt.identity_chunk_bytes(), changes.byte_len(), changes.record_count(),
             stats.logical_bytes, stats.live_bytes_read, stats.baseline_bytes_read, stats.baseline_bytes_written,
             stats.overlay_bytes_written, stats.full_bytes_written, stats.layout_bytes_written, stats.baseline_hole_bytes,
             stats.zero_bytes_omitted, stats.explicit_zero_bytes_written, stats.extent_queries,
+            stats.identity_bytes_hashed, stats.zero_run_bytes_covered,
+            stats.zero_bytes_punched, stats.known_zero_bytes_skipped,
         ).into_bytes();
         self.memory_candidate = Some(candidate);
         self.memory_stats = Some(metadata.clone());

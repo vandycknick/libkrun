@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub use crate::vmm::control::{GenerationTicket, RestoreToken};
+pub use crate::vmm::device_manager::quiescence::AttachmentIdentity;
 pub use crate::vmm::execution::kvm;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use crate::vmm::execution::runtime::KvmCaptureProfile;
@@ -55,10 +56,9 @@ pub use crate::vmm::execution::{
     CpuExecutionState, CpuTimePlan, ExecutionEnvelope, ExecutionLane, StateBinding,
     VmExecutionState,
 };
-pub use crate::vmm::device_manager::quiescence::AttachmentIdentity;
 pub use crate::vmm::memory::image::{
-    AuthenticatedRamImage, RamCaptureMode, RamCaptureReceipt, RamImageAuthentication,
-    RamImageError, RamIoStats, RamSeedMethod, ValidatedRamLayout,
+    AuthenticatedRamImage, RamCaptureMode, RamCaptureReceipt, RamChangeReceipt,
+    RamImageAuthentication, RamImageError, RamIoStats, RamSeedMethod, ValidatedRamLayout,
 };
 pub use crate::vmm::memory::{
     BaselineToken, CaptureError, FullCaptureReason, RestoreInstallationEvidence,
@@ -118,6 +118,7 @@ pub struct ExecutionOutputs {
 pub struct MemoryOutputs {
     pub ram: File,
     pub layout: File,
+    pub changes: File,
 }
 #[derive(Debug)]
 pub struct BaselineImage {
@@ -145,6 +146,7 @@ pub enum OutputRole {
     Devices,
     Ram,
     Layout,
+    Changes,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputProblem {

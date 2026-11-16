@@ -1,12 +1,13 @@
-"""Diagnostic caller authentication using Silo's existing RAM identities."""
+"""Independent stream-map v2 RAM identity and native sparse-change oracle."""
 import hashlib
 import json
 import os
 from pathlib import Path
 import stat
+import struct
 
 MAX_RAM_LAYOUT_BYTES = 64 * 1024
-CHUNK_SIZE = 8 * 1024 * 1024
+CHUNK_SIZE = 64 * 1024
 MAX_INTEGER = (1 << 53) - 1
 
 
@@ -90,6 +91,79 @@ def _read_exact(fd: int, size: int, offset: int) -> bytes:
     return bytes(parts)
 
 
+def unit_identities(fd: int, length: int):
+    """Independent byte oracle; short tails are never padded."""
+    for index, offset in enumerate(range(0, length, CHUNK_SIZE)):
+        data = _read_exact(fd, min(CHUNK_SIZE, length - offset), offset)
+        yield index, hashlib.sha256(data).digest() if any(data) else None
+
+
+def stream_root(fd: int, length: int) -> bytes:
+    """Five 64-way frontiers, not a list proportional to logical RAM."""
+    if not 0 <= length <= 1 << 40:
+        raise ValueError("RAM identity length")
+    slots = [{} for _ in range(5)]
+    groups = [None] * 5
+    tree = None
+
+    def flush(height):
+        nonlocal tree
+        if not slots[height]:
+            return
+        bitmap = sum(1 << slot for slot in slots[height])
+        prefix = (b"silo:stream-map:leaf:v2\n" if height == 0 else
+                  b"silo:stream-map:branch:v2\n" + bytes([height]))
+        encoded = prefix + struct.pack("<Q", bitmap)
+        encoded += b"".join(slots[height][slot] for slot in sorted(slots[height]))
+        digest = hashlib.sha256(encoded).digest()
+        group = groups[height]
+        slots[height] = {}
+        groups[height] = None
+        if height == 4:
+            tree = digest
+        else:
+            push(height + 1, group, digest)
+
+    def push(height, index, digest):
+        group, slot = divmod(index, 64)
+        if groups[height] is not None and groups[height] != group:
+            flush(height)
+        groups[height] = group
+        slots[height][slot] = digest
+
+    for index, digest in unit_identities(fd, length):
+        if digest is not None:
+            push(0, index, digest)
+    for height in range(5):
+        flush(height)
+    return b"silo:stream:v2\n" + struct.pack("<BQB", 16, length, tree is not None) + (tree or b"")
+
+
+def iter_changes(path: Path, length: int, mode: str):
+    """Strict constant-memory decoder for native RAM changes v1."""
+    if mode not in ("full", "incremental") or not 0 <= length <= 1 << 40:
+        raise ValueError("RAM changes coverage/length")
+    units = (length + CHUNK_SIZE - 1) // CHUNK_SIZE
+    previous_end, previous_zero = 0, False
+    with path.open("rb") as source:
+        header = source.read(16)
+        expected = b"KRUNRAM\0" + struct.pack("<HBBI", 1, 16, mode == "incremental", 0)
+        if header != expected:
+            raise ValueError("RAM changes header")
+        while record := source.read(56):
+            if len(record) != 56:
+                raise ValueError("truncated RAM changes record")
+            first, count, kind, reserved, digest = struct.unpack("<QQB7s32s", record)
+            if (reserved != bytes(7) or kind not in (0, 1) or not count
+                    or first < previous_end or first + count > units
+                    or (kind == 1 and count != 1)
+                    or (kind == 0 and (digest != bytes(32) or mode == "full"
+                                      or (previous_zero and first == previous_end)))):
+                raise ValueError("noncanonical RAM changes record")
+            previous_end, previous_zero = first + count, kind == 0
+            yield first, count, digest if kind else None
+
+
 def authenticate_image(ram: Path, layout: Path, expected_layout_digest: bytes,
                        prepared: bytes | None = None, *, ram_fd: int | None = None,
                        layout_fd: int | None = None) -> dict:
@@ -115,13 +189,8 @@ def authenticate_image(ram: Path, layout: Path, expected_layout_digest: bytes,
             raise ValueError("RAM layout differs from exact preparation")
         if ram_metadata.st_size != record["packedLength"]:
             raise ValueError("RAM image logical length mismatch")
-        chunks = []
-        for offset in range(0, ram_metadata.st_size, CHUNK_SIZE):
-            chunk = _read_exact(ram_fd, min(CHUNK_SIZE, ram_metadata.st_size - offset), offset)
-            chunks.append("sha256:" + hashlib.sha256(chunk).hexdigest() if any(chunk) else "zero")
-        stream_map = {"chunkSize": CHUNK_SIZE, "chunks": chunks, "kind": "stream", "length": ram_metadata.st_size, "schema": 1}
-        canonical = json.dumps(stream_map, sort_keys=True, separators=(",", ":")).encode("ascii")
-        stream_digest = hashlib.sha256(b"silo:stream:v1\n" + canonical).hexdigest()
+        root = stream_root(ram_fd, ram_metadata.st_size)
+        stream_digest = hashlib.sha256(root).hexdigest()
         def unchanged(fd, original):
             current = os.fstat(fd)
             return all(getattr(current, field) == getattr(original, field) for field in
@@ -130,7 +199,7 @@ def authenticate_image(ram: Path, layout: Path, expected_layout_digest: bytes,
             raise ValueError("RAM authentication input changed")
         return {"layout_digest": actual_layout.hex(), "stream_digest": stream_digest,
                 "caller_authentication_bytes_read": len(data) + ram_metadata.st_size,
-                "stream_map": stream_map,
+                "stream_root": root.hex(),
                 "ram_inode": [ram_metadata.st_dev, ram_metadata.st_ino],
                 "layout_inode": [layout_metadata.st_dev, layout_metadata.st_ino]}
     finally:

@@ -7,6 +7,9 @@ comparison. Neither mode qualifies physical sharing or restored reclaim.
 from __future__ import annotations
 
 import errno
+import hashlib
+import itertools
+import struct
 import json
 import os
 from pathlib import Path
@@ -18,13 +21,15 @@ import unittest
 import tempfile
 
 from native_device_controller import COUNTERS, Session, digest, save, seal_cut
+from native_ram_image import CHUNK_SIZE, iter_changes, unit_identities
 
 MAX_RAM = 1024 * 1024 * 1024
 SCOPE = "cumulative-union-no-accepted-baseline"
 LEDGER_SCOPE = "accepted-baseline-ledger"
 IO_COUNTERS = frozenset(("logical_bytes", "live_bytes_read", "baseline_bytes_read",
     "baseline_bytes_written", "overlay_bytes_written", "full_bytes_written", "layout_bytes_written",
-    "baseline_hole_bytes", "zero_bytes_omitted", "explicit_zero_bytes_written", "extent_queries"))
+    "baseline_hole_bytes", "zero_bytes_omitted", "explicit_zero_bytes_written", "extent_queries",
+    "identity_bytes_hashed", "zero_run_bytes_covered", "zero_bytes_punched", "known_zero_bytes_skipped"))
 
 
 class MemorySession(Session):
@@ -423,9 +428,9 @@ def image_record(directory: Path, mode: str, baseline: int | None) -> dict:
                         object_pairs_hook=unique_fields)
     required = {"schema", "scope", "mode", "fallback", "baseline_generation",
                 "candidate_generation", "attempt_sequence", "pause_generation",
-                "dirty_pages", "stats", "affected_chunks"}
+                "dirty_pages", "stats", "identity_chunk_bytes", "changes"}
     if (not isinstance(record, dict) or set(record) != required
-            or type(record["schema"]) is not int or record["schema"] != 1
+            or type(record["schema"]) is not int or record["schema"] != 2
             or record["scope"] != LEDGER_SCOPE or record["mode"] != mode
             or record["baseline_generation"] != baseline
             or type(record["baseline_generation"]) not in (int, type(None))
@@ -451,25 +456,75 @@ def image_record(directory: Path, mode: str, baseline: int | None) -> dict:
             or stats["logical_bytes"] != metadata["packed_len"]
             or stats["layout_bytes_written"] != (directory / "memory-layout.json").stat().st_size):
         raise ValueError("native RAM image accounting/cut mismatch")
-    expected_live = (metadata["dirty_pages"] * metadata["granule"]
-                     if mode == "incremental" else metadata["packed_len"])
-    if stats["live_bytes_read"] != expected_live:
-        raise ValueError("native writer live-read accounting differs from selected pages")
+    dirty_units = (key for key, _ in itertools.groupby(
+        page * metadata["granule"] // CHUNK_SIZE
+        for page in range(metadata["page_count"]) if marked(bitmap, page)))
+    # Reflink captures read identity-expanded units; rebuilds read dirty pages
+    # and copy clean baseline bytes. Both hash precisely the affected units.
+    expanded = sum(min(CHUNK_SIZE, metadata["packed_len"] - unit * CHUNK_SIZE)
+                   for unit in (key for key, _ in itertools.groupby(
+                       page * metadata["granule"] // CHUNK_SIZE
+                       for page in range(metadata["page_count"]) if marked(bitmap, page))))
+    dirty_bytes = metadata["dirty_pages"] * metadata["granule"]
     if mode == "incremental":
-        if (stats["full_bytes_written"] or stats["overlay_bytes_written"] != expected_live
+        if stats["live_bytes_read"] not in (dirty_bytes, expanded):
+            raise ValueError("native writer live-read accounting differs from selected units")
+        if (stats["full_bytes_written"]
+                or stats["overlay_bytes_written"] > dirty_bytes
+                or stats["overlay_bytes_written"] + stats["zero_run_bytes_covered"] < dirty_bytes
                 or stats["explicit_zero_bytes_written"] > stats["overlay_bytes_written"]):
             raise ValueError("native dirty overlay accounting mismatch")
-        chunks = sorted({page * metadata["granule"] // (8 * 1024 * 1024)
-                         for page in range(metadata["page_count"]) if marked(bitmap, page)})
     else:
-        if any(stats[key] for key in ("baseline_bytes_read", "baseline_bytes_written",
-                                      "overlay_bytes_written", "explicit_zero_bytes_written")):
-            raise ValueError("native full writer claims incremental work")
-        chunks = list(range((metadata["packed_len"] + 8 * 1024 * 1024 - 1) // (8 * 1024 * 1024)))
-    if (not isinstance(record["affected_chunks"], list)
-            or any(type(chunk) is not int for chunk in record["affected_chunks"])
-            or record["affected_chunks"] != chunks):
-        raise ValueError("native affected-chunk accounting mismatch")
+        if (stats["live_bytes_read"] + stats["known_zero_bytes_skipped"] != metadata["packed_len"]
+                or any(stats[key] for key in ("baseline_bytes_read", "baseline_bytes_written",
+                                             "overlay_bytes_written", "explicit_zero_bytes_written"))):
+            raise ValueError("native full writer claims incremental work or incomplete coverage")
+    if type(record["identity_chunk_bytes"]) is not int or record["identity_chunk_bytes"] != CHUNK_SIZE:
+        raise ValueError("native RAM identity profile")
+    changes = record["changes"]
+    if (not isinstance(changes, dict) or set(changes) != {
+            "byte_len", "sha256", "record_count", "coverage", "baseline_stream"}
+            or any(type(changes[key]) is not int or changes[key] < 0
+                   for key in ("byte_len", "record_count"))
+            or changes["coverage"] != mode
+            or (mode == "full" and changes["baseline_stream"] is not None)
+            or (mode == "incremental" and (not isinstance(changes["baseline_stream"], str)
+                or len(changes["baseline_stream"]) != 64
+                or any(char not in "0123456789abcdef" for char in changes["baseline_stream"])))):
+        raise ValueError("native RAM changes summary")
+    path = directory / "memory.changes"
+    if changes["byte_len"] != path.stat().st_size or changes["sha256"] != digest(path):
+        raise ValueError("native RAM changes file binding")
+    count, hashed = 0, 0
+    with (directory / "memory.ram").open("rb") as ram:
+        expected = ((index, digest) for index, digest in unit_identities(ram.fileno(), metadata["packed_len"])
+                    if digest is not None) if mode == "full" else (
+                        (index, None) for index in dirty_units)
+        actual = iter_changes(path, metadata["packed_len"], mode)
+        def entries():
+            nonlocal count
+            for first, length, identity in actual:
+                count += 1
+                for index in range(first, first + length):
+                    yield index, identity
+        for produced, wanted in itertools.zip_longest(entries(), expected):
+            if produced is None or wanted is None or produced[0] != wanted[0]:
+                raise ValueError("native RAM changes coverage")
+            index, identity = produced
+            size = min(CHUNK_SIZE, metadata["packed_len"] - index * CHUNK_SIZE)
+            if mode == "full":
+                expected_digest = wanted[1]
+            else:
+                data = os.pread(ram.fileno(), size, index * CHUNK_SIZE)
+                if len(data) != size:
+                    raise ValueError("short RAM identity oracle read")
+                expected_digest = hashlib.sha256(data).digest() if any(data) else None
+            if identity != expected_digest:
+                raise ValueError("native RAM changes identity mismatch")
+            if identity is not None:
+                hashed += size
+    if count != changes["record_count"] or hashed != stats["identity_bytes_hashed"]:
+        raise ValueError("native RAM changes count/hash accounting")
     return record
 
 
@@ -504,7 +559,7 @@ def accept_image(session: MemorySession, directory: Path) -> dict:
 
 def retain_image(directory: Path) -> dict:
     manifest = seal_cut(directory)
-    for name in ("memory-layout.json", "memory-image.json", "memory-dirty.json", "memory-dirty.bitmap"):
+    for name in ("memory-layout.json", "memory-image.json", "memory.changes", "memory-dirty.json", "memory-dirty.bitmap"):
         path = directory / name
         manifest[name] = {"bytes": path.stat().st_size, "sha256": digest(path)}
         path.chmod(0o400)
@@ -574,7 +629,7 @@ def zero_cut(session: MemorySession, root: Path, label: str, baseline: int,
              reference: Path, prepared: bool = False) -> tuple[Path, dict]:
     directory = root / label
     record = native_capture(session, directory, "incremental", baseline, prepared)
-    if record["dirty_pages"] or record["stats"]["live_bytes_read"] or record["affected_chunks"]:
+    if record["dirty_pages"] or record["stats"]["live_bytes_read"] or record["changes"]["record_count"]:
         raise RuntimeError("same-cut accepted baseline did not yield zero live reads/dirties")
     if any(digest(reference / name) != digest(directory / name)
            for name in ("memory.ram", "memory-layout.json")):
@@ -1035,18 +1090,24 @@ class DirtyOracleTests(unittest.TestCase):
         (directory / "execution.state").write_bytes(b"same-execution")
         (directory / "devices.state").write_bytes(b"same-devices")
         count = dirty.bit_count()
-        stats = {key: 0 for key in (
-            "logical_bytes", "live_bytes_read", "baseline_bytes_read", "baseline_bytes_written",
-            "overlay_bytes_written", "full_bytes_written", "layout_bytes_written",
-            "baseline_hole_bytes", "zero_bytes_omitted", "explicit_zero_bytes_written", "extent_queries")}
+        stats = dict.fromkeys(IO_COUNTERS, 0)
         stats.update(logical_bytes=8192, live_bytes_read=count * 4096 if mode == "incremental" else 8192,
                      overlay_bytes_written=count * 4096 if mode == "incremental" else 0,
                      full_bytes_written=8192 if mode == "full" else 0, layout_bytes_written=len(layout))
-        record = {"schema": 1, "scope": LEDGER_SCOPE, "mode": mode,
+        present = mode == "full" or count != 0
+        stats["identity_bytes_hashed"] = 8192 if present else 0
+        changes = b"KRUNRAM\0" + struct.pack("<HBBI", 1, 16, mode == "incremental", 0)
+        if present:
+            changes += struct.pack("<QQB7s32s", 0, 1, 1, bytes(7), hashlib.sha256(b"a" * 8192).digest())
+        (directory / "memory.changes").write_bytes(changes)
+        record = {"schema": 2, "scope": LEDGER_SCOPE, "mode": mode,
                   "fallback": None if mode == "incremental" else "requested-full",
                   "baseline_generation": 3, "candidate_generation": 4, "attempt_sequence": attempt,
                   "pause_generation": 7, "dirty_pages": count, "stats": stats,
-                  "affected_chunks": [0] if mode == "full" or count else []}
+                  "identity_chunk_bytes": CHUNK_SIZE,
+                  "changes": {"byte_len": len(changes), "sha256": hashlib.sha256(changes).hexdigest(),
+                              "record_count": int(present), "coverage": mode,
+                              "baseline_stream": "00" * 32 if mode == "incremental" else None}}
         (directory / "memory-image.json").write_text(json.dumps(record))
         return directory
 
@@ -1058,7 +1119,7 @@ class DirtyOracleTests(unittest.TestCase):
             same_cut(incremental, full, 3)
             path = incremental / "memory-image.json"
             record = json.loads(path.read_text())
-            record["stats"]["live_bytes_read"] = 8192
+            record["stats"]["live_bytes_read"] = 4096 + 8192
             path.write_text(json.dumps(record))
             with self.assertRaisesRegex(ValueError, "live-read"):
                 same_cut(incremental, full, 3)
@@ -1084,9 +1145,9 @@ class DirtyOracleTests(unittest.TestCase):
             record = image_record(directory, "incremental", 3)
             self.assertEqual(record["stats"]["live_bytes_read"], 0)
             path = directory / "memory-image.json"
-            for stats, chunks in (({**record["stats"], "live_bytes_read": 4096}, []),
-                                  (record["stats"], [0])):
-                path.write_text(json.dumps({**record, "stats": stats, "affected_chunks": chunks}))
+            for stats, changes in (({**record["stats"], "live_bytes_read": 4096}, record["changes"]),
+                                    (record["stats"], {**record["changes"], "record_count": 1})):
+                path.write_text(json.dumps({**record, "stats": stats, "changes": changes}))
                 with self.assertRaises(ValueError):
                     image_record(directory, "incremental", 3)
 

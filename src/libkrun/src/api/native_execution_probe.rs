@@ -1183,7 +1183,11 @@ fn save_capture(
             .open(out.join(name))
             .map_err(|error| error.to_string())
     };
-    let output = RamOutputFiles::new(output_file("ram.bin")?, output_file("memory-layout.json")?);
+    let output = RamOutputFiles::new(
+        output_file("ram.bin")?,
+        output_file("memory-layout.json")?,
+        output_file("memory.changes")?,
+    );
     let cut_key = key(expected.pause_generation);
     let id = attempt
         .vmm

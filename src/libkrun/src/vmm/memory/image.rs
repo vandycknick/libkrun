@@ -18,12 +18,14 @@ use crate::vmm::execution::{StateBinding, ValidatedExecution};
 use crate::vmm::memory::AttemptId;
 use crate::vmm::memory::image::layout::{MAX_RAM_LAYOUT_BYTES, RamTopology};
 
+pub(crate) mod changes;
 pub mod layout;
 pub mod writer;
+pub use changes::RamChangeReceipt;
 
 pub const RAM_IO_BUFFER_BYTES: usize = 32 * 1024 * 1024;
-pub(crate) const RAM_IO_BUFFER_COUNT: usize = 3;
-pub const RAM_IDENTITY_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const RAM_IO_BUFFER_COUNT: usize = 1;
+pub const RAM_IDENTITY_CHUNK_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RamRegion {
@@ -46,6 +48,7 @@ pub struct ValidatedRamLayout {
 pub enum RamFileRole {
     OutputRam,
     OutputLayout,
+    OutputChanges,
     InputRam,
     InputLayout,
 }
@@ -154,6 +157,8 @@ pub struct RamIoStats {
     pub logical_bytes: u64,
     pub live_bytes_read: u64,
     pub baseline_bytes_read: u64,
+    /// Actual nonzero identity bytes submitted to SHA-256 (not zero coverage).
+    pub identity_bytes_hashed: u64,
     pub baseline_bytes_written: u64,
     pub overlay_bytes_written: u64,
     pub full_bytes_written: u64,
@@ -186,16 +191,18 @@ pub enum RamImageEffects {
 pub struct RamOutputFiles {
     ram: File,
     layout: File,
+    changes: File,
     protected_inputs: Option<Arc<AuthenticatedRamImage>>,
 }
 impl RamOutputFiles {
     /// Takes ownership without effects. Open staging roles without truncation so
     /// inode alias preflight can protect existing inputs.
     /// Completion closes the writers; the caller owns the later durability barrier.
-    pub fn new(ram: File, layout: File) -> Self {
+    pub fn new(ram: File, layout: File, changes: File) -> Self {
         Self {
             ram,
             layout,
+            changes,
             protected_inputs: None,
         }
     }
@@ -232,15 +239,15 @@ impl RamIoScratch {
             Ok(buffer.into_boxed_slice())
         }
         Ok(Self {
-            buffers: [allocate()?, allocate()?, allocate()?],
+            buffers: [allocate()?],
         })
     }
 }
 
 /// The trusted caller authenticates imported bytes and excludes all writers.
-/// `stream` is the ADR0014 StreamId, not a whole-file digest. Native capture
-/// supplies chunk digests, but does not establish immutability from readonly
-/// descriptor metadata.
+/// `stream` is a stream-map v2 root authenticated by the caller at the fixed
+/// 64 KiB RAM profile, not a whole-file digest. Native emits sparse changes;
+/// readonly descriptor metadata alone does not establish immutability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RamImageAuthentication {
     pub state: StateBinding,
@@ -352,8 +359,7 @@ pub struct RamCaptureReceipt {
     layout_fact: FileFact,
     mode: RamCaptureMode,
     stats: RamIoStats,
-    chunks: Vec<u64>,
-    chunk_digests: Vec<Option<[u8; 32]>>,
+    changes: RamChangeReceipt,
     completion: Arc<()>,
     writers_closed: bool,
 }
@@ -380,8 +386,7 @@ impl RamCaptureReceipt {
         mode: RamCaptureMode,
         output: RamOutputFiles,
         stats: RamIoStats,
-        chunks: Vec<u64>,
-        chunk_digests: Vec<Option<[u8; 32]>>,
+        mut changes: RamChangeReceipt,
         deadline: Instant,
     ) -> Result<Self, (RamImageError, RamOutputFiles)> {
         let facts = (|| {
@@ -393,6 +398,10 @@ impl RamCaptureReceipt {
             }
             let ram = inspect_before(&output.ram, RamFileRole::OutputRam, Some(deadline))?;
             let record = inspect_before(&output.layout, RamFileRole::OutputLayout, Some(deadline))?;
+            let change_fact =
+                inspect_before(&output.changes, RamFileRole::OutputChanges, Some(deadline))?;
+            exact_length(change_fact, changes.byte_len, RamFileRole::OutputChanges)?;
+            changes.fact = change_fact;
             exact_length(ram, layout.packed_len(), RamFileRole::OutputRam)?;
             compare_layout_before(
                 &output.layout,
@@ -421,14 +430,13 @@ impl RamCaptureReceipt {
             layout_fact,
             mode,
             stats,
-            chunks,
-            chunk_digests,
+            changes,
             completion: preparation.completion,
             writers_closed: true,
         })
     }
-    pub fn output_identities(&self) -> [(u64, u64, u64); 2] {
-        [self.ram_fact, self.layout_fact]
+    pub fn output_identities(&self) -> [(u64, u64, u64); 3] {
+        [self.ram_fact, self.layout_fact, self.changes.fact]
             .map(|fact| (fact.identity.device, fact.identity.inode, fact.length))
     }
     pub fn binding(&self) -> &StateBinding {
@@ -452,26 +460,11 @@ impl RamCaptureReceipt {
     pub fn attempt(&self) -> &AttemptId {
         &self.attempt
     }
-    pub fn affected_chunks(&self) -> impl Iterator<Item = usize> + '_ {
-        self.chunks
-            .iter()
-            .enumerate()
-            .flat_map(|(word_index, word)| {
-                let mut bits = *word;
-                std::iter::from_fn(move || {
-                    if bits == 0 {
-                        return None;
-                    }
-                    let bit = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    Some(word_index * 64 + bit)
-                })
-            })
+    pub fn identity_chunk_bytes(&self) -> u32 {
+        RAM_IDENTITY_CHUNK_BYTES as u32
     }
-    /// One digest per 8 MiB logical chunk; `None` denotes all zeros only when
-    /// the corresponding affected-chunk bit is set. Unaffected entries are `None`.
-    pub fn chunk_digests(&self) -> &[Option<[u8; 32]>] {
-        &self.chunk_digests
+    pub fn changes(&self) -> &RamChangeReceipt {
+        &self.changes
     }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn matches(
@@ -618,22 +611,6 @@ pub fn map_restore_ram(
     })
 }
 
-pub(crate) fn allocate_chunks(layout: &ValidatedRamLayout) -> Result<Vec<u64>, RamImageError> {
-    let count = usize::try_from(
-        layout
-            .packed_len()
-            .div_ceil(RAM_IDENTITY_CHUNK_BYTES)
-            .div_ceil(64),
-    )
-    .map_err(|_| RamImageError::Geometry)?;
-    let mut chunks = Vec::new();
-    chunks
-        .try_reserve_exact(count)
-        .map_err(|_| RamImageError::Allocation)?;
-    chunks.resize(count, 0);
-    Ok(chunks)
-}
-
 pub(crate) fn preflight(
     cut: &MemoryCut,
     binding: &StateBinding,
@@ -651,6 +628,15 @@ pub(crate) fn preflight(
     layout.validate_registered(cut.domain().layout())?;
     let ram = inspect_before(&output.ram, RamFileRole::OutputRam, Some(deadline))?;
     let record = inspect_before(&output.layout, RamFileRole::OutputLayout, Some(deadline))?;
+    let changes = inspect_before(&output.changes, RamFileRole::OutputChanges, Some(deadline))?;
+    for other in [ram, record] {
+        if changes.identity == other.identity {
+            return Err(RamImageError::Alias {
+                output: RamFileRole::OutputChanges,
+                protected: ProtectedRamRole::OtherOutput,
+            });
+        }
+    }
     if ram.identity == record.identity {
         return Err(RamImageError::Alias {
             output: RamFileRole::OutputRam,
@@ -662,6 +648,7 @@ pub(crate) fn preflight(
         for (role, fact) in [
             (RamFileRole::OutputRam, ram),
             (RamFileRole::OutputLayout, record),
+            (RamFileRole::OutputChanges, changes),
         ] {
             for (protected, input) in [
                 (ProtectedRamRole::BaselineRam, baseline.ram_fact),
@@ -687,6 +674,7 @@ pub(crate) fn preflight(
         for (role, fact) in [
             (RamFileRole::OutputRam, ram),
             (RamFileRole::OutputLayout, record),
+            (RamFileRole::OutputChanges, changes),
         ] {
             if fact.identity.device == backing.device && fact.identity.inode == backing.inode {
                 return Err(RamImageError::Alias {
@@ -794,7 +782,10 @@ fn inspect_before(
             problem: DescriptorProblem::Append,
         });
     }
-    let expected = if matches!(role, RamFileRole::OutputRam | RamFileRole::OutputLayout) {
+    let expected = if matches!(
+        role,
+        RamFileRole::OutputRam | RamFileRole::OutputLayout | RamFileRole::OutputChanges
+    ) {
         OFlag::O_RDWR
     } else {
         OFlag::O_RDONLY
@@ -918,6 +909,7 @@ mod tests {
     use arch::ArchMemoryInfo;
     use arch::guest_memory::{BackingKind, DomainControl, GuestRange, MemoryCut, MemoryDomain};
     use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+    use vmm_sys_util::tempfile::TempFile;
 
     use crate::vmm::control::{BarrierGeneration, BarrierKey, OperationId};
     use crate::vmm::execution::{
@@ -1217,6 +1209,7 @@ mod tests {
         let output = RamOutputFiles::new(
             files.create(&format!("{prefix}-ram"), &[]),
             files.create(&format!("{prefix}-layout"), &[]),
+            TempFile::new().unwrap().as_file().try_clone().unwrap(),
         );
         write_ram_image(
             attempt,
@@ -1259,7 +1252,11 @@ mod tests {
             &binding(),
             layout,
             RamWriteMode::Full,
-            RamOutputFiles::new(ram, record),
+            RamOutputFiles::new(
+                ram,
+                record,
+                TempFile::new().unwrap().as_file().try_clone().unwrap(),
+            ),
             &mut RamIoScratch::new().unwrap(),
             deadline(),
         )
@@ -1389,10 +1386,12 @@ mod tests {
             RamOutputFiles::new(
                 files.readonly("ram-sentinel"),
                 files.writable("layout-sentinel"),
+                TempFile::new().unwrap().as_file().try_clone().unwrap(),
             ),
             RamOutputFiles::new(
                 files.writable("ram-sentinel"),
                 files.readonly("layout-sentinel"),
+                TempFile::new().unwrap().as_file().try_clone().unwrap(),
             ),
         ] {
             let failure = write_ram_image(
@@ -1463,9 +1462,17 @@ mod tests {
                 let sentinel_name = format!("out-{target}-{alias_is_ram}");
                 let sentinel = files.create(&sentinel_name, b"output-sentinel");
                 let mut output = if alias_is_ram {
-                    RamOutputFiles::new(files.writable(target), sentinel)
+                    RamOutputFiles::new(
+                        files.writable(target),
+                        sentinel,
+                        TempFile::new().unwrap().as_file().try_clone().unwrap(),
+                    )
                 } else {
-                    RamOutputFiles::new(sentinel, files.writable(target))
+                    RamOutputFiles::new(
+                        sentinel,
+                        files.writable(target),
+                        TempFile::new().unwrap().as_file().try_clone().unwrap(),
+                    )
                 };
                 output.protect_baseline(Some(baseline.clone()));
                 let failure = write_ram_image(
@@ -1502,7 +1509,11 @@ mod tests {
             &binding(),
             layout,
             RamWriteMode::Full,
-            RamOutputFiles::new(same, dup),
+            RamOutputFiles::new(
+                same,
+                dup,
+                TempFile::new().unwrap().as_file().try_clone().unwrap(),
+            ),
             &mut RamIoScratch::new().unwrap(),
             deadline(),
         )
@@ -1632,7 +1643,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(receipt.mode(), RamCaptureMode::Full);
-        assert_eq!(receipt.affected_chunks().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(receipt.identity_chunk_bytes(), 65536);
     }
 
     #[test]
@@ -1858,6 +1869,7 @@ mod tests {
         let mut output = RamOutputFiles::new(
             files.writable("original-ram"),
             files.create("layout-output", b"layout-sentinel"),
+            TempFile::new().unwrap().as_file().try_clone().unwrap(),
         );
         output.protect_baseline(Some(newer));
         assert!(matches!(

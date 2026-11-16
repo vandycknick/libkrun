@@ -525,8 +525,10 @@ fn inspect(file: &File, role: OutputRole, empty: bool) -> Result<(u64, u64, u64)
     {
         return Err(output_error(role, OutputProblem::Access));
     }
-    if matches!(role, OutputRole::Ram | OutputRole::Layout)
-        && flags.intersection(OFlag::O_ACCMODE) != OFlag::O_RDWR
+    if matches!(
+        role,
+        OutputRole::Ram | OutputRole::Layout | OutputRole::Changes
+    ) && flags.intersection(OFlag::O_ACCMODE) != OFlag::O_RDWR
     {
         return Err(output_error(role, OutputProblem::Access));
     }
@@ -568,13 +570,19 @@ fn write_object(
         binding: binding.clone(),
     })
 }
-fn inspect_outputs(files: &[(OutputRole, &File); 2]) -> Result<[(u64, u64, u64); 2], LiveError> {
-    let facts = [
-        inspect(files[0].1, files[0].0, true)?,
-        inspect(files[1].1, files[1].0, true)?,
-    ];
-    if facts[0].0 == facts[1].0 && facts[0].1 == facts[1].1 {
-        return Err(output_error(files[1].0, OutputProblem::Alias));
+fn inspect_outputs<const N: usize>(
+    files: &[(OutputRole, &File); N],
+) -> Result<[(u64, u64, u64); N], LiveError> {
+    let mut facts = [(0, 0, 0); N];
+    for (index, (role, file)) in files.iter().enumerate() {
+        let fact = inspect(file, *role, true)?;
+        if facts[..index]
+            .iter()
+            .any(|previous| previous.0 == fact.0 && previous.1 == fact.1)
+        {
+            return Err(output_error(*role, OutputProblem::Alias));
+        }
+        facts[index] = fact;
     }
     Ok(facts)
 }
@@ -612,7 +620,10 @@ impl Vmm {
     fn live_ticket(&self, ticket: &CaptureTicket) -> Result<(), LiveError> {
         self.control.live.validate_ticket(&self.control.run, ticket)
     }
-    fn preflight_live_outputs(&self, files: &[(OutputRole, &File); 2]) -> Result<(), LiveError> {
+    fn preflight_live_outputs<const N: usize>(
+        &self,
+        files: &[(OutputRole, &File); N],
+    ) -> Result<(), LiveError> {
         let facts = inspect_outputs(files)?;
         let devices = self.mmio_device_manager.quiescence.live_devices();
         for ((role, _), fact) in files.iter().zip(facts) {
@@ -924,6 +935,7 @@ impl Vmm {
                 self.preflight_live_outputs(&[
                     (OutputRole::Ram, &outputs.ram),
                     (OutputRole::Layout, &outputs.layout),
+                    (OutputRole::Changes, &outputs.changes),
                 ])?;
                 let request = match crossover {
                     None => RamCaptureRequest::Full,
@@ -940,7 +952,7 @@ impl Vmm {
                 match self.write_memory_capture(
                     &ticket.pause,
                     &attempt,
-                    RamOutputFiles::new(outputs.ram, outputs.layout),
+                    RamOutputFiles::new(outputs.ram, outputs.layout, outputs.changes),
                     deadline,
                 ) {
                     Ok(candidate) => {
@@ -1570,7 +1582,8 @@ mod tests {
     fn output_roles_reject_alias_access_append_nonempty_and_missing_cloexec() {
         let first = TempFile::new().unwrap();
         let second = TempFile::new().unwrap();
-        for file in [first.as_file(), second.as_file()] {
+        let third = TempFile::new().unwrap();
+        for file in [first.as_file(), second.as_file(), third.as_file()] {
             nix::fcntl::fcntl(
                 file,
                 nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
@@ -1629,6 +1642,29 @@ mod tests {
             ])
             .is_ok()
         );
+        assert_eq!(
+            inspect_outputs(&[
+                (OutputRole::Ram, first.as_file()),
+                (OutputRole::Layout, second.as_file()),
+                (OutputRole::Changes, third.as_file()),
+            ])
+            .unwrap()
+            .len(),
+            3
+        );
+        for changes in [first.as_file(), second.as_file()] {
+            assert!(matches!(
+                inspect_outputs(&[
+                    (OutputRole::Ram, first.as_file()),
+                    (OutputRole::Layout, second.as_file()),
+                    (OutputRole::Changes, changes),
+                ]),
+                Err(LiveError::Output {
+                    role: OutputRole::Changes,
+                    problem: OutputProblem::Alias,
+                })
+            ));
+        }
         let receipt = write_object(
             first.as_file(),
             OutputRole::Execution,

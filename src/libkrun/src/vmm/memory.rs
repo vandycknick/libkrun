@@ -1338,18 +1338,21 @@ mod tests {
     struct Outputs {
         ram: TempFile,
         layout: TempFile,
+        changes: TempFile,
     }
     impl Outputs {
         fn new() -> Self {
             Self {
                 ram: TempFile::new().unwrap(),
                 layout: TempFile::new().unwrap(),
+                changes: TempFile::new().unwrap(),
             }
         }
         fn owned(&self) -> RamOutputFiles {
             RamOutputFiles::new(
                 self.ram.as_file().try_clone().unwrap(),
                 self.layout.as_file().try_clone().unwrap(),
+                self.changes.as_file().try_clone().unwrap(),
             )
         }
         fn seal(
@@ -2029,7 +2032,11 @@ mod tests {
             .open(&ram_path)
             .unwrap();
         let outputs = Outputs::new();
-        let output = RamOutputFiles::new(ram, outputs.layout.as_file().try_clone().unwrap());
+        let output = RamOutputFiles::new(
+            ram,
+            outputs.layout.as_file().try_clone().unwrap(),
+            TempFile::new().unwrap().as_file().try_clone().unwrap(),
+        );
         let error = match coordinator.write_attempt(
             key(2),
             &attempt,
@@ -2100,7 +2107,9 @@ mod tests {
         stop(&mut coordinator, key(1));
         let (_, mut candidate, retained_staging) =
             capture(&mut coordinator, key(1), RamCaptureRequest::Full);
-        let baseline_map = candidate.receipt().chunk_digests().to_vec();
+        let baseline_map = crate::vmm::memory::image::changes::read_test_changes(
+            retained_staging.changes.as_file(),
+        );
         let image = retained_staging.seal(&mut candidate, key(1));
         let retained = Arc::downgrade(&image);
         let token = coordinator
@@ -2151,22 +2160,28 @@ mod tests {
             assert_eq!(incremental.receipt().stats().known_zero_bytes_skipped, 0);
             if !changed {
                 assert_eq!(incremental.receipt().stats().live_bytes_read, 0);
-                assert_eq!(incremental.receipt().affected_chunks().count(), 0);
+                assert_eq!(incremental.receipt().changes().record_count(), 0);
             } else {
                 assert_eq!(incremental.receipt().stats().zero_run_bytes_covered, 4096);
             }
             let mut resolved_map = baseline_map.clone();
-            for chunk in incremental.receipt().affected_chunks() {
-                resolved_map[chunk] = incremental.receipt().chunk_digests()[chunk];
+            for (chunk, digest) in
+                crate::vmm::memory::image::changes::read_test_changes(output.changes.as_file())
+            {
+                resolved_map.insert(chunk, digest);
             }
             coordinator.abandon_attempt(key, &attempt).unwrap();
-            let (full_attempt, full, full_files) =
+            let (full_attempt, _full, full_files) =
                 capture(&mut coordinator, key, RamCaptureRequest::Full);
             assert_eq!(
                 std::fs::read(output.ram.as_path()).unwrap(),
                 std::fs::read(full_files.ram.as_path()).unwrap()
             );
-            assert_eq!(resolved_map, full.receipt().chunk_digests());
+            resolved_map.retain(|_, value| value.is_some());
+            assert_eq!(
+                resolved_map,
+                crate::vmm::memory::image::changes::read_test_changes(full_files.changes.as_file())
+            );
             assert_eq!(
                 std::fs::read(output.layout.as_path()).unwrap(),
                 std::fs::read(full_files.layout.as_path()).unwrap()

@@ -2,9 +2,6 @@ use std::fs::File;
 use std::io;
 use std::iter::Peekable;
 use std::ops::Range;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::Instant;
 
@@ -12,13 +9,13 @@ use arch::guest_memory::{CutReadKind, CutReader, MemoryCut, PageIndex};
 use sha2::{Digest, Sha256};
 use vm_memory::GuestAddress;
 
+use crate::vmm::memory::image::changes::ChangeWriter;
 use crate::vmm::memory::image::writer::{
     Extents, WriteKind, Writeback, cover_zero, is_all_zero, read_exact_at, write_exact_at,
 };
 use crate::vmm::memory::image::{
-    RAM_IDENTITY_CHUNK_BYTES, RAM_IO_BUFFER_BYTES, RAM_IO_BUFFER_COUNT, RamFileRole, RamImageError,
-    RamIoOperation, RamIoScratch, RamIoStats, RamWriteMode, ValidatedRamLayout, check_deadline,
-    io_error,
+    RAM_IDENTITY_CHUNK_BYTES, RAM_IO_BUFFER_BYTES, RamFileRole, RamImageError, RamIoOperation,
+    RamIoScratch, RamIoStats, RamWriteMode, ValidatedRamLayout, check_deadline, io_error,
 };
 
 const WRITERS: usize = 2;
@@ -32,43 +29,10 @@ pub(crate) struct Input<'a> {
     pub deadline: Instant,
 }
 
-pub(crate) fn allocate_digests(length: u64) -> Result<Vec<Option<[u8; 32]>>, RamImageError> {
-    let count = usize::try_from(length.div_ceil(RAM_IDENTITY_CHUNK_BYTES))
-        .map_err(|_| RamImageError::Geometry)?;
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(count)
-        .map_err(|_| RamImageError::Allocation)?;
-    values.resize(count, None);
-    Ok(values)
-}
-
-#[derive(Default)]
-struct Failure {
-    cancelled: AtomicBool,
-    first: Mutex<Option<RamImageError>>,
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
+struct Failure;
 
 impl Failure {
-    fn record(&self, error: RamImageError) {
-        let mut first = lock(&self.first);
-        if first.is_none() {
-            *first = Some(error);
-        }
-        self.cancelled.store(true, Ordering::Release);
-    }
-
     fn check(&self, deadline: Instant) -> Result<(), RamImageError> {
-        if self.cancelled.load(Ordering::Acquire) {
-            return Err(pipeline_error("RAM capture cancelled"));
-        }
         check_deadline(deadline)
     }
 }
@@ -98,6 +62,7 @@ struct Pack<'a> {
     zero_granules: Vec<bool>,
     nonzero: [bool; CHUNKS_PER_PACK],
     digests: [Option<[u8; 32]>; CHUNKS_PER_PACK],
+    affected: [bool; CHUNKS_PER_PACK],
 }
 
 impl<'a> Pack<'a> {
@@ -122,6 +87,7 @@ impl<'a> Pack<'a> {
             zero_granules,
             nonzero: [false; CHUNKS_PER_PACK],
             digests: [None; CHUNKS_PER_PACK],
+            affected: [false; CHUNKS_PER_PACK],
         })
     }
 
@@ -131,6 +97,7 @@ impl<'a> Pack<'a> {
         self.writes.clear();
         self.nonzero.fill(false);
         self.digests.fill(None);
+        self.affected.fill(false);
     }
 
     fn write_run(&mut self, range: Range<usize>, kind: WriteKind, action: WriteAction) {
@@ -191,13 +158,12 @@ impl<'a> Pack<'a> {
     fn persist(
         &mut self,
         file: &File,
-        affected: &[u64],
         stats: &mut RamIoStats,
         writeback: &mut Writeback,
-        failure: &Failure,
         deadline: Instant,
+        hash_workers: usize,
     ) -> Result<(), RamImageError> {
-        let first = (self.offset / RAM_IDENTITY_CHUNK_BYTES) as usize;
+        let failure = Failure;
         for run in &self.writes {
             failure.check(deadline)?;
             if run.action == WriteAction::Zero {
@@ -215,16 +181,57 @@ impl<'a> Pack<'a> {
                 }
             }
         }
-        for (local, bytes) in self.bytes[..self.length]
-            .chunks(RAM_IDENTITY_CHUNK_BYTES as usize)
-            .enumerate()
-        {
-            failure.check(deadline)?;
-            let index = first + local;
-            if self.nonzero[local] && affected[index / 64] & (1 << (index % 64)) != 0 {
-                self.digests[local] = Some(Sha256::digest(bytes).into());
-            }
-        }
+        let bytes = &self.bytes[..self.length];
+        let affected = &self.affected;
+        let nonzero = &self.nonzero;
+        let count = self.length.div_ceil(RAM_IDENTITY_CHUNK_BYTES as usize);
+        let split = count.div_ceil(hash_workers);
+        let hashed = if count == 1 && affected[0] && nonzero[0] {
+            check_deadline(deadline)?;
+            self.digests[0] = Some(Sha256::digest(bytes).into());
+            bytes.len() as u64
+        } else if (0..count).any(|index| affected[index] && nonzero[index]) {
+            thread::scope(|scope| {
+                let mut workers = [None, None];
+                for (part, digests) in self.digests[..count].chunks_mut(split).enumerate() {
+                    let failure = &failure;
+                    workers[part] = Some(thread::Builder::new().spawn_scoped(scope, move || {
+                        let mut hashed = 0;
+                        for (local, digest) in digests.iter_mut().enumerate() {
+                            failure.check(deadline)?;
+                            let index = part * split + local;
+                            let start = index * RAM_IDENTITY_CHUNK_BYTES as usize;
+                            if start >= bytes.len() {
+                                break;
+                            }
+                            if affected[index] && nonzero[index] {
+                                let end =
+                                    (start + RAM_IDENTITY_CHUNK_BYTES as usize).min(bytes.len());
+                                *digest = Some(Sha256::digest(&bytes[start..end]).into());
+                                hashed += (end - start) as u64;
+                            }
+                        }
+                        Ok::<u64, RamImageError>(hashed)
+                    }));
+                }
+                let mut total = 0;
+                let mut error = None;
+                for worker in workers.into_iter().flatten() {
+                    match worker {
+                        Ok(worker) => match worker.join() {
+                            Ok(Ok(count)) => total += count,
+                            Ok(Err(cause)) => error = Some(cause),
+                            Err(_) => error = Some(pipeline_error("RAM hasher panicked")),
+                        },
+                        Err(cause) => error = Some(RamImageError::Pipeline(cause)),
+                    }
+                }
+                error.map_or(Ok(total), Err)
+            })?
+        } else {
+            0
+        };
+        stats.identity_bytes_hashed += hashed;
         for run in &self.writes {
             failure.check(deadline)?;
             let offset = self.offset + run.range.start as u64;
@@ -252,10 +259,14 @@ impl<'a> Pack<'a> {
         Ok(())
     }
 
-    fn collect_digests(&self, digests: &mut [Option<[u8; 32]>]) {
-        let first = (self.offset / RAM_IDENTITY_CHUNK_BYTES) as usize;
-        let count = self.length.div_ceil(RAM_IDENTITY_CHUNK_BYTES as usize);
-        digests[first..first + count].copy_from_slice(&self.digests[..count]);
+    fn emit(&self, changes: &mut ChangeWriter<'_>) -> Result<(), RamImageError> {
+        let first = self.offset / RAM_IDENTITY_CHUNK_BYTES;
+        for local in 0..self.length.div_ceil(RAM_IDENTITY_CHUNK_BYTES as usize) {
+            if self.affected[local] {
+                changes.push(first + local as u64, self.digests[local])?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -408,32 +419,18 @@ impl Reader<'_> {
         &mut self,
         pack: &mut Pack<'_>,
         pages: &mut Peekable<impl Iterator<Item = PageIndex>>,
-        affected: &[u64],
         stats: &mut RamIoStats,
         failure: &Failure,
     ) -> Result<(), RamImageError> {
         let end = pack.offset + pack.length as u64;
         let granule = self.input.layout.granule() as usize;
         if matches!(self.input.mode, RamWriteMode::Full) {
+            pack.affected.fill(true);
             return self.full(pack, stats, failure);
         }
         if self.input.seeded {
-            let first = (pack.offset / RAM_IDENTITY_CHUNK_BYTES) as usize;
-            for local in 0..pack.length.div_ceil(RAM_IDENTITY_CHUNK_BYTES as usize) {
-                let index = first + local;
-                if affected[index / 64] & (1 << (index % 64)) == 0 {
-                    continue;
-                }
-                let start = local * RAM_IDENTITY_CHUNK_BYTES as usize;
-                let limit = (start + RAM_IDENTITY_CHUNK_BYTES as usize).min(pack.length);
-                self.live(
-                    pack,
-                    pack.offset + start as u64..pack.offset + limit as u64,
-                    stats,
-                    failure,
-                )?;
-                pack.classify(start..limit, None, granule);
-            }
+            self.live(pack, pack.offset..end, stats, failure)?;
+            pack.classify(0..pack.length, None, granule);
         }
         let mut clean_start = pack.offset;
         while let Some(page) = pages.peek() {
@@ -452,6 +449,9 @@ impl Reader<'_> {
                 stop += granule as u64;
             }
             let local = (start - pack.offset) as usize..(stop - pack.offset) as usize;
+            let first = local.start / RAM_IDENTITY_CHUNK_BYTES as usize;
+            let last = (local.end - 1) / RAM_IDENTITY_CHUNK_BYTES as usize;
+            pack.affected[first..=last].fill(true);
             if self.input.seeded {
                 pack.overlay(local, granule);
             } else {
@@ -473,18 +473,21 @@ pub(crate) fn write(
     ram: &File,
     scratch: &mut RamIoScratch,
     stats: &mut RamIoStats,
-    affected: &[u64],
-    digests: &mut [Option<[u8; 32]>],
+    changes: &mut ChangeWriter<'_>,
 ) -> Result<(), RamImageError> {
-    let mut free = Vec::new();
-    free.try_reserve_exact(RAM_IO_BUFFER_COUNT)
-        .map_err(|_| RamImageError::Allocation)?;
-    for bytes in &mut scratch.buffers {
-        free.push(Pack::new(
-            bytes,
-            input.layout.granule() as usize,
-            input.seeded,
-        )?);
+    write_with_workers(input, ram, scratch, stats, changes, WRITERS)
+}
+
+pub(crate) fn write_with_workers(
+    input: Input<'_>,
+    ram: &File,
+    scratch: &mut RamIoScratch,
+    stats: &mut RamIoStats,
+    changes: &mut ChangeWriter<'_>,
+    hash_workers: usize,
+) -> Result<(), RamImageError> {
+    if !(1..=WRITERS).contains(&hash_workers) {
+        return Err(RamImageError::Geometry);
     }
     let mut reader = Reader {
         cut_reader: if matches!(input.mode, RamWriteMode::Full) {
@@ -503,116 +506,54 @@ pub(crate) fn write(
         input,
         region_index: 0,
     };
-    let failure = Failure::default();
-    let (jobs, queued) = mpsc::sync_channel::<Pack<'_>>(WRITERS);
-    let queued = Mutex::new(queued);
-    // All three borrowed packs fit even when failure stops the producer receiving.
-    let (completed, returned) = mpsc::sync_channel::<Pack<'_>>(RAM_IO_BUFFER_COUNT);
+    let failure = Failure;
     let deadline = reader.input.deadline;
-    thread::scope(|scope| {
-        let mut workers = [None, None];
-        for slot in &mut workers {
-            let queued = &queued;
-            let failure = &failure;
-            let completed = completed.clone();
-            match thread::Builder::new().spawn_scoped(scope, move || {
-                let mut stats = RamIoStats::default();
-                let mut writeback = Writeback::default();
-                loop {
-                    let received = lock(queued).recv();
-                    let Ok(mut pack) = received else { break };
-                    // A failed worker must still return its pack so the reader cannot
-                    // wait forever while another worker is blocked on the input queue.
-                    let result = catch_unwind(AssertUnwindSafe(|| {
-                        pack.persist(ram, affected, &mut stats, &mut writeback, failure, deadline)
-                    }));
-                    match result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => failure.record(error),
-                        Err(_) => failure.record(pipeline_error("RAM writer panicked")),
-                    }
-                    if completed.send(pack).is_err() {
-                        break;
-                    }
-                }
-                stats
-            }) {
-                Ok(worker) => *slot = Some(worker),
-                Err(error) => {
-                    failure.record(RamImageError::Pipeline(error));
+    let dirty = match reader.input.mode {
+        RamWriteMode::Full => None,
+        RamWriteMode::Incremental { dirty, .. } => Some(*dirty),
+    };
+    let mut pages = dirty
+        .into_iter()
+        .flat_map(|dirty| dirty.iter_set())
+        .peekable();
+    let granule = u64::from(reader.input.layout.granule());
+    let mut units = dirty
+        .into_iter()
+        .flat_map(|dirty| dirty.iter_set())
+        .map(|page| page.index() as u64 * granule / RAM_IDENTITY_CHUNK_BYTES)
+        .peekable();
+    let mut pack = Pack::new(
+        &mut scratch.buffers[0],
+        granule as usize,
+        reader.input.seeded,
+    )?;
+    let mut writeback = Writeback::default();
+    let mut offset = 0;
+    let length = reader.input.layout.packed_len();
+    loop {
+        failure.check(deadline)?;
+        let range = if reader.input.seeded {
+            let Some(first) = units.next() else { break };
+            let mut end = first + 1;
+            while let Some(next) = units.peek().copied() {
+                if next >= end && (next != end || end - first >= CHUNKS_PER_PACK as u64) {
                     break;
                 }
+                units.next();
+                end = end.max(next + 1);
             }
-        }
-        drop(completed);
-        let result = (|| {
-            let mut pages = match reader.input.mode {
-                RamWriteMode::Full => None,
-                RamWriteMode::Incremental { dirty, .. } => Some(*dirty),
+            first * RAM_IDENTITY_CHUNK_BYTES..(end * RAM_IDENTITY_CHUNK_BYTES).min(length)
+        } else {
+            if offset == length {
+                break;
             }
-            .into_iter()
-            .flat_map(|dirty| dirty.iter_set())
-            .peekable();
-            let mut offset = 0;
-            let mut in_flight = 0;
-            while offset < reader.input.layout.packed_len() {
-                failure.check(deadline)?;
-                let mut pack = match free.pop() {
-                    Some(pack) => pack,
-                    None => {
-                        let pack = returned
-                            .recv()
-                            .map_err(|_| pipeline_error("RAM writers disconnected"))?;
-                        in_flight -= 1;
-                        pack.collect_digests(digests);
-                        pack
-                    }
-                };
-                let length = (reader.input.layout.packed_len() - offset)
-                    .min(pack.bytes.len() as u64) as usize;
-                pack.reset(offset, length);
-                reader.fill(&mut pack, &mut pages, affected, stats, &failure)?;
-                failure.check(deadline)?;
-                offset += length as u64;
-                if pack.writes.is_empty() && !pack.nonzero.iter().any(|nonzero| *nonzero) {
-                    free.push(pack);
-                } else {
-                    jobs.send(pack)
-                        .map_err(|_| pipeline_error("RAM writers disconnected"))?;
-                    in_flight += 1;
-                }
-            }
-            while in_flight != 0 {
-                let pack = returned
-                    .recv()
-                    .map_err(|_| pipeline_error("RAM writers disconnected"))?;
-                in_flight -= 1;
-                pack.collect_digests(digests);
-            }
-            failure.check(deadline)
-        })();
-        if let Err(error) = result {
-            failure.record(error);
-        }
-        drop(jobs);
-        drop(returned);
-        for worker in workers.into_iter().flatten() {
-            match worker.join() {
-                Ok(worker_stats) => {
-                    stats.full_bytes_written += worker_stats.full_bytes_written;
-                    stats.baseline_bytes_written += worker_stats.baseline_bytes_written;
-                    stats.overlay_bytes_written += worker_stats.overlay_bytes_written;
-                    stats.explicit_zero_bytes_written += worker_stats.explicit_zero_bytes_written;
-                    stats.zero_run_bytes_covered += worker_stats.zero_run_bytes_covered;
-                    stats.zero_bytes_punched += worker_stats.zero_bytes_punched;
-                    stats.zero_bytes_omitted += worker_stats.zero_bytes_omitted;
-                }
-                Err(_) => failure.record(pipeline_error("RAM writer panicked")),
-            }
-        }
-    });
-    match lock(&failure.first).take() {
-        Some(error) => Err(error),
-        None => Ok(()),
+            offset..(offset + RAM_IO_BUFFER_BYTES as u64).min(length)
+        };
+        pack.reset(range.start, (range.end - range.start) as usize);
+        reader.fill(&mut pack, &mut pages, stats, &failure)?;
+        pack.persist(ram, stats, &mut writeback, deadline, hash_workers)?;
+        pack.emit(changes)?;
+        offset = range.end;
     }
+    Ok(())
 }
