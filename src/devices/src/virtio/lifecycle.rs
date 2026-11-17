@@ -288,6 +288,28 @@ pub trait VirtioStateProvider: Send {
     fn activation_fenced(&self) -> Result<Option<bool>, ProviderFault> {
         Ok(None)
     }
+    /// Poll an activation-fence observation to its original deadline.
+    /// Contention is pending, never an absent fence or a terminal provider fault.
+    /// Other provider errors, including poisoned worker state, stay terminal.
+    fn poll_activation_fenced(
+        &self,
+        deadline: Instant,
+    ) -> Poll<Result<Option<bool>, ProviderFault>> {
+        if Instant::now() >= deadline {
+            return Poll::Ready(Err(ProviderFault::Deadline));
+        }
+        match self.activation_fenced() {
+            Err(ProviderFault::LockBusy) => {
+                if Instant::now() >= deadline {
+                    Poll::Ready(Err(ProviderFault::Deadline))
+                } else {
+                    Poll::Pending
+                }
+            }
+            Ok(_) if Instant::now() >= deadline => Poll::Ready(Err(ProviderFault::Deadline)),
+            result => Poll::Ready(result),
+        }
+    }
     fn validate_payload(&self, payload: &[u8]) -> Result<(), ProviderFault>;
     fn validate_restore(&self, _payload: &[u8]) -> Result<(), ProviderFault> {
         Err(ProviderFault::Unsupported)

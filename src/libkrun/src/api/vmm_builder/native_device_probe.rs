@@ -44,7 +44,8 @@ use crate::vmm::execution::runtime::KvmCaptureProfile;
 use crate::vmm::execution::{ExecutionEnvelope, ExecutionLane, StateBinding, ValidatedExecution};
 use crate::vmm::memory::image::ValidatedRamLayout;
 use crate::vmm::memory::image::{
-    AuthenticatedRamImage, RamImageAuthentication, RamOutputFiles, map_restore_ram,
+    AdmittedRamImage, RamIdentityAnchor, RamIdentityPolicy, RamInputAuthority,
+    RamImageAuthentication, RamOutputFiles, map_restore_ram,
 };
 use crate::vmm::memory::{AttemptId, CompletedCandidate, DirtyCrossoverPercent, RamCaptureRequest};
 #[cfg(feature = "native-device-probe")]
@@ -542,6 +543,11 @@ impl Driver {
                 crossover: DirtyCrossoverPercent::default(),
             }
         };
+        let identity_policy = match token.as_ref().map(|token| token.identity_anchor()) {
+            Some(RamIdentityAnchor::Identified { stream }) if !full =>
+                RamIdentityPolicy::SinceAnchor { stream },
+            _ => RamIdentityPolicy::Full,
+        };
         #[cfg(feature = "native-device-probe")]
         let key = vmm
             .execution
@@ -552,7 +558,7 @@ impl Driver {
         let attempt = if prepared {
             #[cfg(feature = "native-device-probe")]
             {
-                vmm.diagnostic_begin_memory_capture(key, request)
+                vmm.diagnostic_begin_memory_capture(key, request, identity_policy)
             }
             #[cfg(not(feature = "native-device-probe"))]
             {
@@ -564,6 +570,7 @@ impl Driver {
                     .as_ref()
                     .ok_or("capture without exact pause token")?,
                 request,
+                identity_policy,
             )
         }
         .map_err(|error| error.to_string())?;
@@ -668,7 +675,7 @@ impl Driver {
             Some(crate::vmm::memory::FullCaptureReason::CoverageLost) => "\"coverage-lost\"",
             Some(crate::vmm::memory::FullCaptureReason::DirtyCrossover) => "\"dirty-crossover\"",
         };
-        let changes = receipt.changes();
+        let changes = receipt.changes().identified().map_err(|error| error.to_string())?;
         use std::fmt::Write as _;
         let mut change_digest = String::with_capacity(64);
         for byte in changes.sha256() {
@@ -791,7 +798,7 @@ impl Driver {
                 File::open(directory.join("memory.ram")).map_err(|error| error.to_string())?,
                 File::open(directory.join("memory-layout.json"))
                     .map_err(|error| error.to_string())?,
-                RamImageAuthentication { state, stream },
+                RamInputAuthority::IdentifiedSnapshot(RamImageAuthentication { state, stream }),
             )
             .map_err(|error| error.to_string())?;
         let candidate = self
@@ -1391,17 +1398,12 @@ fn restore(
         return Err("restore RAM authentication layout mismatch".into());
     }
     let image = Arc::new(
-        AuthenticatedRamImage::for_restore(
-            File::from(owned_fd(arguments, "ram-image-fd")?),
-            File::from(owned_fd(arguments, "ram-layout-fd")?),
-            RamImageAuthentication {
-                state: expected,
-                stream: authentication[32..]
-                    .try_into()
-                    .map_err(|_| "stream identity width")?,
-            },
-            &validated,
-        )
+        AdmittedRamImage::for_restore(File::from(owned_fd(arguments, "ram-image-fd")?), File::from(owned_fd(arguments, "ram-layout-fd")?), RamInputAuthority::IdentifiedSnapshot(RamImageAuthentication {
+            state: expected,
+            stream: authentication[32..]
+                .try_into()
+                .map_err(|_| "stream identity width")?,
+        }), &validated)
         .map_err(|error| error.to_string())?,
     );
     if image.layout().packed_len() > MAX_RAM {

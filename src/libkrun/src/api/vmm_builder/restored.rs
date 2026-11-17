@@ -27,7 +27,7 @@ use crate::vmm::execution::device_restore::{
     DeviceEnvelope, PreparedDeviceInstall, RestoreDeviceBinding, ValidatedDevices,
 };
 use crate::vmm::execution::{ExecutionEnvelope, MAX_EXECUTION_BYTES, ValidatedExecution};
-use crate::vmm::memory::image::{AuthenticatedRamImage, map_restore_ram};
+use crate::vmm::memory::image::{AdmittedRamImage, map_restore_ram};
 
 pub(crate) const MAX_DEVICES_BYTES: usize = 32 * 1024 * 1024;
 type Inode = (u64, u64);
@@ -94,18 +94,34 @@ fn distinct(inodes: &mut Vec<Inode>, inode: Inode, role: RestoreRole) -> Result<
 pub(crate) fn read_object(
     file: &File,
     role: RestoreRole,
-    expected: &StateObjectIdentity,
+    expected: &StateObjectAuthority,
     limit: usize,
 ) -> Result<Vec<u8>, RestoreError> {
-    let length = file.metadata().map_err(|error| io(role, error))?.len();
-    if length != expected.length || length == 0 || length > limit as u64 {
+    let before = file.metadata().map_err(|error| io(role, error))?;
+    let length = before.len();
+    if length != expected.length() || length == 0 || length > limit as u64 {
         return Err(descriptor(role, RestoreProblem::Length));
+    }
+    if let StateObjectAuthority::OwnedLocalFile { fingerprint } = expected
+        && (!before.is_file()
+            || fingerprint.mode & 0o222 != 0
+            || NativeFileFingerprint::from_metadata(&before) != *fingerprint)
+    {
+        return Err(descriptor(role, RestoreProblem::FileFacts));
     }
     let mut bytes = vec![0; length as usize];
     file.read_exact_at(&mut bytes, 0)
         .map_err(|error| io(role, error))?;
-    if sha256(&bytes) != expected.sha256 {
-        return Err(descriptor(role, RestoreProblem::Digest));
+    match expected {
+        StateObjectAuthority::Identified(identity) if sha256(&bytes) != identity.sha256 =>
+            return Err(descriptor(role, RestoreProblem::Digest)),
+        StateObjectAuthority::OwnedLocalFile { fingerprint } => {
+            let after = file.metadata().map_err(|error| io(role, error))?;
+            if NativeFileFingerprint::from_metadata(&after) != *fingerprint {
+                return Err(descriptor(role, RestoreProblem::FileFacts));
+            }
+        }
+        _ => {}
     }
     Ok(bytes)
 }
@@ -615,10 +631,16 @@ impl<'a> VmmBuilder<'a> {
             return Err(refusal(RestoreError::Refused(RestoreProblem::Deadline)));
         }
         preflight(&inputs, &resources).map_err(refusal)?;
-        if inputs.expected.binding != inputs.expected.ram_image.state
-            || inputs.expected.ram_image.stream == [0; 32]
-        {
+        if !inputs.expected.validate_authority() {
             return Err(refusal(RestoreError::Refused(RestoreProblem::Topology)));
+        }
+        if matches!(inputs.expected.ram_image, crate::api::live::RamInputAuthority::OwnedLocalCut { .. })
+            && resources.blocks.iter().any(|block| {
+                matches!(&block.backing, RestoreBlockBacking::Raw { read_only: false, .. })
+                    && block.tracking_seed.as_ref().is_none_or(|seed| seed.baseline.is_some())
+            })
+        {
+            return Err(refusal(RestoreError::Refused(RestoreProblem::Generation)));
         }
         let bytes = read_object(
             &inputs.execution,
@@ -667,7 +689,7 @@ impl<'a> VmmBuilder<'a> {
         .map_err(RestoreError::from)
         .map_err(refusal)?;
         let image = Arc::new(
-            AuthenticatedRamImage::for_restore(
+            AdmittedRamImage::for_restore(
                 inputs.ram,
                 inputs.layout,
                 inputs.expected.ram_image,
@@ -999,19 +1021,20 @@ mod tests {
             execution: File::open(files[2].as_path()).unwrap(),
             devices: File::open(files[3].as_path()).unwrap(),
             expected: RestoreIdentity {
-                ram_image: crate::api::live::RamImageAuthentication {
-                    state: binding.clone(),
-                    stream: [7; 32],
-                },
+                ram_image: crate::api::live::RamInputAuthority::IdentifiedSnapshot(
+                    crate::api::live::RamImageAuthentication {
+                        state: binding.clone(),
+                        stream: [7; 32],
+                    }),
                 binding,
-                execution_object: StateObjectIdentity {
+                execution_object: StateObjectAuthority::Identified(StateObjectIdentity {
                     length: 3,
                     sha256: sha256(b"bad"),
-                },
-                devices_object: StateObjectIdentity {
+                }),
+                devices_object: StateObjectAuthority::Identified(StateObjectIdentity {
                     length: 3,
                     sha256: sha256(b"bad"),
-                },
+                }),
             },
         }
     }
@@ -1457,13 +1480,13 @@ mod tests {
             sha256: sha256(b"abc"),
         };
         assert_eq!(
-            read_object(&input, RestoreRole::Execution, &expected, 3).unwrap(),
+            read_object(&input, RestoreRole::Execution, &StateObjectAuthority::Identified(expected.clone()), 3).unwrap(),
             b"abc"
         );
-        assert!(read_object(&input, RestoreRole::Execution, &expected, 2).is_err());
+        assert!(read_object(&input, RestoreRole::Execution, &StateObjectAuthority::Identified(expected.clone()), 2).is_err());
         expected.sha256[0] ^= 1;
         assert!(matches!(
-            read_object(&input, RestoreRole::Execution, &expected, 3),
+            read_object(&input, RestoreRole::Execution, &StateObjectAuthority::Identified(expected.clone()), 3),
             Err(RestoreError::Descriptor {
                 problem: RestoreProblem::Digest,
                 ..
@@ -1471,7 +1494,7 @@ mod tests {
         ));
         expected.length = 4;
         assert!(matches!(
-            read_object(&input, RestoreRole::Execution, &expected, 4),
+            read_object(&input, RestoreRole::Execution, &StateObjectAuthority::Identified(expected), 4),
             Err(RestoreError::Descriptor {
                 problem: RestoreProblem::Length,
                 ..
@@ -1619,5 +1642,33 @@ mod tests {
                 .map(|(fence, phase)| (fence.key, phase)),
             Some((request.key, DispatchPhase::Parked))
         );
+    }
+
+    #[test]
+    fn owned_metadata_reads_require_exact_immutable_file_facts_not_a_digest() {
+        use std::os::unix::fs::FileExt;
+        let backing = file(b"owned execution bytes");
+        let mut permissions = backing.as_file().metadata().unwrap().permissions();
+        permissions.set_readonly(true);
+        backing.as_file().set_permissions(permissions).unwrap();
+        let input = File::open(backing.as_path()).unwrap();
+        let fingerprint = NativeFileFingerprint::from_metadata(&input.metadata().unwrap());
+        let authority = StateObjectAuthority::OwnedLocalFile { fingerprint: fingerprint.clone() };
+        assert_eq!(read_object(&input, RestoreRole::Execution, &authority, 64).unwrap(),
+            b"owned execution bytes");
+        let mut wrong = fingerprint.clone();
+        wrong.inode += 1;
+        assert!(matches!(read_object(&input, RestoreRole::Execution,
+            &StateObjectAuthority::OwnedLocalFile { fingerprint: wrong }, 64),
+            Err(RestoreError::Descriptor { problem: RestoreProblem::FileFacts, .. })));
+        backing.as_file().write_all_at(b"changed execution now", 0).unwrap();
+        backing.as_file().set_times(std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1234),
+        )).unwrap();
+        assert!(matches!(read_object(&input, RestoreRole::Execution, &authority, 64),
+            Err(RestoreError::Descriptor { problem: RestoreProblem::FileFacts, .. })));
+        backing.as_file().set_len(1).unwrap();
+        assert!(matches!(read_object(&input, RestoreRole::Execution, &authority, 64),
+            Err(RestoreError::Descriptor { problem: RestoreProblem::Length, .. })));
     }
 }

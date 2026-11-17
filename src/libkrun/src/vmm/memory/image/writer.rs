@@ -18,9 +18,10 @@ use crate::vmm::execution::StateBinding;
 use crate::vmm::memory::AttemptId;
 use crate::vmm::memory::image::changes::ChangeWriter;
 use crate::vmm::memory::image::{
-    RAM_IDENTITY_CHUNK_BYTES, RamCaptureMode, RamCaptureReceipt, RamFileRole, RamImageEffects,
-    RamImageError, RamImageFailure, RamIoOperation, RamIoScratch, RamIoStats, RamOutputFiles,
-    RamSeedMethod, RamWriteMode, ValidatedRamLayout, check_deadline, io_error, preflight,
+    RAM_IDENTITY_CHUNK_BYTES, RamCaptureIdentity, RamCaptureMode, RamCaptureReceipt, RamFileRole,
+    RamHashSelection, RamIdentityAnchor, RamIdentityReceipt, RamImageEffects, RamImageError,
+    RamImageFailure, RamIoOperation, RamIoScratch, RamIoStats, RamOutputFiles, RamSeedMethod,
+    RamWriteMode, ValidatedRamLayout, check_deadline, io_error, preflight,
 };
 
 mod pipeline;
@@ -33,6 +34,7 @@ pub fn write_ram_image(
     cut: &MemoryCut,
     binding: &StateBinding,
     layout: Arc<ValidatedRamLayout>,
+    identity: RamCaptureIdentity<'_>,
     mode: RamWriteMode<'_>,
     output: RamOutputFiles,
     scratch: &mut RamIoScratch,
@@ -40,6 +42,8 @@ pub fn write_ram_image(
 ) -> Result<RamCaptureReceipt, RamImageFailure> {
     let mut stats = RamIoStats {
         logical_bytes: layout.packed_len(),
+        identity_dirty_pages: identity.identity_dirty_pages as u64,
+        materialization_dirty_pages: identity.materialization_dirty_pages as u64,
         ..RamIoStats::default()
     };
     let mut effects = RamImageEffects::None;
@@ -49,18 +53,45 @@ pub fn write_ram_image(
     };
     let result = (|| {
         check_deadline(deadline)?;
+        if let RamHashSelection::SinceAnchor { stream, dirty } = identity.selection {
+            if identity.anchor != (RamIdentityAnchor::Identified { stream })
+                || matches!(
+                    identity.anchor_generation,
+                    crate::vmm::memory::image::RamIdentityGeneration::Unknown
+                )
+                || !cut.domain().coverage_valid()
+                || dirty.page_count() != cut.domain().layout().page_count()
+            {
+                return Err(RamImageError::Completion);
+            }
+            if let RamWriteMode::Incremental { dirty: writes, .. } = &mode
+                && writes
+                    .words()
+                    .iter()
+                    .zip(dirty.words())
+                    .any(|(writes, hashes)| writes & !hashes != 0)
+            {
+                return Err(RamImageError::Bitmap);
+            }
+        }
         let preparation = preflight(cut, binding, &layout, &mode, &output, deadline)?;
-        let baseline_stream = match &mode {
-            RamWriteMode::Full => None,
-            RamWriteMode::Incremental { baseline, .. } => Some(baseline.authentication.stream),
+        let mut changes = match identity.selection {
+            RamHashSelection::None => ChangeWriter::None,
+            RamHashSelection::Full => ChangeWriter::new(
+                &output.changes,
+                RamCaptureMode::Full,
+                None,
+                layout.packed_len().div_ceil(RAM_IDENTITY_CHUNK_BYTES),
+                deadline,
+            )?,
+            RamHashSelection::SinceAnchor { stream, .. } => ChangeWriter::new(
+                &output.changes,
+                RamCaptureMode::Incremental,
+                Some(stream),
+                layout.packed_len().div_ceil(RAM_IDENTITY_CHUNK_BYTES),
+                deadline,
+            )?,
         };
-        let mut changes = ChangeWriter::new(
-            &output.changes,
-            selected,
-            baseline_stream,
-            layout.packed_len().div_ceil(RAM_IDENTITY_CHUNK_BYTES),
-            deadline,
-        )?;
         check_deadline(deadline)?;
         set_length(&output.ram, RamFileRole::OutputRam, 0, deadline)?;
         effects = RamImageEffects::Started;
@@ -79,9 +110,11 @@ pub fn write_ram_image(
         }
         pipeline::write(
             pipeline::Input {
+                byte_baseline: identity.byte_baseline,
                 cut,
                 layout: &layout,
                 mode: &mode,
+                identity: &identity.selection,
                 seeded: stats.seed_method == RamSeedMethod::Clone,
                 deadline,
             },
@@ -132,6 +165,12 @@ pub fn write_ram_image(
         binding,
         layout,
         selected,
+        RamIdentityReceipt {
+            policy: identity.selection.policy(),
+            anchor: identity.anchor,
+            anchor_generation: identity.anchor_generation,
+            predecessor_generation: identity.predecessor_generation,
+        },
         output,
         stats.clone(),
         changes,
@@ -566,9 +605,10 @@ mod tests {
         seed_incremental, write_exact_at, write_ram_image,
     };
     use crate::vmm::memory::image::{
-        AuthenticatedRamImage, RAM_IDENTITY_CHUNK_BYTES, RamCaptureReceipt, RamFileRole,
-        RamImageAuthentication, RamImageEffects, RamImageError, RamIoOperation, RamIoScratch,
-        RamIoStats, RamOutputFiles, RamSeedMethod, RamWriteMode, ValidatedRamLayout,
+        AdmittedRamImage, RAM_IDENTITY_CHUNK_BYTES, RamCaptureIdentity, RamCaptureReceipt,
+        RamFileRole, RamHashSelection, RamIdentityAnchor, RamIdentityReceipt,
+        RamImageAuthentication, RamImageEffects, RamImageError, RamInputAuthority, RamIoOperation,
+        RamIoScratch, RamIoStats, RamOutputFiles, RamSeedMethod, RamWriteMode, ValidatedRamLayout,
         seal_completed,
     };
 
@@ -587,8 +627,8 @@ mod tests {
         use crate::vmm::memory::image::writer::pipeline as native;
         use crate::vmm::memory::image::writer::tests::{ChangeWriter, read_test_changes};
         use crate::vmm::memory::image::{
-            RAM_IDENTITY_CHUNK_BYTES, RamCaptureMode, RamImageError, RamIoScratch, RamIoStats,
-            RamWriteMode,
+            RAM_IDENTITY_CHUNK_BYTES, RamCaptureMode, RamIdentityAnchor, RamImageError,
+            RamIoScratch, RamIoStats, RamWriteMode,
         };
         pub(crate) use native::Input;
         use std::fs::File;
@@ -616,7 +656,10 @@ mod tests {
                 RamWriteMode::Full => (RamCaptureMode::Full, None),
                 RamWriteMode::Incremental { baseline, .. } => (
                     RamCaptureMode::Incremental,
-                    Some(baseline.authentication().stream),
+                    Some(match baseline.authority().identity_anchor() {
+                        RamIdentityAnchor::Identified { stream } => stream,
+                        RamIdentityAnchor::Unknown => panic!("identified fixture required"),
+                    }),
                 ),
             };
             let mut changes = ChangeWriter::new(
@@ -1058,16 +1101,16 @@ mod tests {
                 .map(|index| *index as usize)
                 .collect()
         }
-        fn seal(&self, receipt: &mut RamCaptureReceipt) -> Arc<AuthenticatedRamImage> {
+        fn seal(&self, receipt: &mut RamCaptureReceipt) -> Arc<AdmittedRamImage> {
             Arc::new(
                 seal_completed(
                     receipt,
                     File::open(self.ram.as_path()).unwrap(),
                     File::open(self.layout.as_path()).unwrap(),
-                    RamImageAuthentication {
+                    RamInputAuthority::IdentifiedSnapshot(RamImageAuthentication {
                         state: binding(),
                         stream: [0; 32],
-                    },
+                    }),
                 )
                 .unwrap(),
             )
@@ -1086,6 +1129,7 @@ mod tests {
             cut,
             &binding(),
             layout,
+            RamCaptureIdentity::for_test(&mode),
             mode,
             output,
             &mut RamIoScratch::new().unwrap(),
@@ -1191,7 +1235,7 @@ mod tests {
         assert_eq!(
             incremental.stats().live_bytes_read,
             if incremental.stats().seed_method == RamSeedMethod::Clone {
-                RAM_IDENTITY_CHUNK_BYTES + 4 * 4096
+                RAM_IDENTITY_CHUNK_BYTES + 2 * 4096
             } else {
                 4 * 4096
             }
@@ -1204,6 +1248,7 @@ mod tests {
         assert!(incremental.stats().explicit_zero_bytes_written <= 3 * 4096);
         if incremental.stats().seed_method == RamSeedMethod::Clone {
             assert_eq!(incremental.stats().baseline_bytes_read, 0);
+            assert_eq!(incremental.stats().baseline_hole_bytes, 0);
             assert_eq!(incremental.stats().baseline_bytes_written, 0);
             assert_eq!(incremental.stats().extent_queries, 0);
         } else {
@@ -1364,10 +1409,15 @@ mod tests {
             let mut digests = pipeline::allocate_digests(layout.packed_len()).unwrap();
             pipeline::write(
                 pipeline::Input {
+                    byte_baseline: None,
                     cut: &current,
                     layout: &layout,
                     mode: &RamWriteMode::Incremental {
                         baseline: &baseline,
+                        dirty: &dirty,
+                    },
+                    identity: &RamHashSelection::SinceAnchor {
+                        stream: [0; 32],
                         dirty: &dirty,
                     },
                     seeded: false,
@@ -1430,6 +1480,7 @@ mod tests {
             &current,
             &binding(),
             layout.clone(),
+            RamCaptureIdentity::for_test(&RamWriteMode::Full),
             RamWriteMode::Full,
             alias,
             &mut RamIoScratch::new().unwrap(),
@@ -1449,6 +1500,7 @@ mod tests {
             &current,
             &binding(),
             layout,
+            RamCaptureIdentity::for_test(&RamWriteMode::Full),
             RamWriteMode::Full,
             files.owned(),
             &mut RamIoScratch::new().unwrap(),
@@ -1584,6 +1636,7 @@ mod tests {
                 &current,
                 &binding(),
                 layout.clone(),
+                RamCaptureIdentity::for_test(&RamWriteMode::Full),
                 RamWriteMode::Full,
                 output,
                 &mut RamIoScratch::new().unwrap(),
@@ -1627,6 +1680,7 @@ mod tests {
             &mapped_cut,
             &binding(),
             layout,
+            RamCaptureIdentity::for_test(&RamWriteMode::Full),
             RamWriteMode::Full,
             output,
             &mut RamIoScratch::new().unwrap(),
@@ -1674,8 +1728,18 @@ mod tests {
         );
         assert_eq!(initial_receipt.stats().full_bytes_written, 0);
         assert_eq!(initial_receipt.stats().zero_bytes_omitted, length as u64);
-        assert_eq!(initial_receipt.changes().record_count(), 0);
-        assert_eq!(initial_receipt.changes().byte_len(), 16);
+        assert_eq!(
+            initial_receipt
+                .changes()
+                .identified()
+                .unwrap()
+                .record_count(),
+            0
+        );
+        assert_eq!(
+            initial_receipt.changes().identified().unwrap().byte_len(),
+            16
+        );
         assert_eq!(baseline_files.bytes(), vec![0; length]);
         let baseline = baseline_files.seal(&mut initial_receipt);
         let epoch = initial.issue_epoch(2).unwrap();
@@ -1706,14 +1770,7 @@ mod tests {
         let mut expected = vec![0; length];
         expected[..changed].fill(0x7f);
         assert_eq!(outputs.bytes(), expected);
-        assert_eq!(
-            receipt.stats().live_bytes_read,
-            if receipt.stats().seed_method == RamSeedMethod::Clone {
-                (changed as u64).div_ceil(RAM_IDENTITY_CHUNK_BYTES) * RAM_IDENTITY_CHUNK_BYTES
-            } else {
-                changed as u64
-            }
-        );
+        assert_eq!(receipt.stats().live_bytes_read, changed as u64);
         assert_eq!(receipt.stats().overlay_bytes_written, changed as u64);
         assert_eq!(receipt.stats().explicit_zero_bytes_written, 0);
     }
@@ -1751,6 +1808,7 @@ mod tests {
             &current,
             &binding(),
             layout,
+            RamCaptureIdentity::for_test(&RamWriteMode::Full),
             RamWriteMode::Full,
             output,
             &mut RamIoScratch::new().unwrap(),
@@ -1860,6 +1918,7 @@ mod tests {
             &current,
             &binding(),
             layout(&domain),
+            RamCaptureIdentity::for_test(&RamWriteMode::Full),
             RamWriteMode::Full,
             files.owned(),
             &mut RamIoScratch::new().unwrap(),
@@ -1954,6 +2013,12 @@ mod tests {
             &binding(),
             layout.clone(),
             finished.mode(),
+            RamIdentityReceipt {
+                policy: *finished.identity_policy(),
+                anchor: finished.identity_anchor(),
+                anchor_generation: finished.identity_anchor_generation(),
+                predecessor_generation: finished.predecessor_generation(),
+            },
             output,
             finished.stats().clone(),
             finished.changes().clone(),
@@ -2586,9 +2651,11 @@ mod tests {
         let mut stats = RamIoStats::default();
         pipeline::write(
             pipeline::Input {
+                byte_baseline: None,
                 cut: current,
                 layout,
                 mode,
+                identity: &RamCaptureIdentity::for_test(mode).selection,
                 seeded,
                 deadline: deadline(),
             },
@@ -2789,9 +2856,11 @@ mod tests {
         let started = Instant::now();
         let error = pipeline::write(
             pipeline::Input {
+                byte_baseline: None,
                 cut: &current,
                 layout: &layout,
                 mode: &RamWriteMode::Full,
+                identity: &RamHashSelection::Full,
                 seeded: false,
                 deadline: deadline(),
             },
@@ -2809,9 +2878,11 @@ mod tests {
         assert_eq!(stats.full_bytes_written, 0);
         pipeline::write(
             pipeline::Input {
+                byte_baseline: None,
                 cut: &current,
                 layout: &layout,
                 mode: &RamWriteMode::Full,
+                identity: &RamHashSelection::Full,
                 seeded: false,
                 deadline: deadline(),
             },
@@ -2839,9 +2910,11 @@ mod tests {
         let mut stats = RamIoStats::default();
         let error = pipeline::write(
             pipeline::Input {
+                byte_baseline: None,
                 cut: &current,
                 layout: &layout,
                 mode: &RamWriteMode::Full,
+                identity: &RamHashSelection::Full,
                 seeded: false,
                 deadline: Instant::now(),
             },
@@ -3010,18 +3083,21 @@ mod tests {
         let bytes = std::fs::read(files.changes.as_path()).unwrap();
         assert!(bytes.len() >= 16);
         assert_eq!(receipt.identity_chunk_bytes(), 65536);
-        assert_eq!(receipt.changes().byte_len(), bytes.len() as u64);
         assert_eq!(
-            *receipt.changes().sha256(),
+            receipt.changes().identified().unwrap().byte_len(),
+            bytes.len() as u64
+        );
+        assert_eq!(
+            *receipt.changes().identified().unwrap().sha256(),
             <[u8; 32]>::from(Sha256::digest(&bytes))
         );
         assert_eq!(
-            receipt.changes().record_count(),
+            receipt.changes().identified().unwrap().record_count(),
             (bytes.len() as u64 - 16) / 56
         );
         assert_eq!(
             receipt.output_identities()[2],
-            receipt.changes().output_identity()
+            receipt.changes().identified().unwrap().output_identity()
         );
         let _ = read_test_changes(files.changes.as_file());
     }
@@ -3070,22 +3146,29 @@ mod tests {
                 output,
             );
             let units = (changed as u64).div_ceil(RAM_IDENTITY_CHUNK_BYTES);
-            assert_eq!(receipt.changes().record_count(), units);
             assert_eq!(
-                receipt.changes().baseline_stream(),
-                Some(baseline.authentication().stream)
+                receipt.changes().identified().unwrap().record_count(),
+                units
+            );
+            assert_eq!(
+                receipt.changes().identified().unwrap().baseline_stream(),
+                Some([0; 32])
             );
             assert_eq!(
                 receipt.stats().identity_bytes_hashed,
                 units * RAM_IDENTITY_CHUNK_BYTES
             );
-            if receipt.stats().seed_method == RamSeedMethod::Clone {
-                assert_eq!(
-                    receipt.stats().live_bytes_read,
+            assert_eq!(
+                receipt.stats().live_bytes_read,
+                if receipt.stats().seed_method == RamSeedMethod::Clone {
                     units * RAM_IDENTITY_CHUNK_BYTES
-                );
-            } else {
-                assert_eq!(receipt.stats().live_bytes_read, changed as u64);
+                } else {
+                    changed as u64
+                }
+            );
+            if receipt.stats().seed_method == RamSeedMethod::Clone {
+                assert_eq!(receipt.stats().baseline_bytes_read, 0);
+                assert_eq!(receipt.stats().extent_queries, 0);
             }
             let identities = independent_digests(&files.bytes());
             for (index, digest) in read_test_changes(files.changes.as_file()) {
@@ -3112,7 +3195,7 @@ mod tests {
             baseline_files.owned(),
         );
         assert_eq!(baseline_files.indices(), [0]);
-        assert_eq!(full.changes().record_count(), 1);
+        assert_eq!(full.changes().identified().unwrap().record_count(), 1);
         assert_change_binding(&baseline_files, &full);
         let baseline = baseline_files.seal(&mut full);
         control
@@ -3186,8 +3269,8 @@ mod tests {
             },
             output,
         );
-        assert_eq!(receipt.changes().record_count(), 0);
-        assert_eq!(receipt.changes().byte_len(), 16);
+        assert_eq!(receipt.changes().identified().unwrap().record_count(), 0);
+        assert_eq!(receipt.changes().identified().unwrap().byte_len(), 16);
         assert_eq!(receipt.stats().live_bytes_read, 0);
         assert_eq!(receipt.stats().identity_bytes_hashed, 0);
         if receipt.stats().seed_method == RamSeedMethod::Clone {
@@ -3229,9 +3312,11 @@ mod tests {
             let mut stats = RamIoStats::default();
             native::write_with_workers(
                 native::Input {
+                    byte_baseline: None,
                     cut: &current,
                     layout: &layout,
                     mode: &RamWriteMode::Full,
+                    identity: &RamHashSelection::Full,
                     seeded: false,
                     deadline: deadline(),
                 },
@@ -3242,7 +3327,8 @@ mod tests {
                 workers,
             )
             .unwrap();
-            let receipt = changes.finish().unwrap();
+            let changes = changes.finish().unwrap();
+            let receipt = changes.identified().unwrap();
             assert_eq!(receipt.record_count(), 6);
             assert_eq!(files.indices(), [0, 1, 511, 512, 513, 1024]);
             assert_eq!(
@@ -3305,6 +3391,7 @@ mod tests {
             &current,
             &binding(),
             layout(&domain),
+            RamCaptureIdentity::for_test(&RamWriteMode::Full),
             RamWriteMode::Full,
             output,
             &mut RamIoScratch::new().unwrap(),
@@ -3373,7 +3460,7 @@ mod tests {
             let mut changes = ChangeWriter::new(
                 files.changes.as_file(),
                 RamCaptureMode::Incremental,
-                Some(baseline.authentication().stream),
+                Some([0; 32]),
                 513,
                 deadline(),
             )
@@ -3381,9 +3468,11 @@ mod tests {
             let mut stats = RamIoStats::default();
             native::write(
                 native::Input {
+                    byte_baseline: None,
                     cut: &current,
                     layout: &layout,
                     mode: &mode,
+                    identity: &RamCaptureIdentity::for_test(&mode).selection,
                     seeded,
                     deadline: deadline(),
                 },
@@ -3394,6 +3483,7 @@ mod tests {
             )
             .unwrap();
             let receipt = changes.finish().unwrap();
+            let receipt = receipt.identified().unwrap();
             assert_eq!(receipt.record_count(), 1);
             assert_eq!(receipt.byte_len(), 72);
             assert_eq!(stats.identity_bytes_hashed, 0);
@@ -3439,6 +3529,7 @@ mod tests {
                 &current,
                 &binding(),
                 layout.clone(),
+                RamCaptureIdentity::for_test(&RamWriteMode::Full),
                 RamWriteMode::Full,
                 output,
                 &mut RamIoScratch::new().unwrap(),
@@ -3462,5 +3553,938 @@ mod tests {
                 b"layout sentinel"
             );
         }
+    }
+
+    #[test]
+    fn unhashed_full_and_incremental_multiregion_images_match_real_byte_oracle() {
+        use crate::vmm::memory::image::RamChangeAuthority;
+        use crate::vmm::memory::image::writer::pipeline as native;
+        let gap = 1 << 20;
+        let raw =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 65536), (GuestAddress(gap), 65536)])
+                .unwrap();
+        raw.write_slice(&[0x11; 4096], GuestAddress(0)).unwrap();
+        raw.write_slice(&[0x22; 4096], GuestAddress(gap + 15 * 4096))
+            .unwrap();
+        let (domain, mut control) = tracked(raw);
+        let layout = layout(&domain);
+        let initial = cut(&mut control);
+        let files = Outputs::new();
+        let receipt = write_ram_image(
+            AttemptId::for_test(),
+            key(),
+            &initial,
+            &binding(),
+            layout.clone(),
+            RamCaptureIdentity {
+                selection: RamHashSelection::None,
+                anchor: RamIdentityAnchor::Unknown,
+                anchor_generation: crate::vmm::memory::image::RamIdentityGeneration::Unknown,
+                predecessor_generation: 0,
+                identity_dirty_pages: 0,
+                materialization_dirty_pages: 0,
+                byte_baseline: None,
+            },
+            RamWriteMode::Full,
+            files.owned(),
+            &mut RamIoScratch::new().unwrap(),
+            deadline(),
+        )
+        .unwrap();
+        let mut expected = vec![0; 2 * 65536];
+        expected[..4096].fill(0x11);
+        expected[65536 + 15 * 4096..].fill(0x22);
+        assert_eq!(files.bytes(), expected);
+        assert!(matches!(receipt.changes(), RamChangeAuthority::None));
+        assert_eq!(receipt.stats().identity_bytes_hashed, 0);
+        assert_eq!(receipt.stats().identity_zero_bytes_filled, 0);
+        assert_eq!(receipt.stats().whole_file_bytes_hashed, 0);
+        assert_eq!(receipt.stats().map_nodes_written, 0);
+        assert_eq!(files.changes.as_file().metadata().unwrap().len(), 0);
+        #[cfg(target_os = "linux")]
+        assert!(receipt.stats().known_zero_bytes_skipped > 0);
+        let baseline = Arc::new(
+            seal_completed(
+                &receipt,
+                File::open(files.ram.as_path()).unwrap(),
+                File::open(files.layout.as_path()).unwrap(),
+                RamInputAuthority::OwnedLocalCut {
+                    state: binding(),
+                    materialization_generation: 1,
+                },
+            )
+            .unwrap(),
+        );
+        let original = files.bytes();
+        control
+            .reopen(&initial, &initial.issue_epoch(2).unwrap())
+            .unwrap();
+        domain
+            .write(GuestAddress(0), 4096)
+            .unwrap()
+            .write_view(0, 4096)
+            .unwrap()
+            .write_slice(&[0; 4096], 0)
+            .unwrap();
+        domain
+            .write(GuestAddress(gap + 4096 + 7), 1)
+            .unwrap()
+            .write_view(0, 1)
+            .unwrap()
+            .write_slice(&[0x33], 0)
+            .unwrap();
+        expected[..4096].fill(0);
+        expected[65536 + 4096 + 7] = 0x33;
+        let current = cut(&mut control);
+        let mut dirty = DirtyPageMap::new(domain.layout());
+        control.drain_host_dirty(&current, &mut dirty).unwrap();
+        assert_eq!(dirty.count(), 2);
+        let mode = RamWriteMode::Incremental {
+            baseline: &baseline,
+            dirty: &dirty,
+        };
+        for seeded in [false, true] {
+            let output = Outputs::new();
+            output.ram.as_file().set_len(layout.packed_len()).unwrap();
+            if seeded {
+                output.ram.as_file().write_all_at(&original, 0).unwrap();
+            }
+            let mut stats = RamIoStats::default();
+            let mut changes = ChangeWriter::None;
+            native::write(
+                native::Input {
+                    byte_baseline: None,
+                    cut: &current,
+                    layout: &layout,
+                    mode: &mode,
+                    identity: &RamHashSelection::None,
+                    seeded,
+                    deadline: deadline(),
+                },
+                output.ram.as_file(),
+                &mut RamIoScratch::new().unwrap(),
+                &mut stats,
+                &mut changes,
+            )
+            .unwrap();
+            assert!(matches!(
+                changes.finish().unwrap(),
+                RamChangeAuthority::None
+            ));
+            assert_eq!(output.bytes(), expected);
+            assert_eq!(stats.live_bytes_read, 2 * 4096);
+            assert_eq!(stats.identity_bytes_hashed, 0);
+            assert_eq!(stats.whole_file_bytes_hashed, 0);
+            assert_eq!(stats.map_nodes_written, 0);
+            assert_eq!(stats.zero_run_bytes_covered, 4096);
+            assert_eq!(output.changes.as_file().metadata().unwrap().len(), 0);
+            if seeded {
+                assert_eq!(stats.baseline_bytes_read, 0);
+                assert_eq!(stats.baseline_bytes_written, 0);
+                assert_eq!(stats.extent_queries, 0);
+            }
+        }
+        let output = Outputs::new();
+        let mut owned = output.owned();
+        owned.protect_baseline(Some(baseline.clone()));
+        let receipt = write_ram_image(
+            AttemptId::for_test(),
+            key(),
+            &current,
+            &binding(),
+            layout.clone(),
+            RamCaptureIdentity {
+                selection: RamHashSelection::None,
+                anchor: RamIdentityAnchor::Unknown,
+                anchor_generation: crate::vmm::memory::image::RamIdentityGeneration::Unknown,
+                predecessor_generation: 1,
+                identity_dirty_pages: 2,
+                materialization_dirty_pages: 2,
+                byte_baseline: Some((&baseline, &dirty)),
+            },
+            RamWriteMode::Incremental {
+                baseline: &baseline,
+                dirty: &dirty,
+            },
+            owned,
+            &mut RamIoScratch::new().unwrap(),
+            deadline(),
+        )
+        .unwrap();
+        assert_eq!(output.bytes(), expected);
+        assert_eq!(receipt.stats().live_bytes_read, 2 * 4096);
+        assert_eq!(receipt.stats().identity_bytes_hashed, 0);
+        assert!(matches!(receipt.changes(), RamChangeAuthority::None));
+        let snapshot = Outputs::new();
+        let mut owned = snapshot.owned();
+        owned.protect_baseline(Some(baseline.clone()));
+        let receipt = write_ram_image(
+            AttemptId::for_test(),
+            key(),
+            &current,
+            &binding(),
+            layout,
+            RamCaptureIdentity {
+                selection: RamHashSelection::Full,
+                anchor: RamIdentityAnchor::Unknown,
+                anchor_generation: crate::vmm::memory::image::RamIdentityGeneration::Unknown,
+                predecessor_generation: 1,
+                identity_dirty_pages: 2,
+                materialization_dirty_pages: 2,
+                byte_baseline: Some((&baseline, &dirty)),
+            },
+            RamWriteMode::Incremental {
+                baseline: &baseline,
+                dirty: &dirty,
+            },
+            owned,
+            &mut RamIoScratch::new().unwrap(),
+            deadline(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.bytes(), expected);
+        assert_eq!(snapshot.digests(), independent_digests(&expected));
+        assert_eq!(
+            receipt.changes().identified().unwrap().coverage(),
+            crate::vmm::memory::image::RamCaptureMode::Full
+        );
+        assert_eq!(
+            receipt.changes().identified().unwrap().baseline_stream(),
+            None
+        );
+        assert_eq!(
+            receipt.stats().live_bytes_read,
+            if receipt.stats().seed_method == RamSeedMethod::Clone {
+                3 * 4096
+            } else {
+                2 * 4096
+            }
+        );
+        assert_eq!(files.bytes(), original);
+    }
+
+    #[test]
+    fn seeded_snapshot_hashes_retained_dirty_units_live_without_baseline_reads_or_writes() {
+        use crate::vmm::memory::image::writer::pipeline as native;
+        let unit = RAM_IDENTITY_CHUNK_BYTES as usize;
+        let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 3 * unit)]).unwrap();
+        raw.write_slice(&vec![0x41; 3 * unit], GuestAddress(0))
+            .unwrap();
+        let (domain, mut control) = tracked(raw);
+        let layout = layout(&domain);
+        let initial = cut(&mut control);
+        let initial_files = Outputs::new();
+        let mut initial_receipt = capture(
+            &initial,
+            layout.clone(),
+            RamWriteMode::Full,
+            initial_files.owned(),
+        );
+        let anchor = initial_files.seal(&mut initial_receipt);
+        let RamIdentityAnchor::Identified { stream } = anchor.authority().identity_anchor() else {
+            panic!("identified initial anchor required")
+        };
+        control
+            .reopen(&initial, &initial.issue_epoch(2).unwrap())
+            .unwrap();
+        domain
+            .write(GuestAddress(0), 4096)
+            .unwrap()
+            .write_view(0, 4096)
+            .unwrap()
+            .write_slice(&[0x72; 4096], 0)
+            .unwrap();
+        let fork_cut = cut(&mut control);
+        let mut retained = DirtyPageMap::new(domain.layout());
+        control.drain_host_dirty(&fork_cut, &mut retained).unwrap();
+        assert_eq!(retained.count(), 1);
+        let mode = RamWriteMode::Incremental {
+            baseline: &anchor,
+            dirty: &retained,
+        };
+        let mut identity = RamCaptureIdentity::for_test(&mode);
+        identity.selection = RamHashSelection::None;
+        let fork_files = Outputs::new();
+        let mut output = fork_files.owned();
+        output.protect_baseline(Some(anchor.clone()));
+        let fork = write_ram_image(
+            AttemptId::for_test(),
+            key(),
+            &fork_cut,
+            &binding(),
+            layout.clone(),
+            identity,
+            mode,
+            output,
+            &mut RamIoScratch::new().unwrap(),
+            deadline(),
+        )
+        .unwrap();
+        let baseline = seal_completed(
+            &fork,
+            File::open(fork_files.ram.as_path()).unwrap(),
+            File::open(fork_files.layout.as_path()).unwrap(),
+            RamInputAuthority::OwnedLocalCut {
+                state: binding(),
+                materialization_generation: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(fork.stats().live_bytes_read, 4096);
+        assert_eq!(fork.stats().identity_bytes_hashed, 0);
+        control
+            .reopen(&fork_cut, &fork_cut.issue_epoch(3).unwrap())
+            .unwrap();
+        let current = cut(&mut control);
+        let mut writes = DirtyPageMap::new(domain.layout());
+        control.drain_host_dirty(&current, &mut writes).unwrap();
+        assert_eq!(writes.count(), 0);
+        let expected = fork_files.bytes();
+        let snapshot = Outputs::new();
+        snapshot.ram.as_file().write_all_at(&expected, 0).unwrap();
+        let mut changes = ChangeWriter::new(
+            snapshot.changes.as_file(),
+            crate::vmm::memory::image::RamCaptureMode::Incremental,
+            Some(stream),
+            3,
+            deadline(),
+        )
+        .unwrap();
+        let mut stats = RamIoStats::default();
+        native::write(
+            native::Input {
+                byte_baseline: None,
+                cut: &current,
+                layout: &layout,
+                mode: &RamWriteMode::Incremental {
+                    baseline: &baseline,
+                    dirty: &writes,
+                },
+                identity: &RamHashSelection::SinceAnchor {
+                    stream,
+                    dirty: &retained,
+                },
+                seeded: true,
+                deadline: deadline(),
+            },
+            snapshot.ram.as_file(),
+            &mut RamIoScratch::new().unwrap(),
+            &mut stats,
+            &mut changes,
+        )
+        .unwrap();
+        let authority = changes.finish().unwrap();
+        assert_eq!(authority.identified().unwrap().record_count(), 1);
+        assert_eq!(stats.live_bytes_read, RAM_IDENTITY_CHUNK_BYTES);
+        assert_eq!(stats.identity_bytes_hashed, RAM_IDENTITY_CHUNK_BYTES);
+        assert_eq!(stats.baseline_bytes_read, 0);
+        assert_eq!(stats.baseline_hole_bytes, 0);
+        assert_eq!(stats.extent_queries, 0);
+        assert_eq!(stats.baseline_bytes_written, 0);
+        assert_eq!(stats.overlay_bytes_written, 0);
+        assert_eq!(stats.full_bytes_written, 0);
+        assert_eq!(snapshot.bytes(), expected);
+        let changed = read_test_changes(snapshot.changes.as_file());
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[&0], independent_digests(&expected)[0]);
+    }
+
+    fn file_digests(file: &File) -> Vec<Option<[u8; 32]>> {
+        let length = file.metadata().unwrap().len();
+        let mut buffer = vec![0; RAM_IDENTITY_CHUNK_BYTES as usize];
+        (0..length)
+            .step_by(buffer.len())
+            .map(|offset| {
+                let count = (length - offset).min(buffer.len() as u64) as usize;
+                file.read_exact_at(&mut buffer[..count], offset).unwrap();
+                buffer[..count]
+                    .iter()
+                    .any(|byte| *byte != 0)
+                    .then(|| Sha256::digest(&buffer[..count]).into())
+            })
+            .collect()
+    }
+
+    fn canonical_root(units: &[Option<[u8; 32]>], length: u64) -> [u8; 32] {
+        let mut nodes = units.to_vec();
+        for height in 0..=4 {
+            nodes = nodes
+                .chunks(64)
+                .map(|children| {
+                    let bitmap = children
+                        .iter()
+                        .enumerate()
+                        .fold(0u64, |bits, (slot, child)| {
+                            bits | if child.is_some() { 1 << slot } else { 0 }
+                        });
+                    if bitmap == 0 {
+                        return None;
+                    }
+                    let mut hash = Sha256::new();
+                    if height == 0 {
+                        hash.update(b"silo:stream-map:leaf:v2\n");
+                    } else {
+                        hash.update(b"silo:stream-map:branch:v2\n");
+                        hash.update([height]);
+                    }
+                    hash.update(bitmap.to_le_bytes());
+                    for child in children.iter().flatten() {
+                        hash.update(child);
+                    }
+                    Some(hash.finalize().into())
+                })
+                .collect();
+        }
+        assert!(nodes.len() <= 1);
+        let head = nodes.first().copied().flatten();
+        let mut root = Sha256::new();
+        root.update(b"silo:stream:v2\n");
+        root.update([16]);
+        root.update(length.to_le_bytes());
+        root.update([u8::from(head.is_some())]);
+        if let Some(head) = head {
+            root.update(head);
+        }
+        root.finalize().into()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_sparse_gib_capture_never_clears_known_zero_scratch_or_classifies_holes() {
+        let length = 3 * 1024 * 1024 * 1024;
+        let populated = 2 * 1024 * 1024;
+        let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), length)]).unwrap();
+        raw.write_slice(&vec![0x31; populated], GuestAddress(0))
+            .unwrap();
+        let (domain, mut control) = tracked(raw);
+        let current = cut(&mut control);
+        let files = Outputs::new();
+        let mut scratch = RamIoScratch::new().unwrap();
+        scratch.buffers[0].fill(0xa5);
+        let receipt = write_ram_image(
+            AttemptId::for_test(),
+            key(),
+            &current,
+            &binding(),
+            layout(&domain),
+            RamCaptureIdentity::for_test(&RamWriteMode::Full),
+            RamWriteMode::Full,
+            files.owned(),
+            &mut scratch,
+            deadline(),
+        )
+        .unwrap();
+        assert_eq!(receipt.stats().live_bytes_read, populated as u64);
+        assert_eq!(receipt.stats().identity_bytes_hashed, populated as u64);
+        assert_eq!(
+            receipt.stats().live_pages_classified,
+            (populated / 4096) as u64
+        );
+        assert_eq!(receipt.stats().identity_zero_bytes_filled, 0);
+        assert_eq!(
+            receipt.stats().known_zero_bytes_skipped,
+            (length - populated) as u64
+        );
+        assert!(
+            scratch.buffers[0][populated..]
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+        assert_eq!(files.indices(), (0..populated / 65536).collect::<Vec<_>>());
+        assert!(
+            files.digests()[..populated / 65536]
+                .iter()
+                .all(|digest| *digest == Some(Sha256::digest([0x31; 65536]).into()))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_child_identity_reads_only_baseline_extents_union_dirty_units() {
+        use crate::vmm::memory::image::RamCaptureMode;
+        use crate::vmm::memory::image::writer::pipeline as native;
+        use vm_memory::{FileOffset, GuestRegionMmap, MmapRegion};
+        let length = 3 * 1024 * 1024 * 1024;
+        let populated = 2 * 1024 * 1024;
+        let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), length)]).unwrap();
+        raw.write_slice(&vec![0x51; populated], GuestAddress(0))
+            .unwrap();
+        let (source, mut control) = tracked(raw);
+        let source_cut = cut(&mut control);
+        let layout = layout(&source);
+        let baseline_files = Outputs::new();
+        let mut identity = RamCaptureIdentity::for_test(&RamWriteMode::Full);
+        identity.selection = RamHashSelection::None;
+        let owned = write_ram_image(
+            AttemptId::for_test(),
+            key(),
+            &source_cut,
+            &binding(),
+            layout.clone(),
+            identity,
+            RamWriteMode::Full,
+            baseline_files.owned(),
+            &mut RamIoScratch::new().unwrap(),
+            deadline(),
+        )
+        .unwrap();
+        let baseline = seal_completed(
+            &owned,
+            File::open(baseline_files.ram.as_path()).unwrap(),
+            File::open(baseline_files.layout.as_path()).unwrap(),
+            RamInputAuthority::OwnedLocalCut {
+                state: binding(),
+                materialization_generation: 1,
+            },
+        )
+        .unwrap();
+        let mapping = MmapRegion::<()>::build(
+            Some(FileOffset::new(
+                File::open(baseline_files.ram.as_path()).unwrap(),
+                0,
+            )),
+            length,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE,
+        )
+        .unwrap();
+        let raw = GuestMemoryMmap::from_regions(vec![
+            GuestRegionMmap::new(mapping, GuestAddress(0)).unwrap(),
+        ])
+        .unwrap();
+        let (child, construction, mut control) =
+            MemoryDomain::construct(raw, 4096, BackingKind::RestoredPrivate).unwrap();
+        let epoch = construction.issue_epoch(1).unwrap();
+        control.finish_tracked(construction, epoch).unwrap();
+        for (offset, value) in [(0, 0), (length - 4096, 0x73)] {
+            child
+                .write(GuestAddress(offset as u64), 4096)
+                .unwrap()
+                .write_view(0, 4096)
+                .unwrap()
+                .write_slice(&[value; 4096], 0)
+                .unwrap();
+        }
+        let current = cut(&mut control);
+        let mut dirty = DirtyPageMap::new(child.layout());
+        control.drain_host_dirty(&current, &mut dirty).unwrap();
+        assert_eq!(dirty.count(), 2);
+        let full = RamWriteMode::Full;
+        let incremental = RamWriteMode::Incremental {
+            baseline: &baseline,
+            dirty: &dirty,
+        };
+        for (mode, seeded) in [(&full, false), (&incremental, false), (&incremental, true)] {
+            let files = Outputs::new();
+            files.ram.as_file().set_len(length as u64).unwrap();
+            if seeded {
+                files
+                    .ram
+                    .as_file()
+                    .write_all_at(&vec![0x51; populated], 0)
+                    .unwrap();
+            }
+            let mut changes = ChangeWriter::new(
+                files.changes.as_file(),
+                RamCaptureMode::Full,
+                None,
+                length as u64 / 65536,
+                deadline(),
+            )
+            .unwrap();
+            let mut stats = RamIoStats::default();
+            native::write(
+                native::Input {
+                    cut: &current,
+                    layout: &layout,
+                    mode,
+                    identity: &RamHashSelection::Full,
+                    byte_baseline: Some((&baseline, &dirty)),
+                    seeded,
+                    deadline: deadline(),
+                },
+                files.ram.as_file(),
+                &mut RamIoScratch::new().unwrap(),
+                &mut stats,
+                &mut changes,
+            )
+            .unwrap();
+            changes.finish().unwrap();
+            let expected_live = if seeded || matches!(mode, RamWriteMode::Full) {
+                populated as u64 + RAM_IDENTITY_CHUNK_BYTES
+            } else {
+                8192
+            };
+            assert_eq!(stats.live_bytes_read, expected_live);
+            assert_eq!(
+                stats.identity_bytes_hashed,
+                populated as u64 + RAM_IDENTITY_CHUNK_BYTES
+            );
+            assert_eq!(stats.full_identity_read_fallback, None);
+            assert!(stats.live_pages_classified <= (populated / 4096 + 16) as u64);
+            assert!(stats.extent_queries <= 10);
+            if seeded {
+                assert_eq!(stats.baseline_bytes_read, 0);
+            }
+            let scanned = file_digests(files.ram.as_file());
+            assert_eq!(files.digests(), scanned);
+            assert_eq!(
+                canonical_root(&files.digests(), length as u64),
+                canonical_root(&scanned, length as u64)
+            );
+            let mut page = [0; 4096];
+            files.ram.as_file().read_exact_at(&mut page, 0).unwrap();
+            assert_eq!(page, [0; 4096]);
+            files
+                .ram
+                .as_file()
+                .read_exact_at(&mut page, length as u64 - 4096)
+                .unwrap();
+            assert_eq!(page, [0x73; 4096]);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn incremental_anonymous_discards_use_cut_residency_across_capture_boundaries() {
+        use devices::virtio::RuntimeGuestMemory;
+        let unit = RAM_IDENTITY_CHUNK_BYTES as usize;
+        let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * unit)]).unwrap();
+        for index in 0..4 {
+            raw.write_slice(&[0x41; 4096], GuestAddress((index * unit) as u64))
+                .unwrap();
+        }
+        let (domain, mut control) = tracked(raw);
+        let layout = layout(&domain);
+        let initial = cut(&mut control);
+        let baseline_files = Outputs::new();
+        let mut receipt = capture(
+            &initial,
+            layout.clone(),
+            RamWriteMode::Full,
+            baseline_files.owned(),
+        );
+        let baseline = baseline_files.seal(&mut receipt);
+        control
+            .reopen(&initial, &initial.issue_epoch(2).unwrap())
+            .unwrap();
+        let memory = RuntimeGuestMemory::new(domain.clone());
+        let discard = |index| {
+            memory
+                .try_write_access(
+                    4096,
+                    GuestAddress((index * unit) as u64),
+                    |_, len, _, view| {
+                        // nix's mman feature is not enabled for this crate.
+                        assert_eq!(
+                            unsafe {
+                                libc::madvise(view.as_mut_ptr().cast(), len, libc::MADV_DONTNEED)
+                            },
+                            0
+                        );
+                        Ok(len)
+                    },
+                )
+                .unwrap();
+        };
+        let write = |index, value| {
+            domain
+                .write(GuestAddress((index * unit) as u64), 4096)
+                .unwrap()
+                .write_view(0, 4096)
+                .unwrap()
+                .write_slice(&[value; 4096], 0)
+                .unwrap();
+        };
+        discard(0);
+        discard(1);
+        write(1, 0x52);
+        write(2, 0x63);
+        discard(2);
+        discard(3);
+        let current = cut(&mut control);
+        let mut dirty = DirtyPageMap::new(domain.layout());
+        control.drain_host_dirty(&current, &mut dirty).unwrap();
+        assert_eq!(dirty.count(), 4);
+        let files = Outputs::new();
+        let mut output = files.owned();
+        output.protect_baseline(Some(baseline.clone()));
+        let first = capture(
+            &current,
+            layout.clone(),
+            RamWriteMode::Incremental {
+                baseline: &baseline,
+                dirty: &dirty,
+            },
+            output,
+        );
+        assert_eq!(first.stats().live_bytes_read, 4096);
+        assert_eq!(
+            first.stats().known_zero_bytes_skipped,
+            if first.stats().seed_method == RamSeedMethod::Clone {
+                4 * unit as u64 - 4096
+            } else {
+                3 * 4096
+            }
+        );
+        assert_eq!(
+            first.stats().identity_bytes_hashed,
+            RAM_IDENTITY_CHUNK_BYTES
+        );
+        let mut resolved = baseline_files.digests();
+        for (index, digest) in read_test_changes(files.changes.as_file()) {
+            resolved[index as usize] = digest;
+        }
+        assert_eq!(resolved, file_digests(files.ram.as_file()));
+        assert_eq!(
+            canonical_root(&resolved, layout.packed_len()),
+            canonical_root(&file_digests(files.ram.as_file()), layout.packed_len())
+        );
+        assert_eq!(resolved.iter().filter(|digest| digest.is_some()).count(), 1);
+        // Abandon the first cut: retain D, then write a previously discarded page.
+        control
+            .reopen(&current, &current.issue_epoch(3).unwrap())
+            .unwrap();
+        write(0, 0x74);
+        discard(1);
+        let current = cut(&mut control);
+        control.drain_host_dirty(&current, &mut dirty).unwrap();
+        let files = Outputs::new();
+        let mut output = files.owned();
+        output.protect_baseline(Some(baseline.clone()));
+        let mut second = capture(
+            &current,
+            layout.clone(),
+            RamWriteMode::Incremental {
+                baseline: &baseline,
+                dirty: &dirty,
+            },
+            output,
+        );
+        assert_eq!(second.stats().live_bytes_read, 4096);
+        let mut resolved = baseline_files.digests();
+        for (index, digest) in read_test_changes(files.changes.as_file()) {
+            resolved[index as usize] = digest;
+        }
+        assert_eq!(resolved, file_digests(files.ram.as_file()));
+        assert_eq!(
+            canonical_root(&resolved, layout.packed_len()),
+            canonical_root(&file_digests(files.ram.as_file()), layout.packed_len())
+        );
+        // Accept the new B, clear D, and write after that capture boundary.
+        let baseline = files.seal(&mut second);
+        control
+            .reopen(&current, &current.issue_epoch(4).unwrap())
+            .unwrap();
+        dirty.clear();
+        write(3, 0x85);
+        let current = cut(&mut control);
+        control.drain_host_dirty(&current, &mut dirty).unwrap();
+        let next = Outputs::new();
+        let mut output = next.owned();
+        output.protect_baseline(Some(baseline.clone()));
+        let third = capture(
+            &current,
+            layout.clone(),
+            RamWriteMode::Incremental {
+                baseline: &baseline,
+                dirty: &dirty,
+            },
+            output,
+        );
+        assert_eq!(third.stats().live_bytes_read, 4096);
+        for (index, digest) in read_test_changes(next.changes.as_file()) {
+            resolved[index as usize] = digest;
+        }
+        assert_eq!(resolved, file_digests(next.ram.as_file()));
+        assert_eq!(
+            canonical_root(&resolved, layout.packed_len()),
+            canonical_root(&file_digests(next.ram.as_file()), layout.packed_len())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_identity_untrustworthy_baseline_extents_fall_back_with_reason() {
+        use crate::vmm::memory::image::writer::pipeline as native;
+        use crate::vmm::memory::image::{RamCaptureMode, RamIdentityReadFallback};
+        for reason in [
+            RamIdentityReadFallback::CoverageLost,
+            RamIdentityReadFallback::BaselineMismatch,
+        ] {
+            let unit = RAM_IDENTITY_CHUNK_BYTES as usize;
+            let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * unit)]).unwrap();
+            raw.write_slice(&vec![0x41; 4 * unit], GuestAddress(0))
+                .unwrap();
+            let (domain, construction, mut control) =
+                MemoryDomain::construct(raw, 4096, BackingKind::RestoredPrivate).unwrap();
+            let epoch = construction.issue_epoch(1).unwrap();
+            control.finish_tracked(construction, epoch).unwrap();
+            let layout = layout(&domain);
+            let initial = cut(&mut control);
+            let baseline_files = Outputs::new();
+            let mut receipt = capture(
+                &initial,
+                layout.clone(),
+                RamWriteMode::Full,
+                baseline_files.owned(),
+            );
+            let baseline = baseline_files.seal(&mut receipt);
+            control
+                .reopen(&initial, &initial.issue_epoch(2).unwrap())
+                .unwrap();
+            domain
+                .write(GuestAddress((3 * unit) as u64), 4096)
+                .unwrap()
+                .write_view(0, 4096)
+                .unwrap()
+                .write_slice(&[0x52; 4096], 0)
+                .unwrap();
+            let current = cut(&mut control);
+            let mut dirty = DirtyPageMap::new(domain.layout());
+            control.drain_host_dirty(&current, &mut dirty).unwrap();
+            match reason {
+                RamIdentityReadFallback::CoverageLost => domain.invalidate_coverage(),
+                RamIdentityReadFallback::BaselineMismatch => {
+                    let (other, _) =
+                        tracked(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap());
+                    dirty = DirtyPageMap::new(other.layout());
+                }
+                RamIdentityReadFallback::ExtentsUnavailable
+                | RamIdentityReadFallback::ExtentLimit => unreachable!(),
+            }
+            let files = Outputs::new();
+            files.ram.as_file().set_len(layout.packed_len()).unwrap();
+            let mut changes = ChangeWriter::new(
+                files.changes.as_file(),
+                RamCaptureMode::Full,
+                None,
+                4,
+                deadline(),
+            )
+            .unwrap();
+            let mut stats = RamIoStats::default();
+            native::write(
+                native::Input {
+                    cut: &current,
+                    layout: &layout,
+                    mode: &RamWriteMode::Full,
+                    identity: &RamHashSelection::Full,
+                    byte_baseline: Some((&baseline, &dirty)),
+                    seeded: false,
+                    deadline: deadline(),
+                },
+                files.ram.as_file(),
+                &mut RamIoScratch::new().unwrap(),
+                &mut stats,
+                &mut changes,
+            )
+            .unwrap();
+            changes.finish().unwrap();
+            assert_eq!(stats.full_identity_read_fallback, Some(reason));
+            assert_eq!(stats.live_bytes_read, layout.packed_len());
+            assert_eq!(stats.identity_bytes_hashed, layout.packed_len());
+            assert_eq!(files.digests(), file_digests(files.ram.as_file()));
+            let mut expected = vec![0x41; 4 * unit];
+            expected[3 * unit..3 * unit + 4096].fill(0x52);
+            assert_eq!(files.bytes(), expected);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn incremental_file_discard_reads_original_mapping_not_zero_or_newer_baseline() {
+        use devices::virtio::RuntimeGuestMemory;
+        use vm_memory::{FileOffset, GuestRegionMmap, MmapRegion};
+        let unit = RAM_IDENTITY_CHUNK_BYTES as usize;
+        let original = TempFile::new().unwrap();
+        original
+            .as_file()
+            .write_all_at(&vec![0x61; 2 * unit], 0)
+            .unwrap();
+        let mapping = MmapRegion::<()>::build(
+            Some(FileOffset::new(File::open(original.as_path()).unwrap(), 0)),
+            2 * unit,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE,
+        )
+        .unwrap();
+        let raw = GuestMemoryMmap::from_regions(vec![
+            GuestRegionMmap::new(mapping, GuestAddress(0)).unwrap(),
+        ])
+        .unwrap();
+        let (domain, construction, mut control) =
+            MemoryDomain::construct(raw, 4096, BackingKind::RestoredPrivate).unwrap();
+        let epoch = construction.issue_epoch(1).unwrap();
+        control.finish_tracked(construction, epoch).unwrap();
+        domain
+            .write(GuestAddress(0), 4096)
+            .unwrap()
+            .write_view(0, 4096)
+            .unwrap()
+            .write_slice(&[0x72; 4096], 0)
+            .unwrap();
+        let initial = cut(&mut control);
+        let layout = layout(&domain);
+        let baseline_files = Outputs::new();
+        let mut receipt = capture(
+            &initial,
+            layout.clone(),
+            RamWriteMode::Full,
+            baseline_files.owned(),
+        );
+        let baseline = baseline_files.seal(&mut receipt);
+        let mut initial_dirty = DirtyPageMap::new(domain.layout());
+        control
+            .drain_host_dirty(&initial, &mut initial_dirty)
+            .unwrap();
+        control
+            .reopen(&initial, &initial.issue_epoch(2).unwrap())
+            .unwrap();
+        RuntimeGuestMemory::new(domain.clone())
+            .try_write_access(4096, GuestAddress(0), |_, len, _, view| {
+                // nix's mman feature is not enabled for this crate.
+                assert_eq!(
+                    unsafe { libc::madvise(view.as_mut_ptr().cast(), len, libc::MADV_DONTNEED) },
+                    0
+                );
+                Ok(len)
+            })
+            .unwrap();
+        let current = cut(&mut control);
+        let mut dirty = DirtyPageMap::new(domain.layout());
+        control.drain_host_dirty(&current, &mut dirty).unwrap();
+        assert_eq!(dirty.count(), 1);
+        let files = Outputs::new();
+        let mut output = files.owned();
+        output.protect_baseline(Some(baseline.clone()));
+        let receipt = capture(
+            &current,
+            layout.clone(),
+            RamWriteMode::Incremental {
+                baseline: &baseline,
+                dirty: &dirty,
+            },
+            output,
+        );
+        assert_eq!(receipt.stats().known_zero_bytes_skipped, 0);
+        assert_eq!(
+            receipt.stats().live_bytes_read,
+            if receipt.stats().seed_method == RamSeedMethod::Clone {
+                65536
+            } else {
+                4096
+            }
+        );
+        assert_eq!(files.bytes(), vec![0x61; 2 * unit]);
+        let mut resolved = baseline_files.digests();
+        for (index, digest) in read_test_changes(files.changes.as_file()) {
+            resolved[index as usize] = digest;
+        }
+        assert_eq!(resolved, file_digests(files.ram.as_file()));
+        assert_eq!(
+            canonical_root(&resolved, layout.packed_len()),
+            canonical_root(&file_digests(files.ram.as_file()), layout.packed_len())
+        );
     }
 }

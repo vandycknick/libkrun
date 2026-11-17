@@ -1,8 +1,8 @@
-//! Authenticated metadata admission before allocating a restored child.
+//! Metadata admission before allocating an identified or owned-cut child.
 //!
-//! The caller retains immutable-inode leases and verifies the full RAM stream.
-//! Admission is an observation, not an install token: construction authenticates
-//! its inputs again. The KVM host-profile observer creates only an empty VM and
+//! The caller retains immutable-inode leases and supplies explicit input authority.
+//! Construction rechecks that authority; inspection is not an install token.
+//! The KVM host-profile observer creates only an empty VM and
 //! one never-run vCPU, without RAM, child identity or external resources.
 
 use std::fs::File;
@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use crate::api::capabilities::{LIVE_STATE_SCHEMA, guest_architecture};
 use crate::api::live::restore::{
-    RestoreAttachment, RestoreError, RestoreIdentity, RestoreRole, StateObjectIdentity,
+    RestoreAttachment, RestoreError, RestoreIdentity, RestoreRole, StateObjectAuthority,
 };
 use crate::api::vmm_builder::restored::{
     MAX_DEVICES_BYTES, inspect, read_object, validate_profile,
@@ -29,7 +29,7 @@ pub struct InspectionInputs<'a> {
     pub devices: &'a File,
     pub layout: &'a File,
     pub expected: &'a RestoreIdentity,
-    pub layout_object: &'a StateObjectIdentity,
+    pub layout_object: &'a StateObjectAuthority,
 }
 
 /// Structural observation of a saved device file, not authentication or an
@@ -247,7 +247,7 @@ fn authenticate_execution(
     file: &File,
     expected: &RestoreIdentity,
 ) -> Result<ValidatedExecution, InspectionError> {
-    if expected.binding != expected.ram_image.state || expected.ram_image.stream == [0; 32] {
+    if !expected.validate_authority() {
         return Err(InspectionError::Binding);
     }
     let bytes = read_object(
@@ -448,7 +448,7 @@ fn validate_queue_geometry(
     Ok(())
 }
 
-/// Authenticates bounded native metadata and probes the actual destination.
+/// Admits bounded native metadata and probes the actual destination.
 /// This never opens a RAM stream or allocates any restored-child resource.
 pub fn inspect_compatibility(
     inputs: InspectionInputs<'_>,
@@ -456,6 +456,11 @@ pub fn inspect_compatibility(
     deadline: Instant,
 ) -> Result<AdmittedShape, InspectionError> {
     check_deadline(deadline)?;
+    if inputs.layout_object.is_identified()
+        != matches!(inputs.expected.ram_image, crate::api::live::RamInputAuthority::IdentifiedSnapshot(_))
+    {
+        return Err(InspectionError::Binding);
+    }
     let execution_inode = inspect(inputs.execution, RestoreRole::Execution, false)?;
     let devices_inode = inspect(inputs.devices, RestoreRole::Devices, false)?;
     if devices_inode == execution_inode {
@@ -527,7 +532,8 @@ pub fn inspect_compatibility(
 #[cfg(test)]
 mod tests {
     use crate::api::live::inspection::*;
-    use crate::api::live::restore::{RestoreProblem, StateObjectIdentity};
+    use crate::api::live::restore::{RestoreProblem, StateObjectAuthority, StateObjectIdentity};
+    use crate::api::live::{RamInputAuthority, RamImageAuthentication};
     use crate::api::vmm_builder::restored::sha256;
     use std::io::Write;
     use std::time::Duration;
@@ -557,7 +563,7 @@ mod tests {
                 read_object(
                     &file,
                     RestoreRole::Execution,
-                    &expected,
+                    &StateObjectAuthority::Identified(expected.clone()),
                     MAX_EXECUTION_BYTES
                 )
                 .is_err()
@@ -568,7 +574,7 @@ mod tests {
             sha256: sha256(b"KRUNEXEC"),
         };
         assert!(matches!(
-            read_object(&file, RestoreRole::Execution, &expected, 7),
+            read_object(&file, RestoreRole::Execution, &StateObjectAuthority::Identified(expected.clone()), 7),
             Err(RestoreError::Descriptor {
                 problem: RestoreProblem::Length,
                 ..
@@ -577,7 +583,7 @@ mod tests {
         let bytes = read_object(
             &file,
             RestoreRole::Execution,
-            &expected,
+            &StateObjectAuthority::Identified(expected),
             MAX_EXECUTION_BYTES,
         )
         .unwrap();
@@ -628,12 +634,12 @@ mod tests {
         };
         let mut expected = RestoreIdentity {
             binding: envelope.binding.clone(),
-            ram_image: crate::api::live::RamImageAuthentication {
+            ram_image: RamInputAuthority::IdentifiedSnapshot(RamImageAuthentication {
                 state: envelope.binding.clone(),
                 stream: [1; 32],
-            },
-            execution_object: identity.clone(),
-            devices_object: identity,
+            }),
+            execution_object: StateObjectAuthority::Identified(identity.clone()),
+            devices_object: StateObjectAuthority::Identified(identity),
         };
         assert!(matches!(
             authenticate_execution(&file, &expected),
@@ -641,13 +647,19 @@ mod tests {
                 | InspectionError::Schema { .. }
                 | InspectionError::Architecture { .. })
         ));
-        expected.ram_image.state.capture = [99; 16];
+        if let RamInputAuthority::IdentifiedSnapshot(authentication) = &mut expected.ram_image {
+            authentication.state.capture = [99; 16];
+        }
         assert!(matches!(
             authenticate_execution(&file, &expected),
             Err(InspectionError::Binding)
         ));
-        expected.ram_image.state = expected.binding.clone();
-        expected.execution_object.sha256[0] ^= 1;
+        if let RamInputAuthority::IdentifiedSnapshot(authentication) = &mut expected.ram_image {
+            authentication.state = expected.binding.clone();
+        }
+        if let StateObjectAuthority::Identified(identity) = &mut expected.execution_object {
+            identity.sha256[0] ^= 1;
+        }
         assert!(matches!(
             authenticate_execution(&file, &expected),
             Err(InspectionError::Descriptor(RestoreError::Descriptor {

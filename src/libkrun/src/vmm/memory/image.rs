@@ -1,6 +1,7 @@
 use std::fmt;
 use std::fs::File;
 use std::io;
+use std::num::NonZeroU64;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::sync::Arc;
 use std::time::Instant;
@@ -151,6 +152,14 @@ pub enum RamSeedMethod {
     Rebuild,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RamIdentityReadFallback {
+    CoverageLost,
+    BaselineMismatch,
+    ExtentsUnavailable,
+    ExtentLimit,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RamIoStats {
     pub seed_method: RamSeedMethod,
@@ -174,6 +183,15 @@ pub struct RamIoStats {
     /// Live RAM bytes not read because cut-bound pagemap metadata proves zero origin.
     pub known_zero_bytes_skipped: u64,
     pub extent_queries: u64,
+    pub map_nodes_written: u64,
+    pub whole_file_bytes_hashed: u64,
+    pub identity_dirty_pages: u64,
+    pub materialization_dirty_pages: u64,
+    /// Pages whose live bytes were inspected for zero/data classification.
+    pub live_pages_classified: u64,
+    /// Scratch bytes cleared only to complete a nonzero identity unit.
+    pub identity_zero_bytes_filled: u64,
+    pub full_identity_read_fallback: Option<RamIdentityReadFallback>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -192,7 +210,7 @@ pub struct RamOutputFiles {
     ram: File,
     layout: File,
     changes: File,
-    protected_inputs: Option<Arc<AuthenticatedRamImage>>,
+    protected_inputs: Option<Arc<AdmittedRamImage>>,
 }
 impl RamOutputFiles {
     /// Takes ownership without effects. Open staging roles without truncation so
@@ -206,7 +224,7 @@ impl RamOutputFiles {
             protected_inputs: None,
         }
     }
-    pub(super) fn protect_baseline(&mut self, baseline: Option<Arc<AuthenticatedRamImage>>) {
+    pub(crate) fn protect_baseline(&mut self, baseline: Option<Arc<AdmittedRamImage>>) {
         self.protected_inputs = baseline;
     }
 }
@@ -254,10 +272,109 @@ pub struct RamImageAuthentication {
     pub stream: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RamIdentityPolicy {
+    None,
+    Full,
+    SinceAnchor { stream: [u8; 32] },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RamIdentityAnchor {
+    Unknown,
+    Identified { stream: [u8; 32] },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RamIdentityGeneration {
+    Unknown,
+    Identified { generation: NonZeroU64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RamInputAuthority {
+    IdentifiedSnapshot(RamImageAuthentication),
+    OwnedLocalCut {
+        state: StateBinding,
+        materialization_generation: u64,
+    },
+}
+
+impl RamInputAuthority {
+    pub fn state(&self) -> &StateBinding {
+        match self {
+            Self::IdentifiedSnapshot(auth) => &auth.state,
+            Self::OwnedLocalCut { state, .. } => state,
+        }
+    }
+
+    pub fn identity_anchor(&self) -> RamIdentityAnchor {
+        match self {
+            Self::IdentifiedSnapshot(auth) => RamIdentityAnchor::Identified {
+                stream: auth.stream,
+            },
+            Self::OwnedLocalCut { .. } => RamIdentityAnchor::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum RamHashSelection<'a> {
+    None,
+    Full,
+    SinceAnchor {
+        stream: [u8; 32],
+        dirty: &'a DirtyPageMap,
+    },
+}
+
+impl RamHashSelection<'_> {
+    pub fn policy(&self) -> RamIdentityPolicy {
+        match self {
+            Self::None => RamIdentityPolicy::None,
+            Self::Full => RamIdentityPolicy::Full,
+            Self::SinceAnchor { stream, .. } => RamIdentityPolicy::SinceAnchor { stream: *stream },
+        }
+    }
+}
+
+pub struct RamCaptureIdentity<'a> {
+    pub selection: RamHashSelection<'a>,
+    pub anchor: RamIdentityAnchor,
+    pub anchor_generation: RamIdentityGeneration,
+    pub predecessor_generation: u64,
+    pub identity_dirty_pages: usize,
+    pub materialization_dirty_pages: usize,
+    pub byte_baseline: Option<(&'a AdmittedRamImage, &'a DirtyPageMap)>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RamIdentityReceipt {
+    pub policy: RamIdentityPolicy,
+    pub anchor: RamIdentityAnchor,
+    pub anchor_generation: RamIdentityGeneration,
+    pub predecessor_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RamChangeAuthority {
+    None,
+    Identified(RamChangeReceipt),
+}
+
+impl RamChangeAuthority {
+    pub fn identified(&self) -> Result<&RamChangeReceipt, RamImageError> {
+        match self {
+            Self::Identified(receipt) => Ok(receipt),
+            Self::None => Err(RamImageError::Completion),
+        }
+    }
+}
+
 pub enum RamWriteMode<'a> {
     Full,
     Incremental {
-        baseline: &'a AuthenticatedRamImage,
+        baseline: &'a AdmittedRamImage,
         dirty: &'a DirtyPageMap,
     },
 }
@@ -274,24 +391,31 @@ struct FileFact {
 }
 
 #[derive(Debug)]
-pub struct AuthenticatedRamImage {
+pub struct AdmittedRamImage {
     ram: Arc<File>,
     layout_file: Arc<File>,
     layout: Arc<ValidatedRamLayout>,
-    authentication: RamImageAuthentication,
+    authority: RamInputAuthority,
     ram_fact: FileFact,
     layout_fact: FileFact,
     completion: Option<Arc<()>>,
 }
-impl AuthenticatedRamImage {
+impl AdmittedRamImage {
     pub fn for_restore(
         ram: File,
         layout: File,
-        auth: RamImageAuthentication,
+        authority: RamInputAuthority,
         execution: &ValidatedExecution,
     ) -> Result<Self, RamImageError> {
-        auth.state.validate()?;
-        if auth.state != execution.envelope().binding {
+        authority.state().validate()?;
+        if matches!(
+            authority,
+            RamInputAuthority::OwnedLocalCut {
+                materialization_generation: 0,
+                ..
+            }
+        ) || authority.state() != &execution.envelope().binding
+        {
             return Err(RamImageError::ExecutionBinding);
         }
         let ram_fact = inspect(&ram, RamFileRole::InputRam)?;
@@ -305,7 +429,7 @@ impl AuthenticatedRamImage {
             ram: Arc::new(ram),
             layout_file: Arc::new(layout),
             layout: validated,
-            authentication: auth,
+            authority,
             ram_fact,
             layout_fact,
             completion: None,
@@ -314,8 +438,8 @@ impl AuthenticatedRamImage {
     pub fn layout(&self) -> &Arc<ValidatedRamLayout> {
         &self.layout
     }
-    pub fn authentication(&self) -> &RamImageAuthentication {
-        &self.authentication
+    pub fn authority(&self) -> &RamInputAuthority {
+        &self.authority
     }
     pub(crate) fn aliases(&self, device: u64, inode: u64) -> bool {
         [self.ram_fact.identity, self.layout_fact.identity]
@@ -359,7 +483,12 @@ pub struct RamCaptureReceipt {
     layout_fact: FileFact,
     mode: RamCaptureMode,
     stats: RamIoStats,
-    changes: RamChangeReceipt,
+    changes: RamChangeAuthority,
+    changes_fact: FileFact,
+    identity_policy: RamIdentityPolicy,
+    identity_anchor: RamIdentityAnchor,
+    identity_anchor_generation: RamIdentityGeneration,
+    predecessor_generation: u64,
     completion: Arc<()>,
     writers_closed: bool,
 }
@@ -384,9 +513,10 @@ impl RamCaptureReceipt {
         binding: &StateBinding,
         layout: Arc<ValidatedRamLayout>,
         mode: RamCaptureMode,
+        identity: RamIdentityReceipt,
         output: RamOutputFiles,
         stats: RamIoStats,
-        mut changes: RamChangeReceipt,
+        mut changes: RamChangeAuthority,
         deadline: Instant,
     ) -> Result<Self, (RamImageError, RamOutputFiles)> {
         let facts = (|| {
@@ -400,8 +530,14 @@ impl RamCaptureReceipt {
             let record = inspect_before(&output.layout, RamFileRole::OutputLayout, Some(deadline))?;
             let change_fact =
                 inspect_before(&output.changes, RamFileRole::OutputChanges, Some(deadline))?;
-            exact_length(change_fact, changes.byte_len, RamFileRole::OutputChanges)?;
-            changes.fact = change_fact;
+            let length = match &mut changes {
+                RamChangeAuthority::None => 0,
+                RamChangeAuthority::Identified(receipt) => {
+                    receipt.fact = change_fact;
+                    receipt.byte_len
+                }
+            };
+            exact_length(change_fact, length, RamFileRole::OutputChanges)?;
             exact_length(ram, layout.packed_len(), RamFileRole::OutputRam)?;
             compare_layout_before(
                 &output.layout,
@@ -411,9 +547,9 @@ impl RamCaptureReceipt {
                 Some(deadline),
             )?;
             check_deadline(deadline)?;
-            Ok((ram, record))
+            Ok((ram, record, change_fact))
         })();
-        let (ram_fact, layout_fact) = match facts {
+        let (ram_fact, layout_fact, changes_fact) = match facts {
             Ok(facts) => facts,
             Err(error) => return Err((error, output)),
         };
@@ -431,12 +567,17 @@ impl RamCaptureReceipt {
             mode,
             stats,
             changes,
+            changes_fact,
+            identity_policy: identity.policy,
+            identity_anchor: identity.anchor,
+            identity_anchor_generation: identity.anchor_generation,
+            predecessor_generation: identity.predecessor_generation,
             completion: preparation.completion,
             writers_closed: true,
         })
     }
     pub fn output_identities(&self) -> [(u64, u64, u64); 3] {
-        [self.ram_fact, self.layout_fact, self.changes.fact]
+        [self.ram_fact, self.layout_fact, self.changes_fact]
             .map(|fact| (fact.identity.device, fact.identity.inode, fact.length))
     }
     pub fn binding(&self) -> &StateBinding {
@@ -463,8 +604,26 @@ impl RamCaptureReceipt {
     pub fn identity_chunk_bytes(&self) -> u32 {
         RAM_IDENTITY_CHUNK_BYTES as u32
     }
-    pub fn changes(&self) -> &RamChangeReceipt {
+    pub fn changes(&self) -> &RamChangeAuthority {
         &self.changes
+    }
+    pub fn identity_policy(&self) -> &RamIdentityPolicy {
+        &self.identity_policy
+    }
+    pub fn identity_anchor(&self) -> RamIdentityAnchor {
+        self.identity_anchor
+    }
+    pub fn identity_anchor_generation(&self) -> RamIdentityGeneration {
+        self.identity_anchor_generation
+    }
+    pub fn predecessor_generation(&self) -> u64 {
+        self.predecessor_generation
+    }
+    pub fn identity_dirty_pages(&self) -> usize {
+        self.stats.identity_dirty_pages as usize
+    }
+    pub fn materialization_dirty_pages(&self) -> usize {
+        self.stats.materialization_dirty_pages as usize
     }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn matches(
@@ -474,7 +633,7 @@ impl RamCaptureReceipt {
         cut: &MemoryCut,
         binding: &StateBinding,
         layout: &ValidatedRamLayout,
-        image: &AuthenticatedRamImage,
+        image: &AdmittedRamImage,
     ) -> Result<(), RamImageError> {
         cut.validate_domain(&self.domain)?;
         let origin = image.completion.as_ref().ok_or(RamImageError::Completion)?;
@@ -484,7 +643,7 @@ impl RamCaptureReceipt {
             || self.cut_generation != cut.generation()
             || self.topology_generation != cut.domain().topology_generation()
             || self.binding != *binding
-            || self.binding != image.authentication.state
+            || &self.binding != image.authority.state()
             || self.layout.as_ref() != layout
             || self.layout.as_ref() != image.layout.as_ref()
             || self.ram_fact != image.ram_fact
@@ -501,13 +660,27 @@ pub fn seal_completed(
     receipt: &RamCaptureReceipt,
     ram: File,
     layout: File,
-    auth: RamImageAuthentication,
-) -> Result<AuthenticatedRamImage, RamImageError> {
+    authority: RamInputAuthority,
+) -> Result<AdmittedRamImage, RamImageError> {
     if !receipt.writers_closed {
         return Err(RamImageError::Completion);
     }
-    auth.state.validate()?;
-    if auth.state != receipt.binding {
+    authority.state().validate()?;
+    let compatible = match (&receipt.identity_policy, &authority) {
+        (
+            RamIdentityPolicy::None,
+            RamInputAuthority::OwnedLocalCut {
+                materialization_generation,
+                ..
+            },
+        ) => *materialization_generation > receipt.predecessor_generation,
+        (
+            RamIdentityPolicy::Full | RamIdentityPolicy::SinceAnchor { .. },
+            RamInputAuthority::IdentifiedSnapshot(_),
+        ) => true,
+        _ => false,
+    };
+    if !compatible || authority.state() != &receipt.binding {
         return Err(RamImageError::Completion);
     }
     let ram_fact = inspect(&ram, RamFileRole::InputRam)?;
@@ -521,11 +694,11 @@ pub fn seal_completed(
         layout_fact.length,
         receipt.layout.canonical_bytes(),
     )?;
-    let image = AuthenticatedRamImage {
+    let image = AdmittedRamImage {
         ram: Arc::new(ram),
         layout_file: Arc::new(layout),
         layout: receipt.layout.clone(),
-        authentication: auth,
+        authority,
         ram_fact,
         layout_fact,
         completion: Some(receipt.completion.clone()),
@@ -537,14 +710,14 @@ pub struct RestoredRam {
     domain: Arc<MemoryDomain>,
     construction: ConstructionAuthority,
     control: DomainControl,
-    baseline: Arc<AuthenticatedRamImage>,
+    baseline: Arc<AdmittedRamImage>,
     info: ArchMemoryInfo,
 }
 type RestoredRamParts = (
     Arc<MemoryDomain>,
     ConstructionAuthority,
     DomainControl,
-    Arc<AuthenticatedRamImage>,
+    Arc<AdmittedRamImage>,
     ArchMemoryInfo,
 );
 impl RestoredRam {
@@ -555,7 +728,7 @@ impl RestoredRam {
         self,
         execution: &ValidatedExecution,
     ) -> Result<RestoredRamParts, RamImageError> {
-        if self.baseline.authentication.state != execution.envelope().binding {
+        if self.baseline.authority.state() != &execution.envelope().binding {
             return Err(RamImageError::ExecutionBinding);
         }
         self.baseline.layout.validate_execution(execution)?;
@@ -570,11 +743,11 @@ impl RestoredRam {
 }
 
 pub fn map_restore_ram(
-    image: Arc<AuthenticatedRamImage>,
+    image: Arc<AdmittedRamImage>,
     execution: &ValidatedExecution,
 ) -> Result<RestoredRam, RamImageError> {
     image.recheck()?;
-    if image.authentication.state != execution.envelope().binding {
+    if image.authority.state() != &execution.envelope().binding {
         return Err(RamImageError::ExecutionBinding);
     }
     image.layout.validate_execution(execution)?;
@@ -693,7 +866,7 @@ pub(crate) fn preflight(
             return Err(RamImageError::Completion);
         }
         if baseline.layout.as_ref() != layout
-            || baseline.authentication.state.ram_layout != binding.ram_layout
+            || baseline.authority.state().ram_layout != binding.ram_layout
         {
             return Err(RamImageError::ExecutionBinding);
         }
@@ -919,10 +1092,10 @@ mod tests {
     use crate::vmm::memory::AttemptId;
     use crate::vmm::memory::image::writer::write_ram_image;
     use crate::vmm::memory::image::{
-        AuthenticatedRamImage, DescriptorProblem, ProtectedRamRole, RamCaptureMode,
+        AdmittedRamImage, DescriptorProblem, ProtectedRamRole, RamCaptureIdentity, RamCaptureMode,
         RamCaptureReceipt, RamFileRole, RamImageAuthentication, RamImageEffects, RamImageError,
-        RamIoScratch, RamOutputFiles, RamWriteMode, ValidatedRamLayout, inspect, map_restore_ram,
-        preflight, seal_completed,
+        RamInputAuthority, RamIoScratch, RamOutputFiles, RamWriteMode, ValidatedRamLayout, inspect,
+        map_restore_ram, preflight, seal_completed,
     };
 
     struct Files(PathBuf);
@@ -1179,7 +1352,7 @@ mod tests {
         files: &Files,
         prefix: &str,
         layout: &Arc<ValidatedRamLayout>,
-    ) -> Arc<AuthenticatedRamImage> {
+    ) -> Arc<AdmittedRamImage> {
         let ram_name = format!("{prefix}-ram");
         let layout_name = format!("{prefix}-layout");
         let ram = files.create(&ram_name, &[]);
@@ -1190,10 +1363,10 @@ mod tests {
         drop(ram);
         drop(files.create(&layout_name, layout.canonical_bytes()));
         Arc::new(
-            AuthenticatedRamImage::for_restore(
+            AdmittedRamImage::for_restore(
                 files.readonly(&ram_name),
                 files.readonly(&layout_name),
-                auth(),
+                RamInputAuthority::IdentifiedSnapshot(auth()),
                 &execution(layout),
             )
             .unwrap(),
@@ -1217,6 +1390,7 @@ mod tests {
             cut,
             &binding(),
             layout,
+            RamCaptureIdentity::for_test(&RamWriteMode::Full),
             RamWriteMode::Full,
             output,
             &mut RamIoScratch::new().unwrap(),
@@ -1251,6 +1425,7 @@ mod tests {
             &cut,
             &binding(),
             layout,
+            RamCaptureIdentity::for_test(&RamWriteMode::Full),
             RamWriteMode::Full,
             RamOutputFiles::new(
                 ram,
@@ -1274,14 +1449,14 @@ mod tests {
             &receipt,
             files.readonly("closed-ram"),
             files.readonly("closed-layout"),
-            auth(),
+            RamInputAuthority::IdentifiedSnapshot(auth()),
         )
         .unwrap();
         let second = seal_completed(
             &receipt,
             files.readonly("closed-ram"),
             files.readonly("closed-layout"),
-            auth(),
+            RamInputAuthority::IdentifiedSnapshot(auth()),
         )
         .unwrap();
         assert!(Arc::ptr_eq(
@@ -1400,6 +1575,7 @@ mod tests {
                 &cut,
                 &binding(),
                 layout.clone(),
+                RamCaptureIdentity::for_test(&RamWriteMode::Full),
                 RamWriteMode::Full,
                 output,
                 &mut RamIoScratch::new().unwrap(),
@@ -1481,6 +1657,7 @@ mod tests {
                     &cut,
                     &binding(),
                     layout.clone(),
+                    RamCaptureIdentity::for_test(&RamWriteMode::Full),
                     RamWriteMode::Full,
                     output,
                     &mut RamIoScratch::new().unwrap(),
@@ -1508,6 +1685,7 @@ mod tests {
             &cut,
             &binding(),
             layout,
+            RamCaptureIdentity::for_test(&RamWriteMode::Full),
             RamWriteMode::Full,
             RamOutputFiles::new(
                 same,
@@ -1545,7 +1723,7 @@ mod tests {
                 &receipt,
                 files.readonly("first-ram"),
                 files.readonly("first-layout"),
-                wrong
+                RamInputAuthority::IdentifiedSnapshot(wrong)
             )
             .is_err()
         );
@@ -1555,7 +1733,7 @@ mod tests {
                 &receipt,
                 files.readonly("copy-ram"),
                 files.readonly("first-layout"),
-                auth()
+                RamInputAuthority::IdentifiedSnapshot(auth())
             )
             .is_err()
         );
@@ -1564,14 +1742,14 @@ mod tests {
                 &receipt,
                 files.writable("first-ram"),
                 files.readonly("first-layout"),
-                auth()
+                RamInputAuthority::IdentifiedSnapshot(auth())
             )
             .is_err()
         );
-        let external = AuthenticatedRamImage::for_restore(
+        let external = AdmittedRamImage::for_restore(
             files.readonly("first-ram"),
             files.readonly("first-layout"),
-            auth(),
+            RamInputAuthority::IdentifiedSnapshot(auth()),
             &execution(&layout),
         )
         .unwrap();
@@ -1579,7 +1757,7 @@ mod tests {
             &receipt,
             files.readonly("first-ram"),
             files.readonly("first-layout"),
-            auth(),
+            RamInputAuthority::IdentifiedSnapshot(auth()),
         )
         .unwrap();
         assert!(
@@ -1625,7 +1803,7 @@ mod tests {
                 &receipt,
                 files.readonly("first-ram"),
                 files.readonly("first-layout"),
-                auth()
+                RamInputAuthority::IdentifiedSnapshot(auth())
             )
             .is_ok()
         );
@@ -1634,7 +1812,7 @@ mod tests {
             &other,
             files.readonly("other-ram"),
             files.readonly("other-layout"),
-            auth(),
+            RamInputAuthority::IdentifiedSnapshot(auth()),
         )
         .unwrap();
         assert!(
@@ -1667,7 +1845,7 @@ mod tests {
                 &receipt,
                 files.readonly("candidate-ram"),
                 files.readonly("candidate-layout"),
-                auth()
+                RamInputAuthority::IdentifiedSnapshot(auth())
             )
             .is_err()
         );
@@ -1681,7 +1859,7 @@ mod tests {
                 &receipt,
                 files.readonly("candidate-ram"),
                 files.readonly("candidate-layout"),
-                auth()
+                RamInputAuthority::IdentifiedSnapshot(auth())
             )
             .is_ok()
         );
@@ -1697,19 +1875,19 @@ mod tests {
         let mut wrong = auth();
         wrong.state.source_run = [8; 16];
         assert!(
-            AuthenticatedRamImage::for_restore(
+            AdmittedRamImage::for_restore(
                 files.readonly("input-ram"),
                 files.readonly("input-layout"),
-                wrong,
+                RamInputAuthority::IdentifiedSnapshot(wrong),
                 &valid_execution
             )
             .is_err()
         );
         assert!(
-            AuthenticatedRamImage::for_restore(
+            AdmittedRamImage::for_restore(
                 files.writable("input-ram"),
                 files.readonly("input-layout"),
-                auth(),
+                RamInputAuthority::IdentifiedSnapshot(auth()),
                 &valid_execution
             )
             .is_err()
@@ -1719,10 +1897,10 @@ mod tests {
             .set_len(layout.packed_len() - 1)
             .unwrap();
         assert!(
-            AuthenticatedRamImage::for_restore(
+            AdmittedRamImage::for_restore(
                 files.readonly("input-ram"),
                 files.readonly("input-layout"),
-                auth(),
+                RamInputAuthority::IdentifiedSnapshot(auth()),
                 &valid_execution
             )
             .is_err()
@@ -1743,10 +1921,10 @@ mod tests {
             .write_all_at(changed.as_bytes(), 0)
             .unwrap();
         assert!(
-            AuthenticatedRamImage::for_restore(
+            AdmittedRamImage::for_restore(
                 files.readonly("input-ram"),
                 files.readonly("input-layout"),
-                auth(),
+                RamInputAuthority::IdentifiedSnapshot(auth()),
                 &valid_execution
             )
             .is_err()
@@ -1892,5 +2070,152 @@ mod tests {
             b"layout-sentinel"
         );
         assert_eq!(domain.backing_kind(), BackingKind::RestoredPrivate);
+    }
+
+    #[test]
+    #[cfg(not(feature = "tee"))]
+    fn owned_restore_maps_complete_private_bytes_and_seeds_only_materialization_authority() {
+        use crate::vmm::memory::MemoryCoordinator;
+        use crate::vmm::memory::image::{RamHashSelection, RamIdentityAnchor};
+        use arch::guest_memory::DirtyPageMap;
+        let files = Files::new();
+        let (_, mut control, layout) = source();
+        let cut = seal(&mut control);
+        let receipt = write_ram_image(
+            AttemptId::for_test(),
+            key(),
+            &cut,
+            &binding(),
+            layout.clone(),
+            RamCaptureIdentity {
+                selection: RamHashSelection::None,
+                anchor: RamIdentityAnchor::Unknown,
+                anchor_generation: crate::vmm::memory::image::RamIdentityGeneration::Unknown,
+                predecessor_generation: 0,
+                identity_dirty_pages: 0,
+                materialization_dirty_pages: 0,
+                byte_baseline: None,
+            },
+            RamWriteMode::Full,
+            RamOutputFiles::new(
+                files.create("owned-ram", &[]),
+                files.create("owned-layout", &[]),
+                TempFile::new().unwrap().as_file().try_clone().unwrap(),
+            ),
+            &mut RamIoScratch::new().unwrap(),
+            deadline(),
+        )
+        .unwrap();
+        assert!(
+            seal_completed(
+                &receipt,
+                files.readonly("owned-ram"),
+                files.readonly("owned-layout"),
+                RamInputAuthority::IdentifiedSnapshot(auth())
+            )
+            .is_err()
+        );
+        let authority = RamInputAuthority::OwnedLocalCut {
+            state: binding(),
+            materialization_generation: 9,
+        };
+        let execution = execution(&layout);
+        let image = Arc::new(
+            AdmittedRamImage::for_restore(
+                files.readonly("owned-ram"),
+                files.readonly("owned-layout"),
+                authority,
+                &execution,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            image.authority().identity_anchor(),
+            RamIdentityAnchor::Unknown
+        );
+        let restored = map_restore_ram(image, &execution).unwrap();
+        let (domain, construction, control, image, _) = restored.into_parts(&execution).unwrap();
+        let mut bytes = [0; 16];
+        construction
+            .memory()
+            .unwrap()
+            .read_slice(&mut bytes, GuestAddress(0))
+            .unwrap();
+        assert_eq!(bytes, [0xa5; 16]);
+        for region in construction.memory().unwrap().iter() {
+            assert_eq!(region.flags(), libc::MAP_PRIVATE);
+        }
+        let epoch = construction.issue_epoch(1).unwrap();
+        let mut memory = MemoryCoordinator::new(control, construction);
+        memory.finish_tracked(epoch).unwrap();
+        memory.seed_restored(image).unwrap();
+        let token = memory.baseline_token().unwrap();
+        assert_eq!(token.memory_generation(), 9);
+        assert_eq!(token.identity_anchor(), RamIdentityAnchor::Unknown);
+        domain
+            .write(GuestAddress(0), 16)
+            .unwrap()
+            .write_view(0, 16)
+            .unwrap()
+            .write_slice(&[0x7d; 16], 0)
+            .unwrap();
+        assert_eq!(read_prefix(&files.path("owned-ram")), [0xa5; 16]);
+        let cut = seal(&mut memory.control);
+        let mut dirty = DirtyPageMap::new(domain.layout());
+        memory.control.drain_host_dirty(&cut, &mut dirty).unwrap();
+        assert_eq!(dirty.count(), 1);
+        assert!(
+            AdmittedRamImage::for_restore(
+                files.readonly("owned-ram"),
+                files.readonly("owned-layout"),
+                RamInputAuthority::OwnedLocalCut {
+                    state: binding(),
+                    materialization_generation: 0,
+                },
+                &execution
+            )
+            .is_err()
+        );
+    }
+
+    impl<'a> RamCaptureIdentity<'a> {
+        pub(crate) fn for_test(mode: &RamWriteMode<'a>) -> Self {
+            use crate::vmm::memory::image::{
+                RamHashSelection, RamIdentityAnchor, RamIdentityGeneration,
+            };
+            use std::num::NonZeroU64;
+            let (selection, anchor, pages, predecessor) = match mode {
+                RamWriteMode::Full => (RamHashSelection::Full, RamIdentityAnchor::Unknown, 0, 0),
+                RamWriteMode::Incremental { baseline, dirty } => {
+                    let anchor = baseline.authority().identity_anchor();
+                    let RamIdentityAnchor::Identified { stream } = anchor else {
+                        panic!("snapshot fixture requires an identified baseline")
+                    };
+                    (
+                        RamHashSelection::SinceAnchor { stream, dirty },
+                        anchor,
+                        dirty.count(),
+                        1,
+                    )
+                }
+            };
+            Self {
+                selection,
+                anchor,
+                predecessor_generation: predecessor,
+                anchor_generation: match anchor {
+                    RamIdentityAnchor::Unknown => RamIdentityGeneration::Unknown,
+                    RamIdentityAnchor::Identified { .. } => RamIdentityGeneration::Identified {
+                        generation: NonZeroU64::MIN,
+                    },
+                },
+                identity_dirty_pages: pages,
+                materialization_dirty_pages: pages,
+                byte_baseline: match mode {
+                    RamWriteMode::Full => None,
+                    RamWriteMode::Incremental { baseline, dirty } => Some((baseline, dirty)),
+                },
+            }
+        }
     }
 }

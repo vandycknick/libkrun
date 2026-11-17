@@ -42,7 +42,7 @@ use crate::api::live::OutputReceipt;
 use crate::api::live::{
     ActivationStage, BaselineImage, CaptureId, CaptureStage, CaptureStatus, CaptureTicket,
     CompletedCapture, ExecutionCaptureReceipt, ExecutionOutputs, FlushReceipt, LiveError,
-    LiveSnapshot, LiveStage, LiveSubject, MemoryCaptureRequest, MemoryOutputs, OutputProblem,
+    LiveProviderSnapshot, LiveSnapshot, LiveStage, LiveSubject, MemoryCaptureRequest, MemoryOutputs, OutputProblem,
     OutputRole,
 };
 use crate::api::live::{DiskGenerationSettlement, DiskGenerationToken, DiskTrackingCut};
@@ -53,7 +53,8 @@ use crate::vmm::control::{
     RestoreToken,
 };
 use crate::vmm::execution::StateBinding;
-use crate::vmm::memory::image::{RamOutputFiles, ValidatedRamLayout};
+use crate::vmm::device_manager::quiescence::AttachmentIdentity;
+use crate::vmm::memory::image::{RamInputAuthority, RamOutputFiles, ValidatedRamLayout};
 use crate::vmm::memory::{AttemptId, CompletedCandidate, DirtyCrossoverPercent, RamCaptureRequest};
 
 type Reply = Sender<Result<ControlReply, ControlFailure>>;
@@ -200,7 +201,7 @@ struct CaptureRecord {
     execution_failure: Option<LiveError>,
     attempt: Option<AttemptId>,
     candidate: Option<CompletedCandidate>,
-    accepted_stream: Option<[u8; 32]>,
+    accepted_authority: Option<RamInputAuthority>,
     terminal: bool,
 }
 impl CaptureRecord {
@@ -395,6 +396,53 @@ impl ActivationBarrier {
         Poll::Ready(result)
     }
 }
+struct PendingSnapshot {
+    deadline: Instant,
+    reply: Reply,
+}
+
+fn observe_live_providers(
+    devices: impl IntoIterator<Item = (AttachmentIdentity, Arc<Mutex<dyn VirtioDevice>>)>,
+    deadline: Instant,
+) -> Poll<Result<Vec<LiveProviderSnapshot>, LiveError>> {
+    if Instant::now() >= deadline {
+        return Poll::Ready(Err(ControlFailure::Deadline.into()));
+    }
+    let mut providers = Vec::new();
+    for (attachment, device) in devices {
+        let device = match device.try_lock() {
+            Ok(device) => device,
+            Err(TryLockError::WouldBlock) => return Poll::Pending,
+            Err(TryLockError::Poisoned(_)) => {
+                return Poll::Ready(Err(LiveError::Execution(
+                    "activation observation: device lock poisoned".into(),
+                )));
+            }
+        };
+        let provider = device.state_provider().ok_or(ControlFailure::FailedFenced)?;
+        let activation_fenced = match provider.poll_activation_fenced(deadline) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(fenced)) => fenced,
+            Poll::Ready(Err(ProviderFault::Deadline)) => {
+                return Poll::Ready(Err(ControlFailure::Deadline.into()));
+            }
+            Poll::Ready(Err(error)) => {
+                return Poll::Ready(Err(LiveError::Execution(format!(
+                    "activation observation: {error:?}"
+                ))));
+            }
+        };
+        providers.push(LiveProviderSnapshot {
+            attachment,
+            activation_fenced,
+        });
+    }
+    if Instant::now() >= deadline {
+        return Poll::Ready(Err(ControlFailure::Deadline.into()));
+    }
+    Poll::Ready(Ok(providers))
+}
+
 #[derive(Default)]
 pub(crate) struct LiveOwner {
     records: BTreeMap<CaptureId, CaptureRecord>,
@@ -402,6 +450,7 @@ pub(crate) struct LiveOwner {
     source_run: Option<[u8; 16]>,
     next_capture: u64,
     activation: Option<ActivationRelease>,
+    snapshots: Vec<PendingSnapshot>,
     pub(crate) activation_released: bool,
     pub(crate) activation_failed: bool,
     #[cfg(all(
@@ -427,7 +476,9 @@ impl LiveOwner {
         if self.irq_probe.as_ref().is_some_and(|probe| probe.pending()) {
             return true;
         }
-        self.records.values().any(|record| record.pending.is_some()) || self.activation.is_some()
+        self.records.values().any(|record| record.pending.is_some())
+            || self.activation.is_some()
+            || !self.snapshots.is_empty()
     }
     pub(crate) fn unresolved(&self) -> bool {
         #[cfg(all(
@@ -741,42 +792,16 @@ impl Vmm {
             LiveRequest::Layout => LiveReply::Layout(self.memory_layout().map_err(|error| {
                 LiveError::from(crate::vmm::memory::CaptureError::Image(error))
             })?),
-            LiveRequest::Snapshot => {
-                let mut file_backings = Vec::new();
-                for fact in self.memory_domain.file_backing_identities() {
-                    let fact = fact.map_err(|error| io_error(OutputRole::Ram, error))?;
-                    file_backings.push((fact.device, fact.inode));
-                }
-                let mut providers = Vec::new();
-                for (attachment, device) in self.mmio_device_manager.quiescence.live_devices() {
-                    let device = device.try_lock().map_err(|_| ControlFailure::Busy)?;
-                    let activation_fenced = device
-                        .state_provider()
-                        .ok_or(ControlFailure::FailedFenced)?
-                        .activation_fenced()
-                        .map_err(|error| {
-                            LiveError::Execution(format!("activation observation: {error:?}"))
-                        })?;
-                    providers.push(crate::api::live::LiveProviderSnapshot {
-                        attachment,
-                        activation_fenced,
+            LiveRequest::Snapshot => match self.observe_live_snapshot(deadline) {
+                Poll::Ready(result) => LiveReply::Snapshot(result?),
+                Poll::Pending => {
+                    self.control.live.snapshots.push(PendingSnapshot {
+                        deadline,
+                        reply: reply.clone(),
                     });
+                    return Ok(None);
                 }
-                LiveReply::Snapshot(LiveSnapshot {
-                    state: self.control.state.clone(),
-                    backing: self.memory_domain.backing_kind(),
-                    file_backings,
-                    tracking: self.memory_domain.tracking_mode(),
-                    coverage_valid: self.memory_domain.coverage_valid(),
-                    pending_dirty_pages: self.memory.pending_dirty_count(),
-                    native_commands_reconciled: self.control.cpus.reconciled(),
-                    activation_released: self.control.live.activation_released,
-                    activation_failed: self.control.live.activation_failed,
-                    restore_installation: self.memory.restore_installation(),
-                    providers,
-                    time_preparation: self.execution.preparation_observation().cloned(),
-                })
-            }
+            },
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             LiveRequest::Profile(profile) => {
                 if self.control.state != ControlState::Running || self.control.live.unresolved() {
@@ -896,7 +921,7 @@ impl Vmm {
                     execution_failure: None,
                     attempt: None,
                     candidate: None,
-                    accepted_stream: None,
+                    accepted_authority: None,
                     terminal: false,
                 };
                 let barrier = BarrierRequest { key, deadline };
@@ -937,6 +962,7 @@ impl Vmm {
                     (OutputRole::Layout, &outputs.layout),
                     (OutputRole::Changes, &outputs.changes),
                 ])?;
+                let identity_policy = request.identity_policy;
                 let request = match crossover {
                     None => RamCaptureRequest::Full,
                     Some(crossover) => RamCaptureRequest::Incremental {
@@ -944,7 +970,7 @@ impl Vmm {
                         crossover,
                     },
                 };
-                let attempt = self.begin_memory_capture(&ticket.pause, request)?;
+                let attempt = self.begin_memory_capture(&ticket.pause, request, identity_policy)?;
                 if let Some(record) = self.control.live.records.get_mut(&ticket.id) {
                     record.attempt = Some(attempt.clone());
                     record.status = CaptureStatus::MemoryPending(ticket.clone());
@@ -1007,7 +1033,7 @@ impl Vmm {
                         .candidate
                         .as_ref()
                         .ok_or(ControlFailure::InvalidToken)?;
-                    if record.accepted_stream != Some(sealed.authentication.stream) {
+                    if record.accepted_authority.as_ref() != Some(&sealed.authentication) {
                         return Err(ControlFailure::InvalidToken.into());
                     }
                     candidate
@@ -1022,7 +1048,7 @@ impl Vmm {
                     .as_ref()
                     .ok_or(ControlFailure::Busy)?
                     .clone();
-                let stream = sealed.authentication.stream;
+                let authority = sealed.authentication.clone();
                 let image = candidate
                     .seal(sealed.ram, sealed.layout, sealed.authentication)
                     .map_err(|error| {
@@ -1039,7 +1065,7 @@ impl Vmm {
                     ticket,
                     baseline: baseline.clone(),
                 };
-                record.accepted_stream = Some(stream);
+                record.accepted_authority = Some(authority);
                 self.execution.retire_serialization();
                 LiveReply::Baseline(baseline)
             }
@@ -1136,7 +1162,48 @@ impl Vmm {
         };
         Ok(Some(result))
     }
+    fn observe_live_snapshot(&self, deadline: Instant) -> Poll<Result<LiveSnapshot, LiveError>> {
+        let providers = std::task::ready!(observe_live_providers(
+            self.mmio_device_manager.quiescence.live_devices(),
+            deadline,
+        ))?;
+        let mut file_backings = Vec::new();
+        for fact in self.memory_domain.file_backing_identities() {
+            let fact = fact.map_err(|error| io_error(OutputRole::Ram, error))?;
+            file_backings.push((fact.device, fact.inode));
+        }
+        if Instant::now() >= deadline {
+            return Poll::Ready(Err(ControlFailure::Deadline.into()));
+        }
+        Poll::Ready(Ok(LiveSnapshot {
+            state: self.control.state.clone(),
+            backing: self.memory_domain.backing_kind(),
+            file_backings,
+            tracking: self.memory_domain.tracking_mode(),
+            coverage_valid: self.memory_domain.coverage_valid(),
+            pending_dirty_pages: self.memory.pending_dirty_count(),
+            native_commands_reconciled: self.control.cpus.reconciled(),
+            activation_released: self.control.live.activation_released,
+            activation_failed: self.control.live.activation_failed,
+            restore_installation: self.memory.restore_installation(),
+            providers,
+            time_preparation: self.execution.preparation_observation().cloned(),
+        }))
+    }
+    fn poll_live_snapshots(&mut self) {
+        let mut snapshots = std::mem::take(&mut self.control.live.snapshots);
+        snapshots.retain(|pending| match self.observe_live_snapshot(pending.deadline) {
+            Poll::Pending => true,
+            Poll::Ready(result) => {
+                answer(&pending.reply, result.map(LiveReply::Snapshot));
+                false
+            }
+        });
+        self.control.live.snapshots = snapshots;
+    }
+
     pub(crate) fn poll_live(&mut self) {
+        self.poll_live_snapshots();
         #[cfg(all(
             feature = "native-device-probe",
             feature = "blk",
@@ -1780,7 +1847,7 @@ mod tests {
                 execution_failure: None,
                 attempt: None,
                 candidate: None,
-                accepted_stream: None,
+                accepted_authority: None,
                 terminal: true,
             },
         );
@@ -2352,5 +2419,94 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn pending_snapshot_keeps_owner_polling_without_reserving_capture() {
+        use crate::vmm::control::live::PendingSnapshot;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (reply, _receiver) = crossbeam_channel::bounded(1);
+        let mut owner = LiveOwner::default();
+        assert!(!owner.pending());
+        owner.snapshots.push(PendingSnapshot { deadline, reply });
+        assert!(owner.pending());
+        assert!(!owner.unresolved());
+        assert_eq!(owner.snapshots[0].deadline, deadline);
+        owner.snapshots.clear();
+        assert!(!owner.pending());
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn snapshot_observation_returns_only_a_complete_real_provider_inventory() {
+        use crate::vmm::control::live::observe_live_providers;
+        use crate::vmm::device_manager::quiescence::AttachmentIdentity;
+        use std::sync::Mutex;
+        use std::task::Poll;
+        let (first, _first_peer) = restored_net("eth0");
+        let (second, _second_peer) = restored_net("eth1");
+        let first_device: Arc<Mutex<dyn devices::virtio::VirtioDevice>> = first.clone();
+        let second_device: Arc<Mutex<dyn devices::virtio::VirtioDevice>> = second.clone();
+        let first_identity = AttachmentIdentity {
+            device_type: devices::DeviceType::Virtio(1),
+            configured_id: "eth0".into(),
+            address: 0xd000_0000,
+            irq: 5,
+        };
+        let second_identity = AttachmentIdentity {
+            device_type: devices::DeviceType::Virtio(1),
+            configured_id: "eth1".into(),
+            address: 0xd000_1000,
+            irq: 6,
+        };
+        let devices = || [
+            (first_identity.clone(), first_device.clone()),
+            (second_identity.clone(), second_device.clone()),
+        ];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let held = second.lock().unwrap();
+        assert!(observe_live_providers(devices(), deadline).is_pending());
+        drop(held);
+        let Poll::Ready(Ok(providers)) = observe_live_providers(devices(), deadline) else {
+            panic!("complete provider inventory expected after contention clears")
+        };
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].attachment, first_identity);
+        assert_eq!(providers[1].attachment, second_identity);
+        assert!(providers.iter().all(|provider| provider.activation_fenced == Some(true)));
+        let poison = second.clone();
+        assert!(std::thread::spawn(move || {
+            let _held = poison.lock().unwrap();
+            panic!("poison actual device owner");
+        }).join().is_err());
+        assert!(matches!(observe_live_providers(devices(), deadline),
+            Poll::Ready(Err(LiveError::Execution(_)))));
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn snapshot_observation_reports_its_original_deadline_while_a_real_device_stays_busy() {
+        use crate::vmm::control::live::observe_live_providers;
+        use crate::vmm::device_manager::quiescence::AttachmentIdentity;
+        use std::sync::Mutex;
+        use std::task::Poll;
+        let (net, _peer) = restored_net("eth0");
+        let device: Arc<Mutex<dyn devices::virtio::VirtioDevice>> = net.clone();
+        let identity = AttachmentIdentity {
+            device_type: devices::DeviceType::Virtio(1),
+            configured_id: "eth0".into(),
+            address: 0xd000_0000,
+            irq: 5,
+        };
+        let devices = || [(identity.clone(), device.clone())];
+        let held = net.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert!(observe_live_providers(devices(), deadline).is_pending());
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        assert!(matches!(observe_live_providers(devices(), deadline),
+            Poll::Ready(Err(LiveError::Control(ControlFailure::Deadline)))));
+        drop(held);
+        assert!(matches!(observe_live_providers(devices(), deadline),
+            Poll::Ready(Err(LiveError::Control(ControlFailure::Deadline)))));
     }
 }

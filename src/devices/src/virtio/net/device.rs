@@ -1989,4 +1989,44 @@ mod tests {
         assert_eq!(worker.tx_q.queue.capture_state().unwrap().next_used, 0);
         assert!(net.capture_payload(stop.key).is_err());
     }
+
+    #[test]
+    fn activation_observation_waits_for_real_worker_admission_without_losing_the_fence() {
+        use std::task::Poll;
+        let (net, _peer, _) = inactive_activation_net();
+        let admission = net.control.as_ref().unwrap().0.clone();
+        let held = admission.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert_eq!(net.activation_fenced(), Err(ProviderFault::LockBusy));
+        assert!(net.poll_activation_fenced(deadline).is_pending());
+        drop(held);
+        assert_eq!(net.poll_activation_fenced(deadline), Poll::Ready(Ok(Some(true))));
+    }
+
+    #[test]
+    fn activation_observation_expires_cleanly_while_real_worker_admission_stays_held() {
+        use std::task::Poll;
+        let (net, _peer, _) = inactive_activation_net();
+        let admission = net.control.as_ref().unwrap().0.clone();
+        let held = admission.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert!(net.poll_activation_fenced(deadline).is_pending());
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        assert_eq!(net.poll_activation_fenced(deadline), Poll::Ready(Err(ProviderFault::Deadline)));
+        drop(held);
+        assert_eq!(net.poll_activation_fenced(deadline), Poll::Ready(Err(ProviderFault::Deadline)));
+    }
+
+    #[test]
+    fn activation_observation_does_not_retry_poisoned_real_worker_admission() {
+        use std::task::Poll;
+        let (net, _peer, _) = inactive_activation_net();
+        let admission = net.control.as_ref().unwrap().0.clone();
+        assert!(std::thread::spawn(move || {
+            let _held = admission.lock().unwrap();
+            panic!("poison actual worker admission");
+        }).join().is_err());
+        assert_eq!(net.poll_activation_fenced(Instant::now() + Duration::from_secs(2)),
+            Poll::Ready(Err(ProviderFault::Worker)));
+    }
 }

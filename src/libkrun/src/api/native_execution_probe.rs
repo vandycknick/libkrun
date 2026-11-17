@@ -35,7 +35,8 @@ use crate::vmm::execution::{
 use crate::vmm::memory::RamCaptureRequest;
 use crate::vmm::memory::image::layout::MAX_RAM_LAYOUT_BYTES;
 use crate::vmm::memory::image::{
-    AuthenticatedRamImage, RamImageAuthentication, RamOutputFiles, RestoredRam, ValidatedRamLayout,
+    AdmittedRamImage, RamIdentityPolicy, RamInputAuthority, RamImageAuthentication,
+    RamOutputFiles, RestoredRam, ValidatedRamLayout,
     map_restore_ram,
 };
 
@@ -390,7 +391,7 @@ fn restored_ram(
     // The controller transfers each authenticated descriptor exactly once.
     let ram = unsafe { File::from_raw_fd(ram_fd) };
     let layout = unsafe { File::from_raw_fd(layout_fd) };
-    let image = AuthenticatedRamImage::for_restore(ram, layout, authentication, execution)
+    let image = AdmittedRamImage::for_restore(ram, layout, RamInputAuthority::IdentifiedSnapshot(authentication), execution)
         .map_err(|error| error.to_string())?;
     map_restore_ram(Arc::new(image), execution).map_err(|error| error.to_string())
 }
@@ -1191,7 +1192,7 @@ fn save_capture(
     let cut_key = key(expected.pause_generation);
     let id = attempt
         .vmm
-        .diagnostic_begin_memory_capture(cut_key, RamCaptureRequest::Full)
+        .diagnostic_begin_memory_capture(cut_key, RamCaptureRequest::Full, RamIdentityPolicy::Full)
         .map_err(|error| error.to_string())?;
     let completed =
         attempt

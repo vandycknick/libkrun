@@ -1,10 +1,11 @@
 use std::fs::File;
 use std::num::NonZeroU32;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
 use std::time::Instant;
 
-use crate::api::live::{RamImageAuthentication, StateBinding};
+use crate::api::live::{RamInputAuthority, StateBinding};
 use crate::api::vmm_builder::Vmm;
 pub use crate::vmm::control::RestoreToken;
 pub use devices::virtio::block::{ReadonlyVmdk, RestoreBlockBacking, VmdkExtent};
@@ -16,11 +17,71 @@ pub struct StateObjectIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeFileFingerprint {
+    pub device: u64,
+    pub inode: u64,
+    pub length: u64,
+    pub mode: u32,
+    pub modified_seconds: i64,
+    pub modified_nanoseconds: i64,
+    pub changed_seconds: i64,
+    pub changed_nanoseconds: i64,
+}
+
+impl NativeFileFingerprint {
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            mode: metadata.mode(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StateObjectAuthority {
+    Identified(StateObjectIdentity),
+    OwnedLocalFile { fingerprint: NativeFileFingerprint },
+}
+
+impl StateObjectAuthority {
+    pub fn length(&self) -> u64 {
+        match self {
+            Self::Identified(identity) => identity.length,
+            Self::OwnedLocalFile { fingerprint } => fingerprint.length,
+        }
+    }
+    pub fn is_identified(&self) -> bool {
+        matches!(self, Self::Identified(_))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestoreIdentity {
     pub binding: StateBinding,
-    pub ram_image: RamImageAuthentication,
-    pub execution_object: StateObjectIdentity,
-    pub devices_object: StateObjectIdentity,
+    pub ram_image: RamInputAuthority,
+    pub execution_object: StateObjectAuthority,
+    pub devices_object: StateObjectAuthority,
+}
+
+impl RestoreIdentity {
+    pub fn validate_authority(&self) -> bool {
+        let identified = matches!(self.ram_image, RamInputAuthority::IdentifiedSnapshot(_));
+        let valid_root = match &self.ram_image {
+            RamInputAuthority::IdentifiedSnapshot(authentication) => authentication.stream != [0; 32],
+            RamInputAuthority::OwnedLocalCut { materialization_generation, .. } =>
+                *materialization_generation != 0,
+        };
+        self.ram_image.state() == &self.binding
+            && self.execution_object.is_identified() == identified
+            && self.devices_object.is_identified() == identified
+            && valid_root
+    }
 }
 
 /// Trust and immutable-inode leases remain the caller's responsibility.
@@ -139,6 +200,7 @@ pub enum RestoreProblem {
     Alias,
     Length,
     Digest,
+    FileFacts,
     Inventory,
     ColdConfiguration,
     Topology,

@@ -22,8 +22,8 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 
 use crate::vmm::memory::image::{
-    FileFact, RamCaptureMode, RamFileRole, RamImageError, RamIoOperation, check_deadline, inspect,
-    io_error,
+    FileFact, RamCaptureMode, RamChangeAuthority, RamFileRole, RamImageError, RamIoOperation,
+    check_deadline, inspect, io_error,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,7 +60,41 @@ impl RamChangeReceipt {
     }
 }
 
-pub(crate) struct ChangeWriter<'a> {
+pub(crate) enum ChangeWriter<'a> {
+    None,
+    Identified(Box<IdentifiedChangeWriter<'a>>),
+}
+
+impl<'a> ChangeWriter<'a> {
+    pub(crate) fn new(
+        file: &'a File,
+        coverage: RamCaptureMode,
+        baseline_stream: Option<[u8; 32]>,
+        units: u64,
+        deadline: Instant,
+    ) -> Result<Self, RamImageError> {
+        IdentifiedChangeWriter::new(file, coverage, baseline_stream, units, deadline)
+            .map(|writer| Self::Identified(Box::new(writer)))
+    }
+
+    pub(crate) fn push(&mut self, index: u64, digest: Option<[u8; 32]>)
+        -> Result<(), RamImageError>
+    {
+        match self {
+            Self::None => Err(RamImageError::Completion),
+            Self::Identified(writer) => writer.push(index, digest),
+        }
+    }
+
+    pub(crate) fn finish(self) -> Result<RamChangeAuthority, RamImageError> {
+        match self {
+            Self::None => Ok(RamChangeAuthority::None),
+            Self::Identified(writer) => writer.finish().map(RamChangeAuthority::Identified),
+        }
+    }
+}
+
+pub(crate) struct IdentifiedChangeWriter<'a> {
     file: &'a File,
     buffer: Vec<u8>,
     offset: u64,
@@ -74,7 +108,7 @@ pub(crate) struct ChangeWriter<'a> {
     deadline: Instant,
 }
 
-impl<'a> ChangeWriter<'a> {
+impl<'a> IdentifiedChangeWriter<'a> {
     pub(crate) fn new(
         file: &'a File,
         coverage: RamCaptureMode,

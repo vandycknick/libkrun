@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 use std::time::Instant;
@@ -7,8 +8,9 @@ use crate::vmm::Vmm;
 use crate::vmm::control::{BarrierKey, ControlFailure, ControlState, PauseToken};
 use crate::vmm::execution::{ExecutionLane, StateBinding};
 use crate::vmm::memory::image::{
-    AuthenticatedRamImage, RamCaptureMode, RamCaptureReceipt, RamImageAuthentication,
-    RamImageError, RamImageFailure, RamIoScratch, RamOutputFiles, RamWriteMode, ValidatedRamLayout,
+    AdmittedRamImage, RamCaptureIdentity, RamCaptureMode, RamCaptureReceipt, RamHashSelection,
+    RamIdentityAnchor, RamIdentityGeneration, RamIdentityPolicy, RamImageError, RamImageFailure,
+    RamInputAuthority, RamIoScratch, RamOutputFiles, RamWriteMode, ValidatedRamLayout,
 };
 #[cfg(not(feature = "tee"))]
 use arch::guest_memory::DirtyEffect;
@@ -34,10 +36,18 @@ pub struct BaselineToken {
     tracker: TrackerIdentity,
     topology: TopologyGeneration,
     memory_generation: u64,
+    identity_anchor: RamIdentityAnchor,
+    identity_anchor_generation: RamIdentityGeneration,
 }
 impl BaselineToken {
     pub fn memory_generation(&self) -> u64 {
         self.memory_generation
+    }
+    pub fn identity_anchor(&self) -> RamIdentityAnchor {
+        self.identity_anchor
+    }
+    pub fn identity_anchor_generation(&self) -> RamIdentityGeneration {
+        self.identity_anchor_generation
     }
 }
 
@@ -126,7 +136,7 @@ impl From<RamImageError> for CaptureError {
 
 struct AcceptedBaseline {
     token: BaselineToken,
-    image: Arc<AuthenticatedRamImage>,
+    image: Arc<AdmittedRamImage>,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum AttemptState {
@@ -143,6 +153,7 @@ struct CaptureAttempt {
     binding: StateBinding,
     layout: Arc<ValidatedRamLayout>,
     full_reason: Option<FullCaptureReason>,
+    identity_policy: RamIdentityPolicy,
     state: AttemptState,
     failure: Option<Arc<RamImageFailure>>,
 }
@@ -171,8 +182,8 @@ impl CompletedCandidate {
         &self,
         ram: File,
         layout: File,
-        authentication: RamImageAuthentication,
-    ) -> Result<Arc<AuthenticatedRamImage>, RamImageError> {
+        authentication: RamInputAuthority,
+    ) -> Result<Arc<AdmittedRamImage>, RamImageError> {
         image::seal_completed(&self.receipt, ram, layout, authentication).map(Arc::new)
     }
 }
@@ -188,6 +199,9 @@ pub struct MemoryCoordinator {
     pub(crate) control: DomainControl,
     pub(crate) construction: Option<ConstructionAuthority>,
     pending: Option<DirtyPageMap>,
+    identity_dirty: Option<DirtyPageMap>,
+    identity_anchor: RamIdentityAnchor,
+    identity_anchor_generation: RamIdentityGeneration,
     key: Option<BarrierKey>,
     pause: Option<PauseToken>,
     closing: Option<ClosingMemory>,
@@ -216,9 +230,14 @@ impl MemoryCoordinator {
         self.pending.as_ref().map_or(0, DirtyPageMap::count)
     }
     pub(crate) fn baseline_token(&self) -> Option<BaselineToken> {
-        self.baseline
-            .as_ref()
-            .map(|baseline| baseline.token.clone())
+        self.baseline.as_ref().map(|baseline| {
+            let mut token = baseline.token.clone();
+            if !self.control.domain().coverage_valid() {
+                token.identity_anchor = RamIdentityAnchor::Unknown;
+                token.identity_anchor_generation = RamIdentityGeneration::Unknown;
+            }
+            token
+        })
     }
     pub(crate) fn restore_installation(&self) -> Option<RestoreInstallationEvidence> {
         self.restore_installation
@@ -298,6 +317,9 @@ impl MemoryCoordinator {
             control,
             construction: Some(construction),
             pending: None,
+            identity_dirty: None,
+            identity_anchor: RamIdentityAnchor::Unknown,
+            identity_anchor_generation: RamIdentityGeneration::Unknown,
             key: None,
             pause: None,
             closing: None,
@@ -325,12 +347,13 @@ impl MemoryCoordinator {
         self.control
             .finish_tracked(self.construction.take().ok_or(MemoryError::State)?, epoch)?;
         self.pending = Some(DirtyPageMap::new(self.control.domain().layout()));
+        self.identity_dirty = Some(DirtyPageMap::new(self.control.domain().layout()));
         Ok(())
     }
     #[cfg(not(feature = "tee"))]
     pub(crate) fn seed_restored(
         &mut self,
-        image: Arc<AuthenticatedRamImage>,
+        image: Arc<AdmittedRamImage>,
     ) -> Result<(), MemoryError> {
         if self.baseline.is_some()
             || self.pending.is_none()
@@ -347,15 +370,32 @@ impl MemoryCoordinator {
         self.layout
             .set(image.layout().clone())
             .map_err(|_| MemoryError::State)?;
+        let generation = match image.authority() {
+            RamInputAuthority::IdentifiedSnapshot(_) => 1,
+            RamInputAuthority::OwnedLocalCut {
+                materialization_generation,
+                ..
+            } => *materialization_generation,
+        };
+        let next_generation = generation.checked_add(1).ok_or(MemoryError::State)?;
+        self.identity_anchor = image.authority().identity_anchor();
+        self.identity_anchor_generation = match self.identity_anchor {
+            RamIdentityAnchor::Unknown => RamIdentityGeneration::Unknown,
+            RamIdentityAnchor::Identified { .. } => RamIdentityGeneration::Identified {
+                generation: NonZeroU64::MIN,
+            },
+        };
         self.baseline = Some(AcceptedBaseline {
             token: BaselineToken {
                 tracker: self.tracker.clone(),
                 topology: self.control.domain().topology_generation(),
-                memory_generation: 1,
+                memory_generation: generation,
+                identity_anchor: self.identity_anchor,
+                identity_anchor_generation: self.identity_anchor_generation,
             },
             image,
         });
-        self.next_memory_generation = 2;
+        self.next_memory_generation = next_generation;
         Ok(())
     }
     pub(crate) fn begin_close(&mut self, key: BarrierKey) -> Result<(), MemoryError> {
@@ -469,6 +509,7 @@ impl MemoryCoordinator {
         &mut self,
         key: BarrierKey,
         request: RamCaptureRequest<'_>,
+        identity_policy: RamIdentityPolicy,
         binding: StateBinding,
         layout: Arc<ValidatedRamLayout>,
     ) -> Result<AttemptId, CaptureError> {
@@ -485,6 +526,17 @@ impl MemoryCoordinator {
             .checked_add(1)
             .ok_or(CaptureError::Exhausted)?;
         let pending = self.pending.as_ref().ok_or(MemoryError::State)?;
+        if let RamIdentityPolicy::SinceAnchor { stream } = identity_policy
+            && (self.identity_anchor != (RamIdentityAnchor::Identified { stream })
+                || !self.control.domain().coverage_valid())
+        {
+            return Err(CaptureError::InvalidCandidate);
+        }
+        // Harvest before writing so failed and abandoned attempts retain complete identity coverage.
+        self.identity_dirty
+            .as_mut()
+            .ok_or(MemoryError::State)?
+            .merge(pending)?;
         let full_reason = select_full(
             request,
             self.baseline.as_ref().map(|baseline| &baseline.token),
@@ -508,6 +560,7 @@ impl MemoryCoordinator {
             binding,
             layout,
             full_reason,
+            identity_policy,
             state: AttemptState::Writing,
             failure: None,
         });
@@ -548,12 +601,48 @@ impl MemoryCoordinator {
                 dirty: self.pending.as_ref().ok_or(MemoryError::State)?,
             }
         };
+        let identity = RamCaptureIdentity {
+            selection: match attempt.identity_policy {
+                RamIdentityPolicy::None => RamHashSelection::None,
+                RamIdentityPolicy::Full => RamHashSelection::Full,
+                RamIdentityPolicy::SinceAnchor { stream } => RamHashSelection::SinceAnchor {
+                    stream,
+                    dirty: self.identity_dirty.as_ref().ok_or(MemoryError::State)?,
+                },
+            },
+            anchor: if self.control.domain().coverage_valid() {
+                self.identity_anchor
+            } else {
+                RamIdentityAnchor::Unknown
+            },
+            anchor_generation: if self.control.domain().coverage_valid() {
+                self.identity_anchor_generation
+            } else {
+                RamIdentityGeneration::Unknown
+            },
+            predecessor_generation: self
+                .baseline
+                .as_ref()
+                .map_or(0, |baseline| baseline.token.memory_generation),
+            identity_dirty_pages: self
+                .identity_dirty
+                .as_ref()
+                .ok_or(MemoryError::State)?
+                .count(),
+            materialization_dirty_pages: self.pending.as_ref().ok_or(MemoryError::State)?.count(),
+            byte_baseline: self
+                .baseline
+                .as_ref()
+                .zip(self.pending.as_ref())
+                .map(|(baseline, dirty)| (baseline.image.as_ref(), dirty)),
+        };
         match image::writer::write_ram_image(
             id.clone(),
             key,
             cut,
             &attempt.binding,
             attempt.layout.clone(),
+            identity,
             mode,
             output,
             self.scratch.as_mut().ok_or(MemoryError::State)?,
@@ -580,7 +669,7 @@ impl MemoryCoordinator {
         &mut self,
         key: BarrierKey,
         candidate: CompletedCandidate,
-        image: Arc<AuthenticatedRamImage>,
+        image: Arc<AdmittedRamImage>,
     ) -> Result<BaselineToken, CaptureError> {
         self.validate_ready(key)?;
         let attempt = self
@@ -614,15 +703,59 @@ impl MemoryCoordinator {
         if self.pending.is_none() {
             return Err(MemoryError::State.into());
         }
+        match (attempt.identity_policy, image.authority()) {
+            (
+                RamIdentityPolicy::None,
+                RamInputAuthority::OwnedLocalCut {
+                    materialization_generation,
+                    ..
+                },
+            ) if *materialization_generation == attempt.generation => {}
+            (
+                RamIdentityPolicy::Full | RamIdentityPolicy::SinceAnchor { .. },
+                RamInputAuthority::IdentifiedSnapshot(_),
+            ) => {}
+            _ => return Err(CaptureError::InvalidCandidate),
+        }
+        let anchor = match image.authority() {
+            RamInputAuthority::IdentifiedSnapshot(authentication) => {
+                RamIdentityAnchor::Identified {
+                    stream: authentication.stream,
+                }
+            }
+            RamInputAuthority::OwnedLocalCut { .. } if !self.control.domain().coverage_valid() => {
+                RamIdentityAnchor::Unknown
+            }
+            RamInputAuthority::OwnedLocalCut { .. } => self.identity_anchor,
+        };
+        let anchor_generation = match image.authority() {
+            RamInputAuthority::IdentifiedSnapshot(_) => RamIdentityGeneration::Identified {
+                generation: NonZeroU64::new(attempt.generation).ok_or(CaptureError::Exhausted)?,
+            },
+            RamInputAuthority::OwnedLocalCut { .. } if anchor == RamIdentityAnchor::Unknown => {
+                RamIdentityGeneration::Unknown
+            }
+            RamInputAuthority::OwnedLocalCut { .. } => self.identity_anchor_generation,
+        };
         let token = BaselineToken {
             tracker: self.tracker.clone(),
             topology: attempt.topology,
             memory_generation: attempt.generation,
+            identity_anchor: anchor,
+            identity_anchor_generation: anchor_generation,
         };
         if candidate.receipt.mode() == RamCaptureMode::Full {
             self.control
                 .restore_coverage(cut, self.next.as_ref().ok_or(MemoryError::State)?)?;
         }
+        if matches!(image.authority(), RamInputAuthority::IdentifiedSnapshot(_)) {
+            self.identity_dirty
+                .as_mut()
+                .ok_or(MemoryError::State)?
+                .clear();
+        }
+        self.identity_anchor = anchor;
+        self.identity_anchor_generation = anchor_generation;
         self.pending.as_mut().ok_or(MemoryError::State)?.clear();
         self.baseline = Some(AcceptedBaseline {
             token: token.clone(),
@@ -661,10 +794,10 @@ fn select_full(
         } => {
             if accepted.is_none() {
                 Some(FullCaptureReason::NoBaseline)
-            } else if baseline.is_none() || baseline != accepted {
-                Some(FullCaptureReason::BaselineToken)
             } else if !coverage_valid {
                 Some(FullCaptureReason::CoverageLost)
+            } else if baseline.is_none() || baseline != accepted {
+                Some(FullCaptureReason::BaselineToken)
             } else if (dirty as u128) * 100 >= (total as u128) * u128::from(crossover.0) {
                 Some(FullCaptureReason::DirtyCrossover)
             } else {
@@ -699,10 +832,7 @@ impl Vmm {
         Ok(self.memory.layout.get().cloned().unwrap_or(layout))
     }
     pub(crate) fn baseline_token(&self) -> Option<BaselineToken> {
-        self.memory
-            .baseline
-            .as_ref()
-            .map(|baseline| baseline.token.clone())
+        self.memory.baseline_token()
     }
     fn paused_memory_key(&self, token: &PauseToken) -> Result<BarrierKey, CaptureError> {
         if !matches!(&self.control.state, ControlState::Paused(current) if current == token)
@@ -774,11 +904,13 @@ impl Vmm {
         &mut self,
         pause: &PauseToken,
         request: RamCaptureRequest<'_>,
+        identity_policy: RamIdentityPolicy,
     ) -> Result<AttemptId, CaptureError> {
         let key = self.paused_memory_key(pause)?;
         let layout = self.memory_layout()?;
         let binding = self.memory_capture_binding(key, &layout)?.clone();
-        self.memory.begin_attempt(key, request, binding, layout)
+        self.memory
+            .begin_attempt(key, request, identity_policy, binding, layout)
     }
     pub(crate) fn write_memory_capture(
         &mut self,
@@ -795,7 +927,7 @@ impl Vmm {
         &mut self,
         pause: &PauseToken,
         candidate: CompletedCandidate,
-        image: Arc<AuthenticatedRamImage>,
+        image: Arc<AdmittedRamImage>,
     ) -> Result<BaselineToken, CaptureError> {
         let key = self.paused_memory_key(pause)?;
         self.validate_attempt_binding(key, &candidate.id)?;
@@ -835,11 +967,13 @@ impl Vmm {
         &mut self,
         key: BarrierKey,
         request: RamCaptureRequest<'_>,
+        identity_policy: RamIdentityPolicy,
     ) -> Result<AttemptId, CaptureError> {
         self.diagnostic_memory_key(key)?;
         let layout = self.memory_layout()?;
         let binding = self.memory_capture_binding(key, &layout)?.clone();
-        self.memory.begin_attempt(key, request, binding, layout)
+        self.memory
+            .begin_attempt(key, request, identity_policy, binding, layout)
     }
     #[cfg(any(feature = "native-execution-probe", feature = "native-device-probe"))]
     pub(crate) fn diagnostic_write_memory_capture(
@@ -858,7 +992,7 @@ impl Vmm {
         &mut self,
         key: BarrierKey,
         candidate: CompletedCandidate,
-        image: Arc<AuthenticatedRamImage>,
+        image: Arc<AdmittedRamImage>,
     ) -> Result<BaselineToken, CaptureError> {
         self.diagnostic_memory_key(key)?;
         self.validate_attempt_binding(key, &candidate.id)?;
@@ -1255,8 +1389,9 @@ mod tests {
     };
     use crate::vmm::execution::{ExecutionLane, StateBinding};
     use crate::vmm::memory::image::{
-        AuthenticatedRamImage, RamCaptureMode, RamImageAuthentication, RamOutputFiles,
-        RamSeedMethod, ValidatedRamLayout,
+        AdmittedRamImage, RamCaptureMode, RamIdentityAnchor, RamIdentityPolicy,
+        RamImageAuthentication, RamInputAuthority, RamOutputFiles, RamSeedMethod,
+        ValidatedRamLayout,
     };
     use crate::vmm::memory::{
         BaselineToken, CaptureError, CompletedCandidate, DirtyCrossoverPercent, FullCaptureReason,
@@ -1303,16 +1438,17 @@ mod tests {
         coordinator
     }
     fn layout(coordinator: &MemoryCoordinator) -> Arc<ValidatedRamLayout> {
+        let length = coordinator.control.domain().layout().page_count() as u64 * 4096;
         Arc::new(
             ValidatedRamLayout::from_registered(
                 coordinator.control.domain().layout(),
                 &ArchMemoryInfo {
-                    ram_below_gap: 10 * 4096,
+                    ram_below_gap: length,
                     ram_above_gap: 0,
-                    ram_last_addr: 10 * 4096,
+                    ram_last_addr: length,
                     shm_start_addr: 1 << 32,
                     page_size: 4096,
-                    initrd_addr: 10 * 4096,
+                    initrd_addr: length,
                     firmware_addr: 0,
                 },
                 ExecutionLane::KvmX86,
@@ -1359,15 +1495,15 @@ mod tests {
             &self,
             candidate: &mut CompletedCandidate,
             key: BarrierKey,
-        ) -> Arc<AuthenticatedRamImage> {
+        ) -> Arc<AdmittedRamImage> {
             candidate
                 .seal(
                     File::open(self.ram.as_path()).unwrap(),
                     File::open(self.layout.as_path()).unwrap(),
-                    RamImageAuthentication {
+                    RamInputAuthority::IdentifiedSnapshot(RamImageAuthentication {
                         state: binding(key),
                         stream: [0; 32],
-                    },
+                    }),
                 )
                 .unwrap()
         }
@@ -1377,8 +1513,19 @@ mod tests {
         key: BarrierKey,
         request: RamCaptureRequest<'_>,
     ) -> crate::vmm::memory::AttemptId {
+        let identity = match coordinator
+            .baseline_token()
+            .map(|token| token.identity_anchor())
+        {
+            Some(RamIdentityAnchor::Identified { stream })
+                if !matches!(request, RamCaptureRequest::Full) =>
+            {
+                RamIdentityPolicy::SinceAnchor { stream }
+            }
+            _ => RamIdentityPolicy::Full,
+        };
         coordinator
-            .begin_attempt(key, request, binding(key), layout(coordinator))
+            .begin_attempt(key, request, identity, binding(key), layout(coordinator))
             .unwrap()
     }
     fn capture(
@@ -1401,7 +1548,7 @@ mod tests {
     fn accept_full(
         coordinator: &mut MemoryCoordinator,
         key: BarrierKey,
-    ) -> (BaselineToken, Arc<AuthenticatedRamImage>, Outputs) {
+    ) -> (BaselineToken, Arc<AdmittedRamImage>, Outputs) {
         let (_, mut candidate, output) = capture(coordinator, key, RamCaptureRequest::Full);
         let image = output.seal(&mut candidate, key);
         let token = coordinator
@@ -1417,6 +1564,8 @@ mod tests {
             tracker: coordinator.tracker.clone(),
             topology: coordinator.control.domain().topology_generation(),
             memory_generation: 1,
+            identity_anchor: RamIdentityAnchor::Unknown,
+            identity_anchor_generation: crate::vmm::memory::image::RamIdentityGeneration::Unknown,
         };
         fn request(baseline: Option<&BaselineToken>) -> RamCaptureRequest<'_> {
             RamCaptureRequest::Incremental {
@@ -1507,6 +1656,7 @@ mod tests {
             coordinator.begin_attempt(
                 key,
                 RamCaptureRequest::Full,
+                RamIdentityPolicy::Full,
                 binding(key),
                 layout(&coordinator)
             ),
@@ -1627,13 +1777,26 @@ mod tests {
         };
         let (id, mut candidate, output) = capture(&mut coordinator, key(2), request);
         assert_eq!(candidate.receipt().mode(), RamCaptureMode::Incremental);
+        let stats = candidate.receipt().stats();
+        // Reflink identity units use live data plus cut-proven zeros; rebuilds compose B and D.
+        let cloned = stats.seed_method == RamSeedMethod::Clone;
         assert_eq!(
-            candidate.receipt().stats().live_bytes_read,
-            if candidate.receipt().stats().seed_method == RamSeedMethod::Clone {
-                10 * 4096
-            } else {
-                4096
-            }
+            stats.live_bytes_read + stats.known_zero_bytes_skipped,
+            if cloned { 10 * 4096 } else { 4096 }
+        );
+        assert_eq!(
+            stats.baseline_bytes_read + stats.baseline_hole_bytes,
+            if cloned { 0 } else { 9 * 4096 }
+        );
+        assert_eq!(stats.identity_bytes_hashed, 0);
+        assert_eq!(
+            candidate
+                .receipt()
+                .changes()
+                .identified()
+                .unwrap()
+                .record_count(),
+            1
         );
         assert_eq!(
             std::fs::read(output.ram.as_path()).unwrap(),
@@ -1737,7 +1900,7 @@ mod tests {
         drop(child.control.domain().write(GuestAddress(4096), 1).unwrap());
         stop(&mut child, key(2));
         assert!(child.pending.as_ref().unwrap().contains(PageIndex::new(1)));
-        let (_, candidate, _output) = capture(
+        let (_, candidate, output) = capture(
             &mut child,
             key(2),
             RamCaptureRequest::Incremental {
@@ -1745,13 +1908,29 @@ mod tests {
                 crossover: DirtyCrossoverPercent::default(),
             },
         );
+        let stats = candidate.receipt().stats();
+        let cloned = stats.seed_method == RamSeedMethod::Clone;
         assert_eq!(
-            candidate.receipt().stats().live_bytes_read,
-            if candidate.receipt().stats().seed_method == RamSeedMethod::Clone {
-                10 * 4096
-            } else {
-                4096
-            }
+            stats.live_bytes_read + stats.known_zero_bytes_skipped,
+            if cloned { 10 * 4096 } else { 4096 }
+        );
+        assert_eq!(
+            stats.baseline_bytes_read + stats.baseline_hole_bytes,
+            if cloned { 0 } else { 9 * 4096 }
+        );
+        assert_eq!(stats.identity_bytes_hashed, 0);
+        assert_eq!(
+            candidate
+                .receipt()
+                .changes()
+                .identified()
+                .unwrap()
+                .record_count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(output.ram.as_path()).unwrap(),
+            vec![0; 10 * 4096]
         );
     }
 
@@ -1790,13 +1969,25 @@ mod tests {
         let (attempt, candidate, output) = capture(&mut coordinator, key(2), request);
         assert!(candidate.receipt().writers_closed());
         assert_eq!(candidate.receipt().mode(), RamCaptureMode::Incremental);
+        let stats = candidate.receipt().stats();
+        let cloned = stats.seed_method == RamSeedMethod::Clone;
         assert_eq!(
-            candidate.receipt().stats().live_bytes_read,
-            if candidate.receipt().stats().seed_method == RamSeedMethod::Clone {
-                10 * 4096
-            } else {
-                4096
-            }
+            stats.live_bytes_read + stats.known_zero_bytes_skipped,
+            if cloned { 10 * 4096 } else { 4096 }
+        );
+        assert_eq!(
+            stats.baseline_bytes_read + stats.baseline_hole_bytes,
+            if cloned { 0 } else { 9 * 4096 }
+        );
+        assert_eq!(stats.identity_bytes_hashed, 10 * 4096);
+        assert_eq!(
+            candidate
+                .receipt()
+                .changes()
+                .identified()
+                .unwrap()
+                .record_count(),
+            1
         );
         let bytes = std::fs::read(output.ram.as_path()).unwrap();
         assert_eq!(bytes[0], 9);
@@ -1817,6 +2008,18 @@ mod tests {
         };
         let (_, mut candidate, output) = capture(&mut coordinator, key(2), request);
         assert_eq!(candidate.receipt().mode(), RamCaptureMode::Incremental);
+        assert_eq!(
+            candidate.receipt().stats().live_bytes_read
+                + candidate.receipt().stats().known_zero_bytes_skipped,
+            if candidate.receipt().stats().seed_method == RamSeedMethod::Clone {
+                10 * 4096
+            } else {
+                4096
+            }
+        );
+        assert_eq!(candidate.receipt().stats().identity_bytes_hashed, 10 * 4096);
+        assert_eq!(candidate.receipt().identity_dirty_pages(), 1);
+        assert_eq!(candidate.receipt().materialization_dirty_pages(), 1);
         assert_eq!(std::fs::read(output.ram.as_path()).unwrap(), bytes);
         let image = output.seal(&mut candidate, key(2));
         let next = coordinator
@@ -1945,6 +2148,7 @@ mod tests {
                 coordinator.begin_attempt(
                     key(1),
                     RamCaptureRequest::Full,
+                    RamIdentityPolicy::Full,
                     binding(key(1)),
                     layout(&coordinator)
                 ),
@@ -1998,94 +2202,136 @@ mod tests {
             );
             return;
         };
-        let mut coordinator = coordinator();
-        stop(&mut coordinator, key(1));
-        let (baseline_token, _baseline, baseline_files) = accept_full(&mut coordinator, key(1));
-        let original = std::fs::read(baseline_files.ram.as_path()).unwrap();
-        coordinator.reopen(key(1)).unwrap();
-        for address in [0, 8192] {
-            coordinator
-                .control
-                .domain()
-                .write(GuestAddress(address), 4096)
-                .unwrap()
-                .write_view(0, 4096)
-                .unwrap()
-                .write_slice(&[0x5a; 4096], 0)
+        for unhashed in [false, true] {
+            let mut coordinator = coordinator();
+            stop(&mut coordinator, key(1));
+            let (initial, baseline_files) =
+                capture_identity(&mut coordinator, key(1), RamIdentityPolicy::Full);
+            let baseline_token = adopt_identity(&mut coordinator, key(1), initial, &baseline_files);
+            let RamIdentityAnchor::Identified { stream } = baseline_token.identity_anchor() else {
+                panic!("identified baseline required")
+            };
+            let original = std::fs::read(baseline_files.ram.as_path()).unwrap();
+            coordinator.reopen(key(1)).unwrap();
+            for address in [0, 8192] {
+                coordinator
+                    .control
+                    .domain()
+                    .write(GuestAddress(address), 4096)
+                    .unwrap()
+                    .write_view(0, 4096)
+                    .unwrap()
+                    .write_slice(&[0x5a; 4096], 0)
+                    .unwrap();
+            }
+            stop(&mut coordinator, key(2));
+            assert_eq!(coordinator.pending_dirty_count(), 2);
+            let attempt = coordinator
+                .begin_attempt(
+                    key(2),
+                    RamCaptureRequest::Incremental {
+                        baseline: Some(&baseline_token),
+                        crossover: DirtyCrossoverPercent::default(),
+                    },
+                    if unhashed {
+                        RamIdentityPolicy::None
+                    } else {
+                        RamIdentityPolicy::SinceAnchor { stream }
+                    },
+                    binding(key(2)),
+                    layout(&coordinator),
+                )
                 .unwrap();
-        }
-        stop(&mut coordinator, key(2));
-        assert_eq!(coordinator.pending_dirty_count(), 2);
-        let attempt = begin(
-            &mut coordinator,
-            key(2),
-            RamCaptureRequest::Incremental {
-                baseline: Some(&baseline_token),
-                crossover: DirtyCrossoverPercent::default(),
-            },
-        );
-        let ram_path = std::path::PathBuf::from(directory).join("ram");
-        let ram = File::options()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&ram_path)
-            .unwrap();
-        let outputs = Outputs::new();
-        let output = RamOutputFiles::new(
-            ram,
-            outputs.layout.as_file().try_clone().unwrap(),
-            TempFile::new().unwrap().as_file().try_clone().unwrap(),
-        );
-        let error = match coordinator.write_attempt(
-            key(2),
-            &attempt,
-            output,
-            Instant::now() + Duration::from_secs(5),
-        ) {
-            Ok(_) => panic!("ENOSPC mid-overlay must fail the attempt"),
-            Err(error) => error,
-        };
-        let CaptureError::Write(failure) = error else {
-            panic!("expected image write failure");
-        };
-        assert!(matches!(&failure.error, RamImageError::Io { source, .. }
+            let ram_path = std::path::Path::new(&directory).join("ram");
+            let ram = File::options()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&ram_path)
+                .unwrap();
+            let outputs = Outputs::new();
+            let output = RamOutputFiles::new(
+                ram,
+                outputs.layout.as_file().try_clone().unwrap(),
+                TempFile::new().unwrap().as_file().try_clone().unwrap(),
+            );
+            let error = match coordinator.write_attempt(
+                key(2),
+                &attempt,
+                output,
+                Instant::now() + Duration::from_secs(5),
+            ) {
+                Ok(_) => panic!("ENOSPC mid-overlay must fail the attempt"),
+                Err(error) => error,
+            };
+            let CaptureError::Write(failure) = error else {
+                panic!("expected image write failure");
+            };
+            assert!(matches!(&failure.error, RamImageError::Io { source, .. }
             if source.raw_os_error() == Some(nix::errno::Errno::ENOSPC as i32)));
-        assert_eq!(failure.effects, RamImageEffects::Started);
-        assert_eq!(failure.stats.seed_method, RamSeedMethod::Rebuild);
-        assert_eq!(failure.stats.overlay_bytes_written, 4096);
-        let mut first = [0; 4096];
-        File::open(&ram_path)
-            .unwrap()
-            .read_exact_at(&mut first, 0)
-            .unwrap();
-        assert_eq!(first, [0x5a; 4096]);
-        assert_eq!(coordinator.pending_dirty_count(), 2);
-        assert_eq!(coordinator.baseline_token(), Some(baseline_token.clone()));
-        assert_eq!(coordinator.reopen(key(2)), Err(ControlFailure::Busy));
-        assert!(coordinator.attempt.as_ref().unwrap().failure.is_some());
-        coordinator.abandon_attempt(key(2), &attempt).unwrap();
-        assert!(!coordinator.has_attempt());
-        assert_eq!(coordinator.pending_dirty_count(), 2);
-        assert_eq!(coordinator.baseline_token(), Some(baseline_token.clone()));
-        assert_eq!(
-            std::fs::read(baseline_files.ram.as_path()).unwrap(),
-            original
-        );
-        let (_, mut retry, files) = capture(
-            &mut coordinator,
-            key(2),
-            RamCaptureRequest::Incremental {
-                baseline: Some(&baseline_token),
-                crossover: DirtyCrossoverPercent::default(),
-            },
-        );
-        assert_eq!(retry.receipt().stats().overlay_bytes_written, 8192);
-        let image = files.seal(&mut retry, key(2));
-        coordinator.accept_attempt(key(2), retry, image).unwrap();
-        assert_eq!(coordinator.pending_dirty_count(), 0);
-        drop(failure);
-        std::fs::remove_file(ram_path).unwrap();
+            assert_eq!(failure.effects, RamImageEffects::Started);
+            assert_eq!(failure.stats.seed_method, RamSeedMethod::Rebuild);
+            assert_eq!(failure.stats.overlay_bytes_written, 4096);
+            if unhashed {
+                assert_eq!(failure.stats.identity_bytes_hashed, 0);
+                assert_eq!(failure.stats.whole_file_bytes_hashed, 0);
+                assert_eq!(failure.stats.map_nodes_written, 0);
+            }
+            let mut first = [0; 4096];
+            File::open(&ram_path)
+                .unwrap()
+                .read_exact_at(&mut first, 0)
+                .unwrap();
+            assert_eq!(first, [0x5a; 4096]);
+            assert_eq!(coordinator.pending_dirty_count(), 2);
+            assert_eq!(coordinator.baseline_token(), Some(baseline_token.clone()));
+            assert_eq!(coordinator.reopen(key(2)), Err(ControlFailure::Busy));
+            assert!(coordinator.attempt.as_ref().unwrap().failure.is_some());
+            coordinator.abandon_attempt(key(2), &attempt).unwrap();
+            assert!(!coordinator.has_attempt());
+            assert_eq!(coordinator.pending_dirty_count(), 2);
+            assert_eq!(coordinator.identity_dirty.as_ref().unwrap().count(), 2);
+            assert_eq!(coordinator.baseline_token(), Some(baseline_token.clone()));
+            assert_eq!(
+                std::fs::read(baseline_files.ram.as_path()).unwrap(),
+                original
+            );
+            let (retry, files) = capture_identity(
+                &mut coordinator,
+                key(2),
+                if unhashed {
+                    RamIdentityPolicy::None
+                } else {
+                    RamIdentityPolicy::SinceAnchor { stream }
+                },
+            );
+            assert_eq!(retry.receipt().stats().overlay_bytes_written, 8192);
+            adopt_identity(&mut coordinator, key(2), retry, &files);
+            assert_eq!(coordinator.pending_dirty_count(), 0);
+            if unhashed {
+                assert_eq!(coordinator.identity_dirty.as_ref().unwrap().count(), 2);
+                let (snapshot, files) = capture_identity(
+                    &mut coordinator,
+                    key(2),
+                    RamIdentityPolicy::SinceAnchor { stream },
+                );
+                assert_eq!(
+                    snapshot.receipt().stats().live_bytes_read
+                        + snapshot.receipt().stats().known_zero_bytes_skipped,
+                    if snapshot.receipt().stats().seed_method == RamSeedMethod::Clone {
+                        10 * 4096
+                    } else {
+                        0
+                    }
+                );
+                assert_eq!(snapshot.receipt().stats().overlay_bytes_written, 0);
+                assert_eq!(snapshot.receipt().stats().identity_bytes_hashed, 10 * 4096);
+                adopt_identity(&mut coordinator, key(2), snapshot, &files);
+            }
+            assert_eq!(coordinator.identity_dirty.as_ref().unwrap().count(), 0);
+            drop(failure);
+            std::fs::remove_file(ram_path).unwrap();
+        }
     }
 
     #[test]
@@ -2157,10 +2403,25 @@ mod tests {
                 },
             );
             assert_eq!(incremental.receipt().mode(), RamCaptureMode::Incremental);
-            assert_eq!(incremental.receipt().stats().known_zero_bytes_skipped, 0);
+            assert_eq!(
+                incremental.receipt().stats().known_zero_bytes_skipped,
+                if changed && incremental.receipt().stats().seed_method == RamSeedMethod::Clone {
+                    6 * 4096
+                } else {
+                    0
+                }
+            );
             if !changed {
                 assert_eq!(incremental.receipt().stats().live_bytes_read, 0);
-                assert_eq!(incremental.receipt().changes().record_count(), 0);
+                assert_eq!(
+                    incremental
+                        .receipt()
+                        .changes()
+                        .identified()
+                        .unwrap()
+                        .record_count(),
+                    0
+                );
             } else {
                 assert_eq!(incremental.receipt().stats().zero_run_bytes_covered, 4096);
             }
@@ -2217,5 +2478,555 @@ mod tests {
             coordinator.abandon_attempt(key, &full_attempt).unwrap();
             coordinator.reopen(key).unwrap();
         }
+    }
+
+    fn four_unit_coordinator() -> MemoryCoordinator {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 65536)]).unwrap();
+        let (_, authority, control) =
+            MemoryDomain::construct(memory, 4096, BackingKind::Boot).unwrap();
+        let epoch = authority.issue_epoch(1).unwrap();
+        let mut memory = MemoryCoordinator::new(control, authority);
+        memory.finish_tracked(epoch).unwrap();
+        memory
+    }
+
+    fn write_page(memory: &MemoryCoordinator, page: usize, value: u8) {
+        memory
+            .control
+            .domain()
+            .write(GuestAddress((page * 4096) as u64), 4096)
+            .unwrap()
+            .write_view(0, 4096)
+            .unwrap()
+            .write_slice(&[value; 4096], 0)
+            .unwrap();
+    }
+
+    fn capture_identity(
+        memory: &mut MemoryCoordinator,
+        key: BarrierKey,
+        identity: RamIdentityPolicy,
+    ) -> (CompletedCandidate, Outputs) {
+        let baseline = memory.baseline_token();
+        let request = RamCaptureRequest::Incremental {
+            baseline: baseline.as_ref(),
+            crossover: DirtyCrossoverPercent::default(),
+        };
+        let id = memory
+            .begin_attempt(key, request, identity, binding(key), layout(memory))
+            .unwrap();
+        let files = Outputs::new();
+        let candidate = memory
+            .write_attempt(
+                key,
+                &id,
+                files.owned(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        (candidate, files)
+    }
+
+    fn adopt_identity(
+        memory: &mut MemoryCoordinator,
+        key: BarrierKey,
+        candidate: CompletedCandidate,
+        files: &Outputs,
+    ) -> BaselineToken {
+        let authority = if *candidate.receipt().identity_policy() == RamIdentityPolicy::None {
+            RamInputAuthority::OwnedLocalCut {
+                state: binding(key),
+                materialization_generation: candidate.memory_generation(),
+            }
+        } else {
+            RamInputAuthority::IdentifiedSnapshot(RamImageAuthentication {
+                state: binding(key),
+                stream: stream_root(
+                    &independent_units(&std::fs::read(files.ram.as_path()).unwrap()),
+                    candidate.receipt().packed_len(),
+                ),
+            })
+        };
+        let image = candidate
+            .seal(
+                File::open(files.ram.as_path()).unwrap(),
+                File::open(files.layout.as_path()).unwrap(),
+                authority,
+            )
+            .unwrap();
+        memory.accept_attempt(key, candidate, image).unwrap()
+    }
+
+    fn independent_units(bytes: &[u8]) -> Vec<Option<[u8; 32]>> {
+        use sha2::{Digest, Sha256};
+        bytes
+            .chunks(65536)
+            .map(|unit| {
+                unit.iter()
+                    .any(|byte| *byte != 0)
+                    .then(|| Sha256::digest(unit).into())
+            })
+            .collect()
+    }
+
+    fn stream_root(units: &[Option<[u8; 32]>], length: u64) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        assert!(units.len() <= 64);
+        let bitmap = units
+            .iter()
+            .enumerate()
+            .fold(0u64, |bits, (index, digest)| {
+                bits | if digest.is_some() { 1 << index } else { 0 }
+            });
+        let head = if bitmap == 0 {
+            None
+        } else {
+            let mut leaf = Sha256::new();
+            leaf.update(b"silo:stream-map:leaf:v2\n");
+            leaf.update(bitmap.to_le_bytes());
+            for digest in units.iter().flatten() {
+                leaf.update(digest);
+            }
+            let mut digest: [u8; 32] = leaf.finalize().into();
+            for height in 1..=4 {
+                let mut branch = Sha256::new();
+                branch.update(b"silo:stream-map:branch:v2\n");
+                branch.update([height]);
+                branch.update(1u64.to_le_bytes());
+                branch.update(digest);
+                digest = branch.finalize().into();
+            }
+            Some(digest)
+        };
+        let mut root = Sha256::new();
+        root.update(b"silo:stream:v2\n");
+        root.update([16]);
+        root.update(length.to_le_bytes());
+        root.update([u8::from(head.is_some())]);
+        if let Some(head) = head {
+            root.update(head);
+        }
+        root.finalize().into()
+    }
+
+    fn assert_unhashed(candidate: &CompletedCandidate, files: &Outputs) {
+        let receipt = candidate.receipt();
+        assert_eq!(*receipt.identity_policy(), RamIdentityPolicy::None);
+        assert!(matches!(
+            receipt.changes(),
+            crate::vmm::memory::image::RamChangeAuthority::None
+        ));
+        assert_eq!(receipt.stats().identity_bytes_hashed, 0);
+        assert_eq!(receipt.stats().map_nodes_written, 0);
+        assert_eq!(receipt.stats().whole_file_bytes_hashed, 0);
+        assert_eq!(files.changes.as_file().metadata().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn accepted_forks_preserve_identity_union_but_write_only_latest_dirties() {
+        use crate::vmm::memory::image::changes::read_test_changes;
+        for anchored in [true, false] {
+            let mut memory = four_unit_coordinator();
+            let mut expected = vec![0x11; 4 * 65536];
+            for page in 0..64 {
+                write_page(&memory, page, 0x11);
+            }
+            let mut retained = Vec::new();
+            let mut units = vec![None; 4];
+            if anchored {
+                stop(&mut memory, key(1));
+                let (candidate, files) =
+                    capture_identity(&mut memory, key(1), RamIdentityPolicy::Full);
+                for (index, digest) in read_test_changes(files.changes.as_file()) {
+                    units[index as usize] = digest;
+                }
+                adopt_identity(&mut memory, key(1), candidate, &files);
+                retained.push(files);
+                memory.reopen(key(1)).unwrap();
+            }
+            let initial_anchor = memory.identity_anchor;
+            let initial_anchor_generation = memory.identity_anchor_generation;
+            write_page(&memory, 0, 0x41);
+            write_page(&memory, 0, 0x42);
+            expected[..4096].fill(0x42);
+            write_page(&memory, 1, 0x55);
+            write_page(&memory, 1, 0x11);
+            write_page(&memory, 2, 0);
+            expected[8192..12288].fill(0);
+            stop(&mut memory, key(2));
+            let (candidate, files) = capture_identity(&mut memory, key(2), RamIdentityPolicy::None);
+            assert_unhashed(&candidate, &files);
+            assert_eq!(std::fs::read(files.ram.as_path()).unwrap(), expected);
+            let first = adopt_identity(&mut memory, key(2), candidate, &files);
+            assert_eq!(memory.pending_dirty_count(), 0);
+            assert_eq!(first.identity_anchor(), initial_anchor);
+            assert_eq!(
+                first.identity_anchor_generation(),
+                initial_anchor_generation
+            );
+            retained.clear();
+            retained.push(files);
+            memory.reopen(key(2)).unwrap();
+
+            write_page(&memory, 16, 0x52);
+            expected[65536..65536 + 4096].fill(0x52);
+            write_page(&memory, 0, 0x43);
+            expected[..4096].fill(0x43);
+            stop(&mut memory, key(3));
+            let (candidate, files) = capture_identity(&mut memory, key(3), RamIdentityPolicy::None);
+            assert_unhashed(&candidate, &files);
+            assert_eq!(candidate.receipt().mode(), RamCaptureMode::Incremental);
+            assert_eq!(candidate.receipt().stats().live_bytes_read, 2 * 4096);
+            assert_eq!(candidate.receipt().stats().overlay_bytes_written, 2 * 4096);
+            assert_eq!(
+                candidate.receipt().predecessor_generation(),
+                first.memory_generation()
+            );
+            assert_eq!(std::fs::read(files.ram.as_path()).unwrap(), expected);
+            assert_eq!(
+                candidate.receipt().identity_dirty_pages(),
+                if anchored { 4 } else { 64 }
+            );
+            let second = adopt_identity(&mut memory, key(3), candidate, &files);
+            assert_eq!(
+                second.identity_anchor_generation(),
+                initial_anchor_generation
+            );
+            retained.clear();
+            retained.push(files);
+            memory.reopen(key(3)).unwrap();
+
+            write_page(&memory, 32, 0x63);
+            expected[2 * 65536..2 * 65536 + 4096].fill(0x63);
+            stop(&mut memory, key(4));
+            let identity = match initial_anchor {
+                RamIdentityAnchor::Identified { stream } => {
+                    RamIdentityPolicy::SinceAnchor { stream }
+                }
+                RamIdentityAnchor::Unknown => RamIdentityPolicy::Full,
+            };
+            let (candidate, files) = capture_identity(&mut memory, key(4), identity);
+            assert_eq!(candidate.receipt().mode(), RamCaptureMode::Incremental);
+            assert_eq!(
+                candidate.receipt().predecessor_generation(),
+                second.memory_generation()
+            );
+            let stats = candidate.receipt().stats();
+            let selected_bytes = if anchored { 3 * 65536 } else { 4 * 65536 };
+            if stats.seed_method == RamSeedMethod::Clone {
+                assert_eq!(stats.live_bytes_read, selected_bytes);
+                assert_eq!(stats.baseline_bytes_read, 0);
+                assert_eq!(stats.baseline_hole_bytes, 0);
+            } else {
+                assert_eq!(stats.live_bytes_read, 4096);
+            }
+            assert_eq!(candidate.receipt().stats().overlay_bytes_written, 4096);
+            assert_eq!(candidate.receipt().materialization_dirty_pages(), 1);
+            assert_eq!(
+                candidate.receipt().identity_dirty_pages(),
+                if anchored { 5 } else { 64 }
+            );
+            let changes = read_test_changes(files.changes.as_file());
+            assert_eq!(
+                changes.keys().copied().collect::<Vec<_>>(),
+                if anchored {
+                    vec![0, 1, 2]
+                } else {
+                    vec![0, 1, 2, 3]
+                }
+            );
+            assert_eq!(
+                candidate.receipt().stats().identity_bytes_hashed,
+                if anchored { 3 * 65536 } else { 4 * 65536 }
+            );
+            for (index, digest) in changes {
+                units[index as usize] = digest;
+            }
+            assert_eq!(std::fs::read(files.ram.as_path()).unwrap(), expected);
+            assert_eq!(units, independent_units(&expected));
+            assert_eq!(
+                stream_root(&units, expected.len() as u64),
+                stream_root(&independent_units(&expected), expected.len() as u64)
+            );
+            assert_eq!(
+                candidate.receipt().identity_anchor_generation(),
+                initial_anchor_generation
+            );
+            let accepted = adopt_identity(&mut memory, key(4), candidate, &files);
+            let crate::vmm::memory::image::RamIdentityGeneration::Identified { generation } =
+                accepted.identity_anchor_generation()
+            else {
+                panic!("identified acceptance must advance its anchor epoch")
+            };
+            assert_eq!(generation.get(), accepted.memory_generation());
+            assert_eq!(memory.identity_dirty.as_ref().unwrap().count(), 0);
+            assert_eq!(memory.pending_dirty_count(), 0);
+        }
+    }
+
+    #[test]
+    fn fork_abandon_failure_and_rejected_acceptance_never_lose_coverage() {
+        let mut memory = four_unit_coordinator();
+        write_page(&memory, 0, 0x11);
+        stop(&mut memory, key(1));
+        let (candidate, initial) = capture_identity(&mut memory, key(1), RamIdentityPolicy::Full);
+        let initial_token = adopt_identity(&mut memory, key(1), candidate, &initial);
+        let RamIdentityAnchor::Identified {
+            stream: initial_root,
+        } = initial_token.identity_anchor()
+        else {
+            panic!("initial snapshot must be identified")
+        };
+        memory.reopen(key(1)).unwrap();
+        write_page(&memory, 0, 0x42);
+        stop(&mut memory, key(2));
+        let request = RamCaptureRequest::Incremental {
+            baseline: Some(&initial_token),
+            crossover: DirtyCrossoverPercent::default(),
+        };
+        let id = memory
+            .begin_attempt(
+                key(2),
+                request,
+                RamIdentityPolicy::None,
+                binding(key(2)),
+                layout(&memory),
+            )
+            .unwrap();
+        let failed = Outputs::new();
+        assert!(
+            memory
+                .write_attempt(key(2), &id, failed.owned(), Instant::now())
+                .is_err()
+        );
+        memory.abandon_attempt(key(2), &id).unwrap();
+        assert_eq!(memory.baseline_token(), Some(initial_token.clone()));
+        assert_eq!(memory.pending_dirty_count(), 1);
+        assert_eq!(memory.identity_dirty.as_ref().unwrap().count(), 1);
+        let (candidate, abandoned) = capture_identity(&mut memory, key(2), RamIdentityPolicy::None);
+        let id = candidate.id.clone();
+        memory.abandon_attempt(key(2), &id).unwrap();
+        assert_eq!(memory.baseline_token(), Some(initial_token));
+        assert_eq!(memory.pending_dirty_count(), 1);
+        drop(abandoned);
+        let (candidate, accepted) = capture_identity(&mut memory, key(2), RamIdentityPolicy::None);
+        let id = candidate.id.clone();
+        let adopted = adopt_identity(&mut memory, key(2), candidate, &accepted);
+        assert!(memory.abandon_attempt(key(2), &id).is_err());
+        assert_eq!(memory.baseline_token(), Some(adopted.clone()));
+        assert_eq!(memory.pending_dirty_count(), 0);
+        assert_eq!(memory.identity_dirty.as_ref().unwrap().count(), 1);
+        memory.reopen(key(2)).unwrap();
+        write_page(&memory, 16, 0x53);
+        stop(&mut memory, key(3));
+        assert!(
+            memory
+                .begin_attempt(
+                    key(3),
+                    RamCaptureRequest::Incremental {
+                        baseline: Some(&adopted),
+                        crossover: DirtyCrossoverPercent::default(),
+                    },
+                    RamIdentityPolicy::SinceAnchor { stream: [0x99; 32] },
+                    binding(key(3)),
+                    layout(&memory)
+                )
+                .is_err()
+        );
+        assert!(!memory.has_attempt());
+        let (candidate, files) = capture_identity(&mut memory, key(3), RamIdentityPolicy::None);
+        let wrong = candidate
+            .seal(
+                File::open(files.ram.as_path()).unwrap(),
+                File::open(files.layout.as_path()).unwrap(),
+                RamInputAuthority::OwnedLocalCut {
+                    state: binding(key(3)),
+                    materialization_generation: candidate.memory_generation() + 1,
+                },
+            )
+            .unwrap();
+        assert!(
+            memory
+                .accept_attempt(key(3), candidate.clone(), wrong)
+                .is_err()
+        );
+        assert_eq!(memory.baseline_token(), Some(adopted));
+        assert_eq!(memory.pending_dirty_count(), 1);
+        memory.abandon_attempt(key(3), &candidate.id).unwrap();
+        let (candidate, files) = capture_identity(
+            &mut memory,
+            key(3),
+            RamIdentityPolicy::SinceAnchor {
+                stream: initial_root,
+            },
+        );
+        assert_eq!(candidate.receipt().identity_dirty_pages(), 2);
+        assert_eq!(candidate.receipt().materialization_dirty_pages(), 1);
+        assert_eq!(candidate.receipt().stats().overlay_bytes_written, 4096);
+        memory.abandon_attempt(key(3), &candidate.id).unwrap();
+        assert_eq!(memory.identity_dirty.as_ref().unwrap().count(), 2);
+        assert_eq!(memory.pending_dirty_count(), 1);
+        drop(files);
+        let (candidate, files) = capture_identity(
+            &mut memory,
+            key(3),
+            RamIdentityPolicy::SinceAnchor {
+                stream: initial_root,
+            },
+        );
+        adopt_identity(&mut memory, key(3), candidate, &files);
+        assert_eq!(memory.identity_dirty.as_ref().unwrap().count(), 0);
+        assert_eq!(memory.pending_dirty_count(), 0);
+    }
+
+    #[test]
+    fn owned_child_seed_preserves_bytes_but_never_inherits_source_identity() {
+        let mut source = coordinator();
+        write_page(&source, 1, 0x64);
+        stop(&mut source, key(1));
+        let (candidate, files) = capture_identity(&mut source, key(1), RamIdentityPolicy::None);
+        let generation = candidate.memory_generation();
+        let image = candidate
+            .seal(
+                File::open(files.ram.as_path()).unwrap(),
+                File::open(files.layout.as_path()).unwrap(),
+                RamInputAuthority::OwnedLocalCut {
+                    state: binding(key(1)),
+                    materialization_generation: generation,
+                },
+            )
+            .unwrap();
+        source
+            .accept_attempt(key(1), candidate, image.clone())
+            .unwrap();
+        let mut child = coordinator_with_backing(BackingKind::RestoredPrivate);
+        child.seed_restored(image).unwrap();
+        let token = child.baseline_token().unwrap();
+        assert_eq!(token.identity_anchor(), RamIdentityAnchor::Unknown);
+        assert_eq!(token.memory_generation(), generation);
+        write_page(&child, 1, 0x65);
+        stop(&mut child, key(2));
+        let (candidate, files) = capture_identity(&mut child, key(2), RamIdentityPolicy::Full);
+        assert_eq!(candidate.receipt().mode(), RamCaptureMode::Incremental);
+        assert_eq!(candidate.receipt().stats().overlay_bytes_written, 4096);
+        assert_eq!(candidate.receipt().stats().identity_bytes_hashed, 10 * 4096);
+        assert_eq!(
+            candidate.receipt().identity_anchor(),
+            RamIdentityAnchor::Unknown
+        );
+        let token = adopt_identity(&mut child, key(2), candidate, &files);
+        assert_eq!(
+            token.identity_anchor(),
+            RamIdentityAnchor::Identified {
+                stream: stream_root(
+                    &independent_units(&std::fs::read(files.ram.as_path()).unwrap()),
+                    10 * 4096
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_after_zero_fork_emits_tombstone_without_rewriting_or_hashing_zero_bytes() {
+        use crate::vmm::memory::image::changes::read_test_changes;
+        let mut memory = four_unit_coordinator();
+        write_page(&memory, 0, 0x51);
+        stop(&mut memory, key(1));
+        let (snapshot, initial) = capture_identity(&mut memory, key(1), RamIdentityPolicy::Full);
+        let token = adopt_identity(&mut memory, key(1), snapshot, &initial);
+        let RamIdentityAnchor::Identified { stream } = token.identity_anchor() else {
+            panic!("identified snapshot required")
+        };
+        memory.reopen(key(1)).unwrap();
+        write_page(&memory, 0, 0);
+        write_page(&memory, 0, 0);
+        stop(&mut memory, key(2));
+        let (fork, files) = capture_identity(&mut memory, key(2), RamIdentityPolicy::None);
+        assert_unhashed(&fork, &files);
+        assert_eq!(fork.receipt().stats().zero_run_bytes_covered, 4096);
+        adopt_identity(&mut memory, key(2), fork, &files);
+        assert_eq!(memory.identity_dirty.as_ref().unwrap().count(), 1);
+        let (snapshot, zero) = capture_identity(
+            &mut memory,
+            key(2),
+            RamIdentityPolicy::SinceAnchor { stream },
+        );
+        assert_eq!(
+            snapshot.receipt().stats().live_bytes_read
+                + snapshot.receipt().stats().known_zero_bytes_skipped,
+            if snapshot.receipt().stats().seed_method == RamSeedMethod::Clone {
+                65536
+            } else {
+                0
+            }
+        );
+        assert_eq!(snapshot.receipt().stats().overlay_bytes_written, 0);
+        assert_eq!(snapshot.receipt().stats().identity_bytes_hashed, 0);
+        let changes = read_test_changes(zero.changes.as_file());
+        assert_eq!(changes.into_iter().collect::<Vec<_>>(), vec![(0, None)]);
+        let bytes = std::fs::read(zero.ram.as_path()).unwrap();
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        let root = stream_root(&independent_units(&bytes), bytes.len() as u64);
+        assert_ne!(root, stream);
+        let token = adopt_identity(&mut memory, key(2), snapshot, &zero);
+        assert_eq!(
+            token.identity_anchor(),
+            RamIdentityAnchor::Identified { stream: root }
+        );
+    }
+
+    #[test]
+    fn coverage_loss_fork_repairs_byte_baseline_but_invalidates_identified_anchor() {
+        let mut memory = four_unit_coordinator();
+        write_page(&memory, 0, 0x51);
+        stop(&mut memory, key(1));
+        let (snapshot, initial) = capture_identity(&mut memory, key(1), RamIdentityPolicy::Full);
+        let token = adopt_identity(&mut memory, key(1), snapshot, &initial);
+        let RamIdentityAnchor::Identified { stream } = token.identity_anchor() else {
+            panic!("identified snapshot required")
+        };
+        memory.control.domain().invalidate_coverage();
+        assert_eq!(
+            memory.baseline_token().unwrap().identity_anchor(),
+            RamIdentityAnchor::Unknown
+        );
+        let (fork, files) = capture_identity(&mut memory, key(1), RamIdentityPolicy::None);
+        assert_eq!(fork.full_reason(), Some(FullCaptureReason::CoverageLost));
+        assert_unhashed(&fork, &files);
+        let token = adopt_identity(&mut memory, key(1), fork, &files);
+        assert!(memory.control.domain().coverage_valid());
+        assert_eq!(token.identity_anchor(), RamIdentityAnchor::Unknown);
+        assert!(
+            memory
+                .begin_attempt(
+                    key(1),
+                    RamCaptureRequest::Incremental {
+                        baseline: Some(&token),
+                        crossover: DirtyCrossoverPercent::default(),
+                    },
+                    RamIdentityPolicy::SinceAnchor { stream },
+                    binding(key(1)),
+                    layout(&memory)
+                )
+                .is_err()
+        );
+        let (snapshot, files) = capture_identity(&mut memory, key(1), RamIdentityPolicy::Full);
+        assert_eq!(snapshot.receipt().mode(), RamCaptureMode::Incremental);
+        let cloned = snapshot.receipt().stats().seed_method == RamSeedMethod::Clone;
+        assert_eq!(
+            snapshot.receipt().stats().live_bytes_read,
+            if cloned { 4096 } else { 0 }
+        );
+        assert_eq!(
+            snapshot.receipt().stats().known_zero_bytes_skipped,
+            if cloned { 4 * 65536 - 4096 } else { 3 * 65536 }
+        );
+        assert_eq!(snapshot.receipt().stats().overlay_bytes_written, 0);
+        assert_eq!(snapshot.receipt().stats().identity_bytes_hashed, 65536);
+        let token = adopt_identity(&mut memory, key(1), snapshot, &files);
+        assert_eq!(
+            token.identity_anchor(),
+            RamIdentityAnchor::Identified { stream }
+        );
     }
 }

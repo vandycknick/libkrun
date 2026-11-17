@@ -57,8 +57,10 @@ pub use crate::vmm::execution::{
     VmExecutionState,
 };
 pub use crate::vmm::memory::image::{
-    AuthenticatedRamImage, RamCaptureMode, RamCaptureReceipt, RamChangeReceipt,
-    RamImageAuthentication, RamImageError, RamIoStats, RamSeedMethod, ValidatedRamLayout,
+    AdmittedRamImage, RamCaptureMode, RamCaptureReceipt, RamChangeAuthority, RamChangeReceipt,
+    RamIdentityAnchor, RamIdentityGeneration, RamIdentityPolicy, RamIdentityReadFallback,
+    RamImageAuthentication, RamImageError, RamInputAuthority, RamIoStats, RamSeedMethod,
+    ValidatedRamLayout,
 };
 pub use crate::vmm::memory::{
     BaselineToken, CaptureError, FullCaptureReason, RestoreInstallationEvidence,
@@ -124,18 +126,20 @@ pub struct MemoryOutputs {
 pub struct BaselineImage {
     pub ram: File,
     pub layout: File,
-    pub authentication: RamImageAuthentication,
+    pub authentication: RamInputAuthority,
 }
 #[derive(Clone, Debug)]
 pub struct MemoryCaptureRequest {
     pub baseline: Option<BaselineToken>,
     pub full_at_dirty_percent: u8,
+    pub identity_policy: RamIdentityPolicy,
 }
 impl Default for MemoryCaptureRequest {
     fn default() -> Self {
         Self {
             baseline: None,
             full_at_dirty_percent: 60,
+            identity_policy: RamIdentityPolicy::Full,
         }
     }
 }

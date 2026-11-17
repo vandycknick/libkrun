@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::thread;
 use std::time::Instant;
 
-use arch::guest_memory::{CutReadKind, CutReader, MemoryCut, PageIndex};
+use arch::guest_memory::{CutReadKind, CutReader, DirtyPageMap, MemoryCut, PageIndex};
 use sha2::{Digest, Sha256};
 use vm_memory::GuestAddress;
 
@@ -14,8 +14,9 @@ use crate::vmm::memory::image::writer::{
     Extents, WriteKind, Writeback, cover_zero, is_all_zero, read_exact_at, write_exact_at,
 };
 use crate::vmm::memory::image::{
-    RAM_IDENTITY_CHUNK_BYTES, RAM_IO_BUFFER_BYTES, RamFileRole, RamImageError, RamIoOperation,
-    RamIoScratch, RamIoStats, RamWriteMode, ValidatedRamLayout, check_deadline, io_error,
+    AdmittedRamImage, RAM_IDENTITY_CHUNK_BYTES, RAM_IO_BUFFER_BYTES, RamFileRole, RamHashSelection,
+    RamIdentityReadFallback, RamImageError, RamIoOperation, RamIoScratch, RamIoStats, RamWriteMode,
+    ValidatedRamLayout, check_deadline, io_error,
 };
 
 const WRITERS: usize = 2;
@@ -25,6 +26,8 @@ pub(crate) struct Input<'a> {
     pub cut: &'a MemoryCut,
     pub layout: &'a ValidatedRamLayout,
     pub mode: &'a RamWriteMode<'a>,
+    pub identity: &'a RamHashSelection<'a>,
+    pub byte_baseline: Option<(&'a AdmittedRamImage, &'a DirtyPageMap)>,
     pub seeded: bool,
     pub deadline: Instant,
 }
@@ -59,7 +62,7 @@ struct Pack<'a> {
     length: usize,
     seeded: bool,
     writes: Vec<WriteRun>,
-    zero_granules: Vec<bool>,
+    zeros: Vec<Range<usize>>,
     nonzero: [bool; CHUNKS_PER_PACK],
     digests: [Option<[u8; 32]>; CHUNKS_PER_PACK],
     affected: [bool; CHUNKS_PER_PACK],
@@ -71,20 +74,17 @@ impl<'a> Pack<'a> {
         writes
             .try_reserve_exact(bytes.len() / granule.min(4096))
             .map_err(|_| RamImageError::Allocation)?;
-        let mut zero_granules = Vec::new();
-        if seeded {
-            zero_granules
-                .try_reserve_exact(bytes.len() / granule)
-                .map_err(|_| RamImageError::Allocation)?;
-            zero_granules.resize(bytes.len() / granule, false);
-        }
+        let mut zeros = Vec::new();
+        zeros
+            .try_reserve_exact(bytes.len() / granule.min(4096))
+            .map_err(|_| RamImageError::Allocation)?;
         Ok(Self {
             bytes,
             offset: 0,
             length: 0,
             seeded,
             writes,
-            zero_granules,
+            zeros,
             nonzero: [false; CHUNKS_PER_PACK],
             digests: [None; CHUNKS_PER_PACK],
             affected: [false; CHUNKS_PER_PACK],
@@ -95,6 +95,7 @@ impl<'a> Pack<'a> {
         self.offset = offset;
         self.length = length;
         self.writes.clear();
+        self.zeros.clear();
         self.nonzero.fill(false);
         self.digests.fill(None);
         self.affected.fill(false);
@@ -129,9 +130,6 @@ impl<'a> Pack<'a> {
                 nonzero |= data;
                 cursor = limit;
             }
-            if self.seeded {
-                self.zero_granules[start / granule] = !nonzero;
-            }
             if let Some(kind) = kind {
                 let action = if nonzero {
                     WriteAction::Data
@@ -143,16 +141,11 @@ impl<'a> Pack<'a> {
         }
     }
 
-    fn overlay(&mut self, range: Range<usize>, granule: usize) {
-        for start in (range.start..range.end).step_by(granule) {
-            let end = (start + granule).min(range.end);
-            let action = if self.zero_granules[start / granule] {
-                WriteAction::Zero
-            } else {
-                WriteAction::Data
-            };
-            self.write_run(start..end, WriteKind::Overlay, action);
+    fn known_zero(&mut self, range: Range<usize>, kind: Option<WriteKind>) {
+        if let Some(kind) = kind {
+            self.write_run(range.clone(), kind, WriteAction::Zero);
         }
+        self.zeros.push(range);
     }
 
     fn persist(
@@ -164,21 +157,19 @@ impl<'a> Pack<'a> {
         hash_workers: usize,
     ) -> Result<(), RamImageError> {
         let failure = Failure;
-        for run in &self.writes {
+        for range in &self.zeros {
             failure.check(deadline)?;
-            if run.action == WriteAction::Zero {
-                let mut start = run.range.start;
-                while start < run.range.end {
-                    let chunk = start / RAM_IDENTITY_CHUNK_BYTES as usize;
-                    let end = run
-                        .range
-                        .end
-                        .min((chunk + 1) * RAM_IDENTITY_CHUNK_BYTES as usize);
-                    if self.nonzero[chunk] {
-                        self.bytes[start..end].fill(0);
-                    }
-                    start = end;
+            let mut start = range.start;
+            while start < range.end {
+                let chunk = start / RAM_IDENTITY_CHUNK_BYTES as usize;
+                let end = range
+                    .end
+                    .min((chunk + 1) * RAM_IDENTITY_CHUNK_BYTES as usize);
+                if self.affected[chunk] && self.nonzero[chunk] {
+                    self.bytes[start..end].fill(0);
+                    stats.identity_zero_bytes_filled += (end - start) as u64;
                 }
+                start = end;
             }
         }
         let bytes = &self.bytes[..self.length];
@@ -278,14 +269,16 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
-    fn full(
+    fn sparse_live(
         &mut self,
         pack: &mut Pack<'_>,
+        range: Range<u64>,
+        write_kind: Option<WriteKind>,
         stats: &mut RamIoStats,
         failure: &Failure,
     ) -> Result<(), RamImageError> {
-        let mut offset = pack.offset;
-        let end = offset + pack.length as u64;
+        let mut offset = range.start;
+        let end = range.end;
         while offset < end {
             failure.check(self.input.deadline)?;
             let region = self
@@ -311,15 +304,13 @@ impl Reader<'_> {
             match kind {
                 CutReadKind::Read => {
                     self.live(pack, offset..offset + length as u64, stats, failure)?;
-                    pack.classify(
-                        range,
-                        Some(WriteKind::Full),
-                        self.input.layout.granule() as usize,
-                    );
+                    pack.classify(range, write_kind, self.input.layout.granule() as usize);
+                    stats.live_pages_classified +=
+                        length as u64 / u64::from(self.input.layout.granule());
                 }
                 CutReadKind::KnownZero => {
                     stats.known_zero_bytes_skipped += length as u64;
-                    pack.write_run(range, WriteKind::Full, WriteAction::Zero);
+                    pack.known_zero(range, write_kind);
                 }
             }
             offset += length as u64;
@@ -407,7 +398,7 @@ impl Reader<'_> {
             )?;
             pack.classify(
                 local,
-                Some(WriteKind::Baseline),
+                (!self.input.seeded).then_some(WriteKind::Baseline),
                 self.input.layout.granule() as usize,
             );
             offset = end;
@@ -425,13 +416,16 @@ impl Reader<'_> {
         let end = pack.offset + pack.length as u64;
         let granule = self.input.layout.granule() as usize;
         if matches!(self.input.mode, RamWriteMode::Full) {
-            pack.affected.fill(true);
-            return self.full(pack, stats, failure);
+            return self.sparse_live(
+                pack,
+                pack.offset..end,
+                Some(WriteKind::Full),
+                stats,
+                failure,
+            );
         }
-        if self.input.seeded {
-            self.live(pack, pack.offset..end, stats, failure)?;
-            pack.classify(0..pack.length, None, granule);
-        }
+        let live_identity =
+            self.input.seeded && !matches!(self.input.identity, RamHashSelection::None);
         let mut clean_start = pack.offset;
         while let Some(page) = pages.peek() {
             let start = page.index() as u64 * granule as u64;
@@ -448,24 +442,100 @@ impl Reader<'_> {
                 pages.next();
                 stop += granule as u64;
             }
-            let local = (start - pack.offset) as usize..(stop - pack.offset) as usize;
-            let first = local.start / RAM_IDENTITY_CHUNK_BYTES as usize;
-            let last = (local.end - 1) / RAM_IDENTITY_CHUNK_BYTES as usize;
-            pack.affected[first..=last].fill(true);
-            if self.input.seeded {
-                pack.overlay(local, granule);
-            } else {
+            if live_identity {
+                self.sparse_live(pack, clean_start..start, None, stats, failure)?;
+            } else if !self.input.seeded {
                 self.clean(pack, clean_start..start, stats, failure)?;
-                self.live(pack, start..stop, stats, failure)?;
-                pack.classify(local, Some(WriteKind::Overlay), granule);
             }
+            self.sparse_live(pack, start..stop, Some(WriteKind::Overlay), stats, failure)?;
             clean_start = stop;
         }
-        if !self.input.seeded {
+        if live_identity {
+            self.sparse_live(pack, clean_start..end, None, stats, failure)?;
+        } else if !self.input.seeded {
             self.clean(pack, clean_start..end, stats, failure)?;
         }
         Ok(())
     }
+}
+
+// Extents are a byte proof only while B is complete and D covers every writer.
+// Bound metadata independently of logical RAM size; unsupported or pathological
+// extent maps retain the correct full live-read path.
+fn full_identity_extents(
+    input: &Input<'_>,
+    stats: &mut RamIoStats,
+) -> Result<Option<Vec<Range<u64>>>, RamImageError> {
+    if !matches!(input.identity, RamHashSelection::Full) {
+        return Ok(None);
+    }
+    let baseline = input.byte_baseline.or(match input.mode {
+        RamWriteMode::Full => None,
+        RamWriteMode::Incremental { baseline, dirty } => Some((*baseline, *dirty)),
+    });
+    let Some((baseline, dirty)) = baseline else {
+        return Ok(None);
+    };
+    let fallback = if !input.cut.domain().coverage_valid() {
+        Some(RamIdentityReadFallback::CoverageLost)
+    } else if baseline.layout().as_ref() != input.layout
+        || dirty.page_count() != input.cut.domain().layout().page_count()
+        || baseline.recheck_before(Some(input.deadline)).is_err()
+    {
+        Some(RamIdentityReadFallback::BaselineMismatch)
+    } else {
+        None
+    };
+    if let Some(reason) = fallback {
+        check_deadline(input.deadline)?;
+        stats.full_identity_read_fallback = Some(reason);
+        return Ok(None);
+    }
+    let mut extents = Extents {
+        file: &baseline.ram,
+        length: input.layout.packed_len(),
+        supported: true,
+    };
+    let mut ranges: Vec<Range<u64>> = Vec::new();
+    let mut offset = 0;
+    let mut count = 0;
+    while offset < extents.length {
+        check_deadline(input.deadline)?;
+        let data = match extents.next(offset, stats, input.deadline) {
+            Ok(data) if extents.supported => data,
+            Err(RamImageError::Deadline) => return Err(RamImageError::Deadline),
+            _ => {
+                stats.full_identity_read_fallback =
+                    Some(RamIdentityReadFallback::ExtentsUnavailable);
+                return Ok(None);
+            }
+        };
+        let Some(data) = data else { break };
+        if count == 65536 {
+            stats.full_identity_read_fallback = Some(RamIdentityReadFallback::ExtentLimit);
+            return Ok(None);
+        }
+        count += 1;
+        offset = data.end;
+        let range = data.start / RAM_IDENTITY_CHUNK_BYTES * RAM_IDENTITY_CHUNK_BYTES
+            ..data.end.div_ceil(RAM_IDENTITY_CHUNK_BYTES) * RAM_IDENTITY_CHUNK_BYTES;
+        if let Some(last) = ranges.last_mut()
+            && range.start <= last.end
+        {
+            last.end = range.end;
+        } else {
+            ranges
+                .try_reserve(1)
+                .map_err(|_| RamImageError::Allocation)?;
+            ranges.push(range);
+        }
+    }
+    if baseline.recheck_before(Some(input.deadline)).is_err() {
+        check_deadline(input.deadline)?;
+        stats.full_identity_read_fallback = Some(RamIdentityReadFallback::BaselineMismatch);
+        return Ok(None);
+    }
+    Ok(Some(ranges))
 }
 
 pub(crate) fn write(
@@ -489,12 +559,10 @@ pub(crate) fn write_with_workers(
     if !(1..=WRITERS).contains(&hash_workers) {
         return Err(RamImageError::Geometry);
     }
+    let full_extents = full_identity_extents(&input, stats)?;
+    let sparse_full = full_extents.is_some();
     let mut reader = Reader {
-        cut_reader: if matches!(input.mode, RamWriteMode::Full) {
-            Some(input.cut.reader().map_err(RamImageError::Authority)?)
-        } else {
-            None
-        },
+        cut_reader: Some(input.cut.reader().map_err(RamImageError::Authority)?),
         extents: match input.mode {
             RamWriteMode::Full => None,
             RamWriteMode::Incremental { baseline, .. } => Some(Extents {
@@ -517,10 +585,46 @@ pub(crate) fn write_with_workers(
         .flat_map(|dirty| dirty.iter_set())
         .peekable();
     let granule = u64::from(reader.input.layout.granule());
-    let mut units = dirty
+    let identity_dirty = match reader.input.identity {
+        RamHashSelection::SinceAnchor { dirty, .. } => Some(*dirty),
+        _ => None,
+    };
+    let selection = identity_dirty
+        .or(dirty)
+        .or_else(|| reader.input.byte_baseline.map(|(_, dirty)| dirty));
+    let unit_bytes = if matches!(reader.input.identity, RamHashSelection::None) {
+        granule
+    } else {
+        RAM_IDENTITY_CHUNK_BYTES
+    };
+    let mut dirty_units = selection
         .into_iter()
         .flat_map(|dirty| dirty.iter_set())
-        .map(|page| page.index() as u64 * granule / RAM_IDENTITY_CHUNK_BYTES)
+        .map(|page| page.index() as u64 * granule / unit_bytes)
+        .peekable();
+    let mut data_units = full_extents
+        .iter()
+        .flatten()
+        .flat_map(|range| range.start / unit_bytes..range.end / unit_bytes)
+        .peekable();
+    let mut units =
+        std::iter::from_fn(
+            || match (dirty_units.peek().copied(), data_units.peek().copied()) {
+                (Some(dirty), Some(data)) if dirty == data => {
+                    dirty_units.next();
+                    data_units.next()
+                }
+                (Some(dirty), Some(data)) if data < dirty => data_units.next(),
+                (Some(_), _) => dirty_units.next(),
+                (None, _) => data_units.next(),
+            },
+        )
+        .peekable();
+    let selected = sparse_full
+        || (reader.input.seeded && !matches!(reader.input.identity, RamHashSelection::Full));
+    let mut hash_pages = identity_dirty
+        .into_iter()
+        .flat_map(|dirty| dirty.iter_set())
         .peekable();
     let mut pack = Pack::new(
         &mut scratch.buffers[0],
@@ -532,28 +636,53 @@ pub(crate) fn write_with_workers(
     let length = reader.input.layout.packed_len();
     loop {
         failure.check(deadline)?;
-        let range = if reader.input.seeded {
+        let range = if selected {
             let Some(first) = units.next() else { break };
             let mut end = first + 1;
             while let Some(next) = units.peek().copied() {
-                if next >= end && (next != end || end - first >= CHUNKS_PER_PACK as u64) {
+                if next >= end
+                    && (next != end || (end - first) * unit_bytes >= RAM_IO_BUFFER_BYTES as u64)
+                {
                     break;
                 }
                 units.next();
                 end = end.max(next + 1);
             }
-            first * RAM_IDENTITY_CHUNK_BYTES..(end * RAM_IDENTITY_CHUNK_BYTES).min(length)
+            first * unit_bytes..(end * unit_bytes).min(length)
         } else {
             if offset == length {
                 break;
             }
             offset..(offset + RAM_IO_BUFFER_BYTES as u64).min(length)
         };
+        if sparse_full {
+            stats.known_zero_bytes_skipped += range.start - offset;
+        }
         pack.reset(range.start, (range.end - range.start) as usize);
         reader.fill(&mut pack, &mut pages, stats, &failure)?;
+        match reader.input.identity {
+            RamHashSelection::None => {}
+            RamHashSelection::Full => pack.affected.fill(true),
+            RamHashSelection::SinceAnchor { .. } => {
+                while let Some(page) = hash_pages.peek() {
+                    let start = page.index() as u64 * granule;
+                    if start >= range.end {
+                        break;
+                    }
+                    hash_pages.next();
+                    if start >= range.start {
+                        pack.affected
+                            [((start - range.start) / RAM_IDENTITY_CHUNK_BYTES) as usize] = true;
+                    }
+                }
+            }
+        }
         pack.persist(ram, stats, &mut writeback, deadline, hash_workers)?;
         pack.emit(changes)?;
         offset = range.end;
+    }
+    if sparse_full {
+        stats.known_zero_bytes_skipped += length - offset;
     }
     Ok(())
 }
