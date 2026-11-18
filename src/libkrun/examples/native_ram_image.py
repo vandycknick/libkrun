@@ -1,4 +1,4 @@
-"""Independent stream-map v2 RAM identity and native sparse-change oracle."""
+"""Independent stream-map v1 RAM identity and native sparse-change oracle."""
 import hashlib
 import json
 import os
@@ -111,8 +111,8 @@ def stream_root(fd: int, length: int) -> bytes:
         if not slots[height]:
             return
         bitmap = sum(1 << slot for slot in slots[height])
-        prefix = (b"silo:stream-map:leaf:v2\n" if height == 0 else
-                  b"silo:stream-map:branch:v2\n" + bytes([height]))
+        prefix = (b"silo:stream-map:leaf:v1\n" if height == 0 else
+                  b"silo:stream-map:branch:v1\n" + bytes([height]))
         encoded = prefix + struct.pack("<Q", bitmap)
         encoded += b"".join(slots[height][slot] for slot in sorted(slots[height]))
         digest = hashlib.sha256(encoded).digest()
@@ -136,7 +136,7 @@ def stream_root(fd: int, length: int) -> bytes:
             push(0, index, digest)
     for height in range(5):
         flush(height)
-    return b"silo:stream:v2\n" + struct.pack("<BQB", 16, length, tree is not None) + (tree or b"")
+    return b"silo:stream:v1\n" + struct.pack("<BQB", 16, length, tree is not None) + (tree or b"")
 
 
 def iter_changes(path: Path, length: int, mode: str):

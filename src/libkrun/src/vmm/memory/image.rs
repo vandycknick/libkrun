@@ -263,7 +263,7 @@ impl RamIoScratch {
 }
 
 /// The trusted caller authenticates imported bytes and excludes all writers.
-/// `stream` is a stream-map v2 root authenticated by the caller at the fixed
+/// `stream` is a stream-map v1 root authenticated by the caller at the fixed
 /// 64 KiB RAM profile, not a whole-file digest. Native emits sparse changes;
 /// readonly descriptor metadata alone does not establish immutability.
 #[derive(Clone, Debug, Eq, PartialEq)]

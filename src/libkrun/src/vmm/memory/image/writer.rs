@@ -26,6 +26,9 @@ use crate::vmm::memory::image::{
 
 mod pipeline;
 
+// Smaller interior holes cause extent fragmentation that makes reflink clones costly.
+const MIN_ZERO_HOLE_BYTES: usize = RAM_IDENTITY_CHUNK_BYTES as usize;
+
 // Failure must retain staging owners without a new allocation after output effects.
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
 pub fn write_ram_image(
@@ -600,8 +603,8 @@ mod tests {
     use crate::vmm::memory::AttemptId;
     use crate::vmm::memory::image::changes::{ChangeWriter, read_test_changes};
     use crate::vmm::memory::image::writer::{
-        Extents, WriteKind, Writeback, account_write, check_deadline, clone_baseline,
-        count_zero_bytes, cover_zero, io_error, is_all_zero, mark_chunks, read_exact_at,
+        Extents, MIN_ZERO_HOLE_BYTES, WriteKind, Writeback, account_write, check_deadline,
+        clone_baseline, count_zero_bytes, cover_zero, io_error, is_all_zero, mark_chunks, read_exact_at,
         seed_incremental, write_exact_at, write_ram_image,
     };
     use crate::vmm::memory::image::{
@@ -969,17 +972,29 @@ mod tests {
             kind: WriteKind,
         ) -> Result<(), RamImageError> {
             let mut run = None;
-            for start in (0..len).step_by(self.granule) {
+            let mut start = 0;
+            while start < len {
                 let end = (start + self.granule).min(len);
                 if !is_all_zero(&self.buffer[start..end]) {
                     if run.is_none() {
                         run = Some(start);
                     }
-                } else {
-                    self.stats.zero_bytes_omitted += (end - start) as u64;
-                    if let Some(first) = run.take() {
-                        self.write_buffer(first..start, offset + first as u64, kind)?;
-                    }
+                    start = end;
+                    continue;
+                }
+                let first_zero = start;
+                start = end;
+                while start < len
+                    && is_all_zero(&self.buffer[start..(start + self.granule).min(len)])
+                {
+                    start = (start + self.granule).min(len);
+                }
+                if run.is_some() && start < len && start - first_zero < MIN_ZERO_HOLE_BYTES {
+                    continue;
+                }
+                self.stats.zero_bytes_omitted += (start - first_zero) as u64;
+                if let Some(first) = run.take() {
+                    self.write_buffer(first..first_zero, offset + first as u64, kind)?;
                 }
             }
             if let Some(first) = run {
@@ -1183,7 +1198,7 @@ mod tests {
             full.stats().live_bytes_read + full.stats().known_zero_bytes_skipped,
             layout.packed_len()
         );
-        assert_eq!(full.stats().full_bytes_written, 6 * 4096);
+        assert_eq!(full.stats().full_bytes_written, 8 * 4096);
         assert_eq!(baseline_files.indices(), [0, 15, 16, 127, 128]);
         assert_eq!(
             std::fs::read(baseline_files.layout.as_path()).unwrap(),
@@ -1240,7 +1255,14 @@ mod tests {
                 4 * 4096
             }
         );
-        assert_eq!(incremental.stats().zero_run_bytes_covered, 3 * 4096);
+        assert_eq!(
+            incremental.stats().zero_run_bytes_covered,
+            if incremental.stats().seed_method == RamSeedMethod::Clone {
+                3 * 4096
+            } else {
+                4 * 4096
+            }
+        );
         assert_eq!(
             incremental.stats().overlay_bytes_written,
             4096 + incremental.stats().explicit_zero_bytes_written
@@ -2121,38 +2143,39 @@ mod tests {
                 .sparse(len, offset, kind)
                 .unwrap();
                 let mut reference_stats = RamIoStats::default();
-                let mut run = None;
-                for (index, block) in bytes.chunks(4096).enumerate() {
-                    let start = index * 4096;
-                    if block.iter().any(|byte| *byte != 0) {
-                        if run.is_none() {
-                            run = Some(start);
-                        }
-                    } else {
-                        reference_stats.zero_bytes_omitted += block.len() as u64;
-                        if let Some(first) = run.take() {
-                            write_exact_at(
-                                reference.as_file(),
-                                &bytes[first..start],
-                                offset + first as u64,
-                                kind,
-                                &mut reference_stats,
-                                deadline(),
-                            )
-                            .unwrap();
-                        }
+                let mut data: Vec<bool> = bytes
+                    .chunks(4096)
+                    .map(|block| block.iter().any(|byte| *byte != 0))
+                    .collect();
+                let mut index = 0;
+                while index < data.len() {
+                    if data[index] {
+                        index += 1;
+                        continue;
+                    }
+                    let first = index;
+                    while index < data.len() && !data[index] {
+                        index += 1;
+                    }
+                    let end = (index * 4096).min(len);
+                    if first > 0 && index < data.len() && end - first * 4096 < MIN_ZERO_HOLE_BYTES {
+                        data[first..index].fill(true);
                     }
                 }
-                if let Some(first) = run {
-                    write_exact_at(
-                        reference.as_file(),
-                        &bytes[first..],
-                        offset + first as u64,
-                        kind,
-                        &mut reference_stats,
-                        deadline(),
-                    )
-                    .unwrap();
+                for (index, block) in bytes.chunks(4096).enumerate() {
+                    if data[index] {
+                        write_exact_at(
+                            reference.as_file(),
+                            block,
+                            offset + (index * 4096) as u64,
+                            kind,
+                            &mut reference_stats,
+                            deadline(),
+                        )
+                        .unwrap();
+                    } else {
+                        reference_stats.zero_bytes_omitted += block.len() as u64;
+                    }
                 }
                 let actual = std::fs::read(output.as_path()).unwrap();
                 assert_eq!(actual, std::fs::read(reference.as_path()).unwrap());
@@ -2501,7 +2524,7 @@ mod tests {
         assert_eq!(receipt.stats().baseline_bytes_written, 4096);
         assert_eq!(receipt.stats().overlay_bytes_written, 0);
         assert_eq!(receipt.stats().explicit_zero_bytes_written, 0);
-        assert_eq!(receipt.stats().zero_run_bytes_covered, 4096);
+        assert_eq!(receipt.stats().zero_run_bytes_covered, 2 * 4096);
         assert_eq!(
             read_test_changes(outputs.changes.as_file()).get(&0),
             Some(&independent_digests(&expected)[0])
@@ -3922,9 +3945,9 @@ mod tests {
                     }
                     let mut hash = Sha256::new();
                     if height == 0 {
-                        hash.update(b"silo:stream-map:leaf:v2\n");
+                        hash.update(b"silo:stream-map:leaf:v1\n");
                     } else {
-                        hash.update(b"silo:stream-map:branch:v2\n");
+                        hash.update(b"silo:stream-map:branch:v1\n");
                         hash.update([height]);
                     }
                     hash.update(bitmap.to_le_bytes());
@@ -3938,7 +3961,7 @@ mod tests {
         assert!(nodes.len() <= 1);
         let head = nodes.first().copied().flatten();
         let mut root = Sha256::new();
-        root.update(b"silo:stream:v2\n");
+        root.update(b"silo:stream:v1\n");
         root.update([16]);
         root.update(length.to_le_bytes());
         root.update([u8::from(head.is_some())]);
@@ -4486,5 +4509,241 @@ mod tests {
             canonical_root(&resolved, layout.packed_len()),
             canonical_root(&file_digests(files.ram.as_file()), layout.packed_len())
         );
+    }
+
+    fn assert_allocation(file: &File, range: Range<u64>, data: bool) {
+        use nix::errno::Errno;
+        use nix::unistd::{Whence, lseek};
+
+        file.sync_all().unwrap();
+        // Some filesystems legally report every byte as data. Probe a real
+        // sparse file before requiring holes, rather than assuming support.
+        let probe = TempFile::new().unwrap();
+        probe.as_file().set_len(3 * 4096).unwrap();
+        probe.as_file().write_all_at(&[1; 4096], 8192).unwrap();
+        probe.as_file().sync_all().unwrap();
+        match lseek(probe.as_file(), 4096, Whence::SeekData) {
+            Ok(8192) => {}
+            Ok(_) | Err(Errno::EINVAL | Errno::EOPNOTSUPP) => {
+                eprintln!("test filesystem does not report sparse extents");
+                return;
+            }
+            Err(error) => panic!("sparse extent probe failed: {error}"),
+        }
+        let offset = i64::try_from(range.start).unwrap();
+        if data {
+            assert_eq!(lseek(file, offset, Whence::SeekData).unwrap(), offset);
+            assert!(lseek(file, offset, Whence::SeekHole).unwrap() as u64 >= range.end);
+        } else {
+            assert_eq!(lseek(file, offset, Whence::SeekHole).unwrap(), offset);
+            match lseek(file, offset, Whence::SeekData) {
+                Ok(next) => assert!(next as u64 >= range.end),
+                Err(Errno::ENXIO) => {}
+                Err(error) => panic!("data extent query failed: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn alternating_zero_pages_are_dense_without_changing_identity() {
+        let length = 4 * 1024 * 1024 + 4096;
+        let mut expected = vec![0; length];
+        for start in (0..length).step_by(8192) {
+            expected[start..start + 4096].fill(0x59);
+        }
+        let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), length)]).unwrap();
+        raw.write_slice(&expected, GuestAddress(0)).unwrap();
+        let (domain, mut control) = tracked(raw);
+        let current = cut(&mut control);
+        let files = Outputs::new();
+        let receipt = capture(&current, layout(&domain), RamWriteMode::Full, files.owned());
+        assert_eq!(files.bytes(), expected);
+        assert_allocation(files.ram.as_file(), 0..length as u64, true);
+        let dense = TempFile::new().unwrap();
+        dense.as_file().write_all_at(&expected, 0).unwrap();
+        let digests = file_digests(dense.as_file());
+        assert_eq!(files.digests(), digests);
+        assert_eq!(
+            canonical_root(&files.digests(), length as u64),
+            canonical_root(&digests, length as u64)
+        );
+        assert_eq!(receipt.stats().full_bytes_written, length as u64);
+        assert_eq!(receipt.stats().zero_bytes_omitted, 0);
+        assert_eq!(
+            receipt.stats().zero_run_bytes_covered,
+            (length / 8192 * 4096) as u64
+        );
+    }
+
+    #[test]
+    fn interior_zero_hole_threshold_is_strict() {
+        for zeros in [MIN_ZERO_HOLE_BYTES - 4096, MIN_ZERO_HOLE_BYTES] {
+            let length = zeros + 8192;
+            let mut expected = vec![0; length];
+            expected[..4096].fill(0x51);
+            expected[length - 4096..].fill(0x62);
+            let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), length)]).unwrap();
+            raw.write_slice(&expected, GuestAddress(0)).unwrap();
+            let (domain, mut control) = tracked(raw);
+            let current = cut(&mut control);
+            let files = Outputs::new();
+            let receipt = capture(&current, layout(&domain), RamWriteMode::Full, files.owned());
+            let promoted = zeros < MIN_ZERO_HOLE_BYTES;
+            assert_eq!(files.bytes(), expected);
+            assert_eq!(files.digests(), independent_digests(&expected));
+            assert_allocation(files.ram.as_file(), 4096..(4096 + zeros) as u64, promoted);
+            assert_eq!(
+                receipt.stats().full_bytes_written,
+                if promoted { length } else { 8192 } as u64
+            );
+            assert_eq!(
+                receipt.stats().zero_bytes_omitted,
+                if promoted { 0 } else { zeros } as u64
+            );
+            assert_eq!(receipt.stats().zero_run_bytes_covered, zeros as u64);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn promoted_known_zero_clears_stale_scratch_with_and_without_hashing() {
+        for hashed in [false, true] {
+            let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 3 * 4096)]).unwrap();
+            raw.write_slice(&[0x51; 4096], GuestAddress(0)).unwrap();
+            raw.write_slice(&[0x62; 4096], GuestAddress(8192)).unwrap();
+            let (domain, mut control) = tracked(raw);
+            let current = cut(&mut control);
+            let files = Outputs::new();
+            let mut scratch = RamIoScratch::new().unwrap();
+            scratch.buffers[0].fill(0xa5);
+            let mut identity = RamCaptureIdentity::for_test(&RamWriteMode::Full);
+            if !hashed {
+                identity.selection = RamHashSelection::None;
+            }
+            let receipt = write_ram_image(
+                AttemptId::for_test(),
+                key(),
+                &current,
+                &binding(),
+                layout(&domain),
+                identity,
+                RamWriteMode::Full,
+                files.owned(),
+                &mut scratch,
+                deadline(),
+            )
+            .unwrap();
+            let mut expected = vec![0x51; 3 * 4096];
+            expected[4096..8192].fill(0);
+            expected[8192..].fill(0x62);
+            assert_eq!(files.bytes(), expected);
+            assert_eq!(receipt.stats().known_zero_bytes_skipped, 4096);
+            assert_eq!(
+                receipt.stats().identity_zero_bytes_filled,
+                if hashed { 4096 } else { 0 }
+            );
+            assert_eq!(receipt.stats().full_bytes_written, 3 * 4096);
+            assert_eq!(receipt.stats().zero_bytes_omitted, 0);
+            assert_eq!(receipt.stats().zero_run_bytes_covered, 4096);
+            assert_allocation(files.ram.as_file(), 0..3 * 4096, true);
+            if hashed {
+                assert_eq!(files.digests(), independent_digests(&expected));
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_incremental_promotes_zero_between_dirty_data() {
+        let length = 3 * 4096;
+        let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), length)]).unwrap();
+        raw.write_slice(&vec![0x71; length], GuestAddress(0)).unwrap();
+        let (domain, mut control) = tracked(raw);
+        let layout = layout(&domain);
+        let initial = cut(&mut control);
+        let baseline_files = Outputs::new();
+        let mut full = capture(
+            &initial,
+            layout.clone(),
+            RamWriteMode::Full,
+            baseline_files.owned(),
+        );
+        let baseline = baseline_files.seal(&mut full);
+        control
+            .reopen(&initial, &initial.issue_epoch(2).unwrap())
+            .unwrap();
+        let mut expected = vec![0x52; length];
+        expected[4096..8192].fill(0);
+        domain
+            .write(GuestAddress(0), length)
+            .unwrap()
+            .write_view(0, length)
+            .unwrap()
+            .write_slice(&expected, 0)
+            .unwrap();
+        let current = cut(&mut control);
+        let mut dirty = DirtyPageMap::new(domain.layout());
+        control.drain_host_dirty(&current, &mut dirty).unwrap();
+        let files = Outputs::new();
+        // Keep the seeded-path assertion even on filesystems without reflinks.
+        if clone_baseline(baseline_files.ram.as_file(), files.ram.as_file(), length as u64).is_err() {
+            files
+                .ram
+                .as_file()
+                .write_all_at(&baseline_files.bytes(), 0)
+                .unwrap();
+        }
+        let mut digests = pipeline::allocate_digests(length as u64).unwrap();
+        let mut stats = RamIoStats::default();
+        let mode = RamWriteMode::Incremental {
+            baseline: &baseline,
+            dirty: &dirty,
+        };
+        pipeline::write(
+            pipeline::Input {
+                byte_baseline: None,
+                cut: &current,
+                layout: &layout,
+                mode: &mode,
+                identity: &RamHashSelection::Full,
+                seeded: true,
+                deadline: deadline(),
+            },
+            files.ram.as_file(),
+            &mut RamIoScratch::new().unwrap(),
+            &mut stats,
+            &[1],
+            &mut digests,
+        )
+        .unwrap();
+        assert_eq!(files.bytes(), expected);
+        assert_eq!(digests, independent_digests(&expected));
+        assert_allocation(files.ram.as_file(), 0..length as u64, true);
+        assert_eq!(stats.overlay_bytes_written, length as u64);
+        assert_eq!(stats.explicit_zero_bytes_written, 4096);
+        assert_eq!(stats.zero_run_bytes_covered, 4096);
+        assert_eq!(stats.zero_bytes_punched, 0);
+        assert_eq!(stats.zero_bytes_omitted, 0);
+        assert_eq!(baseline_files.bytes(), vec![0x71; length]);
+    }
+
+    #[test]
+    fn pack_edge_zero_pages_stay_sparse() {
+        let pack = crate::vmm::memory::image::RAM_IO_BUFFER_BYTES;
+        for zero in [0, pack - 4096, pack, pack + 4096] {
+            let length = pack + 8192;
+            let mut expected = vec![0x43; length];
+            expected[zero..zero + 4096].fill(0);
+            let raw = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), length)]).unwrap();
+            raw.write_slice(&expected, GuestAddress(0)).unwrap();
+            let (domain, mut control) = tracked(raw);
+            let current = cut(&mut control);
+            let files = Outputs::new();
+            let receipt = capture(&current, layout(&domain), RamWriteMode::Full, files.owned());
+            assert_eq!(files.bytes(), expected);
+            assert_eq!(files.digests(), independent_digests(&expected));
+            assert_allocation(files.ram.as_file(), zero as u64..(zero + 4096) as u64, false);
+            assert_eq!(receipt.stats().zero_bytes_omitted, 4096);
+            assert_eq!(receipt.stats().full_bytes_written, (length - 4096) as u64);
+        }
     }
 }

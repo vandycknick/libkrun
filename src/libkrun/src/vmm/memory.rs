@@ -2423,7 +2423,15 @@ mod tests {
                     0
                 );
             } else {
-                assert_eq!(incremental.receipt().stats().zero_run_bytes_covered, 4096);
+                // Rebuilds also cover the five zero pages now allocated in the baseline.
+                assert_eq!(
+                    incremental.receipt().stats().zero_run_bytes_covered,
+                    if incremental.receipt().stats().seed_method == RamSeedMethod::Clone {
+                        4096
+                    } else {
+                        6 * 4096
+                    }
+                );
             }
             let mut resolved_map = baseline_map.clone();
             for (chunk, digest) in
@@ -2582,7 +2590,7 @@ mod tests {
             None
         } else {
             let mut leaf = Sha256::new();
-            leaf.update(b"silo:stream-map:leaf:v2\n");
+            leaf.update(b"silo:stream-map:leaf:v1\n");
             leaf.update(bitmap.to_le_bytes());
             for digest in units.iter().flatten() {
                 leaf.update(digest);
@@ -2590,7 +2598,7 @@ mod tests {
             let mut digest: [u8; 32] = leaf.finalize().into();
             for height in 1..=4 {
                 let mut branch = Sha256::new();
-                branch.update(b"silo:stream-map:branch:v2\n");
+                branch.update(b"silo:stream-map:branch:v1\n");
                 branch.update([height]);
                 branch.update(1u64.to_le_bytes());
                 branch.update(digest);
@@ -2599,7 +2607,7 @@ mod tests {
             Some(digest)
         };
         let mut root = Sha256::new();
-        root.update(b"silo:stream:v2\n");
+        root.update(b"silo:stream:v1\n");
         root.update([16]);
         root.update(length.to_le_bytes());
         root.update([u8::from(head.is_some())]);

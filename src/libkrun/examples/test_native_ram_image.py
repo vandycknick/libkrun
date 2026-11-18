@@ -33,12 +33,12 @@ class RamImageAuthenticationTests(unittest.TestCase):
                 output.write(b"x" * 4096)
             result = authenticate_image(ram, layout, hashlib.sha256(data).digest(), data)
             chunk = hashlib.sha256(b"x" * 4096).digest()
-            leaf = b"silo:stream-map:leaf:v2\n" + struct.pack("<Q", 2) + chunk
+            leaf = b"silo:stream-map:leaf:v1\n" + struct.pack("<Q", 2) + chunk
             tree = hashlib.sha256(leaf).digest()
             for height in range(1, 5):
-                tree = hashlib.sha256(b"silo:stream-map:branch:v2\n" + bytes([height])
+                tree = hashlib.sha256(b"silo:stream-map:branch:v1\n" + bytes([height])
                                       + struct.pack("<Q", 1) + tree).digest()
-            canonical = b"silo:stream:v2\n" + struct.pack("<BQB", 16, CHUNK_SIZE + 4096, 1) + tree
+            canonical = b"silo:stream:v1\n" + struct.pack("<BQB", 16, CHUNK_SIZE + 4096, 1) + tree
             self.assertEqual(result["stream_root"], canonical.hex())
             self.assertEqual(result["stream_digest"], hashlib.sha256(canonical).hexdigest())
             self.assertEqual(result["caller_authentication_bytes_read"], len(data) + CHUNK_SIZE + 4096)
@@ -94,7 +94,7 @@ class RamImageAuthenticationTests(unittest.TestCase):
                 ram.write_bytes(b"x" * 4096)
                 result = authenticate_image(ram, layout, layout_digest(data), ram_fd=fd)
                 self.assertEqual(result["stream_root"],
-                                 (b"silo:stream:v2\n" + struct.pack("<BQB", 16, 4096, 0)).hex())
+                                 (b"silo:stream:v1\n" + struct.pack("<BQB", 16, 4096, 0)).hex())
                 self.assertEqual(result["ram_inode"], [os.fstat(fd).st_dev, os.fstat(fd).st_ino])
                 self.assertNotEqual(result["ram_inode"][1], ram.stat().st_ino)
             finally:
@@ -158,7 +158,7 @@ class RamChangesTests(unittest.TestCase):
             for index in indices:
                 payload = b"x" * 4096 + (bytes(CHUNK_SIZE - 4096) if index != 4096 else b"")
                 pages.setdefault(index // 64, {})[index % 64] = hashlib.sha256(payload).digest()
-            level = {index: hashlib.sha256(b"silo:stream-map:leaf:v2\n"
+            level = {index: hashlib.sha256(b"silo:stream-map:leaf:v1\n"
                      + struct.pack("<Q", sum(1 << bit for bit in entries))
                      + b"".join(entries[bit] for bit in sorted(entries))).digest()
                      for index, entries in pages.items()}
@@ -166,11 +166,11 @@ class RamChangesTests(unittest.TestCase):
                 parents = {}
                 for index, digest in level.items():
                     parents.setdefault(index // 64, {})[index % 64] = digest
-                level = {index: hashlib.sha256(b"silo:stream-map:branch:v2\n" + bytes([height])
+                level = {index: hashlib.sha256(b"silo:stream-map:branch:v1\n" + bytes([height])
                          + struct.pack("<Q", sum(1 << bit for bit in entries))
                          + b"".join(entries[bit] for bit in sorted(entries))).digest()
                          for index, entries in parents.items()}
-            self.assertEqual(actual, b"silo:stream:v2\n" + struct.pack("<BQB", 16, length, 1) + level[0])
+            self.assertEqual(actual, b"silo:stream:v1\n" + struct.pack("<BQB", 16, length, 1) + level[0])
 
 
 if __name__ == "__main__":

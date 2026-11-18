@@ -11,7 +11,8 @@ use vm_memory::GuestAddress;
 
 use crate::vmm::memory::image::changes::ChangeWriter;
 use crate::vmm::memory::image::writer::{
-    Extents, WriteKind, Writeback, cover_zero, is_all_zero, read_exact_at, write_exact_at,
+    Extents, MIN_ZERO_HOLE_BYTES, WriteKind, Writeback, cover_zero, is_all_zero, read_exact_at,
+    write_exact_at,
 };
 use crate::vmm::memory::image::{
     AdmittedRamImage, RAM_IDENTITY_CHUNK_BYTES, RAM_IO_BUFFER_BYTES, RamFileRole, RamHashSelection,
@@ -54,6 +55,7 @@ struct WriteRun {
     range: Range<usize>,
     kind: WriteKind,
     action: WriteAction,
+    promoted_zero_bytes: usize,
 }
 
 struct Pack<'a> {
@@ -114,6 +116,7 @@ impl<'a> Pack<'a> {
             range,
             kind,
             action,
+            promoted_zero_bytes: 0,
         });
     }
 
@@ -148,6 +151,44 @@ impl<'a> Pack<'a> {
         self.zeros.push(range);
     }
 
+    fn coalesce_writes(&mut self) {
+        // Pack-edge neighbours are unknown, so only bridge zeros bounded by
+        // contiguous data of the same kind entirely inside this pack.
+        for index in 1..self.writes.len().saturating_sub(1) {
+            let left = &self.writes[index - 1];
+            let zero = &self.writes[index];
+            let right = &self.writes[index + 1];
+            if zero.action == WriteAction::Zero
+                && zero.range.len() < MIN_ZERO_HOLE_BYTES
+                && left.action == WriteAction::Data
+                && right.action == WriteAction::Data
+                && left.kind == zero.kind
+                && right.kind == zero.kind
+                && left.range.end == zero.range.start
+                && zero.range.end == right.range.start
+            {
+                let zero = &mut self.writes[index];
+                zero.promoted_zero_bytes = zero.range.len();
+                zero.action = WriteAction::Data;
+            }
+        }
+        let mut count = 0;
+        for index in 0..self.writes.len() {
+            if count > 0
+                && self.writes[count - 1].kind == self.writes[index].kind
+                && self.writes[count - 1].action == self.writes[index].action
+                && self.writes[count - 1].range.end == self.writes[index].range.start
+            {
+                self.writes[count - 1].range.end = self.writes[index].range.end;
+                self.writes[count - 1].promoted_zero_bytes += self.writes[index].promoted_zero_bytes;
+            } else {
+                self.writes.swap(count, index);
+                count += 1;
+            }
+        }
+        self.writes.truncate(count);
+    }
+
     fn persist(
         &mut self,
         file: &File,
@@ -157,6 +198,8 @@ impl<'a> Pack<'a> {
         hash_workers: usize,
     ) -> Result<(), RamImageError> {
         let failure = Failure;
+        self.coalesce_writes();
+        let mut writes = self.writes.iter().peekable();
         for range in &self.zeros {
             failure.check(deadline)?;
             let mut start = range.start;
@@ -165,8 +208,26 @@ impl<'a> Pack<'a> {
                 let end = range
                     .end
                     .min((chunk + 1) * RAM_IDENTITY_CHUNK_BYTES as usize);
-                if self.affected[chunk] && self.nonzero[chunk] {
+                while writes.peek().is_some_and(|run| run.range.end <= start) {
+                    writes.next();
+                }
+                let end = if let Some(run) = writes.peek() {
+                    end.min(if run.range.start > start {
+                        run.range.start
+                    } else {
+                        run.range.end
+                    })
+                } else {
+                    end
+                };
+                let identity = self.affected[chunk] && self.nonzero[chunk];
+                let written = writes.peek().is_some_and(|run| {
+                    run.range.start <= start && run.action == WriteAction::Data
+                });
+                if identity || written {
                     self.bytes[start..end].fill(0);
+                }
+                if identity {
                     stats.identity_zero_bytes_filled += (end - start) as u64;
                 }
                 start = end;
@@ -237,6 +298,7 @@ impl<'a> Pack<'a> {
                         deadline,
                     )?;
                     writeback.completed(file, offset, run.range.len() as u64);
+                    stats.zero_run_bytes_covered += run.promoted_zero_bytes as u64;
                 }
                 WriteAction::Zero => cover_zero(
                     file,
