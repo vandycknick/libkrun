@@ -97,7 +97,7 @@ pub struct Serial {
 }
 
 impl Serial {
-    pub fn preflight_state(&self) -> Result<(), utils::state::Error> {
+    pub fn preflight_state(&self) -> std::result::Result<(), utils::state::Error> {
         if self.state_fault {
             return Err(utils::state::Error::Invalid("PL011 terminality fault"));
         }
