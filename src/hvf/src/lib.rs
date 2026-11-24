@@ -986,7 +986,25 @@ impl HvfVcpu<'_> {
                 self.vtimer_masked = true;
                 return Ok(VcpuExit::VtimerActivated);
             }
-            HV_EXIT_REASON_CANCELED => return Ok(VcpuExit::Canceled),
+            HV_EXIT_REASON_CANCELED => {
+                // A cancel can win the race with a firing vtimer: HVF has
+                // already masked the timer but reports only the cancel, and
+                // the activation exit never comes. Take it here, or the mask
+                // cache is stale and the timer interrupt is lost.
+                let mut masked = false;
+                let ret = unsafe { hv_vcpu_get_vtimer_mask(self.vcpuid, &mut masked) };
+                if ret != HV_SUCCESS {
+                    return Err(Error::NativeCall {
+                        symbol: "hv_vcpu_get_vtimer_mask",
+                        status: ret,
+                    });
+                }
+                if masked && !self.vtimer_masked {
+                    self.vtimer_masked = true;
+                    return Ok(VcpuExit::VtimerActivated);
+                }
+                return Ok(VcpuExit::Canceled);
+            }
             _ => {
                 let pc = self.read_reg(hv_reg_t_HV_REG_PC)?;
                 return Err(Error::UnexpectedExit {
