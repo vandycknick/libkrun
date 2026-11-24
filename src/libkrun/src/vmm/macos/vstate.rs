@@ -1172,7 +1172,6 @@ impl Vcpu {
                     result: outcome,
                     execution,
                 });
-                let _ = self.exit_evt.write(1);
                 if stopped {
                     return;
                 }
