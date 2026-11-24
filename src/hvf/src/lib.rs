@@ -109,7 +109,8 @@ const CNTHCTL_EL2_BITS: u64 = CNTHCTL_EL0VCTEN | CNTHCTL_EL0PCTEN;
 
 const AA64PFR0_EL1_EL2EN: u64 = 1 << 8;
 const AA64PFR0_EL1_GIC3EN: u64 = 1 << 24;
-const AA64PFR1_EL1_SMEMASK: u64 = 3 << 24;
+const AA64PFR0_EL1_SVE: u64 = 0xf << 32;
+const AA64PFR1_EL1_SME: u64 = 0xf << 24;
 
 const EC_WFX_TRAP: u64 = 0x1;
 const EC_AA64_HVC: u64 = 0x16;
@@ -691,6 +692,31 @@ impl HvfVcpu<'_> {
                 status: ret,
             });
         }
+        // The execution state has no storage for SVE or SME registers, so no
+        // vCPU may advertise them: a guest that used them could not be paused,
+        // captured or restored. Every vCPU gets the same model before it runs.
+        self.clear_id_feature(hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR0_EL1, AA64PFR0_EL1_SVE)?;
+        self.clear_id_feature(hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1, AA64PFR1_EL1_SME)
+    }
+
+    fn clear_id_feature(&self, register: u16, field: u64) -> Result<(), Error> {
+        let value = self.read_sys_reg(register)?;
+        if value & field == 0 {
+            return Ok(());
+        }
+        let ret = unsafe { hv_vcpu_set_sys_reg(self.vcpuid, register, value & !field) };
+        if ret != HV_SUCCESS {
+            return Err(Error::ExecutionRegister {
+                symbol: "hv_vcpu_set_sys_reg",
+                register: u32::from(register),
+                status: ret,
+            });
+        }
+        if self.read_sys_reg(register)? & field != 0 {
+            return Err(Error::ExecutionState(state::StateError(
+                "HVF kept an SVE/SME feature field that was cleared",
+            )));
+        }
         Ok(())
     }
 
@@ -755,36 +781,6 @@ impl HvfVcpu<'_> {
             if ret != HV_SUCCESS {
                 return Err(Error::NativeCall {
                     symbol: "hv_vcpu_set_sys_reg(ID_AA64PFR0_EL1)",
-                    status: ret,
-                });
-            }
-
-            // If SME is enabled in ID_AA64PFR1_EL1 in the VM, the guest will
-            // break after enabling the MMU. Mask it out.
-            let mut val: u64 = 0;
-            let ret = unsafe {
-                hv_vcpu_get_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
-                    &mut val as *mut _,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::NativeCall {
-                    symbol: "hv_vcpu_get_sys_reg(ID_AA64PFR1_EL1)",
-                    status: ret,
-                });
-            }
-            let ret = unsafe {
-                hv_vcpu_set_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
-                    val & !AA64PFR1_EL1_SMEMASK,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::NativeCall {
-                    symbol: "hv_vcpu_set_sys_reg(ID_AA64PFR1_EL1)",
                     status: ret,
                 });
             }
