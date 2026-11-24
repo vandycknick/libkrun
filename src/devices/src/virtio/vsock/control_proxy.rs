@@ -58,10 +58,10 @@ struct OutboundFrame {
     deadline: Instant,
 }
 
-#[derive(Clone, Copy)]
 struct PendingRequest {
     proxy_id: u64,
     deadline: Instant,
+    sent_fd: Option<OwnedFd>,
 }
 
 struct Shared {
@@ -69,6 +69,7 @@ struct Shared {
     next_request_id: u32,
     frames: VecDeque<OutboundFrame>,
     queued_bytes: usize,
+    // Sent rights are held by at most MAX_PENDING requests, not counted here.
     queued_fds: usize,
     pending: HashMap<u32, PendingRequest>,
 }
@@ -191,9 +192,14 @@ impl ControlHandle {
             request_id,
             deadline,
         });
-        shared
-            .pending
-            .insert(request_id, PendingRequest { proxy_id, deadline });
+        shared.pending.insert(
+            request_id,
+            PendingRequest {
+                proxy_id,
+                deadline,
+                sent_fd: None,
+            },
+        );
         drop(shared);
         let _ = self.wake.write(1);
         Ok(request_id)
@@ -533,13 +539,19 @@ impl ControlProxy {
                 Ok(0) => return Err("sendmsg made no progress".into()),
                 Ok(written) => {
                     byte_budget -= written;
-                    let transferred_fd = frame.fd.take().is_some();
+                    let sent_fd = frame.fd.take();
                     let complete = {
                         frame.offset += written;
                         frame.offset == frame.bytes.len()
                     };
-                    if transferred_fd {
+                    if let Some(sent_fd) = sent_fd {
+                        let request_id = frame.request_id;
                         shared.queued_fds -= 1;
+                        if let Some(pending) = shared.pending.get_mut(&request_id) {
+                            // On macOS, closing another socket can cause EOF on a socket
+                            // held only by an in-flight message. Keep it until settlement.
+                            pending.sent_fd = Some(sent_fd);
+                        }
                     }
                     if complete {
                         let Some(frame) = shared.frames.pop_front() else {
@@ -562,6 +574,14 @@ impl ControlProxy {
         self.line_fd.take();
         self.line_deadline = None;
         self.handle.fail()
+    }
+}
+
+impl Drop for ControlProxy {
+    fn drop(&mut self) {
+        if self.fd.is_some() {
+            self.handle.fence();
+        }
     }
 }
 
@@ -661,7 +681,7 @@ fn validate_stream(fd: impl AsFd) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::virtio::vsock::control_proxy::*;
-    use nix::sys::socket::{AddressFamily, SockFlag, socketpair};
+    use nix::sys::socket::{AddressFamily, ControlMessageOwned, SockFlag, recvmsg, socketpair};
     use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 
     fn pair() -> (OwnedFd, OwnedFd) {
@@ -675,6 +695,54 @@ mod tests {
         prepare_stream(&pair.0).unwrap();
         prepare_stream(&pair.1).unwrap();
         pair
+    }
+
+    fn recv_chunk(peer: &OwnedFd, data: &mut [u8]) -> (usize, Vec<OwnedFd>) {
+        let mut iov = [IoSliceMut::new(data)];
+        let mut cmsg = nix::cmsg_space!([RawFd; 2]);
+        let message = recvmsg::<()>(
+            peer.as_raw_fd(),
+            &mut iov,
+            Some(&mut cmsg),
+            MsgFlags::empty(),
+        )
+        .unwrap();
+        let mut rights = Vec::new();
+        for cmsg in message.cmsgs().unwrap() {
+            let ControlMessageOwned::ScmRights(fds) = cmsg else {
+                panic!("expected SCM_RIGHTS");
+            };
+            rights.extend(
+                fds.into_iter()
+                    .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
+            );
+        }
+        (message.bytes, rights)
+    }
+
+    fn assert_peer_open(peer: &OwnedFd) {
+        assert_eq!(
+            nix::unistd::read(peer, &mut [0]).unwrap_err(),
+            Errno::EAGAIN
+        );
+    }
+
+    fn send_connect(
+        control: &mut ControlProxy,
+        handle: &ControlHandle,
+        peer: &OwnedFd,
+        proxy_id: u64,
+    ) -> (u32, OwnedFd) {
+        let (passed, data_peer) = pair();
+        let id = handle.enqueue_connect(9, 7, proxy_id, passed).unwrap();
+        assert!(control.flush().unwrap());
+        let mut line = [0; MAX_LINE_BYTES];
+        let (bytes, rights) = recv_chunk(peer, &mut line);
+        assert_eq!(&line[..bytes], format!("CONNECT {id} 9 7\n").as_bytes());
+        assert_eq!(rights.len(), 1);
+        drop(rights);
+        assert_peer_open(&data_peer);
+        (id, data_peer)
     }
 
     #[test]
@@ -752,50 +820,70 @@ mod tests {
     #[test]
     fn split_frame_progress_transfers_rights_once_and_preserves_alignment() {
         let (local, peer) = pair();
-        let (passed, _passed_peer) = pair();
+        let (passed, passed_peer) = pair();
         let (mut control, handle) = ControlProxy::new(local, []).unwrap();
-        handle.enqueue_connect(9, 7, 1, passed).unwrap();
+        let id = handle.enqueue_connect(9, 7, 1, passed).unwrap();
         assert!(!control.flush_limited(1).unwrap());
-        let mut byte = [0u8; 1];
-        let mut iov = [IoSliceMut::new(&mut byte)];
-        let mut cmsg = nix::cmsg_space!([RawFd; 2]);
-        let rights: usize = {
-            let message = nix::sys::socket::recvmsg::<()>(
-                peer.as_raw_fd(),
-                &mut iov,
-                Some(&mut cmsg),
-                MsgFlags::empty(),
-            )
-            .unwrap();
-            message
-                .cmsgs()
-                .unwrap()
-                .map(|cmsg| match cmsg {
-                    nix::sys::socket::ControlMessageOwned::ScmRights(fds) => fds.len(),
-                    _ => 0,
-                })
-                .sum()
-        };
-        assert_eq!(rights, 1);
+        let mut byte = [0];
+        let (bytes, rights) = recv_chunk(&peer, &mut byte);
+        assert_eq!(bytes, 1);
+        assert_eq!(rights.len(), 1);
+        drop(rights);
+        assert_peer_open(&passed_peer);
+        assert_eq!(handle.shared.lock().unwrap().queued_fds, 0);
         assert_eq!(byte, [b'C']);
 
         assert!(control.flush().unwrap());
         let mut remainder = [0u8; MAX_LINE_BYTES];
-        let mut iov = [IoSliceMut::new(&mut remainder)];
-        let mut cmsg = nix::cmsg_space!([RawFd; 2]);
-        let (bytes, rights) = {
-            let message = nix::sys::socket::recvmsg::<()>(
-                peer.as_raw_fd(),
-                &mut iov,
-                Some(&mut cmsg),
-                MsgFlags::empty(),
-            )
-            .unwrap();
-            (message.bytes, message.cmsgs().unwrap().count())
-        };
+        let (bytes, rights) = recv_chunk(&peer, &mut remainder);
         assert_eq!(bytes, b"ONNECT 1 9 7\n".len());
-        assert_eq!(rights, 0);
         assert_eq!(&remainder[..bytes], b"ONNECT 1 9 7\n");
+        assert!(rights.is_empty());
+        assert_peer_open(&passed_peer);
+        assert_eq!(handle.take_pending(id), Some(1));
+        assert_eq!(nix::unistd::read(&passed_peer, &mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn admission_and_rejection_release_sent_rights() {
+        let (local, peer) = pair();
+        let (mut control, handle) = ControlProxy::new(local, []).unwrap();
+
+        for reply in ["OK", "REJECT"] {
+            let (id, passed_peer) = send_connect(&mut control, &handle, &peer, 42);
+            nix::unistd::write(&peer, format!("{reply} {id}\n").as_bytes()).unwrap();
+            let messages = control.read_messages().unwrap();
+            let reply_id = match (reply, messages.as_slice()) {
+                ("OK", [Incoming::Admit(id)]) | ("REJECT", [Incoming::Reject(id)]) => *id,
+                _ => panic!("expected {reply}, got {messages:?}"),
+            };
+            assert_eq!(reply_id, id);
+            assert_eq!(handle.take_pending(reply_id), Some(42));
+            assert_eq!(nix::unistd::read(&passed_peer, &mut [0]).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn cancellation_and_expiry_release_sent_rights() {
+        let (local, peer) = pair();
+        let (mut control, handle) = ControlProxy::new(local, []).unwrap();
+
+        let (id, passed_peer) = send_connect(&mut control, &handle, &peer, 44);
+        handle.cancel_proxy(44);
+        assert_eq!(handle.take_pending(id), None);
+        assert_eq!(nix::unistd::read(&passed_peer, &mut [0]).unwrap(), 0);
+
+        let (id, passed_peer) = send_connect(&mut control, &handle, &peer, 45);
+        handle
+            .shared
+            .lock()
+            .unwrap()
+            .pending
+            .get_mut(&id)
+            .unwrap()
+            .deadline = Instant::now();
+        assert_eq!(handle.expire(), (vec![45], false));
+        assert_eq!(nix::unistd::read(&passed_peer, &mut [0]).unwrap(), 0);
     }
 
     #[test]
@@ -880,10 +968,10 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_and_partial_expired_frames_have_distinct_outcomes() {
-        let (local, _peer) = pair();
+    fn expiry_removes_unsent_frame_and_fails_partial_frame() {
+        let (local, peer) = pair();
         let (passed, _passed_peer) = pair();
-        let (_control, handle) = ControlProxy::new(local, []).unwrap();
+        let (mut control, handle) = ControlProxy::new(local, []).unwrap();
         let request_id = handle.enqueue_connect(9, 7, 44, passed).unwrap();
         {
             let mut shared = handle.shared.lock().unwrap();
@@ -892,33 +980,45 @@ mod tests {
         }
         assert_eq!(handle.expire(), (vec![44], false));
 
-        let (passed, _passed_peer) = pair();
+        let (passed, passed_peer) = pair();
         let request_id = handle.enqueue_connect(9, 7, 45, passed).unwrap();
+        assert!(!control.flush_limited(1).unwrap());
+        let (bytes, rights) = recv_chunk(&peer, &mut [0]);
+        assert_eq!(bytes, 1);
+        assert_eq!(rights.len(), 1);
+        drop(rights);
+        assert_peer_open(&passed_peer);
         {
             let mut shared = handle.shared.lock().unwrap();
             shared.pending.get_mut(&request_id).unwrap().deadline = Instant::now();
-            let frame = shared.frames.front_mut().unwrap();
-            frame.deadline = Instant::now();
-            frame.offset = 1;
+            shared.frames.front_mut().unwrap().deadline = Instant::now();
         }
         assert_eq!(handle.expire(), (Vec::new(), true));
+        assert_eq!(control.close(), vec![45]);
+        assert_eq!(nix::unistd::read(&passed_peer, &mut [0]).unwrap(), 0);
     }
 
     #[test]
     fn cancellation_drops_unsent_frame_and_fences_partial_frame() {
-        let (local, _peer) = pair();
+        let (local, peer) = pair();
         let (passed, _passed_peer) = pair();
-        let (_control, handle) = ControlProxy::new(local, []).unwrap();
+        let (mut control, handle) = ControlProxy::new(local, []).unwrap();
         handle.enqueue_connect(9, 7, 66, passed).unwrap();
         handle.cancel_proxy(66);
         assert!(!handle.wants_write());
         assert!(handle.is_active());
 
-        let (passed, _passed_peer) = pair();
+        let (passed, passed_peer) = pair();
         handle.enqueue_connect(9, 7, 67, passed).unwrap();
-        handle.shared.lock().unwrap().frames[0].offset = 1;
+        assert!(!control.flush_limited(1).unwrap());
+        let (bytes, rights) = recv_chunk(&peer, &mut [0]);
+        assert_eq!(bytes, 1);
+        assert_eq!(rights.len(), 1);
+        drop(rights);
+        assert_peer_open(&passed_peer);
         handle.cancel_proxy(67);
         assert!(!handle.is_active());
+        assert_eq!(nix::unistd::read(&passed_peer, &mut [0]).unwrap(), 0);
     }
 
     #[test]
@@ -1060,18 +1160,9 @@ mod tests {
         assert_eq!(epoll.wait(1, 0, &mut events).unwrap(), 1);
         assert_eq!(events[0].data(), 23);
 
-        let mut byte = [0u8; 1];
-        let mut iov = [IoSliceMut::new(&mut byte)];
-        let mut cmsg = nix::cmsg_space!([RawFd; 1]);
-        let message = nix::sys::socket::recvmsg::<()>(
-            peer.as_raw_fd(),
-            &mut iov,
-            Some(&mut cmsg),
-            MsgFlags::empty(),
-        )
-        .unwrap();
-        assert_eq!(message.bytes, 1);
-        assert_eq!(message.cmsgs().unwrap().count(), 1);
+        let (bytes, rights) = recv_chunk(&peer, &mut [0]);
+        assert_eq!(bytes, 1);
+        assert_eq!(rights.len(), 1);
     }
 
     #[test]
@@ -1108,15 +1199,38 @@ mod tests {
     }
 
     #[test]
-    fn closing_control_cancels_queued_fds_and_pending_requests() {
+    fn closing_control_cancels_queued_and_sent_rights() {
         let (local, peer) = pair();
         let (passed, passed_peer) = pair();
         let (mut control, handle) = ControlProxy::new(local, []).unwrap();
+        let (_, sent_peer) = send_connect(&mut control, &handle, &peer, 76);
         handle.enqueue_connect(9, 7, 77, passed).unwrap();
-        assert_eq!(control.close(), vec![77]);
+        let mut pending = control.close();
+        pending.sort_unstable();
+        assert_eq!(pending, vec![76, 77]);
         let mut byte = [0u8; 1];
+        assert_eq!(nix::unistd::read(&sent_peer, &mut byte).unwrap(), 0);
         assert_eq!(nix::unistd::read(&passed_peer, &mut byte).unwrap(), 0);
         assert_eq!(nix::unistd::read(&peer, &mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn fencing_control_releases_sent_rights() {
+        let (local, peer) = pair();
+        let (mut control, handle) = ControlProxy::new(local, []).unwrap();
+        let (_, passed_peer) = send_connect(&mut control, &handle, &peer, 42);
+        handle.fence();
+        assert_eq!(nix::unistd::read(&passed_peer, &mut [0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn dropping_control_releases_sent_rights_with_a_live_handle() {
+        let (local, peer) = pair();
+        let (mut control, handle) = ControlProxy::new(local, []).unwrap();
+        let (_, passed_peer) = send_connect(&mut control, &handle, &peer, 42);
+        drop(control);
+        assert!(!handle.is_active());
+        assert_eq!(nix::unistd::read(&passed_peer, &mut [0]).unwrap(), 0);
     }
 
     #[test]
