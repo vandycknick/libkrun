@@ -747,22 +747,23 @@ mod tests {
             AddressFamily::Unix,
             SockType::Stream,
             None,
-            SockFlag::SOCK_NONBLOCK,
+            SockFlag::empty(),
         )
         .unwrap();
-        send(sender.as_raw_fd(), b"received", MsgFlags::empty()).unwrap();
+        let nonblocking = MsgFlags::MSG_DONTWAIT;
+        send(sender.as_raw_fd(), b"received", nonblocking).unwrap();
         assert_eq!(
             recv_into(
                 receiver.as_raw_fd(),
                 packet.buf_mut().unwrap(),
                 32,
-                MsgFlags::empty()
+                nonblocking
             )
             .unwrap(),
             8
         );
         assert_eq!(
-            recv_into(-1, packet.buf_mut().unwrap(), 32, MsgFlags::empty()),
+            recv_into(-1, packet.buf_mut().unwrap(), 32, nonblocking),
             Err(Errno::EBADF)
         );
         assert_eq!(
@@ -770,7 +771,7 @@ mod tests {
                 receiver.as_raw_fd(),
                 packet.buf_mut().unwrap(),
                 33,
-                MsgFlags::empty()
+                nonblocking
             ),
             Err(Errno::EINVAL)
         );

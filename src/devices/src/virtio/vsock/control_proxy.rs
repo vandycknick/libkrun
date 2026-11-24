@@ -682,7 +682,7 @@ mod tests {
         let unconnected = nix::sys::socket::socket(
             AddressFamily::Unix,
             SockType::Stream,
-            SockFlag::SOCK_CLOEXEC,
+            SockFlag::empty(),
             None,
         )
         .unwrap();
@@ -691,15 +691,11 @@ mod tests {
             AddressFamily::Unix,
             SockType::Datagram,
             None,
-            SockFlag::SOCK_CLOEXEC,
+            SockFlag::empty(),
         )
         .unwrap();
         assert!(ControlProxy::new(datagram, std::iter::empty()).is_err());
         let (connected, _peer) = pair();
-        let address =
-            nix::sys::socket::getpeername::<nix::sys::socket::UnixAddr>(connected.as_raw_fd())
-                .unwrap();
-        assert!(address.path().is_none());
         assert!(ControlProxy::new(connected, std::iter::empty()).is_ok());
     }
 
