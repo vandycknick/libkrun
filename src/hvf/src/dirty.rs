@@ -734,9 +734,13 @@ fn protect(gpa: u64, len: u64, permissions: u8) -> Result<(), i64> {
     }
 }
 
+/// A guest data write that stage 2 refused. HVF reports the first write to a
+/// write-protected page it has not populated yet as a translation fault and
+/// later ones as permission faults; both mean the same thing for a tracked RAM
+/// page. Whether the address is RAM is decided by the caller, not the syndrome.
 fn qualified_ram_write(syndrome: u64) -> bool {
     matches!((syndrome >> 26) & 0x3f, 0x24 | 0x25)
-        && matches!(syndrome & 0x3f, 0x0c..=0x0f)
+        && matches!(syndrome & 0x3f, 0x04..=0x07 | 0x0c..=0x0f)
         && syndrome & (1 << 6) != 0
         && syndrome & ((1 << 7) | (1 << 8) | (1 << 10)) == 0
 }
@@ -753,13 +757,12 @@ mod tests {
     use crate::dirty::{Lifecycle, qualified_ram_write, valid_mmio_translation};
 
     #[test]
-    fn permission_classifier_does_not_require_scalar_emulation_syndrome() {
+    fn ram_write_classifier_does_not_require_scalar_emulation_syndrome() {
         for ec in [0x24, 0x25] {
-            for level in 0x0c..=0x0f {
+            for level in (0x04..=0x07).chain(0x0c..=0x0f) {
                 let syndrome = (ec << 26) | (1 << 6) | level;
                 assert!(qualified_ram_write(syndrome));
                 assert!(qualified_ram_write(syndrome | (1 << 24)));
-                assert!(!valid_mmio_translation(syndrome));
                 for unsupported in [1 << 7, 1 << 8, 1 << 10] {
                     assert!(!qualified_ram_write(syndrome | unsupported));
                 }
@@ -769,18 +772,26 @@ mod tests {
         for ec in [0x20, 0x21, 0, 0x3f] {
             assert!(!qualified_ram_write((ec << 26) | (1 << 6) | 0x0f));
         }
-        for status in [0, 4, 7, 8, 11, 16, 63] {
+        for status in [0, 3, 8, 11, 16, 63] {
             assert!(!qualified_ram_write((0x24 << 26) | (1 << 6) | status));
         }
     }
 
     #[test]
-    fn translation_and_permission_faults_are_disjoint() {
+    fn first_write_to_an_unpopulated_protected_page_is_a_ram_write() {
+        // Observed on macOS 26.7.1 (Apple M5) for the first store of a booting
+        // guest: data abort, WnR, translation fault level 3, no valid ISS.
+        assert!(qualified_ram_write(0x9200_0047));
+        assert!(!valid_mmio_translation(0x9200_0047));
+    }
+
+    #[test]
+    fn mmio_translation_requires_a_decoded_access() {
         for status in 0..64 {
             let syndrome = (0x24 << 26) | (1 << 24) | (1 << 6) | status;
-            assert!(!(qualified_ram_write(syndrome) && valid_mmio_translation(syndrome)));
             assert_eq!(valid_mmio_translation(syndrome), (4..=7).contains(&status));
             assert!(!valid_mmio_translation(syndrome & !(1 << 24)));
+            assert!(!valid_mmio_translation(syndrome | (1 << 7)));
         }
     }
 
