@@ -335,6 +335,8 @@ pub(crate) struct ControlProxy {
     handle: Arc<ControlHandle>,
     line: Vec<u8>,
     line_fd: Option<OwnedFd>,
+    /// The current line's descriptor arrived with its peer already closed.
+    line_void: bool,
     protected_identities: HashSet<UnixSocketIdentity>,
     line_deadline: Option<Instant>,
     ancillary: Vec<u8>,
@@ -357,6 +359,7 @@ impl ControlProxy {
                 handle: handle.clone(),
                 line: Vec::new(),
                 line_fd: None,
+                line_void: false,
                 protected_identities,
                 line_deadline: None,
                 ancillary: vec![
@@ -396,7 +399,7 @@ impl ControlProxy {
         let mut messages = Vec::new();
         let mut bytes_read = 0;
         while bytes_read < RECEIVE_BYTE_BUDGET && messages.len() < RECEIVE_FRAME_BUDGET {
-            let Some((byte, mut fds)) = self.read_byte()? else {
+            let Some((byte, mut fds, peer_gone)) = self.read_byte()? else {
                 break;
             };
             bytes_read += 1;
@@ -408,7 +411,12 @@ impl ControlProxy {
                 return Err("ancillary fd is not exactly one on the first byte".into());
             }
             if first && fds.len() == 1 {
-                self.line_fd = fds.pop();
+                if peer_gone {
+                    self.line_void = true;
+                    fds.clear();
+                } else {
+                    self.line_fd = fds.pop();
+                }
             }
             if !byte.is_ascii() || self.line.len() == MAX_LINE_BYTES {
                 return Err("oversized or non-ASCII control frame".into());
@@ -418,7 +426,13 @@ impl ControlProxy {
                 let line = mem::take(&mut self.line);
                 let fd = self.line_fd.take();
                 self.line_deadline = None;
-                messages.push(parse_line(&line, fd)?);
+                if mem::take(&mut self.line_void) {
+                    // The sender gave this connection up before we took it.
+                    // There is nobody to answer; the frame is consumed.
+                    parse_void_connect(&line)?;
+                } else {
+                    messages.push(parse_line(&line, fd)?);
+                }
             }
         }
         Ok(messages)
@@ -437,7 +451,7 @@ impl ControlProxy {
         self.line_deadline.is_some_and(|deadline| deadline <= now)
     }
 
-    fn read_byte(&mut self) -> Result<Option<(u8, Vec<OwnedFd>)>, String> {
+    fn read_byte(&mut self) -> Result<Option<(u8, Vec<OwnedFd>, bool)>, String> {
         let fd = self.fd.as_ref().ok_or("control channel is closed")?;
         let mut byte = 0u8;
         let mut iov = [IoSliceMut::new(std::slice::from_mut(&mut byte))];
@@ -494,13 +508,13 @@ impl ControlProxy {
             }
             cmsg = unsafe { libc::CMSG_NXTHDR(&header, cmsg) };
         }
-        validate_received_fds(
+        let peer_gone = validate_received_fds(
             header.msg_flags,
             unknown,
             &received,
             &self.protected_identities,
         )?;
-        Ok(Some((byte, received)))
+        Ok(Some((byte, received, peer_gone)))
     }
 
     pub(crate) fn flush(&mut self) -> Result<bool, String> {
@@ -572,6 +586,7 @@ impl ControlProxy {
         self.fd.take();
         self.line.clear();
         self.line_fd.take();
+        self.line_void = false;
         self.line_deadline = None;
         self.handle.fail()
     }
@@ -585,25 +600,31 @@ impl Drop for ControlProxy {
     }
 }
 
+/// Returns whether a received descriptor's peer has already closed. Such a
+/// descriptor is one abandoned connection, not a fault of the control channel.
 fn validate_received_fds(
     message_flags: libc::c_int,
     unknown: bool,
     received: &[OwnedFd],
     protected_identities: &HashSet<UnixSocketIdentity>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if message_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 || unknown {
         return Err("truncated or unknown ancillary data".into());
     }
+    let mut peer_gone = false;
     for received_fd in received {
-        set_fd_flags(received_fd).map_err(|error| error.to_string())?;
-        validate_stream(received_fd).map_err(|error| error.to_string())?;
+        let live = received_stream_is_live(received_fd).map_err(|error| error.to_string())?;
+        if live {
+            set_fd_flags(received_fd).map_err(|error| error.to_string())?;
+        }
+        peer_gone |= !live;
         let identity =
             unix_socket_identity(received_fd.as_fd()).map_err(|error| error.to_string())?;
         if protected_identities.contains(&identity) {
             return Err("received fd aliases a protected socket endpoint".into());
         }
     }
-    Ok(())
+    Ok(peer_gone)
 }
 
 fn parse_u32(value: &[u8]) -> Result<u32, String> {
@@ -631,6 +652,19 @@ fn parse_line(line: &[u8], fd: Option<OwnedFd>) -> Result<Incoming, String> {
         }),
         [b"OK", request_id] if fd.is_none() => Ok(Incoming::Admit(parse_u32(request_id)?)),
         [b"REJECT", request_id] if fd.is_none() => Ok(Incoming::Reject(parse_u32(request_id)?)),
+        _ => Err("invalid control frame".into()),
+    }
+}
+
+/// The line that came with a descriptor whose peer was already gone. Only a
+/// CONNECT carries a descriptor, so anything else is still a protocol fault.
+fn parse_void_connect(line: &[u8]) -> Result<(), String> {
+    let Some((b'\n', body)) = line.split_last() else {
+        return Err("unterminated control frame".into());
+    };
+    let fields: Vec<&[u8]> = body.split(|byte| *byte == b' ').collect();
+    match fields.as_slice() {
+        [b"CONNECT", port] => parse_u32(port).map(|_| ()),
         _ => Err("invalid control frame".into()),
     }
 }
@@ -666,6 +700,29 @@ fn set_fd_flags(fd: &OwnedFd) -> std::io::Result<()> {
 
 fn validate_stream(fd: impl AsFd) -> std::io::Result<()> {
     let fd = fd.as_fd();
+    validate_local_stream(fd)?;
+    nix::sys::socket::getpeername::<nix::sys::socket::UnixAddr>(fd.as_raw_fd())
+        .map_err(std::io::Error::from)?;
+    Ok(())
+}
+
+/// Whether a descriptor received for one connection still has its peer. The
+/// sender may already have given the connection up and closed its end.
+///
+/// macOS answers `getpeername` on such a socket with EINVAL (a socket that was
+/// never connected gets ENOTCONN), and refuses socket options on it as well.
+/// Linux keeps returning the peer, and the proxy then sees an ordinary hang-up.
+fn received_stream_is_live(fd: impl AsFd) -> std::io::Result<bool> {
+    let fd = fd.as_fd();
+    validate_local_stream(fd)?;
+    match nix::sys::socket::getpeername::<nix::sys::socket::UnixAddr>(fd.as_raw_fd()) {
+        Ok(_) => Ok(true),
+        Err(Errno::EINVAL) if cfg!(target_os = "macos") => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_local_stream(fd: BorrowedFd<'_>) -> std::io::Result<()> {
     if getsockopt(&fd, sockopt::SockType)? != SockType::Stream {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -673,8 +730,6 @@ fn validate_stream(fd: impl AsFd) -> std::io::Result<()> {
         ));
     }
     getsockname::<nix::sys::socket::UnixAddr>(fd.as_raw_fd()).map_err(std::io::Error::from)?;
-    nix::sys::socket::getpeername::<nix::sys::socket::UnixAddr>(fd.as_raw_fd())
-        .map_err(std::io::Error::from)?;
     Ok(())
 }
 
@@ -815,6 +870,63 @@ mod tests {
         assert_eq!(*port, 42);
         let flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD).unwrap());
         assert!(flags.contains(FdFlag::FD_CLOEXEC));
+    }
+
+    #[test]
+    fn connect_whose_sender_already_closed_is_one_dead_connection_not_a_channel_fault() {
+        let (local, peer) = pair();
+        let (passed, passed_peer) = pair();
+        let (mut control, _) = ControlProxy::new(local, []).unwrap();
+        drop(passed_peer);
+        sendmsg::<()>(
+            peer.as_raw_fd(),
+            &[IoSlice::new(b"CONNECT 42\n")],
+            &[ControlMessage::ScmRights(&[passed.as_raw_fd()])],
+            MsgFlags::empty(),
+            None,
+        )
+        .unwrap();
+        drop(passed);
+        // macOS can tell the peer is gone and consumes the frame; Linux hands
+        // the connection on and its proxy reads the hang-up.
+        let messages = control.read_messages().unwrap();
+        if cfg!(target_os = "macos") {
+            assert!(messages.is_empty());
+        } else {
+            let [Incoming::Connect { port, fd }] = messages.as_slice() else {
+                panic!("expected one CONNECT frame");
+            };
+            assert_eq!(*port, 42);
+            assert_eq!(nix::unistd::read(fd, &mut [0]).unwrap(), 0);
+        }
+
+        let (live, _live_peer) = pair();
+        sendmsg::<()>(
+            peer.as_raw_fd(),
+            &[IoSlice::new(b"CONNECT 43\n")],
+            &[ControlMessage::ScmRights(&[live.as_raw_fd()])],
+            MsgFlags::empty(),
+            None,
+        )
+        .unwrap();
+        let messages = control.read_messages().unwrap();
+        assert!(matches!(
+            messages.as_slice(),
+            [Incoming::Connect { port: 43, .. }]
+        ));
+
+        // Only a CONNECT may arrive with a descriptor, dead peer or not.
+        let (passed, passed_peer) = pair();
+        drop(passed_peer);
+        sendmsg::<()>(
+            peer.as_raw_fd(),
+            &[IoSlice::new(b"OK 7\n")],
+            &[ControlMessage::ScmRights(&[passed.as_raw_fd()])],
+            MsgFlags::empty(),
+            None,
+        )
+        .unwrap();
+        assert!(control.read_messages().is_err());
     }
 
     #[test]
