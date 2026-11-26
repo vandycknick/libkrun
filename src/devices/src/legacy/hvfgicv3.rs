@@ -12,6 +12,7 @@ use crate::legacy::irqchip::IrqChipT;
 use hvf::Error;
 use hvf::bindings::{HV_SUCCESS, hv_gic_config_t, hv_ipa_t, hv_return_t};
 use hvf::framework::{HvfFramework, OwnedConfig};
+use hvf::host::gic_region_sizes;
 use utils::eventfd::EventFd;
 
 // Device trees specific constants
@@ -24,8 +25,6 @@ struct HvfGicBindings {
         unsafe extern "C" fn(hv_gic_config_t, hv_ipa_t) -> hv_return_t,
     hv_gic_config_set_redistributor_base:
         unsafe extern "C" fn(hv_gic_config_t, hv_ipa_t) -> hv_return_t,
-    hv_gic_get_distributor_size: unsafe extern "C" fn(*mut usize) -> hv_return_t,
-    hv_gic_get_redistributor_size: unsafe extern "C" fn(*mut usize) -> hv_return_t,
     hv_gic_set_spi: unsafe extern "C" fn(u32, bool) -> hv_return_t,
     framework: Arc<HvfFramework>,
 }
@@ -41,6 +40,17 @@ pub struct HvfGicV3 {
 }
 
 impl HvfGicV3 {
+    /// [Distributor base, distributor size, redistributor base, total redistributor size].
+    pub fn geometry(vcpu_count: u64, [dist_size, redist_size]: [u64; 2]) -> Option<[u64; 4]> {
+        let redists_size = redist_size.checked_mul(vcpu_count)?;
+        if dist_size == 0 || redists_size == 0 {
+            return None;
+        }
+        let redists_addr = arch::MMIO_MEM_START.checked_sub(redists_size)?;
+        let dist_addr = redists_addr.checked_sub(dist_size)?;
+        Some([dist_addr, dist_size, redists_addr, redists_size])
+    }
+
     pub fn new(vcpu_count: u64, framework: Arc<HvfFramework>) -> Result<Self, Error> {
         let bindings = unsafe {
             HvfGicBindings {
@@ -50,36 +60,15 @@ impl HvfGicV3 {
                     .symbol(b"hv_gic_config_set_distributor_base\0")?,
                 hv_gic_config_set_redistributor_base: *framework
                     .symbol(b"hv_gic_config_set_redistributor_base\0")?,
-                hv_gic_get_distributor_size: *framework.symbol(b"hv_gic_get_distributor_size\0")?,
-                hv_gic_get_redistributor_size: *framework
-                    .symbol(b"hv_gic_get_redistributor_size\0")?,
                 hv_gic_set_spi: *framework.symbol(b"hv_gic_set_spi\0")?,
                 framework,
             }
         };
 
-        let mut dist_size: usize = 0;
-        let ret = unsafe { (bindings.hv_gic_get_distributor_size)(&mut dist_size) };
-        if ret != HV_SUCCESS {
-            return Err(Error::NativeCall {
-                symbol: "hv_gic_get_distributor_size",
-                status: ret,
-            });
-        }
-        let dist_size = dist_size as u64;
-
-        let mut redist_size: usize = 0;
-        let ret = unsafe { (bindings.hv_gic_get_redistributor_size)(&mut redist_size) };
-        if ret != HV_SUCCESS {
-            return Err(Error::NativeCall {
-                symbol: "hv_gic_get_redistributor_size",
-                status: ret,
-            });
-        }
-
-        let redists_size = redist_size as u64 * vcpu_count;
-        let dist_addr = arch::MMIO_MEM_START - dist_size - redists_size;
-        let redists_addr = arch::MMIO_MEM_START - redists_size;
+        let properties = Self::geometry(vcpu_count, gic_region_sizes(&bindings.framework)?).ok_or(
+            Error::ExecutionState(hvf::state::StateError("GIC memory topology")),
+        )?;
+        let [dist_addr, _, redists_addr, _] = properties;
 
         let gic_config = unsafe {
             OwnedConfig::new(
@@ -99,10 +88,7 @@ impl HvfGicV3 {
         }
 
         let ret = unsafe {
-            (bindings.hv_gic_config_set_redistributor_base)(
-                gic_config.as_ptr(),
-                arch::MMIO_MEM_START - redists_size,
-            )
+            (bindings.hv_gic_config_set_redistributor_base)(gic_config.as_ptr(), redists_addr)
         };
         if ret != HV_SUCCESS {
             return Err(Error::NativeCall {
@@ -121,7 +107,7 @@ impl HvfGicV3 {
 
         Ok(Self {
             bindings,
-            properties: [dist_addr, dist_size, redists_addr, redists_size],
+            properties,
             vcpu_count,
         })
     }
@@ -227,5 +213,25 @@ impl GICDevice for HvfGicV3 {
 
     fn version(&self) -> u32 {
         7
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::legacy::HvfGicV3;
+
+    #[test]
+    fn native_gic_geometry_precedes_mmio_with_one_redistributor_per_cpu() {
+        assert_eq!(
+            HvfGicV3::geometry(1, [0x1_0000, 0x2_0000]),
+            Some([0x09fd_0000, 0x1_0000, 0x09fe_0000, 0x2_0000])
+        );
+        assert_eq!(
+            HvfGicV3::geometry(4, [0x1_0000, 0x2_0000]),
+            Some([0x09f7_0000, 0x1_0000, 0x09f8_0000, 0x8_0000])
+        );
+        assert_eq!(HvfGicV3::geometry(0, [0x1_0000, 0x2_0000]), None);
+        assert_eq!(HvfGicV3::geometry(2, [0x1_0000, u64::MAX]), None);
+        assert_eq!(HvfGicV3::geometry(1, [u64::MAX, 0x2_0000]), None);
     }
 }

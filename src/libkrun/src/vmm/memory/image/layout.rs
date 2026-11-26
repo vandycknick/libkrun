@@ -110,7 +110,7 @@ impl ValidatedRamLayout {
         Ok(layout)
     }
 
-    fn decode_record(bytes: &[u8]) -> Result<Self, RamImageError> {
+    pub(crate) fn decode_record(bytes: &[u8]) -> Result<Self, RamImageError> {
         if bytes.len() > MAX_RAM_LAYOUT_BYTES {
             return Err(Error::Limit.into());
         }
@@ -293,8 +293,15 @@ impl ValidatedRamLayout {
     }
 
     pub fn validate_execution(&self, execution: &ValidatedExecution) -> Result<(), RamImageError> {
-        let envelope = execution.envelope();
         self.validate_native()?;
+        self.validate_execution_binding(execution)
+    }
+
+    pub(crate) fn validate_execution_binding(
+        &self,
+        execution: &ValidatedExecution,
+    ) -> Result<(), RamImageError> {
+        let envelope = execution.envelope();
         self.validate_lane(envelope.lane)?;
         if self.granule != envelope.page_granule
             || self.regions.len() != envelope.memory_regions.len()

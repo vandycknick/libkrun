@@ -20,9 +20,10 @@ pub fn capture_clock_cut() -> Result<crate::state::ClockCut, Error> {
     let mut timebase = MachTimebase { numer: 0, denom: 0 };
     let status = unsafe { mach_timebase_info(&mut timebase) };
     if status != 0 {
-        return Err(Error::ExecutionState(crate::state::StateError(
-            "Mach timebase query failed",
-        )));
+        return Err(Error::NativeCall {
+            symbol: "mach_timebase_info",
+            status,
+        });
     }
     let frequency: u64;
     unsafe { std::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency) };

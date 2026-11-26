@@ -41,6 +41,7 @@ pub enum Error {
     IrqsExhausted,
     Provider(devices::virtio::lifecycle::ProviderFault),
     DeviceLock,
+    InvalidRestorePosition,
     BarrierActive,
     EventManager(polly::event_manager::Error),
 }
@@ -59,6 +60,7 @@ impl fmt::Display for Error {
             Error::IrqsExhausted => write!(f, "no more IRQs are available"),
             Error::Provider(e) => write!(f, "failed to bind transport attachment: {e:?}"),
             Error::DeviceLock => write!(f, "device lock unavailable"),
+            Error::InvalidRestorePosition => write!(f, "invalid restored MMIO address or IRQ"),
             Error::BarrierActive => write!(f, "device topology is fenced"),
             Error::EventManager(e) => write!(f, "failed to register device callback: {e:?}"),
         }
@@ -77,7 +79,7 @@ type Result<T> = ::std::result::Result<T, Error>;
 /// It has to be larger than 0x100 (the offset where the configuration space starts from
 /// the beginning of the memory mapped device registers) + the size of the configuration space
 /// Currently hardcoded to 4K.
-const MMIO_LEN: u64 = 0x1000;
+pub(crate) const MMIO_LEN: u64 = 0x1000;
 
 /// HVF publishes synchronously through the retained controller lock, rather than
 /// through a KVM irqfd registration. Pending device/controller bits stay separate.
@@ -136,16 +138,22 @@ pub struct MMIODeviceManager {
 }
 
 impl MMIODeviceManager {
-    pub fn set_restore_position(&mut self, address: u64, irq: u32) -> Result<()> {
-        if self.route_request.is_some()
-            || irq < arch::IRQ_BASE
-            || irq > self.last_irq
+    pub(crate) fn validate_restore_position(address: u64, irq: u32, last_irq: u32) -> Result<()> {
+        if !(arch::IRQ_BASE..=last_irq).contains(&irq)
             || address < arch::MMIO_MEM_START
             || address.checked_add(MMIO_LEN).is_none()
-            || address % MMIO_LEN != 0
+            || !address.is_multiple_of(MMIO_LEN)
         {
+            return Err(Error::InvalidRestorePosition);
+        }
+        Ok(())
+    }
+
+    pub fn set_restore_position(&mut self, address: u64, irq: u32) -> Result<()> {
+        if self.route_request.is_some() {
             return Err(Error::BarrierActive);
         }
+        Self::validate_restore_position(address, irq, self.last_irq)?;
         self.mmio_base = address;
         self.irq = irq;
         Ok(())
@@ -821,22 +829,35 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "tee"))]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     fn hvf_route_inventory_retains_source_and_refuses_missing_provider() {
+        use crate::vmm::device_manager::quiescence::ManagerFault;
+        use devices::virtio::Fs;
+        use devices::virtio::lifecycle::ProviderFault;
+        use devices::virtio::passthrough::PermissionSemantics;
         use polly::event_manager::{BarrierGeneration, OperationId};
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let device = Arc::new(Mutex::new(devices::virtio::Rng::new().unwrap()));
+        let device = Fs::new(
+            "fs0".into(),
+            PermissionSemantics::LinuxComplete,
+            None,
+            Arc::default(),
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+        let type_id = device.device_type();
         let transport = devices::virtio::MmioTransport::new(
             crate::vmm::memory::runtime_memory_for_test(memory),
             DummyIrqChip::new().into(),
-            device,
+            Arc::new(Mutex::new(device)),
             None,
         )
         .unwrap();
         let source = transport.interrupt_transport().clone();
         let mut manager = MMIODeviceManager::new(&mut 0xd000_0000, (32, 64));
         let (address, irq) = manager
-            .register_mmio_device(transport, 4, "rng0".into())
+            .register_mmio_device(transport, type_id, "fs0".into())
             .unwrap();
         let route = &manager.irq_routes()[0];
         assert_eq!(route.address, address);
@@ -844,7 +865,11 @@ mod tests {
         assert!(std::ptr::eq(route.source().status(), source.status()));
         assert!(!route.is_fenced());
         let error = manager.preflight_quiesce().unwrap_err();
-        assert_eq!(error.attachment.unwrap().configured_id, "rng0");
+        assert_eq!(error.attachment.unwrap().configured_id, "fs0");
+        assert!(matches!(
+            error.fault,
+            ManagerFault::Provider(ProviderFault::Unsupported)
+        ));
         let request = BarrierRequest {
             key: BarrierKey {
                 operation: OperationId(1),
@@ -858,5 +883,28 @@ mod tests {
         );
         assert!(!manager.irq_routes()[0].is_fenced());
         assert!(manager.route_request.is_none());
+    }
+
+    #[test]
+    fn restore_position_reuses_metadata_validation_before_changing_the_cursor() {
+        let mut base = arch::MMIO_MEM_START;
+        let mut manager = MMIODeviceManager::new(&mut base, (arch::IRQ_BASE, arch::IRQ_MAX));
+        let address = base + MMIO_LEN;
+        assert!(
+            MMIODeviceManager::validate_restore_position(address, arch::IRQ_MAX, arch::IRQ_MAX)
+                .is_ok()
+        );
+        manager
+            .set_restore_position(address, arch::IRQ_MAX)
+            .unwrap();
+        for (invalid_address, invalid_irq) in
+            [(address + 1, arch::IRQ_BASE), (address, arch::IRQ_MAX + 1)]
+        {
+            assert!(matches!(
+                manager.set_restore_position(invalid_address, invalid_irq),
+                Err(Error::InvalidRestorePosition)
+            ));
+            assert_eq!((manager.mmio_base, manager.irq), (address, arch::IRQ_MAX));
+        }
     }
 }

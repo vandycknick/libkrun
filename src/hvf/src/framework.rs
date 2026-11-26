@@ -170,7 +170,7 @@ unsafe fn optional_symbol<T: Copy>(library: &libloading::Library, name: &[u8]) -
     }
 }
 
-fn native_status(symbol: &'static str, status: hv_return_t) -> Result<(), Error> {
+pub(crate) fn native_status(symbol: &'static str, status: hv_return_t) -> Result<(), Error> {
     if status == crate::bindings::HV_SUCCESS {
         Ok(())
     } else {

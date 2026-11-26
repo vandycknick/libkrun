@@ -15,6 +15,8 @@ mod execution;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub mod framework;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub mod host;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub use execution::capture_clock_cut;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 mod probe;
@@ -111,6 +113,16 @@ const AA64PFR0_EL1_EL2EN: u64 = 1 << 8;
 const AA64PFR0_EL1_GIC3EN: u64 = 1 << 24;
 const AA64PFR0_EL1_SVE: u64 = 0xf << 32;
 const AA64PFR1_EL1_SME: u64 = 0xf << 24;
+
+fn id_feature_mask(register: u16) -> u64 {
+    if register == hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR0_EL1 {
+        AA64PFR0_EL1_SVE
+    } else if register == hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1 {
+        AA64PFR1_EL1_SME
+    } else {
+        0
+    }
+}
 
 const EC_WFX_TRAP: u64 = 0x1;
 const EC_AA64_HVC: u64 = 0x16;
@@ -695,11 +707,12 @@ impl HvfVcpu<'_> {
         // The execution state has no storage for SVE or SME registers, so no
         // vCPU may advertise them: a guest that used them could not be paused,
         // captured or restored. Every vCPU gets the same model before it runs.
-        self.clear_id_feature(hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR0_EL1, AA64PFR0_EL1_SVE)?;
-        self.clear_id_feature(hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1, AA64PFR1_EL1_SME)
+        self.clear_id_feature(hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR0_EL1)?;
+        self.clear_id_feature(hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1)
     }
 
-    fn clear_id_feature(&self, register: u16, field: u64) -> Result<(), Error> {
+    fn clear_id_feature(&self, register: u16) -> Result<(), Error> {
+        let field = id_feature_mask(register);
         let value = self.read_sys_reg(register)?;
         if value & field == 0 {
             return Ok(());
