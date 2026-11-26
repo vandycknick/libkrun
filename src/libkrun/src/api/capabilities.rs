@@ -421,8 +421,8 @@ pub struct NativeLiveOperations {
 
 impl NativeLiveOperations {
     /// Pause is implemented on every recognized lane. Capture, restore, fork and
-    /// incremental capture have exported-API evidence only on KVM x86_64; the
-    /// arm64 lanes remain pending until their own runtime gates pass.
+    /// incremental capture have exported-API evidence on KVM x86_64 and HVF
+    /// arm64; KVM arm64 remains pending until its own runtime gates pass.
     pub const fn for_lane(lane: NativeLane) -> Self {
         let excluded = matches!(lane, NativeLane::Unsupported);
         let not_implemented = NativeOperationSupport::Unsupported(if excluded {
@@ -430,7 +430,7 @@ impl NativeLiveOperations {
         } else {
             NativeUnsupportedReason::NotImplemented
         });
-        let live_state = if matches!(lane, NativeLane::KvmX86_64) {
+        let live_state = if matches!(lane, NativeLane::KvmX86_64 | NativeLane::HvfArm64GicV3) {
             NativeOperationSupport::Supported
         } else {
             not_implemented
@@ -626,8 +626,8 @@ mod tests {
         ] {
             // Exhaustive on purpose: a new lane must choose its row here.
             let (pause, live_state) = match lane {
-                NativeLane::KvmX86_64 => (supported, supported),
-                NativeLane::KvmArm64GicV3 | NativeLane::HvfArm64GicV3 => (supported, pending),
+                NativeLane::KvmX86_64 | NativeLane::HvfArm64GicV3 => (supported, supported),
+                NativeLane::KvmArm64GicV3 => (supported, pending),
                 NativeLane::Unsupported => (excluded, excluded),
             };
             let operations = NativeLiveOperations::for_lane(lane);
@@ -646,7 +646,7 @@ mod tests {
                 assert_eq!(operation, live_state, "{lane:?} {name}");
                 assert_eq!(
                     operation.is_supported(),
-                    lane == NativeLane::KvmX86_64,
+                    matches!(lane, NativeLane::KvmX86_64 | NativeLane::HvfArm64GicV3),
                     "{lane:?} {name}"
                 );
             }

@@ -1945,13 +1945,16 @@ host, construct a VM or grant runtime qualification:
 | --- | --- | --- |
 | KVM x86_64 | supported | supported |
 | KVM arm64 GICv3 | supported | unsupported, `NotImplemented` (pending) |
-| HVF arm64 GICv3 | supported | unsupported, `NotImplemented` (pending) |
+| HVF arm64 GICv3 | supported | supported |
 | excluded build | unsupported, `BuildExcluded` | unsupported, `BuildExcluded` |
 
 The KVM x86_64 declaration rests on the passed exported-API cohorts `api`,
 `incremental`, `partial`, `restore-failures`, `failures`, `late`, `absent`,
 `expiry`, `restore-timeout` and `faults`, each with every owner reaped. The
-arm64 lanes change only after their own exported-path gates pass. A supported native
+HVF arm64 declaration rests on exported-API runs on Apple silicon (macOS 26):
+full and incremental capture, source resume, fresh-process restore and two
+children from one capture, at 1, 2 and 4 vCPUs, each with every owner reaped.
+The KVM arm64 lane changes only after its own exported-path gates pass. A supported native
 operation is a primitive, not public delivery: Silo still reports every public
 live operation `not-delivered`, and a lane declaration does not admit every
 storage or device profile (raw and read-only flat VMDK block admission still

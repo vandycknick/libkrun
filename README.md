@@ -248,7 +248,8 @@ executes guest code, or performs capture/restore/reclaim probes.
 `incremental`, each `NativeOperationSupport`. For the recognized
 `KvmX86_64`, `KvmArm64GicV3` and `HvfArm64GicV3` lanes, `pause` is
 `Supported`: the native whole-machine pause primitive is implemented.
-The other four operations remain `Unsupported(NotImplemented)`.
+The other four operations are `Supported` on `KvmX86_64` and `HvfArm64GicV3`
+and `Unsupported(NotImplemented)` on `KvmArm64GicV3`.
 The `Unsupported` lane returns `Unsupported(BuildExcluded)` for all five
 operations, including diagnostic probe builds excluded by lane selection.
 Native support describes implementation, not host/VM admission, runtime
