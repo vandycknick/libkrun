@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use super::defs;
 use super::defs::uapi;
 use super::muxer::{MuxerRx, push_packet};
-use super::muxer_rxq::MuxerRxQ;
+use crate::virtio::vsock::muxer_rxq::{MuxerRxQ, RxDrainStop};
 use crate::virtio::vsock::packet::PacketQueue as VirtQueue;
 use crate::virtio::vsock::packet::{
     RxPacket, TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, TxPacket,
@@ -212,9 +212,17 @@ impl UnixProxy {
     }
 
     pub fn recv_pkt(&mut self) -> (bool, bool) {
-        let mut have_used = false;
-        let mut wait_credit = false;
         let mut queue = self.queue.lock().unwrap();
+        let drained = self
+            .rxq
+            .lock()
+            .unwrap()
+            .drain(self.cid, &mut queue, &self.mem);
+        let mut have_used = drained.used_queue;
+        if drained.stop != RxDrainStop::Empty {
+            return (have_used, false);
+        }
+        let mut wait_credit = false;
 
         while let Some(head) = queue.pop(&self.mem) {
             let (len, _packet) = match RxPacket::from_rx_virtq_head(&head, &mut queue.snapshot) {
@@ -263,7 +271,6 @@ impl UnixProxy {
                 }
                 break;
             } else {
-                have_used = true;
                 self.push_cnt += Wrapping(len as u32);
                 debug!(
                     "recv_pkt: pushing packet with {} bytes, push_cnt={}",
@@ -273,6 +280,7 @@ impl UnixProxy {
                     error!("failed to add used elements to the queue: {e:?}");
                     break;
                 }
+                have_used = true;
             }
         }
 

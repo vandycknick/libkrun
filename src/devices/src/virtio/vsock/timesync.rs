@@ -3,6 +3,7 @@ use std::thread;
 use std::time;
 
 use crate::virtio::vsock::defs::uapi;
+use crate::virtio::vsock::muxer_rxq::{MuxerRxQ, RxDrainStop};
 use crate::virtio::vsock::packet::PacketQueue as VirtQueue;
 use crate::virtio::vsock::packet::RxPacket;
 use crate::virtio::vsock::worker_control::{Owner, WorkerControl};
@@ -18,6 +19,7 @@ pub(crate) struct TimesyncThread {
     cid: u64,
     mem: RuntimeGuestMemory,
     queue_mutex: Arc<Mutex<VirtQueue>>,
+    rxq: Arc<Mutex<MuxerRxQ>>,
     interrupt: InterruptTransport,
     control: Arc<WorkerControl>,
 }
@@ -27,12 +29,14 @@ impl TimesyncThread {
         cid: u64,
         mem: RuntimeGuestMemory,
         queue_mutex: Arc<Mutex<VirtQueue>>,
+        rxq: Arc<Mutex<MuxerRxQ>>,
         interrupt: InterruptTransport,
         control: Arc<WorkerControl>,
     ) -> Self {
         Self {
             cid,
             mem,
+            rxq,
             queue_mutex,
             interrupt,
             control,
@@ -44,22 +48,44 @@ impl TimesyncThread {
             self.control.fail();
             return false;
         };
-        let Some(head) = queue.pop(&self.mem) else {
+        let Ok(mut rxq) = self.rxq.lock() else {
+            self.control.fail();
             return false;
         };
+        let drained = rxq.drain(self.cid, &mut queue, &self.mem);
+        drop(rxq);
+        let sent = match drained.stop {
+            RxDrainStop::Empty => self.try_send_time(&mut queue, time),
+            RxDrainStop::NoBuffer => None,
+            RxDrainStop::Fault => {
+                self.control.fail();
+                None
+            }
+        };
+        drop(queue);
+        if (drained.used_queue || sent.is_some()) && self.interrupt.try_signal_used_queue().is_err()
+        {
+            self.control.fail();
+            return false;
+        }
+        sent == Some(true)
+    }
+
+    fn try_send_time(&self, queue: &mut VirtQueue, time: u64) -> Option<bool> {
+        let head = queue.pop(&self.mem)?;
         let Ok(mut packet) = RxPacket::from_rx_virtq_head(&head, &mut queue.snapshot) else {
             queue.record_processing_failure();
             self.control.fail();
-            if queue.add_used(&self.mem, head.index, 0).is_ok() {
-                self.interrupt.signal_used_queue();
-            }
-            return false;
+            return queue
+                .add_used(&self.mem, head.index, 0)
+                .ok()
+                .map(|()| false);
         };
         if packet.buf().is_none_or(|buffer| buffer.len() < 8) {
             if queue.undo_pop(head.index).is_err() {
                 self.control.fail();
             }
-            return false;
+            return None;
         }
         packet
             .set_op(uapi::VSOCK_OP_RW)
@@ -73,6 +99,7 @@ impl TimesyncThread {
             .set_fwd_cnt(0)
             .set_len(8);
         packet.write_time_sync(time);
+        drop(packet);
         if queue
             .add_used(
                 &self.mem,
@@ -80,12 +107,11 @@ impl TimesyncThread {
                 crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE as u32 + 8,
             )
             .is_err()
-            || self.interrupt.try_signal_used_queue().is_err()
         {
             self.control.fail();
-            return false;
+            return None;
         }
-        true
+        Some(true)
     }
 
     fn work(&mut self) {

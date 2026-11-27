@@ -195,6 +195,7 @@ impl MuxerThread {
                 id,
                 credit_rx,
                 &self.proxy_map,
+                &self.rxq,
                 &self.queue,
                 &self.mem,
             );

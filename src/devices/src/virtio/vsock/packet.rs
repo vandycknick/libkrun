@@ -598,7 +598,7 @@ impl RxPacket {
             }
         }
     }
-    pub fn write_getname_rsp(&mut self, rsp: TsiGetnameRsp) {
+    pub fn write_getname_rsp(&mut self, rsp: &TsiGetnameRsp) {
         let Some(payload_len) = rsp.payload_len() else {
             return;
         };
@@ -925,7 +925,7 @@ mod tests {
         let head = DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 0).unwrap();
         let mut packet =
             RxPacket::from_rx_virtq_head(&head, &mut DescriptorChainSnapshot::new(8)).unwrap();
-        packet.write_getname_rsp(TsiGetnameRsp::default());
+        packet.write_getname_rsp(&TsiGetnameRsp::default());
         let mut bytes = [0; 132];
         packet.buf().unwrap().read_slice(&mut bytes, 0).unwrap();
         assert_eq!(&bytes[..4], &(-1i32).to_le_bytes());
@@ -1067,7 +1067,7 @@ mod tests {
         let head = DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 0).unwrap();
         let mut rx =
             RxPacket::from_rx_virtq_head(&head, &mut DescriptorChainSnapshot::new(8)).unwrap();
-        rx.write_getname_rsp(TsiGetnameRsp {
+        rx.write_getname_rsp(&TsiGetnameRsp {
             result: 0,
             addr_len: 28,
             addr: decoded.addr,

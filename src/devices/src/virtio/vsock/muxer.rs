@@ -13,7 +13,6 @@ use utils::windows::RawFd;
 use super::TsiFlags;
 use super::defs;
 use super::defs::uapi;
-use super::muxer_rxq::{MuxerRxQ, rx_to_pkt};
 use super::muxer_thread::MuxerThread;
 use super::reaper::ReaperThread;
 #[cfg(target_os = "macos")]
@@ -25,8 +24,11 @@ use super::unix_proxy::UnixProxy;
 use crate::virtio::vsock::control_proxy::{
     ControlHandle, ControlProxy, UnixSocketIdentity, prepare_stream,
 };
+use crate::virtio::vsock::muxer_rxq::{
+    MuxerRxQ, RxDelivery, RxDrain, RxDrainStop, try_push_virtqueue,
+};
 use crate::virtio::vsock::packet::PacketQueue as VirtQueue;
-use crate::virtio::vsock::packet::{RxPacket, TsiConnectReq, TsiGetnameRsp, TxPacket};
+use crate::virtio::vsock::packet::{TsiConnectReq, TsiGetnameRsp, TxPacket};
 use crate::virtio::vsock::proxy::{Proxy, ProxyRemoval, ProxyStatus, ProxyUpdate};
 use crate::virtio::vsock::unix_proxy::UnixAcceptorProxy;
 use crossbeam_channel::{Sender, unbounded};
@@ -98,89 +100,77 @@ pub enum MuxerRx {
 pub(crate) enum PushPacketOutcome {
     UsedQueue,
     Buffered,
+    Dropped,
 }
 
-pub(crate) fn try_push_packet(
+pub(crate) fn push_packet(
     cid: u64,
     rx: MuxerRx,
     rxq_mutex: &Arc<Mutex<MuxerRxQ>>,
     queue_mutex: &Arc<Mutex<VirtQueue>>,
     mem: &RuntimeGuestMemory,
-) -> Result<PushPacketOutcome, Box<MuxerRx>> {
-    let rx = match try_push_virtqueue(cid, rx, queue_mutex, mem) {
-        Ok(()) => return Ok(PushPacketOutcome::UsedQueue),
-        Err(rx) => rx,
-    };
-
-    rxq_mutex
-        .lock()
-        .unwrap()
-        .push(*rx)
-        .map(|()| PushPacketOutcome::Buffered)
-}
-
-fn try_push_virtqueue(
-    cid: u64,
-    rx: MuxerRx,
-    queue_mutex: &Arc<Mutex<VirtQueue>>,
-    mem: &RuntimeGuestMemory,
-) -> Result<(), Box<MuxerRx>> {
+) -> PushPacketOutcome {
+    // The RX callback must not run between the empty-ring check and buffering.
     let mut queue = queue_mutex.lock().unwrap();
-    #[cfg(feature = "native-device-probe")]
-    let credit = matches!(
-        &rx,
-        MuxerRx::CreditRequest { .. } | MuxerRx::CreditUpdate { .. }
-    );
-    if let Some(head) = queue.pop(mem) {
-        if let Ok(mut pkt) = RxPacket::from_rx_virtq_head(&head, &mut queue.snapshot) {
-            if let Err(rx) = rx_to_pkt(cid, rx, &mut pkt) {
-                let _ = queue.undo_pop(head.index);
-                return Err(rx);
-            }
-            match queue.add_used(
-                mem,
-                head.index,
-                crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE as u32 + pkt.len(),
-            ) {
-                Ok(()) =>
-                {
-                    #[cfg(feature = "native-device-probe")]
-                    if credit {
-                        queue.record_counter(
-                            crate::virtio::vsock::worker_control::WorkerCounter::CreditDelivered,
-                        );
-                    }
-                }
-                Err(error) => log::error!("failed to publish vsock packet: {error:?}"),
-            }
-            return Ok(());
-        }
-        queue.record_processing_failure();
-        let _ = queue.add_used(mem, head.index, 0);
-        return Ok(());
+    let mut rxq = rxq_mutex.lock().unwrap();
+    let mut drained = RxDrain::default();
+    if rxq.is_full() {
+        drained = rxq.drain(cid, &mut queue, mem);
     }
-
-    Err(Box::new(rx))
+    let accepted = rxq.push(rx);
+    if !accepted {
+        log::error!("couldn't preserve packet because the bounded RX queue is full");
+        queue.record_processing_failure();
+    } else if drained.stop != RxDrainStop::Fault {
+        drained.used_queue |= rxq.drain(cid, &mut queue, mem).used_queue;
+    }
+    if drained.used_queue {
+        PushPacketOutcome::UsedQueue
+    } else if accepted {
+        PushPacketOutcome::Buffered
+    } else {
+        PushPacketOutcome::Dropped
+    }
 }
 
 fn flush_proxy_credit(
     cid: u64,
     id: u64,
     proxy: &mut dyn Proxy,
+    rxq: &Mutex<MuxerRxQ>,
     queue: &Arc<Mutex<VirtQueue>>,
     mem: &RuntimeGuestMemory,
 ) -> bool {
-    let mut used_queue = false;
-    while let Some(credit) = proxy.pop_deferred_credit() {
-        match try_push_virtqueue(cid, *credit, queue, mem) {
-            Ok(()) => used_queue = true,
-            Err(credit) => {
-                if proxy.defer_credit(credit).is_err() {
-                    error!("proxy {id} rejected a deferred credit packet");
+    let Some(mut credit) = proxy.pop_deferred_credit() else {
+        return false;
+    };
+    let mut queue = queue.lock().unwrap();
+    let drained = rxq.lock().unwrap().drain(cid, &mut queue, mem);
+    let mut used_queue = drained.used_queue;
+    if drained.stop == RxDrainStop::Empty {
+        loop {
+            match try_push_virtqueue(cid, &credit, &mut queue, mem) {
+                RxDelivery::Delivered => used_queue = true,
+                RxDelivery::TooSmall => {
+                    used_queue = true;
+                    continue;
                 }
-                break;
+                RxDelivery::NoBuffer => break,
+                RxDelivery::Fault {
+                    used_queue: published,
+                } => {
+                    used_queue |= published;
+                    break;
+                }
             }
+            let Some(next) = proxy.pop_deferred_credit() else {
+                return used_queue;
+            };
+            credit = next;
         }
+    }
+    if proxy.defer_credit(credit).is_err() {
+        log::error!("proxy {id} rejected a deferred credit packet");
     }
     used_queue
 }
@@ -190,6 +180,7 @@ pub(crate) fn push_proxy_credit(
     id: u64,
     credit: MuxerRx,
     proxy_map: &ProxyMap,
+    rxq: &Mutex<MuxerRxQ>,
     queue: &Arc<Mutex<VirtQueue>>,
     mem: &RuntimeGuestMemory,
 ) -> bool {
@@ -208,22 +199,7 @@ pub(crate) fn push_proxy_credit(
     if let Ok(queue) = queue.lock() {
         queue.record_counter(crate::virtio::vsock::worker_control::WorkerCounter::CreditQueued);
     }
-    flush_proxy_credit(cid, id, &mut *proxy, queue, mem)
-}
-
-pub(crate) fn push_packet(
-    cid: u64,
-    rx: MuxerRx,
-    rxq_mutex: &Arc<Mutex<MuxerRxQ>>,
-    queue_mutex: &Arc<Mutex<VirtQueue>>,
-    mem: &RuntimeGuestMemory,
-) {
-    if try_push_packet(cid, rx, rxq_mutex, queue_mutex, mem).is_err() {
-        error!("couldn't preserve packet because the bounded RX queue is full");
-        if let Ok(mut queue) = queue_mutex.lock() {
-            queue.record_processing_failure();
-        }
-    }
+    flush_proxy_credit(cid, id, &mut *proxy, rxq, queue, mem)
 }
 
 pub(crate) struct VsockMuxer {
@@ -499,6 +475,7 @@ impl VsockMuxer {
                 self.cid,
                 mem.clone(),
                 queue.clone(),
+                self.rxq.clone(),
                 interrupt.clone(),
                 self.worker_control.clone(),
             );
@@ -547,12 +524,16 @@ impl VsockMuxer {
         !self.rxq.lock().unwrap().is_empty()
     }
 
-    pub(crate) fn recv_pkt(&mut self, pkt: &mut RxPacket) -> crate::virtio::vsock::Result<()> {
-        let mut queue = self
+    pub(crate) fn drain_rx(
+        &self,
+        queue: &mut VirtQueue,
+        mem: &RuntimeGuestMemory,
+    ) -> crate::virtio::vsock::Result<RxDrain> {
+        let mut rxq = self
             .rxq
             .lock()
             .map_err(|_| crate::virtio::vsock::VsockError::LockPoisoned)?;
-        queue.fill_packet(self.cid, pkt)
+        Ok(rxq.drain(self.cid, queue, mem))
     }
 
     pub(crate) fn retry_deferred_credit(&self) -> bool {
@@ -563,7 +544,8 @@ impl VsockMuxer {
         let mut used_queue = false;
         for proxy in proxy_map.values() {
             let mut proxy = proxy.lock().unwrap();
-            used_queue |= flush_proxy_credit(self.cid, proxy.id(), &mut *proxy, queue, mem);
+            used_queue |=
+                flush_proxy_credit(self.cid, proxy.id(), &mut *proxy, &self.rxq, queue, mem);
         }
         used_queue
     }
@@ -630,7 +612,7 @@ impl VsockMuxer {
             && let (Some(queue), Some(mem)) = (&self.queue, &self.mem)
         {
             credit_used_queue =
-                push_proxy_credit(self.cid, id, credit, &self.proxy_map, queue, mem);
+                push_proxy_credit(self.cid, id, credit, &self.proxy_map, &self.rxq, queue, mem);
         }
 
         match update.remove_proxy {
@@ -888,7 +870,12 @@ impl VsockMuxer {
         debug!("DGRAM OP_RW");
         let id = ((pkt.src_port() as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
 
-        if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
+        let update = {
+            let map = self.proxy_map.read().unwrap();
+            let Some(proxy_lock) = map.get(&id) else {
+                debug!("DGRAM ignoring OP_RW for {}", pkt.src_port());
+                return;
+            };
             debug!("DGRAM allowing OP_RW for {}", pkt.src_port());
             let mut proxy = proxy_lock.lock().unwrap();
             if !matches!(
@@ -898,11 +885,9 @@ impl VsockMuxer {
             ) {
                 return;
             }
-            let update = proxy.sendmsg(pkt);
-            self.process_proxy_update(id, update);
-        } else {
-            debug!("DGRAM ignoring OP_RW for {}", pkt.src_port());
-        }
+            proxy.sendmsg(pkt)
+        };
+        self.process_proxy_update(id, update);
     }
 
     pub(crate) fn send_dgram_pkt(&mut self, pkt: &TxPacket) -> crate::virtio::vsock::Result<()> {
@@ -1370,6 +1355,110 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn rx_refill_racing_with_packet_push_cannot_strand_a_response() {
+        use std::sync::{Barrier, atomic::Ordering};
+        use std::thread;
+
+        use crate::legacy::DummyIrqChip;
+        use crate::virtio::vsock::device::Vsock;
+        use crate::virtio::{DeviceState, InterruptTransport};
+
+        const ITERATIONS: u16 = 20_000;
+        let mem = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let guest = VirtQueue::new(GuestAddress(0), &mem, 8);
+        guest.dtable[0].set(0x1000, VSOCK_PKT_HDR_SIZE as u32, 2, 0);
+        for entry in &guest.avail.ring {
+            entry.set(0);
+        }
+        let queue = Arc::new(Mutex::new(
+            crate::virtio::vsock::packet::PacketQueue::from_queue(guest.create_queue()),
+        ));
+        let avail_idx = queue.lock().unwrap().avail_ring.0 + 2;
+        let mut device = Vsock::new(3, None, None, TsiFlags::empty()).unwrap();
+        device.queue_rx = Some(queue.clone());
+        device.device_state = DeviceState::Activated(
+            mem.clone(),
+            InterruptTransport::new(DummyIrqChip::new().into(), "vsock-rx-test".into(), None)
+                .unwrap(),
+        );
+        let rxq = device.muxer.rxq.clone();
+        let barrier = Barrier::new(2);
+        let mut first_stranded = None;
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                for i in 1..=ITERATIONS {
+                    barrier.wait();
+                    crate::virtio::vsock::muxer::push_packet(
+                        3,
+                        MuxerRx::Reset {
+                            local_port: u32::from(i),
+                            peer_port: 9,
+                        },
+                        &rxq,
+                        &queue,
+                        &mem,
+                    );
+                    barrier.wait();
+                }
+            });
+            for i in 1..=ITERATIONS {
+                barrier.wait();
+                mem.store(i, GuestAddress(avail_idx), Ordering::Release)
+                    .unwrap();
+                device.process_stream_rx();
+                barrier.wait();
+                let pending = rxq.lock().unwrap().len();
+                let used = guest.used.idx.get();
+                if used != i || pending != 0 {
+                    first_stranded.get_or_insert((i, used, pending));
+                    device.process_stream_rx();
+                }
+            }
+        });
+        assert_eq!(first_stranded, None, "(posted, used, buffered)");
+    }
+
+    #[test]
+    fn rx_push_drains_the_older_response_before_the_new_one() {
+        use crate::virtio::vsock::muxer::{PushPacketOutcome, push_packet};
+        use crate::virtio::vsock::muxer_rxq::MuxerRxQ;
+        use crate::virtio::vsock::packet::PacketQueue;
+
+        let mem = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let guest = VirtQueue::new(GuestAddress(0), &mem, 8);
+        let queue = Arc::new(Mutex::new(PacketQueue::from_queue(guest.create_queue())));
+        let rxq = Arc::new(Mutex::new(MuxerRxQ::new()));
+        let push = |port| {
+            push_packet(
+                3,
+                MuxerRx::Reset {
+                    local_port: port,
+                    peer_port: 9,
+                },
+                &rxq,
+                &queue,
+                &mem,
+            )
+        };
+        assert_eq!(push(7), PushPacketOutcome::Buffered);
+        guest.dtable[0].set(0x1000, VSOCK_PKT_HDR_SIZE as u32, 2, 0);
+        guest.avail.ring[0].set(0);
+        guest.avail.idx.set(1);
+
+        assert_eq!(push(8), PushPacketOutcome::UsedQueue);
+        assert_eq!(guest.used.idx.get(), 1);
+        let head = DescriptorChain::checked_new(&mem, GuestAddress(0), 8, 0).unwrap();
+        let packet = RxPacket::from_rx_virtq_head(
+            &head,
+            &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(8),
+        )
+        .unwrap();
+        assert_eq!(packet.src_port(), 7);
+        assert_eq!(rxq.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn guest_send_credit_update_reaches_the_receive_virtqueue() {
         let mem = RuntimeGuestMemory::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
         let queue = VirtQueue::new(GuestAddress(0), &mem, 8);
@@ -1445,15 +1534,10 @@ mod tests {
         muxer.queue = Some(queue_mutex.clone());
         muxer.mem = Some(mem.clone());
         for port in 0..defs::MUXER_RXQ_SIZE as u32 {
-            muxer
-                .rxq
-                .lock()
-                .unwrap()
-                .push(MuxerRx::Reset {
-                    local_port: port,
-                    peer_port: port,
-                })
-                .unwrap();
+            assert!(muxer.rxq.lock().unwrap().push(MuxerRx::Reset {
+                local_port: port,
+                peer_port: port,
+            }));
         }
 
         let (fd, _peer) = socketpair(
@@ -1545,9 +1629,28 @@ mod tests {
         )
         .unwrap();
         muxer.send_stream_pkt(&guest_write).unwrap();
-        assert!(!muxer.retry_deferred_credit());
-
         assert_eq!(queue_mutex.lock().unwrap().next_used.0, 2);
+        let pending = defs::MUXER_RXQ_SIZE as u16;
+        for used in (2..=pending).step_by(2) {
+            for offset in 0..2 {
+                let head_index = offset * 2;
+                let head =
+                    DescriptorChain::checked_new(&mem, GuestAddress(0), 8, head_index).unwrap();
+                let packet = RxPacket::from_rx_virtq_head(
+                    &head,
+                    &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(8),
+                )
+                .unwrap();
+                assert_eq!(packet.op(), uapi::VSOCK_OP_RST);
+                assert_eq!(packet.src_port(), u32::from(used - 2 + offset));
+                queue.avail.ring[usize::from((used + offset) % 8)].set(head_index);
+            }
+            queue.avail.idx.set(used + 2);
+            assert!(muxer.retry_deferred_credit());
+            assert_eq!(queue.used.idx.get(), used + 2);
+        }
+        assert!(!muxer.retry_deferred_credit());
+        assert!(muxer.rxq.lock().unwrap().is_empty());
         let request_head = DescriptorChain::checked_new(&mem, GuestAddress(0), 8, 0).unwrap();
         let request = RxPacket::from_rx_virtq_head(
             &request_head,
@@ -1578,15 +1681,10 @@ mod tests {
         muxer.queue = Some(queue_mutex.clone());
         muxer.mem = Some(mem.clone());
         for port in 0..defs::MUXER_RXQ_SIZE as u32 {
-            muxer
-                .rxq
-                .lock()
-                .unwrap()
-                .push(MuxerRx::Reset {
-                    local_port: port,
-                    peer_port: port,
-                })
-                .unwrap();
+            assert!(muxer.rxq.lock().unwrap().push(MuxerRx::Reset {
+                local_port: port,
+                peer_port: port,
+            }));
         }
 
         let (fd, _peer) = socketpair(

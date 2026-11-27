@@ -794,6 +794,7 @@ mod tests {
     use crate::virtio::vsock::control_proxy::prepare_stream;
     use crate::virtio::vsock::defs::uapi;
     use crate::virtio::vsock::muxer_rxq::MuxerRxQ;
+    use crate::virtio::vsock::packet::PacketQueue;
     use crate::virtio::vsock::packet::{RxPacket, TxPacket, VSOCK_PKT_HDR_SIZE};
     use crate::virtio::vsock::unix_proxy::unix::*;
     use crate::virtio::{Descriptor, DescriptorChain, Queue, RuntimeGuestMemory};
@@ -966,27 +967,18 @@ mod tests {
     }
 
     fn buffered_response_op(rxq: &Arc<Mutex<MuxerRxQ>>, memory: &RuntimeGuestMemory) -> u16 {
-        memory
-            .write_obj(
-                Descriptor {
-                    addr: 0x3900,
-                    len: VSOCK_PKT_HDR_SIZE as u32,
-                    flags: 2,
-                    next: 0,
-                },
-                GuestAddress(0x3800),
-            )
-            .unwrap();
+        let ring = VirtQueue::new(GuestAddress(0x3800), memory, 1);
+        ring.dtable[0].set(0x3900, VSOCK_PKT_HDR_SIZE as u32, 2, 0);
+        ring.avail.ring[0].set(0);
+        ring.avail.idx.set(1);
+        let mut queue = PacketQueue::from_queue(ring.create_queue());
+        assert!(rxq.lock().unwrap().drain(3, &mut queue, memory).used_queue);
         let head = DescriptorChain::checked_new(memory, GuestAddress(0x3800), 1, 0).unwrap();
-        let mut packet = RxPacket::from_rx_virtq_head(
+        let packet = RxPacket::from_rx_virtq_head(
             &head,
             &mut crate::virtio::descriptor_utils::DescriptorChainSnapshot::new(1),
         )
         .unwrap();
-        rxq.lock()
-            .expect("bounded response queue")
-            .fill_packet(3, &mut packet)
-            .unwrap();
         packet.op()
     }
 

@@ -5,12 +5,38 @@
 //! Bounded ordered protocol responses, retained with the source mux while parked.
 use std::collections::VecDeque;
 
+use crate::virtio::RuntimeGuestMemory;
 use crate::virtio::vsock::defs;
 use crate::virtio::vsock::defs::uapi;
 use crate::virtio::vsock::muxer::MuxerRx;
-use crate::virtio::vsock::packet::{RxPacket, TsiAcceptRsp, TsiConnectRsp, TsiListenRsp};
+use crate::virtio::vsock::packet::{
+    PacketQueue, RxPacket, TsiAcceptRsp, TsiConnectRsp, TsiListenRsp, VSOCK_PKT_HDR_SIZE,
+};
+
+#[derive(Default, PartialEq, Eq)]
+pub(crate) enum RxDrainStop {
+    #[default]
+    Empty,
+    NoBuffer,
+    Fault,
+}
+
+#[derive(Default)]
+pub(crate) struct RxDrain {
+    pub used_queue: bool,
+    pub stop: RxDrainStop,
+}
+
+pub(crate) enum RxDelivery {
+    Delivered,
+    TooSmall,
+    NoBuffer,
+    Fault { used_queue: bool },
+}
 
 /// The muxer RX queue.
+///
+/// Take the guest RX virtqueue lock before locking this queue to deliver packets.
 pub struct MuxerRxQ {
     /// The RX queue data.
     q: VecDeque<MuxerRx>,
@@ -27,30 +53,41 @@ impl MuxerRxQ {
     }
 
     /// Refuses overflow without dropping an accepted protocol response.
-    pub fn push(&mut self, rx: MuxerRx) -> Result<(), Box<MuxerRx>> {
-        if !self.is_full() {
-            self.q.push_back(rx);
-            return Ok(());
+    pub fn push(&mut self, rx: MuxerRx) -> bool {
+        if self.is_full() {
+            return false;
         }
-
-        Err(Box::new(rx))
+        self.q.push_back(rx);
+        true
     }
 
-    pub(crate) fn fill_packet(
+    pub(crate) fn drain(
         &mut self,
         cid: u64,
-        packet: &mut RxPacket,
-    ) -> crate::virtio::vsock::Result<()> {
-        let Some(rx) = self.q.pop_front() else {
-            return Err(crate::virtio::vsock::VsockError::NoData);
-        };
-        match rx_to_pkt(cid, rx, packet) {
-            Ok(()) => Ok(()),
-            Err(rx) => {
-                self.q.push_front(*rx);
-                Err(crate::virtio::vsock::VsockError::BufDescTooSmall)
+        queue: &mut PacketQueue,
+        mem: &RuntimeGuestMemory,
+    ) -> RxDrain {
+        let mut used_queue = false;
+        let stop = loop {
+            let Some(rx) = self.q.front() else {
+                break RxDrainStop::Empty;
+            };
+            match try_push_virtqueue(cid, rx, queue, mem) {
+                RxDelivery::Delivered => {
+                    self.q.pop_front();
+                    used_queue = true;
+                }
+                RxDelivery::TooSmall => used_queue = true,
+                RxDelivery::NoBuffer => break RxDrainStop::NoBuffer,
+                RxDelivery::Fault {
+                    used_queue: published,
+                } => {
+                    used_queue |= published;
+                    break RxDrainStop::Fault;
+                }
             }
-        }
+        };
+        RxDrain { used_queue, stop }
     }
 
     /// Get the total number of items in the queue.
@@ -69,14 +106,53 @@ impl MuxerRxQ {
     }
 }
 
-pub(crate) fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut RxPacket) -> Result<(), Box<MuxerRx>> {
-    let required = match &rx {
+pub(crate) fn try_push_virtqueue(
+    cid: u64,
+    rx: &MuxerRx,
+    queue: &mut PacketQueue,
+    mem: &RuntimeGuestMemory,
+) -> RxDelivery {
+    let Some(head) = queue.pop(mem) else {
+        return RxDelivery::NoBuffer;
+    };
+    let (len, delivery) = match RxPacket::from_rx_virtq_head(&head, &mut queue.snapshot) {
+        Ok(mut pkt) => {
+            if rx_to_pkt(cid, rx, &mut pkt) {
+                (VSOCK_PKT_HDR_SIZE as u32 + pkt.len(), RxDelivery::Delivered)
+            } else {
+                (0, RxDelivery::TooSmall)
+            }
+        }
+        Err(error) => {
+            log::warn!("RX queue error: {error:?}");
+            queue.record_processing_failure();
+            (0, RxDelivery::Fault { used_queue: true })
+        }
+    };
+    if let Err(error) = queue.add_used(mem, head.index, len) {
+        log::error!("failed to publish vsock packet: {error:?}");
+        return RxDelivery::Fault { used_queue: false };
+    }
+    #[cfg(feature = "native-device-probe")]
+    if matches!(delivery, RxDelivery::Delivered)
+        && matches!(
+            rx,
+            MuxerRx::CreditRequest { .. } | MuxerRx::CreditUpdate { .. }
+        )
+    {
+        queue.record_counter(crate::virtio::vsock::worker_control::WorkerCounter::CreditDelivered);
+    }
+    delivery
+}
+
+fn rx_to_pkt(cid: u64, rx: &MuxerRx, pkt: &mut RxPacket) -> bool {
+    let required = match rx {
         MuxerRx::ConnResponse { .. }
         | MuxerRx::ListenResponse { .. }
         | MuxerRx::AcceptResponse { .. } => 4,
         MuxerRx::GetnameResponse { data, .. } => {
             let Some(length) = data.payload_len() else {
-                return Err(Box::new(rx));
+                return false;
             };
             length
         }
@@ -84,9 +160,9 @@ pub(crate) fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut RxPacket) -> Result<(),
     };
     let buffer_len = pkt.buf().map_or(0, |buffer| buffer.len() as u32);
     if (buffer_len as usize) < required {
-        return Err(Box::new(rx));
+        return false;
     }
-    match rx {
+    match *rx {
         MuxerRx::Reset {
             local_port,
             peer_port,
@@ -164,7 +240,7 @@ pub(crate) fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut RxPacket) -> Result<(),
         MuxerRx::GetnameResponse {
             local_port,
             peer_port,
-            data,
+            ref data,
         } => {
             pkt.set_op(uapi::VSOCK_OP_RW)
                 .set_src_cid(uapi::VSOCK_HOST_CID)
@@ -239,20 +315,19 @@ pub(crate) fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut RxPacket) -> Result<(),
             pkt.set_len(required as u32);
         }
     }
-    Ok(())
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use vm_memory::GuestAddress;
 
-    use crate::virtio::RuntimeGuestMemory;
     use crate::virtio::descriptor_utils::DescriptorChainSnapshot;
     use crate::virtio::queue::tests::VirtQueue;
-    use crate::virtio::vsock::VsockError;
     use crate::virtio::vsock::muxer::MuxerRx;
-    use crate::virtio::vsock::muxer_rxq::MuxerRxQ;
-    use crate::virtio::vsock::packet::{RxPacket, TsiGetnameRsp, VSOCK_PKT_HDR_SIZE};
+    use crate::virtio::vsock::muxer_rxq::{MuxerRxQ, RxDrainStop};
+    use crate::virtio::vsock::packet::{PacketQueue, RxPacket, TsiGetnameRsp, VSOCK_PKT_HDR_SIZE};
+    use crate::virtio::{DescriptorChain, RuntimeGuestMemory};
 
     #[test]
     fn provider_vsock_mux_responses_complete_only_initialized_payload_bytes() {
@@ -271,11 +346,7 @@ mod tests {
                 memory
                     .write_slice(&vec![0xa5; capacity as usize], GuestAddress(0x5000))
                     .unwrap();
-                let mut queue = ring.create_queue();
-                let head = queue.pop(&memory).unwrap();
-                let mut packet =
-                    RxPacket::from_rx_virtq_head(&head, &mut DescriptorChainSnapshot::new(8))
-                        .unwrap();
+                let mut queue = PacketQueue::from_queue(ring.create_queue());
                 let response = match kind {
                     0 => MuxerRx::ConnResponse {
                         local_port: 7,
@@ -300,12 +371,16 @@ mod tests {
                 };
                 let required = if kind == 3 { 24u32 } else { 4 };
                 let mut responses = MuxerRxQ::new();
-                responses.push(response).unwrap();
-                let result = responses.fill_packet(3, &mut packet);
+                assert!(responses.push(response));
+                let drained = responses.drain(3, &mut queue, &memory);
+                assert!(drained.used_queue);
+                assert_eq!(ring.used.idx.get(), 1);
+                let used = ring.used.ring[0].get();
+                assert_eq!(used.id, 0);
                 let mut bytes = vec![0; capacity as usize];
-                packet.buf().unwrap().read_slice(&mut bytes, 0).unwrap();
+                memory.read_slice(&mut bytes, GuestAddress(0x5000)).unwrap();
                 if capacity < required {
-                    assert!(matches!(result, Err(VsockError::BufDescTooSmall)));
+                    assert!(drained.stop == RxDrainStop::NoBuffer);
                     assert_eq!(responses.len(), 1);
                     assert_eq!(bytes, vec![0xa5; capacity as usize]);
                     let mut header = [0; VSOCK_PKT_HDR_SIZE];
@@ -313,11 +388,15 @@ mod tests {
                         .read_slice(&mut header, GuestAddress(0x4000))
                         .unwrap();
                     assert_eq!(header, [0xa5; VSOCK_PKT_HDR_SIZE]);
-                    queue.undo_pop(head.index).unwrap();
-                    assert_eq!(ring.used.idx.get(), 0);
+                    assert_eq!(used.len, 0);
                 } else {
-                    result.unwrap();
+                    assert!(drained.stop == RxDrainStop::Empty);
                     assert!(responses.is_empty());
+                    let head =
+                        DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 0).unwrap();
+                    let packet =
+                        RxPacket::from_rx_virtq_head(&head, &mut DescriptorChainSnapshot::new(8))
+                            .unwrap();
                     assert_eq!(packet.len(), required);
                     assert_eq!(
                         &bytes[..4],
@@ -327,16 +406,6 @@ mod tests {
                         assert_eq!(&bytes[4..8], &16u32.to_le_bytes());
                     }
                     assert!(bytes[required as usize..].iter().all(|byte| *byte == 0xa5));
-                    queue
-                        .add_used(
-                            &memory,
-                            head.index,
-                            VSOCK_PKT_HDR_SIZE as u32 + packet.len(),
-                        )
-                        .unwrap();
-                    assert_eq!(ring.used.idx.get(), 1);
-                    let used = ring.used.ring[0].get();
-                    assert_eq!(used.id, u32::from(head.index));
                     assert_eq!(used.len, VSOCK_PKT_HDR_SIZE as u32 + required);
                 }
             }
@@ -352,26 +421,24 @@ mod tests {
         memory
             .write_slice(&[0xa5; VSOCK_PKT_HDR_SIZE], GuestAddress(0x4000))
             .unwrap();
-        let head =
-            crate::virtio::DescriptorChain::checked_new(&memory, GuestAddress(0), 8, 0).unwrap();
-        let mut packet =
-            RxPacket::from_rx_virtq_head(&head, &mut DescriptorChainSnapshot::new(8)).unwrap();
+        ring.avail.ring[0].set(0);
+        ring.avail.idx.set(1);
+        let mut queue = PacketQueue::from_queue(ring.create_queue());
         let data = TsiGetnameRsp {
             addr_len: u32::MAX,
             ..TsiGetnameRsp::default()
         };
         let mut responses = MuxerRxQ::new();
-        responses
-            .push(MuxerRx::GetnameResponse {
-                local_port: 7,
-                peer_port: 9,
-                data,
-            })
-            .unwrap();
-        assert!(matches!(
-            responses.fill_packet(3, &mut packet),
-            Err(VsockError::BufDescTooSmall)
-        ));
+        assert!(responses.push(MuxerRx::GetnameResponse {
+            local_port: 7,
+            peer_port: 9,
+            data,
+        }));
+        let drained = responses.drain(3, &mut queue, &memory);
+        assert!(drained.used_queue);
+        assert!(drained.stop == RxDrainStop::NoBuffer);
+        assert_eq!(ring.used.idx.get(), 1);
+        assert_eq!(ring.used.ring[0].get().len, 0);
         assert_eq!(responses.len(), 1);
         let mut header = [0; VSOCK_PKT_HDR_SIZE];
         memory
