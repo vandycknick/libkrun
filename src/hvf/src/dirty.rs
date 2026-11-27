@@ -12,7 +12,9 @@ use arch::guest_memory::{
     TrackingMode,
 };
 
-use crate::bindings::{HV_SUCCESS, hv_vm_map, hv_vm_protect, hv_vm_unmap};
+use crate::bindings::{
+    HV_SUCCESS, hv_vcpu_exit_exception_t, hv_vcpu_t, hv_vm_map, hv_vm_protect, hv_vm_unmap,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Lifecycle {
@@ -23,15 +25,6 @@ enum Lifecycle {
 }
 
 impl Lifecycle {
-    fn validate_entered(&mut self, entered: u64) -> bool {
-        if *self == Self::Armed(entered) {
-            true
-        } else {
-            *self = Self::Failed;
-            false
-        }
-    }
-
     fn next_epoch(self, harvested: u64) -> Option<u64> {
         if self == Self::Armed(harvested) {
             harvested.checked_add(1)
@@ -301,7 +294,7 @@ impl HvfRamProtection {
         Ok(epoch)
     }
 
-    pub fn entered_epoch(&self) -> Result<Option<CpuTrackingEpoch>, DirtyFailure> {
+    pub fn entered_epoch(&self, vcpu: hv_vcpu_t) -> Result<Option<CpuTrackingEpoch>, DirtyFailure> {
         let mut inner = self.lock(DirtyOperation::Fault)?;
         if let Some(domain) = &inner.domain {
             match domain.tracking_mode() {
@@ -321,12 +314,15 @@ impl HvfRamProtection {
                 .clone()
                 .map(Some)
                 .ok_or_else(|| refused(DirtyOperation::Fault)),
-            _ => Err(failure(
-                DirtyOperation::Fault,
-                DirtyLocation::Vm,
-                DirtyEffect::ProtectionUnknown,
-                0,
-            )),
+            _ => {
+                inner.log_fault_rejection("entered_epoch", vcpu, None);
+                Err(failure(
+                    DirtyOperation::Fault,
+                    DirtyLocation::Vm,
+                    DirtyEffect::ProtectionUnknown,
+                    0,
+                ))
+            }
         }
     }
 
@@ -353,9 +349,9 @@ impl HvfRamProtection {
 
     pub fn handle_ram_write_fault(
         &self,
+        vcpu: hv_vcpu_t,
         entered: &CpuTrackingEpoch,
-        syndrome: u64,
-        ipa: u64,
+        exception: &hv_vcpu_exit_exception_t,
     ) -> Result<DirtyFaultResolution, DirtyFailure> {
         let mut inner = self.lock(DirtyOperation::Fault)?;
         let domain = inner
@@ -363,8 +359,9 @@ impl HvfRamProtection {
             .clone()
             .ok_or_else(|| refused(DirtyOperation::Fault))?;
         if entered.validate_domain(&domain).is_err()
-            || !inner.lifecycle.validate_entered(entered.epoch())
+            || inner.lifecycle != Lifecycle::Armed(entered.epoch())
         {
+            inner.log_fault_rejection("validate_entered", vcpu, Some((entered, exception)));
             inner.fail();
             return Err(failure(
                 DirtyOperation::Fault,
@@ -373,6 +370,8 @@ impl HvfRamProtection {
                 0,
             ));
         }
+        let syndrome = exception.syndrome;
+        let ipa = exception.physical_address;
         let page = domain.layout().page_at(ipa);
         let mapping = inner
             .mappings
@@ -385,6 +384,7 @@ impl HvfRamProtection {
         if !qualified_ram_write(syndrome)
             || mapping.is_none_or(|mapping| mapping.permissions.bits() & RamPermissions::WRITE == 0)
         {
+            inner.log_fault_rejection("handle_ram_write_fault", vcpu, Some((entered, exception)));
             inner.fail();
             return Err(failure(
                 DirtyOperation::Fault,
@@ -447,9 +447,19 @@ impl HvfRamProtection {
         Ok(DirtyFaultResolution::Retry)
     }
 
-    pub fn reject_instruction_fault(&self, _entered: &CpuTrackingEpoch) -> DirtyFailure {
+    pub fn reject_instruction_fault(
+        &self,
+        vcpu: hv_vcpu_t,
+        entered: &CpuTrackingEpoch,
+        exception: &hv_vcpu_exit_exception_t,
+    ) -> DirtyFailure {
         match self.lock(DirtyOperation::Fault) {
             Ok(mut inner) => {
+                inner.log_fault_rejection(
+                    "reject_instruction_fault",
+                    vcpu,
+                    Some((entered, exception)),
+                );
                 inner.fail();
                 failure(
                     DirtyOperation::Fault,
@@ -613,6 +623,54 @@ impl HvfRamProtection {
 }
 
 impl ProtectionInner {
+    #[cold]
+    fn log_fault_rejection(
+        &self,
+        path: &str,
+        vcpu: hv_vcpu_t,
+        fault: Option<(&CpuTrackingEpoch, &hv_vcpu_exit_exception_t)>,
+    ) {
+        let lifecycle = self.lifecycle;
+        let armed_epoch = match lifecycle {
+            Lifecycle::Armed(epoch) => Some(epoch),
+            _ => None,
+        };
+        let published_epoch = self.epoch.as_ref().map(CpuTrackingEpoch::epoch);
+        if let Some((entered, exception)) = fault {
+            let syndrome = exception.syndrome;
+            let ec = (syndrome >> 26) & 0x3f;
+            let fsc = syndrome & 0x3f;
+            let wnr = (syndrome >> 6) & 1;
+            let s1ptw = (syndrome >> 7) & 1;
+            let cm = (syndrome >> 8) & 1;
+            let fnv = (syndrome >> 10) & 1;
+            let ipa = exception.physical_address;
+            let va = exception.virtual_address;
+            let page = self
+                .domain
+                .as_ref()
+                .and_then(|domain| domain.layout().page_at(ipa))
+                .map(PageIndex::index);
+            log::error!(
+                "HVF dirty tracking rejected: path={path} vcpu={vcpu} ec={ec:#04x} \
+                 syndrome={syndrome:#018x} fsc={fsc:#04x} wnr={wnr} s1ptw={s1ptw} cm={cm} \
+                 fnv={fnv} ipa={ipa:#x} va={va:#x} tracked_ram={} page={page:?} \
+                 entered_epoch={} armed_epoch={armed_epoch:?} published_epoch={published_epoch:?} \
+                 lifecycle={lifecycle:?}",
+                page.is_some(),
+                entered.epoch(),
+            );
+        } else {
+            // Admission failed before hv_vcpu_run; the exit record is not from this entry.
+            log::error!(
+                "HVF dirty tracking rejected: path={path} vcpu={vcpu} ec=None syndrome=None \
+                 fsc=None wnr=None s1ptw=None cm=None fnv=None ipa=None va=None tracked_ram=None \
+                 page=None entered_epoch=None armed_epoch={armed_epoch:?} \
+                 published_epoch={published_epoch:?} lifecycle={lifecycle:?}"
+            );
+        }
+    }
+
     fn next_reestablishment_epoch(&self) -> Result<u64, DirtyFailure> {
         if self.lifecycle != Lifecycle::Failed || self.last_issued_epoch == 0 {
             return Err(refused(DirtyOperation::Reestablish));
@@ -736,11 +794,14 @@ fn protect(gpa: u64, len: u64, permissions: u8) -> Result<(), i64> {
 
 /// A guest data write that stage 2 refused. HVF reports the first write to a
 /// write-protected page it has not populated yet as a translation fault and
-/// later ones as permission faults; both mean the same thing for a tracked RAM
-/// page. Whether the address is RAM is decided by the caller, not the syndrome.
+/// later ones as permission faults. When the host has cleared the access flag
+/// of that stage 2 entry (page aging under memory pressure) the same write
+/// arrives as an access flag fault, which the architecture ranks above a
+/// permission fault. All three mean the same thing for a tracked RAM page.
+/// Whether the address is RAM is decided by the caller, not the syndrome.
 fn qualified_ram_write(syndrome: u64) -> bool {
     matches!((syndrome >> 26) & 0x3f, 0x24 | 0x25)
-        && matches!(syndrome & 0x3f, 0x04..=0x07 | 0x0c..=0x0f)
+        && matches!(syndrome & 0x3f, 0x04..=0x0f)
         && syndrome & (1 << 6) != 0
         && syndrome & ((1 << 7) | (1 << 8) | (1 << 10)) == 0
 }
@@ -754,12 +815,20 @@ fn valid_mmio_translation(syndrome: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::dirty::{Lifecycle, qualified_ram_write, valid_mmio_translation};
+    use arch::guest_memory::{
+        BackingKind, DirtyEffect, DirtyLocation, DirtyOperation, MemoryDomain,
+    };
+
+    use crate::bindings::hv_vcpu_exit_exception_t;
+    use crate::dirty::{
+        DirtyFaultResolution, HvfRamProtection, Lifecycle, qualified_ram_write,
+        valid_mmio_translation,
+    };
 
     #[test]
     fn ram_write_classifier_does_not_require_scalar_emulation_syndrome() {
         for ec in [0x24, 0x25] {
-            for level in (0x04..=0x07).chain(0x0c..=0x0f) {
+            for level in 0x04..=0x0f {
                 let syndrome = (ec << 26) | (1 << 6) | level;
                 assert!(qualified_ram_write(syndrome));
                 assert!(qualified_ram_write(syndrome | (1 << 24)));
@@ -770,19 +839,44 @@ mod tests {
             }
         }
         for ec in [0x20, 0x21, 0, 0x3f] {
-            assert!(!qualified_ram_write((ec << 26) | (1 << 6) | 0x0f));
+            for flags in [0, 1 << 6, 1 << 7] {
+                assert!(!qualified_ram_write((ec << 26) | flags | 0x0f));
+            }
         }
-        for status in [0, 3, 8, 11, 16, 63] {
+        for status in [0, 3, 16, 63] {
             assert!(!qualified_ram_write((0x24 << 26) | (1 << 6) | status));
         }
     }
 
     #[test]
+    fn write_to_a_protected_page_whose_access_flag_was_cleared_is_a_ram_write() {
+        // Observed on M5 under host load right after a resume: level 3 access
+        // flag fault, WnR set, on a tracked page; the other vCPU reported the
+        // same page as a level 3 permission fault.
+        for (syndrome, write) in [
+            (0x93df_804b, true),
+            (0x93df_804f, true),
+            (0x93df_800b, false),
+            (0x93df_808b, false),
+        ] {
+            assert_eq!(qualified_ram_write(syndrome), write, "{syndrome:#x}");
+        }
+    }
+
+    #[test]
     fn first_write_to_an_unpopulated_protected_page_is_a_ram_write() {
-        // Observed on macOS 26.7.1 (Apple M5) for the first store of a booting
-        // guest: data abort, WnR, translation fault level 3, no valid ISS.
-        assert!(qualified_ram_write(0x9200_0047));
-        assert!(!valid_mmio_translation(0x9200_0047));
+        // The first scalar store observed on M5 gives a level 3 translation
+        // fault with WnR and no valid ISS. DC ZVA also uses WnR, not CM.
+        for (syndrome, write) in [
+            (0x9200_0047, true),
+            (0x9200_004f, true),
+            (0x9200_0147, false),
+            (0x9200_0087, false),
+            (0x9200_0487, false),
+        ] {
+            assert_eq!(qualified_ram_write(syndrome), write, "{syndrome:#x}");
+            assert!(!valid_mmio_translation(syndrome), "{syndrome:#x}");
+        }
     }
 
     #[test]
@@ -797,15 +891,80 @@ mod tests {
 
     #[test]
     fn epoch_identity_does_not_admit_duplicates_from_previous_epochs() {
-        let mut state = Lifecycle::Armed(2);
-        assert!(state.validate_entered(2));
-        assert!(state.validate_entered(2));
-        assert!(!state.validate_entered(1));
-        assert_eq!(state, Lifecycle::Failed);
-        assert!(!state.validate_entered(2));
-        for mut state in [Lifecycle::Unarmed, Lifecycle::Disabled, Lifecycle::Failed] {
-            assert!(!state.validate_entered(1));
-            assert_eq!(state, Lifecycle::Failed);
+        let abort = hv_vcpu_exit_exception_t {
+            // A decoded MMIO fault would otherwise be passed through.
+            syndrome: 0x9300_0047,
+            virtual_address: 0x8000,
+            physical_address: 0x4000,
+        };
+        for (lifecycle, entered) in [
+            (Lifecycle::Armed(2), 1),
+            (Lifecycle::Unarmed, 2),
+            (Lifecycle::Disabled, 2),
+            (Lifecycle::Failed, 2),
+        ] {
+            let (domain, authority, _) =
+                MemoryDomain::construct(Default::default(), 16384, BackingKind::Boot).unwrap();
+            let current = authority.issue_epoch(2).unwrap();
+            let entered = authority.issue_epoch(entered).unwrap();
+            let protection = HvfRamProtection::new();
+            protection.bind(domain.clone()).unwrap();
+            {
+                let mut inner = protection.lock(DirtyOperation::Fault).unwrap();
+                inner.lifecycle = lifecycle;
+                inner.epoch = Some(current.clone());
+            }
+            if lifecycle == Lifecycle::Armed(2) {
+                for _ in 0..2 {
+                    assert_eq!(
+                        protection.handle_ram_write_fault(0, &current, &abort),
+                        Ok(DirtyFaultResolution::NotHandled)
+                    );
+                }
+            }
+            let error = protection
+                .handle_ram_write_fault(0, &entered, &abort)
+                .unwrap_err();
+            assert_eq!(error.operation, DirtyOperation::Fault);
+            assert_eq!(error.location, DirtyLocation::Vm);
+            assert_eq!(error.effect, DirtyEffect::ProtectionUnknown);
+            assert_eq!(error.native_code, 0);
+            assert_eq!(
+                protection.lock(DirtyOperation::Fault).unwrap().lifecycle,
+                Lifecycle::Failed
+            );
+            assert!(!domain.coverage_valid());
+        }
+    }
+
+    #[test]
+    fn instruction_abort_while_armed_still_invalidates_coverage() {
+        for syndrome in [0x8200_000f, 0x8200_008f] {
+            let (domain, authority, _) =
+                MemoryDomain::construct(Default::default(), 16384, BackingKind::Boot).unwrap();
+            let epoch = authority.issue_epoch(1).unwrap();
+            let protection = HvfRamProtection::new();
+            protection.bind(domain.clone()).unwrap();
+            {
+                let mut inner = protection.lock(DirtyOperation::Fault).unwrap();
+                inner.lifecycle = Lifecycle::Armed(1);
+                inner.epoch = Some(epoch.clone());
+            }
+            let error = protection.reject_instruction_fault(
+                0,
+                &epoch,
+                &hv_vcpu_exit_exception_t {
+                    syndrome,
+                    virtual_address: 0x8000,
+                    physical_address: 0x4000,
+                },
+            );
+            assert_eq!(error.effect, DirtyEffect::ProtectionUnknown);
+            assert!(!domain.coverage_valid());
+            assert_eq!(
+                protection.lock(DirtyOperation::Fault).unwrap().lifecycle,
+                Lifecycle::Failed
+            );
         }
     }
 
@@ -856,22 +1015,19 @@ mod tests {
 
     #[test]
     fn construction_and_failed_owners_cannot_enter_or_fall_back_to_untracked() {
-        use crate::dirty::HvfRamProtection;
-        use arch::guest_memory::{DirtyEffect, DirtyOperation};
-
         let protection = HvfRamProtection::new();
-        assert!(protection.entered_epoch().is_err());
+        assert!(protection.entered_epoch(0).is_err());
         assert!(protection.check_mapping_mutation().is_ok());
         match protection.lock(DirtyOperation::Fault) {
             Ok(mut inner) => inner.fail(),
             Err(error) => panic!("new protection owner unexpectedly failed: {error:?}"),
         }
-        assert!(protection.entered_epoch().is_err());
+        assert!(protection.entered_epoch(0).is_err());
         assert!(protection.finalize_untracked().is_err());
         assert!(protection.check_mapping_mutation().is_err());
         assert!(matches!(
             protection
-                .entered_epoch()
+                .entered_epoch(0)
                 .err()
                 .map(|failure| failure.effect),
             Some(DirtyEffect::ProtectionUnknown)

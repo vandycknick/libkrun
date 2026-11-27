@@ -983,7 +983,7 @@ impl HvfVcpu<'_> {
 
         let entered_epoch = self
             .protection
-            .entered_epoch()
+            .entered_epoch(self.vcpuid)
             .map_err(Error::DirtyTracking)?;
         let ret = unsafe { hv_vcpu_run(self.vcpuid) };
         if ret != HV_SUCCESS {
@@ -1039,7 +1039,11 @@ impl HvfVcpu<'_> {
             EC_INSTRUCTIONABORT | EC_INSTRUCTIONABORT_CURRENT => {
                 if let Some(entered) = &entered_epoch {
                     return Err(Error::DirtyTracking(
-                        self.protection.reject_instruction_fault(entered),
+                        self.protection.reject_instruction_fault(
+                            self.vcpuid,
+                            entered,
+                            &exit.exception,
+                        ),
                     ));
                 }
                 let pa = exit.exception.physical_address;
@@ -1068,7 +1072,7 @@ impl HvfVcpu<'_> {
                 if let Some(entered) = &entered_epoch {
                     match self
                         .protection
-                        .handle_ram_write_fault(entered, syndrome, pa)
+                        .handle_ram_write_fault(self.vcpuid, entered, &exit.exception)
                         .map_err(Error::DirtyTracking)?
                     {
                         DirtyFaultResolution::Retry => return Ok(VcpuExit::MemoryRetry),
